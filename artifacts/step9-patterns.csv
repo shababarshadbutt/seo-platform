@@ -1,0 +1,5 @@
+"Pattern","Total URLs","Coverage %","Sampled","Hit","Miss","Confidence %","Redirect %","Status","Suspicious Segment"
+"/products/{param}",55,55,5,5,0,90,10,"GOOD","No"
+"/blog/{param}",25,25,5,3,2,60,20,"WARNING","No"
+"/legacy/{param}",15,15,5,2,3,20,70,"BAD","legacy"
+"/old-sale/{param}",5,5,3,0,3,0,0,"BAD","No"

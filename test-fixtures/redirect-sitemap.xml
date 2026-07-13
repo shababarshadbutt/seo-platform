@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://httpbin.org/redirect-to?url=https://example.com/final-url-path-alpha&amp;status_code=301</loc>
+  </url>
+  <url>
+    <loc>https://httpbin.org/redirect-to?url=https://example.com/final-url-path-beta&amp;status_code=301</loc>
+  </url>
+  <url>
+    <loc>https://httpbin.org/redirect-to?url=https://example.com/final-url-path-gamma&amp;status_code=301</loc>
+  </url>
+</urlset>

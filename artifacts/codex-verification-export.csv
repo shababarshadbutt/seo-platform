@@ -1,0 +1,2 @@
+"Pattern","Total URLs","Coverage %","Sampled","Hit","Miss","Confidence %","Redirect %","Status","Suspicious Segment"
+"/{param}/{param}",3,100,3,0,3,0,0,"BAD","No"

@@ -1,0 +1,6 @@
+@echo off
+echo Starting Sitemap Migration Health Checker...
+docker compose up -d
+echo Waiting for services to start...
+timeout /t 20 /nobreak
+start http://localhost:3010

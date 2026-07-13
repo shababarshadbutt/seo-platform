@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://newsite.example/products/alpha-100</loc>
+  </url>
+  <url>
+    <loc>https://newsite.example/products/broken-200</loc>
+  </url>
+  <url>
+    <loc>https://newsite.example/products/unclosed
+</urlset>
+

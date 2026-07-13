@@ -1,0 +1,60 @@
+services:
+  frontend:
+    image: shababarshadbutt/sitemap-frontend:v1.2 
+    ports:
+      - "3010:3000"
+    environment:
+      NEXT_PUBLIC_BACKEND_URL: http://localhost:3011
+    depends_on:
+      - backend
+
+  backend:
+    image: shababarshadbutt/sitemap-backend:v1.2
+    ports:
+      - "3011:3001"
+    environment:
+      DATABASE_URL: postgresql://sitemap:sitemap@postgres:5432/sitemap_health
+      REDIS_URL: redis://redis:6379
+      UPLOAD_DIR: /uploads
+      EXPORT_DIR: /exports
+    volumes:
+      - uploads:/uploads
+      - exports:/exports
+    depends_on:
+      - postgres
+      - redis
+
+  worker:
+    image: shababarshadbutt/sitemap-backend:v1.2 
+    command: npm run worker
+    environment:
+      DATABASE_URL: postgresql://sitemap:sitemap@postgres:5432/sitemap_health
+      REDIS_URL: redis://redis:6379
+      UPLOAD_DIR: /uploads
+      EXPORT_DIR: /exports
+    volumes:
+      - uploads:/uploads
+      - exports:/exports
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: sitemap
+      POSTGRES_PASSWORD: sitemap
+      POSTGRES_DB: sitemap_health
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+
+volumes:
+  uploads:
+  exports:
+  postgres_data:
+  redis_data:
