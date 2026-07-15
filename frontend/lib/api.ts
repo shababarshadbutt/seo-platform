@@ -39,9 +39,17 @@ export type SitemapFile = {
   is_index: boolean;
   had_preamble_stripped: boolean;
   is_empty: boolean;
+  is_deleted?: boolean;
+  deleted_at?: string | null;
+  gsc_deletion_status?: GscDeletionStatus | null;
+  gsc_deletion_error?: string | null;
   mismatched_url_count?: NumberLike;
   is_edited?: boolean;
 };
+
+export type SitemapFileStatus = "active" | "deleted" | "empty" | "invalid";
+
+export type GscDeletionStatus = "submitted" | "failed" | "skipped";
 
 export type SitemapSourceRole = "current" | "legacy";
 
@@ -847,6 +855,95 @@ export async function getBulkReplaceStatus(sessionId: string) {
   return readJsonResponse<BulkReplaceStatus>(response);
 }
 
+export type SessionFile = {
+  id: string;
+  filename: string;
+  source_role: SitemapSourceRole;
+  total_urls: number;
+  is_index: boolean;
+  is_deleted: boolean;
+  deleted_at: string | null;
+  gsc_deletion_status: GscDeletionStatus | null;
+  gsc_deletion_error: string | null;
+  status: SitemapFileStatus;
+};
+
+export type SessionFilesResponse = {
+  session: {
+    name: string;
+    base_url: string;
+    gsc_property_url: string | null;
+    gsc_configured: boolean;
+  };
+  files: SessionFile[];
+};
+
+export type FileDeletionResult = {
+  file_id: string;
+  filename: string;
+  deleted: boolean;
+  gsc_status: GscDeletionStatus;
+  gsc_error?: string;
+};
+
+export async function getSessionFiles(
+  sessionId: string,
+  status?: SitemapFileStatus
+) {
+  const query = status ? `?status=${encodeURIComponent(status)}` : "";
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/files${query}`),
+    { cache: "no-store" }
+  );
+
+  return readJsonResponse<SessionFilesResponse>(response);
+}
+
+export async function deleteSessionFiles(
+  sessionId: string,
+  input: {
+    fileIds: string[];
+    gscPropertyUrl?: string;
+    gscCredentials?: string;
+  }
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/files/delete`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        file_ids: input.fileIds,
+        ...(input.gscPropertyUrl
+          ? { gsc_property_url: input.gscPropertyUrl }
+          : {}),
+        ...(input.gscCredentials
+          ? { gsc_credentials: input.gscCredentials }
+          : {})
+      })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<{ results: FileDeletionResult[] }>(response);
+}
+
+export async function restoreSessionFiles(
+  sessionId: string,
+  fileIds: string[]
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/files/restore`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file_ids: fileIds })
+    }
+  );
+
+  return readJsonResponse<{ restored: number }>(response);
+}
+
 export function getSessionExportUrl(sessionId: string, format: ExportFormat) {
   return backendUrl(
     `/api/sessions/${sessionId}/export?format=${encodeURIComponent(format)}`
@@ -986,4 +1083,11 @@ export async function downloadSessionExport(
 }
 
 export function numberValue(value: NumberLike) {
-  if (value === null || value === un
+  if (value === null || value === undefined) {
+    return 0;
+  }
+
+  const parsed = typeof value === "number" ? value : Number(value);
+
+  return Number.isFinite(parsed) ? parsed : 0;
+}

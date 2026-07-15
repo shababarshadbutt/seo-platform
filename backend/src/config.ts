@@ -58,5 +58,11 @@ export const config = {
     min: 1
   }),
   defaultHttpUserAgent:
-    process.env.DEFAULT_HTTP_USER_AGENT ?? DEFAULT_HTTP_USER_AGENT
+    process.env.DEFAULT_HTTP_USER_AGENT ?? DEFAULT_HTTP_USER_AGENT,
+  // Secret used to encrypt sensitive per-session data at rest (GSC service
+  // account JSON). Any non-empty string works; it is stretched to a 32-byte
+  // AES-256 key via scrypt. Falls back to a dev-only default so local runs
+  // work without extra setup — set a real value in production.
+  encryptionKey:
+    process.env.ENCRYPTION_KEY ?? "dev-insecure-encryption-key-change-me"
 };

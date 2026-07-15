@@ -1558,9 +1558,13 @@ export default function ResultsDashboardPage({
   const hasSomeEmptySitemaps = emptySitemapCount > 0 && !allSitemapsEmpty;
 
   // Download-sitemaps counts + rough size estimate (~100 bytes per <loc>).
+  // Deleted files are excluded from downloads, so they don't count here.
+  const deletedSitemapCount =
+    sessionData?.sitemap_files.filter((file) => file.is_deleted).length ?? 0;
   const currentSitemapFiles =
-    sessionData?.sitemap_files.filter((file) => file.source_role === "current") ??
-    [];
+    sessionData?.sitemap_files.filter(
+      (file) => file.source_role === "current" && !file.is_deleted
+    ) ?? [];
   const editedSitemapCount = currentSitemapFiles.filter(
     (file) => file.is_edited
   ).length;
@@ -1712,6 +1716,14 @@ export default function ResultsDashboardPage({
               <Button asChild>
                 <Link href="/">New Analysis</Link>
               </Button>
+              {hasSitemapFiles ? (
+                <Button asChild variant="outline">
+                  <Link href={`/sessions/${params.id}/files`}>
+                    <FileText className="mr-2 h-4 w-4" />
+                    Files
+                  </Link>
+                </Button>
+              ) : null}
               {session?.status === "COMPLETE" ||
               session?.status === "COMPLETED" ? (
                 <Button
@@ -1788,6 +1800,13 @@ export default function ResultsDashboardPage({
                       All files ({formatNumber(allSitemapCount)}{" "}
                       {allSitemapCount === 1 ? "file" : "files"})
                     </DropdownMenuItem>
+                    {deletedSitemapCount > 0 ? (
+                      <p className="px-2 py-1.5 text-xs text-amber-700">
+                        {formatNumber(deletedSitemapCount)} deleted{" "}
+                        {deletedSitemapCount === 1 ? "sitemap" : "sitemaps"}{" "}
+                        excluded
+                      </p>
+                    ) : null}
                   </DropdownMenuContent>
                 </DropdownMenu>
               ) : null}
@@ -1846,6 +1865,27 @@ export default function ResultsDashboardPage({
                 <span>
                   This sitemap contained extra text before the XML content. It
                   was automatically cleaned and processed successfully.
+                </span>
+              </div>
+            ) : null}
+
+            {deletedSitemapCount > 0 ? (
+              <div
+                className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900"
+                role="status"
+              >
+                <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>
+                  {formatNumber(deletedSitemapCount)} sitemap{" "}
+                  {deletedSitemapCount === 1 ? "file has" : "files have"} been
+                  deleted and will be excluded from downloads. Pattern counts
+                  include their URLs.{" "}
+                  <Link
+                    href={`/sessions/${params.id}/files`}
+                    className="font-medium underline underline-offset-2"
+                  >
+                    Manage files
+                  </Link>
                 </span>
               </div>
             ) : null}

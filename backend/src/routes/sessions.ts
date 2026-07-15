@@ -18,7 +18,13 @@ import type { FastifyBaseLogger, FastifyPluginAsync } from "fastify";
 import type { PoolClient } from "pg";
 
 import { config } from "../config.js";
+import { decryptSecret, encryptSecret } from "../crypto/secrets.js";
 import { pool } from "../db/pool.js";
+import {
+  deleteFromGSC,
+  parseServiceAccount,
+  type ServiceAccountCredentials
+} from "../gsc/deleteSitemap.js";
 import {
   generateSessionExport,
   SessionExportNotFoundError,
@@ -39,6 +45,7 @@ import {
   enqueueBulkReplaceJob,
   enqueueBulkReplaceUndoJob
 } from "../queue/bulkReplaceQueue.js";
+import { isSameDomain, normalizeHost } from "../sitemaps/domain.js";
 import { fetchSitemapPreview } from "../sitemaps/fetchPreview.js";
 import {
   buildRedirectFixedStoredFilename,
@@ -100,6 +107,20 @@ type FileParams = {
 type PatternParams = {
   id: string;
   patternId: string;
+};
+
+type FilesListQuery = {
+  status?: string;
+};
+
+type DeleteFilesBody = {
+  file_ids?: unknown;
+  gsc_property_url?: unknown;
+  gsc_credentials?: unknown;
+};
+
+type RestoreFilesBody = {
+  file_ids?: unknown;
 };
 
 type ExportQuery = {
@@ -343,6 +364,72 @@ function isEditedStoredFilename(sessionId: string, filename: string) {
     filename.startsWith(`${sessionId}-renamed-`) ||
     filename.startsWith(`${sessionId}-bulk-`)
   );
+}
+
+// Derived display status for a sitemap file in the Files management view.
+// Deleted wins over everything; otherwise invalid > empty > active.
+type SitemapFileStatus = "active" | "deleted" | "empty" | "invalid";
+
+function sitemapFileStatus(row: {
+  is_deleted: boolean;
+  is_valid: boolean;
+  is_empty: boolean;
+}): SitemapFileStatus {
+  if (row.is_deleted) {
+    return "deleted";
+  }
+
+  if (!row.is_valid) {
+    return "invalid";
+  }
+
+  if (row.is_empty) {
+    return "empty";
+  }
+
+  return "active";
+}
+
+// Accept a pasted GSC service-account key as either raw JSON or base64-encoded
+// JSON (the API contract documents base64) and return the raw JSON string.
+function decodeGscCredentialsInput(raw: string): string {
+  const trimmed = raw.trim();
+
+  if (trimmed.startsWith("{")) {
+    return trimmed;
+  }
+
+  try {
+    const decoded = Buffer.from(trimmed, "base64").toString("utf8").trim();
+
+    if (decoded.startsWith("{")) {
+      return decoded;
+    }
+  } catch {
+    // fall through — treat the original input as-is
+  }
+
+  return trimmed;
+}
+
+// Validate a body-supplied file_ids array into a de-duplicated list of UUID
+// strings. Returns an error message string when the shape is wrong.
+function parseFileIds(value: unknown): string[] | { error: string } {
+  if (!Array.isArray(value) || value.length === 0) {
+    return { error: "file_ids must be a non-empty array" };
+  }
+
+  const ids = new Set<string>();
+
+  for (const entry of value) {
+    if (typeof entry !== "string" || entry.trim().length === 0) {
+      return { error: "file_ids must contain only non-empty strings" };
+    }
+
+    ids.add(entry.trim());
+  }
+
+  return [...ids];
 }
 
 // Detect the URL path prefix an existing sitemap index uses for its child
@@ -965,18 +1052,14 @@ async function drainMultipartFile(uploadedFile: MultipartFile) {
   await finished(uploadedFile.file);
 }
 
-function normalizeDomainHost(hostname: string) {
-  return hostname.toLowerCase().replace(/^www\./, "");
-}
-
 function expectedHostFromBaseUrl(baseUrl: string) {
-  return normalizeDomainHost(new URL(baseUrl).hostname);
+  return normalizeHost(new URL(baseUrl).hostname);
 }
 
 function detectedHostFromUrl(value: string) {
   const url = new URL(value);
 
-  return normalizeDomainHost(url.hostname);
+  return normalizeHost(url.hostname);
 }
 
 function sitemapUrlDomainMismatchMessage(
@@ -985,7 +1068,7 @@ function sitemapUrlDomainMismatchMessage(
 ) {
   const detectedHost = detectedHostFromUrl(sitemapUrl);
 
-  if (detectedHost === expectedHost) {
+  if (isSameDomain(detectedHost, expectedHost)) {
     return null;
   }
 
@@ -1050,7 +1133,7 @@ async function detectedHostFromSitemapSample(filePath: string) {
       return null;
     }
 
-    return normalizeDomainHost(sampleUrl.hostname);
+    return normalizeHost(sampleUrl.hostname);
   } catch {
     return null;
   }
@@ -1066,7 +1149,7 @@ async function validateUploadedFileDomain(
 
   const detectedHost = await detectedHostFromSitemapSample(upload.file_path);
 
-  if (!detectedHost || detectedHost === expectedHost) {
+  if (!detectedHost || isSameDomain(detectedHost, expectedHost)) {
     return null;
   }
 
@@ -1903,6 +1986,10 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           is_index,
           had_preamble_stripped,
           is_empty,
+          is_deleted,
+          deleted_at,
+          gsc_deletion_status,
+          gsc_deletion_error,
           mismatched_url_count,
           (
             filename LIKE (session_id::text || '-fixed-%')
@@ -2878,6 +2965,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           SELECT filename, is_index
           FROM sitemap_files
           WHERE session_id = $1 AND source_role = 'current'
+            AND is_deleted = false
           ORDER BY filename ASC
         `,
         [request.params.id]
@@ -3705,6 +3793,333 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       });
 
       return reply.code(202).send({ job_id: jobRowId });
+    }
+  );
+
+  // List every sitemap file for a session with deletion + GSC state, for the
+  // Files management view. Filename is the clean display label. Optional
+  // ?status=active|deleted|empty|invalid filter.
+  app.get<{ Params: SessionParams; Querystring: FilesListQuery }>(
+    "/api/sessions/:id/files",
+    async (request, reply) => {
+      const sessionResult = await pool.query<{
+        name: string;
+        base_url: string;
+        gsc_property_url: string | null;
+        gsc_credentials_encrypted: string | null;
+      }>(
+        `
+          SELECT name, base_url, gsc_property_url, gsc_credentials_encrypted
+          FROM sessions
+          WHERE id = $1
+        `,
+        [request.params.id]
+      );
+
+      if (sessionResult.rowCount === 0) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "session not found"
+        });
+      }
+
+      const session = sessionResult.rows[0];
+
+      const filesResult = await pool.query<{
+        id: string;
+        filename: string;
+        source_role: SitemapSourceRole;
+        total_urls: string;
+        is_valid: boolean;
+        is_empty: boolean;
+        is_index: boolean;
+        is_deleted: boolean;
+        deleted_at: string | null;
+        gsc_deletion_status: string | null;
+        gsc_deletion_error: string | null;
+      }>(
+        `
+          SELECT
+            id,
+            filename,
+            source_role,
+            total_urls,
+            is_valid,
+            is_empty,
+            is_index,
+            is_deleted,
+            deleted_at,
+            gsc_deletion_status,
+            gsc_deletion_error
+          FROM sitemap_files
+          WHERE session_id = $1
+          ORDER BY is_index DESC, filename ASC, id ASC
+        `,
+        [request.params.id]
+      );
+
+      const requestedStatus = request.query.status?.toLowerCase();
+      const statusFilter =
+        requestedStatus === "active" ||
+        requestedStatus === "deleted" ||
+        requestedStatus === "empty" ||
+        requestedStatus === "invalid"
+          ? requestedStatus
+          : null;
+
+      const files = filesResult.rows
+        .map((row) => {
+          const status = sitemapFileStatus(row);
+
+          return {
+            id: row.id,
+            filename: downloadDisplayName(request.params.id, row.filename),
+            source_role: row.source_role,
+            total_urls: Number(row.total_urls),
+            is_index: row.is_index,
+            is_deleted: row.is_deleted,
+            deleted_at: row.deleted_at,
+            gsc_deletion_status: row.gsc_deletion_status,
+            gsc_deletion_error: row.gsc_deletion_error,
+            status
+          };
+        })
+        .filter((file) => (statusFilter ? file.status === statusFilter : true));
+
+      return {
+        session: {
+          name: session.name,
+          base_url: session.base_url,
+          gsc_property_url: session.gsc_property_url,
+          gsc_configured: Boolean(session.gsc_credentials_encrypted)
+        },
+        files
+      };
+    }
+  );
+
+  // Soft-delete one or more sitemap files: mark them deleted (row + on-disk file
+  // are kept for audit / undo) and submit a deletion request to Google Search
+  // Console when credentials are available. Local deletion is applied first so a
+  // GSC failure never blocks the local state change.
+  app.post<{ Params: SessionParams; Body: DeleteFilesBody }>(
+    "/api/sessions/:id/files/delete",
+    async (request, reply) => {
+      const sessionResult = await pool.query<{
+        base_url: string;
+        gsc_property_url: string | null;
+        gsc_credentials_encrypted: string | null;
+      }>(
+        `
+          SELECT base_url, gsc_property_url, gsc_credentials_encrypted
+          FROM sessions
+          WHERE id = $1
+        `,
+        [request.params.id]
+      );
+
+      if (sessionResult.rowCount === 0) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "session not found"
+        });
+      }
+
+      const session = sessionResult.rows[0];
+
+      const fileIds = parseFileIds(request.body.file_ids);
+
+      if ("error" in fileIds) {
+        return reply.code(400).send(badRequest(fileIds.error));
+      }
+
+      // Only operate on files that actually belong to this session.
+      const filesResult = await pool.query<{
+        id: string;
+        filename: string;
+      }>(
+        `
+          SELECT id, filename
+          FROM sitemap_files
+          WHERE session_id = $1 AND id = ANY($2::uuid[])
+        `,
+        [request.params.id, fileIds]
+      );
+
+      if (filesResult.rowCount === 0) {
+        return reply
+          .code(400)
+          .send(badRequest("none of the file_ids belong to this session"));
+      }
+
+      // Resolve GSC credentials + property. New credentials in the body are
+      // stored (encrypted) for reuse; otherwise fall back to what's on the
+      // session. Property URL defaults to the session base URL.
+      const propertyInput =
+        typeof request.body.gsc_property_url === "string"
+          ? request.body.gsc_property_url.trim()
+          : "";
+      const credentialsInput =
+        typeof request.body.gsc_credentials === "string"
+          ? request.body.gsc_credentials.trim()
+          : "";
+
+      const propertyUrl =
+        propertyInput || session.gsc_property_url || session.base_url;
+
+      let credentials: ServiceAccountCredentials | null = null;
+      let credentialsToPersist: string | null = null;
+      let credentialsError: string | null = null;
+
+      if (credentialsInput) {
+        try {
+          const rawJson = decodeGscCredentialsInput(credentialsInput);
+          credentials = parseServiceAccount(rawJson);
+          credentialsToPersist = encryptSecret(rawJson);
+        } catch (error) {
+          credentialsError =
+            error instanceof Error ? error.message : "invalid credentials";
+        }
+      } else if (session.gsc_credentials_encrypted) {
+        try {
+          credentials = parseServiceAccount(
+            decryptSecret(session.gsc_credentials_encrypted)
+          );
+        } catch (error) {
+          credentialsError =
+            error instanceof Error
+              ? error.message
+              : "stored credentials could not be read";
+        }
+      }
+
+      if (credentialsError) {
+        return reply.code(400).send(badRequest(credentialsError));
+      }
+
+      // Persist credentials / property for reuse before processing files.
+      if (credentialsToPersist || propertyInput) {
+        await pool.query(
+          `
+            UPDATE sessions
+            SET
+              gsc_property_url = COALESCE($2, gsc_property_url),
+              gsc_credentials_encrypted = COALESCE($3, gsc_credentials_encrypted)
+            WHERE id = $1
+          `,
+          [
+            request.params.id,
+            propertyInput || null,
+            credentialsToPersist
+          ]
+        );
+      }
+
+      const results: Array<{
+        file_id: string;
+        filename: string;
+        deleted: boolean;
+        gsc_status: "submitted" | "failed" | "skipped";
+        gsc_error?: string;
+      }> = [];
+
+      for (const file of filesResult.rows) {
+        const displayName = downloadDisplayName(
+          request.params.id,
+          file.filename
+        );
+
+        let gscStatus: "submitted" | "failed" | "skipped" = "skipped";
+        let gscError: string | null = null;
+
+        if (credentials) {
+          const sitemapUrl = isHttpUrl(file.filename)
+            ? file.filename
+            : `${session.base_url.replace(/\/+$/, "")}/sitemaps/${displayName}`;
+
+          request.log.info(
+            { sitemapUrl, propertyUrl, fileId: file.id },
+            "submitting GSC sitemap deletion"
+          );
+
+          const gscResult = await deleteFromGSC(
+            propertyUrl,
+            sitemapUrl,
+            credentials
+          );
+
+          if (gscResult.success) {
+            gscStatus = "submitted";
+          } else {
+            gscStatus = "failed";
+            gscError = gscResult.error ?? "GSC deletion failed";
+          }
+        }
+
+        await pool.query(
+          `
+            UPDATE sitemap_files
+            SET
+              is_deleted = true,
+              deleted_at = NOW(),
+              gsc_deletion_status = $3,
+              gsc_deletion_error = $4
+            WHERE session_id = $1 AND id = $2
+          `,
+          [request.params.id, file.id, gscStatus, gscError]
+        );
+
+        results.push({
+          file_id: file.id,
+          filename: displayName,
+          deleted: true,
+          gsc_status: gscStatus,
+          ...(gscError ? { gsc_error: gscError } : {})
+        });
+      }
+
+      return reply.send({ results });
+    }
+  );
+
+  // Undo a soft-delete: restore files locally and clear their GSC deletion
+  // state. This does NOT re-add them to Google Search Console.
+  app.post<{ Params: SessionParams; Body: RestoreFilesBody }>(
+    "/api/sessions/:id/files/restore",
+    async (request, reply) => {
+      const sessionResult = await pool.query(
+        "SELECT 1 FROM sessions WHERE id = $1",
+        [request.params.id]
+      );
+
+      if (sessionResult.rowCount === 0) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "session not found"
+        });
+      }
+
+      const fileIds = parseFileIds(request.body.file_ids);
+
+      if ("error" in fileIds) {
+        return reply.code(400).send(badRequest(fileIds.error));
+      }
+
+      const restoreResult = await pool.query<{ id: string }>(
+        `
+          UPDATE sitemap_files
+          SET
+            is_deleted = false,
+            deleted_at = NULL,
+            gsc_deletion_status = NULL,
+            gsc_deletion_error = NULL
+          WHERE session_id = $1 AND id = ANY($2::uuid[])
+          RETURNING id
+        `,
+        [request.params.id, fileIds]
+      );
+
+      return reply.send({ restored: restoreResult.rowCount ?? 0 });
     }
   );
 

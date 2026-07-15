@@ -36,6 +36,7 @@ services:
       FRONTEND_URL: http://frontend:3000
       PDF_BACKEND_URL: http://localhost:3001
       CHROMIUM_PATH: /usr/bin/chromium-browser
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-dev-insecure-encryption-key-change-me}
     ports:
       - "${BACKEND_PORT:-3001}:3001"
     volumes:
