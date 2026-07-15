@@ -3,6 +3,7 @@ import type { FastifyBaseLogger } from "fastify";
 import { config } from "../config.js";
 import { pool } from "../db/pool.js";
 import { enqueueSamplePatternsJob } from "../queue/sitemapQueue.js";
+import { isSameDomain, normalizeHost } from "../sitemaps/domain.js";
 import { displaySourceFilename } from "../sitemaps/filenames.js";
 import { streamSitemapUrlLocs } from "../sitemaps/parser.js";
 import { isSessionCancelled } from "./sessionCompletion.js";
@@ -149,10 +150,6 @@ type ParsedLocResult =
       mismatch: MismatchedUrl;
     };
 
-function normalizeHost(hostname: string) {
-  return hostname.toLowerCase().replace(/^www\./, "");
-}
-
 function expectedHostFromBaseUrl(baseUrl: string) {
   return normalizeHost(new URL(baseUrl).hostname);
 }
@@ -185,7 +182,7 @@ function parseLocForExtraction(
 
   const detectedHost = normalizeHost(url.hostname);
 
-  if (sourceRole === "current" && detectedHost !== expectedHost) {
+  if (sourceRole === "current" && !isSameDomain(detectedHost, expectedHost)) {
     return {
       kind: "mismatched",
       mismatch: {
