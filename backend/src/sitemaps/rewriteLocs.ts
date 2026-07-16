@@ -17,7 +17,14 @@ function segmentsFromTemplate(template: string) {
   const trimmed = template.trim();
   const path = trimmed.startsWith("/") ? trimmed.slice(1) : trimmed;
 
-  return path === "" ? [] : path.split("/");
+  // filter(Boolean) drops empty segments from leading/trailing/double slashes,
+  // matching how URL paths are tokenised in buildPatternTemplateRewriter
+  // (`split("/").filter(Boolean)`). Without this, a template ending in "/" (as
+  // the trailing-slash fix leaves patterns.template) carries a phantom empty
+  // segment, so its segment count never matches its own URLs and a subsequent
+  // rename / bulk-replace silently no-ops. The trailing slash is preserved
+  // separately via the URL's own `hadTrailingSlash`, so ignoring it here is safe.
+  return path === "" ? [] : path.split("/").filter(Boolean);
 }
 
 // Build a rewriter that replaces specific whole URLs, not path segments: each

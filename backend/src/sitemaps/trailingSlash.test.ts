@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { buildTrailingSlashRewriter } from "./rewriteLocs.js";
+import {
+  buildPatternTemplateRewriter,
+  buildTrailingSlashRewriter
+} from "./rewriteLocs.js";
 
 const fix = buildTrailingSlashRewriter();
 
@@ -59,5 +62,64 @@ describe("buildTrailingSlashRewriter", () => {
   test("treats a trailing dotted version segment with a short suffix as a file", () => {
     // Documented heuristic limit: a short dotted suffix reads as an extension.
     assert.equal(fix("https://example.com/v1.2"), null);
+  });
+});
+
+describe("buildPatternTemplateRewriter with trailing-slash templates", () => {
+  // Regression: a trailing-slash fix rewrites patterns.template to end in "/",
+  // so a subsequent rename passes that slashed template as `fromTemplate`. The
+  // rewriter must still match its own (also-slashed) URLs and apply the rename,
+  // preserving the trailing slash — otherwise the rename silently no-ops and the
+  // order (fix-slashes then rename) loses the rename entirely.
+  test("matches a slashed URL when the from-template is slashed", () => {
+    const rewrite = buildPatternTemplateRewriter(
+      "/parts/{param}/",
+      "/components/{param}/"
+    );
+    assert.equal(
+      rewrite("https://example.com/parts/part-100/"),
+      "https://example.com/components/part-100/"
+    );
+  });
+
+  test("preserves the URL's trailing slash even if templates omit it", () => {
+    const rewrite = buildPatternTemplateRewriter(
+      "/parts/{param}",
+      "/components/{param}"
+    );
+    assert.equal(
+      rewrite("https://example.com/parts/part-100/"),
+      "https://example.com/components/part-100/"
+    );
+  });
+
+  test("a slashed from-template still matches an unslashed URL", () => {
+    const rewrite = buildPatternTemplateRewriter(
+      "/parts/{param}/",
+      "/components/{param}"
+    );
+    assert.equal(
+      rewrite("https://example.com/parts/part-100"),
+      "https://example.com/components/part-100"
+    );
+  });
+
+  test("still inserts a static segment (order-based param carry)", () => {
+    const rewrite = buildPatternTemplateRewriter(
+      "/manufacturer/{param}/",
+      "/aviation/manufacturer/{param}/"
+    );
+    assert.equal(
+      rewrite("https://example.com/manufacturer/jamco/"),
+      "https://example.com/aviation/manufacturer/jamco/"
+    );
+  });
+
+  test("non-matching path still passes through unchanged (null)", () => {
+    const rewrite = buildPatternTemplateRewriter(
+      "/parts/{param}/",
+      "/components/{param}/"
+    );
+    assert.equal(rewrite("https://example.com/other/thing/"), null);
   });
 });
