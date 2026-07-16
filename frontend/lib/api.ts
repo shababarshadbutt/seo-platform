@@ -1,0 +1,1093 @@
+export type SessionStatus =
+  | "PENDING"
+  | "PROCESSING"
+  | "EXTRACTING"
+  | "EXTRACTED"
+  | "SAMPLING"
+  | "COMPLETE"
+  | "COMPLETED"
+  | "FAILED"
+  | "CANCELLED";
+
+export type NumberLike = number | string | null | undefined;
+
+export type ExportFormat = "csv" | "xlsx" | "pdf";
+
+export type Session = {
+  id: string;
+  name: string;
+  base_url: string;
+  sample_size: number;
+  concurrency: number;
+  user_agent?: string;
+  status: SessionStatus;
+  upload_complete: boolean;
+  created_at: string;
+  mismatched_url_count?: NumberLike;
+};
+
+export type SitemapFile = {
+  id: string;
+  session_id: string;
+  filename: string;
+  source_role: SitemapSourceRole;
+  total_urls: NumberLike;
+  parsed_at: string | null;
+  is_valid: boolean;
+  parse_error: string | null;
+  parse_error_offset: NumberLike;
+  is_index: boolean;
+  had_preamble_stripped: boolean;
+  is_empty: boolean;
+  is_deleted?: boolean;
+  deleted_at?: string | null;
+  gsc_deletion_status?: GscDeletionStatus | null;
+  gsc_deletion_error?: string | null;
+  mismatched_url_count?: NumberLike;
+  is_edited?: boolean;
+};
+
+export type SitemapFileStatus = "active" | "deleted" | "empty" | "invalid";
+
+export type GscDeletionStatus = "submitted" | "failed" | "skipped";
+
+export type SitemapSourceRole = "current" | "legacy";
+
+export type SitemapUrlPreview = {
+  filename: string;
+  total_urls: NumberLike;
+  is_index: boolean;
+  is_valid: boolean;
+  preview_patterns: string[];
+  parse_error: string | null;
+  had_preamble_stripped: boolean;
+};
+
+export type UploadRejectedFile = {
+  filename: string;
+  message: string;
+  detected_host?: string;
+  expected_host?: string;
+};
+
+export type UploadSitemapResponse = {
+  session_id?: string;
+  status?: SessionStatus;
+  sitemap_file_id?: string;
+  sitemap_files?: Array<{
+    sitemap_file_id: string;
+    filename: string;
+    is_index: boolean;
+    root_element: string | null;
+    source_role: SitemapSourceRole;
+    parse_job_id?: string;
+  }>;
+  rejected_files?: UploadRejectedFile[];
+  is_index?: boolean;
+  root_element?: string | null;
+};
+
+type UploadCompleteResponse = {
+  session_id: string;
+  upload_complete: boolean;
+};
+
+export type UploadProgress = {
+  loadedBytes: number;
+  totalBytes: number;
+  transferredFiles: number;
+  totalFiles: number;
+  percent: number;
+};
+
+export type SessionResponse = {
+  session: Session;
+  sitemap_files: SitemapFile[];
+};
+
+export type Pattern = {
+  id: string;
+  session_id: string;
+  source_role: SitemapSourceRole;
+  template: string;
+  total_urls: NumberLike;
+  coverage_pct: NumberLike;
+  confidence_pct: NumberLike;
+  status: string | null;
+  has_suspicious_segment: boolean;
+  suspicious_segment_value: string | null;
+  redirect_pct: NumberLike;
+  missing_in_current: boolean;
+  source_file: string | null;
+  original_template?: string | null;
+  transform_original_template?: string | null;
+};
+
+export type SampledUrl = {
+  id: string;
+  pattern_id: string;
+  url: string;
+  original_url?: string | null;
+  http_status: NumberLike;
+  response_ms: NumberLike;
+  is_hit: boolean;
+  checked_at: string | null;
+  final_url: string | null;
+  redirect_count: NumberLike;
+  http_status_category:
+    | "success"
+    | "redirect"
+    | "failure"
+    | "soft_404"
+    | null;
+  is_soft_404: boolean;
+  source_file: string | null;
+};
+
+export type MismatchedUrl = {
+  id: string;
+  sitemap_file_id: string;
+  session_id: string;
+  filename: string;
+  url: string;
+  detected_host: string;
+  expected_host: string;
+  created_at: string;
+};
+
+export type SessionHistoryItem = {
+  id: string;
+  name: string;
+  base_url: string;
+  status: SessionStatus;
+  created_at: string;
+  mismatched_url_count: NumberLike;
+  total_urls: NumberLike;
+  pattern_count: NumberLike;
+  healthy_count: NumberLike;
+  warning_count: NumberLike;
+  broken_count: NumberLike;
+  health_score: NumberLike;
+  empty_sitemap_count: NumberLike;
+};
+
+export type SystemDiskUsage = {
+  upload_storage_bytes: number;
+  upload_storage_mb: number;
+};
+
+type CreateSessionInput = {
+  name: string;
+  baseUrl: string;
+  sampleSize: number;
+  concurrency: number;
+};
+
+type CreateSessionResponse = {
+  session_id: string;
+};
+
+type PatternsResponse = {
+  patterns: Pattern[];
+};
+
+type SamplesResponse = {
+  sampled_urls: SampledUrl[];
+};
+
+type MismatchedUrlsResponse = {
+  mismatched_urls: MismatchedUrl[];
+};
+
+type SessionsResponse = {
+  sessions: SessionHistoryItem[];
+};
+
+const DEFAULT_API_TIMEOUT_MS = 10000;
+const EXPORT_API_TIMEOUT_MS = 180000;
+const UPLOAD_API_TIMEOUT_MS = 30 * 60 * 1000;
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly payload: unknown
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+function backendUrl(path: string) {
+  const baseUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
+
+  if (!baseUrl) {
+    throw new Error("NEXT_PUBLIC_BACKEND_URL is not configured");
+  }
+
+  return `${baseUrl.replace(/\/$/, "")}${path}`;
+}
+
+async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+  timeoutMs = DEFAULT_API_TIMEOUT_MS
+) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  if (init.signal) {
+    if (init.signal.aborted) {
+      controller.abort();
+    } else {
+      init.signal.addEventListener("abort", () => controller.abort(), {
+        once: true
+      });
+    }
+  }
+
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function readJsonResponse<T>(response: Response): Promise<T> {
+  const text = await response.text();
+  let payload: any = null;
+
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = null;
+  }
+
+  if (!response.ok) {
+    const message =
+      typeof payload?.message === "string"
+        ? payload.message
+        : `Request failed with status ${response.status}`;
+
+    throw new ApiError(message, response.status, payload);
+  }
+
+  return payload as T;
+}
+
+export function apiErrorPayload(error: unknown) {
+  return error instanceof ApiError ? error.payload : null;
+}
+
+export function friendlyApiErrorMessage(
+  error: unknown,
+  fallback = "Something went wrong."
+) {
+  // Backend responded with an error status — surface its actual message so the
+  // user sees what went wrong rather than a generic connectivity complaint.
+  if (error instanceof ApiError) {
+    if (error.status === 413) {
+      return "Too many files selected — try selecting fewer files at once";
+    }
+
+    return error.message || fallback;
+  }
+
+  // A timeout aborts the in-flight request client-side; the backend may still be
+  // finishing the work, so don't blame connectivity.
+  if (error instanceof Error && error.name === "AbortError") {
+    return "Request timed out — the operation may still be running in the background";
+  }
+
+  if (error instanceof TypeError) {
+    return "Cannot connect to backend — make sure Docker is running";
+  }
+
+  if (error instanceof Error) {
+    if (
+      error.message.includes("Failed to fetch") ||
+      error.message.includes("fetch failed") ||
+      error.message.includes("NetworkError")
+    ) {
+      return "Cannot connect to backend — make sure Docker is running";
+    }
+
+    return error.message || fallback;
+  }
+
+  return fallback;
+}
+
+export async function createSession(input: CreateSessionInput) {
+  const response = await fetchWithTimeout(backendUrl("/api/sessions"), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      name: input.name,
+      base_url: input.baseUrl,
+      sample_size: input.sampleSize,
+      concurrency: input.concurrency
+    })
+  });
+
+  return readJsonResponse<CreateSessionResponse>(response);
+}
+
+export async function uploadSitemap(
+  sessionId: string,
+  files: File[],
+  legacyFiles: File[] = [],
+  options: {
+    onProgress?: (progress: UploadProgress) => void;
+  } = {}
+): Promise<UploadSitemapResponse> {
+  const formData = new FormData();
+  const totalFiles = files.length + legacyFiles.length;
+
+  for (const file of files) {
+    formData.append("files", file, file.name);
+  }
+
+  for (const file of legacyFiles) {
+    formData.append("legacy_files", file, file.name);
+  }
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+
+    xhr.open("POST", backendUrl(`/api/sessions/${sessionId}/upload`));
+    xhr.timeout = UPLOAD_API_TIMEOUT_MS;
+
+    xhr.upload.onprogress = (event) => {
+      const totalBytes = event.lengthComputable ? event.total : 0;
+      const percent =
+        totalBytes > 0 ? Math.min(100, (event.loaded / totalBytes) * 100) : 0;
+      const transferredFiles =
+        totalBytes > 0
+          ? Math.min(
+              totalFiles,
+              Math.floor((event.loaded / totalBytes) * totalFiles)
+            )
+          : 0;
+
+      options.onProgress?.({
+        loadedBytes: event.loaded,
+        totalBytes,
+        transferredFiles,
+        totalFiles,
+        percent
+      });
+    };
+
+    xhr.onload = () => {
+      let payload: any = null;
+
+      try {
+        payload = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch {
+        payload = null;
+      }
+
+      if (xhr.status < 200 || xhr.status >= 300) {
+        const message =
+          typeof payload?.message === "string"
+            ? payload.message
+            : `Request failed with status ${xhr.status}`;
+
+        reject(new ApiError(message, xhr.status, payload));
+        return;
+      }
+
+      options.onProgress?.({
+        loadedBytes: 0,
+        totalBytes: 0,
+        transferredFiles: totalFiles,
+        totalFiles,
+        percent: 100
+      });
+      resolve(payload as UploadSitemapResponse);
+    };
+
+    xhr.onerror = () => {
+      reject(new TypeError("Failed to upload sitemap files"));
+    };
+
+    xhr.ontimeout = () => {
+      const error = new Error("Upload timed out");
+
+      error.name = "AbortError";
+      reject(error);
+    };
+
+    xhr.send(formData);
+  });
+}
+
+export async function completeSitemapUpload(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/upload-complete`),
+    {
+      method: "POST"
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<UploadCompleteResponse>(response);
+}
+
+export async function previewSitemapUrl(sitemapUrl: string) {
+  const response = await fetchWithTimeout(
+    backendUrl("/api/fetch-sitemap"),
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        sitemap_url: sitemapUrl
+      })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<SitemapUrlPreview>(response);
+}
+
+export async function submitSitemapUrl(
+  sessionId: string,
+  sitemapUrl: string,
+  filename: string
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/url`),
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        sitemap_url: sitemapUrl,
+        filename
+      })
+    }
+  );
+
+  return readJsonResponse(response);
+}
+
+export async function submitSitemapUrls(
+  sessionId: string,
+  sitemaps: Array<{
+    sitemapUrl: string;
+    filename: string;
+    sourceRole?: SitemapSourceRole;
+  }>
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/urls`),
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        sitemaps: sitemaps.map((sitemap) => ({
+          sitemap_url: sitemap.sitemapUrl,
+          filename: sitemap.filename,
+          source_role: sitemap.sourceRole ?? "current"
+        }))
+      })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<UploadSitemapResponse>(response);
+}
+
+export async function getSession(sessionId: string) {
+  const response = await fetchWithTimeout(backendUrl(`/api/sessions/${sessionId}`), {
+    cache: "no-store"
+  });
+
+  return readJsonResponse<SessionResponse>(response);
+}
+
+export async function getSessions() {
+  const response = await fetchWithTimeout(backendUrl("/api/sessions"), {
+    cache: "no-store"
+  });
+  const data = await readJsonResponse<SessionsResponse>(response);
+
+  return data.sessions;
+}
+
+export async function getSystemDiskUsage() {
+  const response = await fetchWithTimeout(backendUrl("/api/system/disk"), {
+    cache: "no-store"
+  });
+
+  return readJsonResponse<SystemDiskUsage>(response);
+}
+
+export async function deleteSession(sessionId: string) {
+  const response = await fetchWithTimeout(backendUrl(`/api/sessions/${sessionId}`), {
+    method: "DELETE"
+  });
+
+  if (!response.ok) {
+    await readJsonResponse(response);
+  }
+}
+
+export type CancelSessionResult = {
+  cancelled: boolean;
+  session_id: string;
+};
+
+export async function cancelSession(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/cancel`),
+    {
+      method: "POST"
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CancelSessionResult>(response);
+}
+
+export async function getPatterns(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/patterns`),
+    {
+      cache: "no-store"
+    }
+  );
+  const data = await readJsonResponse<PatternsResponse>(response);
+
+  return data.patterns;
+}
+
+export async function getPatternSamples(sessionId: string, patternId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/samples`),
+    {
+      cache: "no-store"
+    }
+  );
+  const data = await readJsonResponse<SamplesResponse>(response);
+
+  return data.sampled_urls;
+}
+
+export async function getMismatchedUrls(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/mismatched-urls`),
+    {
+      cache: "no-store"
+    }
+  );
+  const data = await readJsonResponse<MismatchedUrlsResponse>(response);
+
+  return data.mismatched_urls;
+}
+
+export type FindReplaceResult = {
+  affected: number;
+  find: string;
+  replace: string;
+  match_case: boolean;
+};
+
+export type FindReplaceUndoResult = {
+  restored: number;
+};
+
+export type FindReplacePreview = {
+  affected_count: number;
+  preview: Array<{ before: string; after: string }>;
+};
+
+// NOTE: the /find-replace and /find-replace/preview endpoints still exist on
+// the backend and back the shared redirect-fix undo (undoFindReplace below).
+// The standalone Find & Replace UI was removed in v1.13, so the preview/apply
+// client helpers are gone; only undo remains wired to the UI.
+export async function undoFindReplace(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/find-replace/undo`),
+    {
+      method: "POST"
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<FindReplaceUndoResult>(response);
+}
+
+export type PatternSourceFile = {
+  source_file: string;
+  occurrences: number;
+};
+
+export type RenamePatternResult = {
+  old_template: string;
+  new_template: string;
+  occurrence_count: number;
+  source_files_count: number;
+  undo?: boolean;
+};
+
+export async function getPatternSourceFiles(
+  sessionId: string,
+  patternId: string
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/source-files`),
+    { cache: "no-store" }
+  );
+  const data = await readJsonResponse<{ source_files: PatternSourceFile[] }>(
+    response
+  );
+
+  return data.source_files;
+}
+
+export async function renamePatternTemplate(
+  sessionId: string,
+  patternId: string,
+  input: { newTemplate: string; sourceFiles: string[] }
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/rename`),
+    {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        new_template: input.newTemplate,
+        source_files: input.sourceFiles
+      })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<RenamePatternResult>(response);
+}
+
+export type TransformPatternResult = {
+  urls_transformed: number;
+  files_rewritten: number;
+  old_template: string;
+  new_template: string;
+  sample_before_after: Array<{ before: string; after: string }>;
+};
+
+// Apply a pattern-scoped URL structure transformation (+ optional label rename).
+// Heavy like rename, so it uses the long timeout.
+export async function transformPatternStructure(
+  sessionId: string,
+  patternId: string,
+  input: {
+    newTemplate: string;
+    currentStructure: string;
+    newStructure: string;
+    sourceFiles: string[];
+  }
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/transform`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        new_template: input.newTemplate,
+        current_structure: input.currentStructure,
+        new_structure: input.newStructure,
+        source_files: input.sourceFiles
+      })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<TransformPatternResult>(response);
+}
+
+export async function undoPatternTransform(
+  sessionId: string,
+  patternId: string
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/transform-undo`
+    ),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      // Fastify rejects an empty body when content-type is JSON — send "{}".
+      body: JSON.stringify({})
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<{
+    undo: boolean;
+    files_restored: number;
+    template: string;
+  }>(response);
+}
+
+export async function applyPatternRedirects(
+  sessionId: string,
+  patternId: string,
+  urlIds?: string[]
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/apply-redirects`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(urlIds ? { url_ids: urlIds } : {})
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<{ updated: number }>(response);
+}
+
+export type BulkReplaceFile = {
+  filename: string;
+  url_count: number;
+};
+
+export type BulkReplacePreview = {
+  files_affected: number;
+  urls_affected: number;
+  estimated_seconds: number;
+  sample_urls: { before: string; after: string }[];
+  files: BulkReplaceFile[];
+};
+
+export type BulkReplaceJobStatus =
+  | "NONE"
+  | "PENDING"
+  | "RUNNING"
+  | "COMPLETE"
+  | "FAILED"
+  | "UNDOING"
+  | "UNDONE";
+
+export type BulkReplaceStatus = {
+  status: BulkReplaceJobStatus;
+  job_id?: string;
+  files_total?: number;
+  files_done?: number;
+  urls_rewritten?: number;
+  from_pattern?: string;
+  to_pattern?: string;
+  error?: string | null;
+};
+
+export async function previewBulkReplace(
+  sessionId: string,
+  input: { fromPattern: string; toPattern: string }
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/bulk-replace/preview`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        from_pattern: input.fromPattern,
+        to_pattern: input.toPattern
+      })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<BulkReplacePreview>(response);
+}
+
+export async function applyBulkReplace(
+  sessionId: string,
+  input: { fromPattern: string; toPattern: string; selectedFiles?: string[] }
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/bulk-replace/apply`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        from_pattern: input.fromPattern,
+        to_pattern: input.toPattern,
+        ...(input.selectedFiles ? { selected_files: input.selectedFiles } : {})
+      })
+    }
+  );
+
+  return readJsonResponse<{ job_id: string }>(response);
+}
+
+export async function undoBulkReplace(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/bulk-replace/undo`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    }
+  );
+
+  return readJsonResponse<{ job_id: string }>(response);
+}
+
+export async function getBulkReplaceStatus(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/bulk-replace-status`),
+    {
+      cache: "no-store"
+    }
+  );
+
+  return readJsonResponse<BulkReplaceStatus>(response);
+}
+
+export type SessionFile = {
+  id: string;
+  filename: string;
+  source_role: SitemapSourceRole;
+  total_urls: number;
+  is_index: boolean;
+  is_deleted: boolean;
+  deleted_at: string | null;
+  gsc_deletion_status: GscDeletionStatus | null;
+  gsc_deletion_error: string | null;
+  status: SitemapFileStatus;
+};
+
+export type SessionFilesResponse = {
+  session: {
+    name: string;
+    base_url: string;
+    gsc_property_url: string | null;
+    gsc_configured: boolean;
+  };
+  files: SessionFile[];
+};
+
+export type FileDeletionResult = {
+  file_id: string;
+  filename: string;
+  deleted: boolean;
+  gsc_status: GscDeletionStatus;
+  gsc_error?: string;
+};
+
+export async function getSessionFiles(
+  sessionId: string,
+  status?: SitemapFileStatus
+) {
+  const query = status ? `?status=${encodeURIComponent(status)}` : "";
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/files${query}`),
+    { cache: "no-store" }
+  );
+
+  return readJsonResponse<SessionFilesResponse>(response);
+}
+
+export async function deleteSessionFiles(
+  sessionId: string,
+  input: {
+    fileIds: string[];
+    gscPropertyUrl?: string;
+    gscCredentials?: string;
+  }
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/files/delete`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        file_ids: input.fileIds,
+        ...(input.gscPropertyUrl
+          ? { gsc_property_url: input.gscPropertyUrl }
+          : {}),
+        ...(input.gscCredentials
+          ? { gsc_credentials: input.gscCredentials }
+          : {})
+      })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<{ results: FileDeletionResult[] }>(response);
+}
+
+export async function restoreSessionFiles(
+  sessionId: string,
+  fileIds: string[]
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/files/restore`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file_ids: fileIds })
+    }
+  );
+
+  return readJsonResponse<{ restored: number }>(response);
+}
+
+export function getSessionExportUrl(sessionId: string, format: ExportFormat) {
+  return backendUrl(
+    `/api/sessions/${sessionId}/export?format=${encodeURIComponent(format)}`
+  );
+}
+
+export async function downloadCorrectedSitemap(
+  sessionId: string,
+  patternId: string
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/download-sitemap`
+    ),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    let message = `Download failed with status ${response.status}`;
+
+    try {
+      const payload = text ? JSON.parse(text) : null;
+
+      if (typeof payload?.message === "string") {
+        message = payload.message;
+      }
+    } catch {
+      if (text) {
+        message = text;
+      }
+    }
+
+    throw new Error(message);
+  }
+
+  const blob = await response.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = objectUrl;
+  link.download = downloadFilename(response, "corrected-sitemap.xml");
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+export async function downloadSitemapsZip(
+  sessionId: string,
+  type: "edited" | "all"
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/download-sitemaps?type=${type}`),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    let message = `Download failed with status ${response.status}`;
+
+    try {
+      const payload = text ? JSON.parse(text) : null;
+
+      if (typeof payload?.message === "string") {
+        message = payload.message;
+      }
+    } catch {
+      if (text) {
+        message = text;
+      }
+    }
+
+    throw new Error(message);
+  }
+
+  const blob = await response.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = objectUrl;
+  link.download = downloadFilename(response, `${type}-sitemaps.zip`);
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+function downloadFilename(response: Response, fallback: string) {
+  const disposition = response.headers.get("content-disposition");
+  const match = disposition?.match(/filename="?([^"]+)"?/i);
+
+  return match?.[1] ?? fallback;
+}
+
+export async function downloadSessionExport(
+  sessionId: string,
+  format: ExportFormat
+) {
+  const response = await fetchWithTimeout(
+    getSessionExportUrl(sessionId, format),
+    {},
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    let message = `Export failed with status ${response.status}`;
+
+    try {
+      const payload = text ? JSON.parse(text) : null;
+
+      if (typeof payload?.message === "string") {
+        message = payload.message;
+      }
+    } catch {
+      if (text) {
+        message = text;
+      }
+    }
+
+    throw new Error(message);
+  }
+
+  const blob = await response.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = objectUrl;
+  link.download = downloadFilename(response, `sitemap-report.${format}`);
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+export function numberValue(value: NumberLike) {
+  if (value === null || value === undefined) {
+    return 0;
+  }
+
+  const parsed = typeof value === "number" ? value : Number(value);
+
+  return Number.isFinite(parsed) ? parsed : 0;
+}

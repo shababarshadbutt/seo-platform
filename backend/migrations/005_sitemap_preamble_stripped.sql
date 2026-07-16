@@ -1,0 +1,2 @@
+ALTER TABLE sitemap_files
+  ADD COLUMN IF NOT EXISTS had_preamble_stripped BOOLEAN NOT NULL DEFAULT FALSE;

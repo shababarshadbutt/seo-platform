@@ -1,0 +1,2 @@
+ALTER TABLE sessions
+  ADD COLUMN IF NOT EXISTS uploads_cleaned_at TIMESTAMPTZ;

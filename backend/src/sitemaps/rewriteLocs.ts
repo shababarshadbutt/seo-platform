@@ -1,0 +1,295 @@
+import { createReadStream, createWriteStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
+import { Transform, type TransformCallback } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
+import { createGunzip, createGzip } from "node:zlib";
+
+const PARAM_SEGMENT = "{param}";
+const LOC_OPEN = "<loc>";
+const LOC_CLOSE = "</loc>";
+
+// A rewrite decision for a single <loc> URL: return the replacement URL, or
+// null to leave the URL exactly as-is (so non-matching locs pass through byte
+// for byte).
+export type LocUrlRewriter = (url: string) => string | null;
+
+function segmentsFromTemplate(template: string) {
+  const trimmed = template.trim();
+  const path = trimmed.startsWith("/") ? trimmed.slice(1) : trimmed;
+
+  return path === "" ? [] : path.split("/");
+}
+
+// Build a rewriter that replaces specific whole URLs, not path segments: each
+// <loc> whose exact URL is a key in `replacements` is swapped for the mapped
+// value. Used by apply-redirects, where individual sampled URLs are replaced by
+// their concrete redirect destinations. Non-matching URLs pass through
+// unchanged (returns null so the loc is emitted byte-for-byte).
+export function buildLocMapRewriter(
+  replacements: Map<string, string>
+): LocUrlRewriter {
+  return (url: string) => {
+    const next = replacements.get(url);
+
+    return next === undefined || next === url ? null : next;
+  };
+}
+
+// Number of "{param}" placeholders in a pattern template.
+export function countTemplateParams(template: string): number {
+  return segmentsFromTemplate(template).filter(
+    (segment) => segment === PARAM_SEGMENT
+  ).length;
+}
+
+// Build a rewriter that maps URLs matching `fromTemplate` onto `toTemplate`,
+// carrying each concrete {param} value across IN ORDER (not by array index) so
+// the two templates may differ in length/structure (e.g. inserting a static
+// segment). Used by both pattern rename and bulk pattern replace.
+// e.g. from=/manufacturer/{param}, to=/aviation/manufacturer/{param} turns
+// .../manufacturer/jamco-parts into .../aviation/manufacturer/jamco-parts.
+// The caller must ensure both templates have the same number of {param}
+// placeholders. Host, scheme, query string and trailing slash are preserved.
+// A URL whose path does not match `fromTemplate` (segment count or a static
+// segment differs) returns null so the loc passes through byte-for-byte.
+export function buildPatternTemplateRewriter(
+  fromTemplate: string,
+  toTemplate: string
+): LocUrlRewriter {
+  const fromSegments = segmentsFromTemplate(fromTemplate);
+  const toSegments = segmentsFromTemplate(toTemplate);
+
+  return (rawUrl: string) => {
+    let url: URL;
+
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return null;
+    }
+
+    const hadTrailingSlash =
+      url.pathname.length > 1 && url.pathname.endsWith("/");
+    const urlSegments = url.pathname.split("/").filter(Boolean);
+
+    if (urlSegments.length !== fromSegments.length) {
+      return null;
+    }
+
+    // Capture the concrete value at each {param} position, and bail if any
+    // static segment fails to match exactly.
+    const params: string[] = [];
+
+    for (let index = 0; index < fromSegments.length; index += 1) {
+      if (fromSegments[index] === PARAM_SEGMENT) {
+        params.push(urlSegments[index]);
+      } else if (fromSegments[index] !== urlSegments[index]) {
+        return null;
+      }
+    }
+
+    // Refill {param} positions in the target template in capture order.
+    let paramCursor = 0;
+    const rebuiltSegments = toSegments.map((segment) =>
+      segment === PARAM_SEGMENT ? params[paramCursor++] ?? segment : segment
+    );
+    let nextPath = `/${rebuiltSegments.join("/")}`;
+
+    if (hadTrailingSlash && !nextPath.endsWith("/")) {
+      nextPath += "/";
+    }
+
+    url.pathname = nextPath;
+
+    const nextUrl = url.toString();
+
+    return nextUrl === rawUrl ? null : nextUrl;
+  };
+}
+
+function decodeXmlText(value: string) {
+  return value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+function encodeXmlText(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// Given the raw inner text of a <loc> element (which may be wrapped in CDATA
+// and/or padded with whitespace), apply the rewriter and return the new raw
+// inner text, or null if nothing should change.
+function rewriteLocInner(rawInner: string, rewriteUrl: LocUrlRewriter) {
+  const cdataMatch = rawInner.match(/^(\s*)<!\[CDATA\[([\s\S]*?)\]\]>(\s*)$/);
+
+  if (cdataMatch) {
+    const [, leading, inner, trailing] = cdataMatch;
+    const nextUrl = rewriteUrl(inner.trim());
+
+    if (nextUrl === null) {
+      return null;
+    }
+
+    return `${leading}<![CDATA[${nextUrl}]]>${trailing}`;
+  }
+
+  const leading = rawInner.match(/^\s*/)?.[0] ?? "";
+  const trailing = rawInner.match(/\s*$/)?.[0] ?? "";
+  const core = rawInner.slice(leading.length, rawInner.length - trailing.length);
+  const nextUrl = rewriteUrl(decodeXmlText(core));
+
+  if (nextUrl === null) {
+    return null;
+  }
+
+  return `${leading}${encodeXmlText(nextUrl)}${trailing}`;
+}
+
+// Streaming transform that rewrites only the text inside <loc>...</loc>
+// elements and passes every other byte through unchanged, so the output is the
+// original document with just the matching URLs updated.
+class LocRewriteTransform extends Transform {
+  private pending = "";
+  private inLoc = false;
+  private locText = "";
+  private readonly decoder = new StringDecoder("utf8");
+
+  constructor(private readonly rewriteUrl: LocUrlRewriter) {
+    super({ decodeStrings: false, encoding: "utf8" });
+  }
+
+  rewrittenCount = 0;
+
+  override _transform(
+    chunk: string | Buffer,
+    _encoding: BufferEncoding,
+    callback: TransformCallback
+  ) {
+    const buffer = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+
+    // StringDecoder buffers any partial multibyte sequence at the chunk
+    // boundary so we never split a UTF-8 character mid-stream.
+    this.pending += this.decoder.write(buffer);
+    this.drain(false);
+    callback();
+  }
+
+  override _flush(callback: TransformCallback) {
+    this.pending += this.decoder.end();
+    this.drain(true);
+
+    if (this.inLoc) {
+      // Unterminated <loc>: emit what we captured verbatim rather than lose it.
+      this.push(this.locText);
+      this.locText = "";
+      this.inLoc = false;
+    }
+
+    if (this.pending) {
+      this.push(this.pending);
+      this.pending = "";
+    }
+
+    callback();
+  }
+
+  private drain(isEnd: boolean) {
+    for (;;) {
+      if (!this.inLoc) {
+        const openIndex = this.pending.indexOf(LOC_OPEN);
+
+        if (openIndex === -1) {
+          // Hold back a tail that could be a partial "<loc>" straddling chunks.
+          const keep = isEnd ? 0 : LOC_OPEN.length - 1;
+          const safeLength = Math.max(0, this.pending.length - keep);
+
+          if (safeLength > 0) {
+            this.push(this.pending.slice(0, safeLength));
+            this.pending = this.pending.slice(safeLength);
+          }
+
+          return;
+        }
+
+        this.push(this.pending.slice(0, openIndex + LOC_OPEN.length));
+        this.pending = this.pending.slice(openIndex + LOC_OPEN.length);
+        this.inLoc = true;
+        this.locText = "";
+      } else {
+        const closeIndex = this.pending.indexOf(LOC_CLOSE);
+
+        if (closeIndex === -1) {
+          const keep = isEnd ? 0 : LOC_CLOSE.length - 1;
+          const safeLength = Math.max(0, this.pending.length - keep);
+
+          this.locText += this.pending.slice(0, safeLength);
+          this.pending = this.pending.slice(safeLength);
+
+          return;
+        }
+
+        this.locText += this.pending.slice(0, closeIndex);
+
+        const rewritten = rewriteLocInner(this.locText, this.rewriteUrl);
+
+        if (rewritten !== null) {
+          this.rewrittenCount += 1;
+          this.push(rewritten);
+        } else {
+          this.push(this.locText);
+        }
+
+        this.push(LOC_CLOSE);
+        this.pending = this.pending.slice(closeIndex + LOC_CLOSE.length);
+        this.inLoc = false;
+        this.locText = "";
+      }
+    }
+  }
+}
+
+// Stream `inputPath` through the loc rewriter into `outputPath`, decompressing
+// and recompressing when the file is gzipped. Returns how many <loc> URLs were
+// changed.
+export async function rewriteSitemapLocFile(options: {
+  inputPath: string;
+  outputPath: string;
+  isGzip: boolean;
+  rewriteUrl: LocUrlRewriter;
+}): Promise<number> {
+  const transform = new LocRewriteTransform(options.rewriteUrl);
+  const readable = createReadStream(options.inputPath);
+  const writable = createWriteStream(options.outputPath);
+  const stages = options.isGzip
+    ? [readable, createGunzip(), transform, createGzip(), writable]
+    : [readable, transform, writable];
+
+  await pipeline(stages);
+
+  return transform.rewrittenCount;
+}
+
+// Stream `inputPath` into `outputPath`, replacing each <loc> whose exact URL is
+// a key in `replacements` with its mapped value (URL-level replacement, as used
+// by apply-redirects). Gzip-aware, same as rewriteSitemapLocFile. Returns how
+// many <loc> URLs were changed.
+export async function rewriteSpecificLocs(options: {
+  inputPath: string;
+  outputPath: string;
+  isGzip: boolean;
+  replacements: Map<string, string>;
+}): Promise<number> {
+  return rewriteSitemapLocFile({
+    inputPath: options.inputPath,
+    outputPath: options.outputPath,
+    isGzip: options.isGzip,
+    rewriteUrl: buildLocMapRewriter(options.replacements)
+  });
+}
