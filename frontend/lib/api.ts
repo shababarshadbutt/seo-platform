@@ -291,8 +291,25 @@ export function friendlyApiErrorMessage(
   // Backend responded with an error status — surface its actual message so the
   // user sees what went wrong rather than a generic connectivity complaint.
   if (error instanceof ApiError) {
+    // Out of disk space: the backend maps ENOSPC to HTTP 507, but also catch any
+    // disk-related message in case an error slips through with a different code.
+    if (
+      error.status === 507 ||
+      (error.message && error.message.toLowerCase().includes("disk"))
+    ) {
+      return "Server storage is full — free up disk space and try again";
+    }
+
     if (error.status === 413) {
       return "Too many files selected — try selecting fewer files at once";
+    }
+
+    if (error.status >= 500) {
+      return `Server error — ${error.message || "please try again"}`;
+    }
+
+    if (error.status >= 400) {
+      return error.message || "Invalid request — please check your input";
     }
 
     return error.message || fallback;
@@ -1149,12 +1166,13 @@ export async function downloadCorrectedSitemap(
   if (!response.ok) {
     const text = await response.text();
     let message = `Download failed with status ${response.status}`;
+    let payload: unknown = null;
 
     try {
-      const payload = text ? JSON.parse(text) : null;
+      payload = text ? JSON.parse(text) : null;
 
-      if (typeof payload?.message === "string") {
-        message = payload.message;
+      if (typeof (payload as { message?: unknown })?.message === "string") {
+        message = (payload as { message: string }).message;
       }
     } catch {
       if (text) {
@@ -1162,7 +1180,7 @@ export async function downloadCorrectedSitemap(
       }
     }
 
-    throw new Error(message);
+    throw new ApiError(message, response.status, payload);
   }
 
   const blob = await response.blob();
@@ -1190,12 +1208,13 @@ export async function downloadSitemapsZip(
   if (!response.ok) {
     const text = await response.text();
     let message = `Download failed with status ${response.status}`;
+    let payload: unknown = null;
 
     try {
-      const payload = text ? JSON.parse(text) : null;
+      payload = text ? JSON.parse(text) : null;
 
-      if (typeof payload?.message === "string") {
-        message = payload.message;
+      if (typeof (payload as { message?: unknown })?.message === "string") {
+        message = (payload as { message: string }).message;
       }
     } catch {
       if (text) {
@@ -1203,7 +1222,7 @@ export async function downloadSitemapsZip(
       }
     }
 
-    throw new Error(message);
+    throw new ApiError(message, response.status, payload);
   }
 
   const blob = await response.blob();
@@ -1238,12 +1257,13 @@ export async function downloadSessionExport(
   if (!response.ok) {
     const text = await response.text();
     let message = `Export failed with status ${response.status}`;
+    let payload: unknown = null;
 
     try {
-      const payload = text ? JSON.parse(text) : null;
+      payload = text ? JSON.parse(text) : null;
 
-      if (typeof payload?.message === "string") {
-        message = payload.message;
+      if (typeof (payload as { message?: unknown })?.message === "string") {
+        message = (payload as { message: string }).message;
       }
     } catch {
       if (text) {
@@ -1251,7 +1271,7 @@ export async function downloadSessionExport(
       }
     }
 
-    throw new Error(message);
+    throw new ApiError(message, response.status, payload);
   }
 
   const blob = await response.blob();

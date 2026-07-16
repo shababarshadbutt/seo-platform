@@ -208,10 +208,6 @@ function displayFilename(sessionId: string, filename: string) {
   return withoutSession.replace(/^(current|legacy)-/i, "").replace(uuidPrefix, "");
 }
 
-function sourceFilePhrase(sourceFile: string | null) {
-  return sourceFile ? ` (from ${sourceFile})` : "";
-}
-
 function roundOne(value: number) {
   return Number(value.toFixed(1));
 }
@@ -435,9 +431,7 @@ function makeInsights(rows: PatternRow[], missingLegacyRows: PatternRow[]) {
 
   missingLegacyRows.forEach((row) => {
     insights.push(
-      `Pattern ${row.template}${sourceFilePhrase(
-        row.sourceFile
-      )} found in old sitemap - no matching pattern in new sitemap.`
+      `Pattern ${row.template} found in old sitemap - no matching pattern in new sitemap.`
     );
   });
 
@@ -446,9 +440,7 @@ function makeInsights(rows: PatternRow[], missingLegacyRows: PatternRow[]) {
       const failedPct = Math.max(0, 100 - row.confidencePct);
 
       insights.push(
-        `Pattern ${row.template}${sourceFilePhrase(
-          row.sourceFile
-        )} covers ${formatPercent(
+        `Pattern ${row.template} covers ${formatPercent(
           row.coveragePct
         )} of URLs; ${formatPercent(
           failedPct
@@ -458,9 +450,7 @@ function makeInsights(rows: PatternRow[], missingLegacyRows: PatternRow[]) {
 
     if (row.hasSuspiciousSegment) {
       insights.push(
-        `Pattern ${row.template}${sourceFilePhrase(
-          row.sourceFile
-        )} contains a suspicious fixed segment ${
+        `Pattern ${row.template} contains a suspicious fixed segment ${
           row.suspiciousSegmentValue ?? "unknown"
         } that may be a migration artifact.`
       );
@@ -468,9 +458,7 @@ function makeInsights(rows: PatternRow[], missingLegacyRows: PatternRow[]) {
 
     if (row.redirectPct > 50) {
       insights.push(
-        `Pattern ${row.template}${sourceFilePhrase(
-          row.sourceFile
-        )} has a high redirect rate (${formatPercent(
+        `Pattern ${row.template} has a high redirect rate (${formatPercent(
           row.redirectPct
         )}). URLs are live, but redirects may slow search engines down.`
       );
@@ -484,9 +472,7 @@ function makeInsights(rows: PatternRow[], missingLegacyRows: PatternRow[]) {
 
     if (row.hasSoft404) {
       insights.push(
-        `Pattern ${row.template}${sourceFilePhrase(
-          row.sourceFile
-        )} has soft-404 responses — pages load but show no content. Verify these URLs return real data.`
+        `Pattern ${row.template} has soft-404 responses — pages load but show no content. Verify these URLs return real data.`
       );
     }
   });

@@ -6,6 +6,7 @@ import { config } from "./config.js";
 import { closeSitemapQueue } from "./queue/sitemapQueue.js";
 import { closePool } from "./db/pool.js";
 import { runMigrations } from "./db/migrate.js";
+import { fsErrorResponse } from "./errors/fsErrors.js";
 import { sessionRoutes } from "./routes/sessions.js";
 
 const app = Fastify({
@@ -22,6 +23,43 @@ await app.register(multipart, {
     fileSize: 1024 * 1024 * 1024
   }
 });
+// Central error mapping so file-system failures surface as actionable HTTP
+// responses instead of an opaque 500 (which the frontend used to render as the
+// misleading "Cannot connect to backend"). Set BEFORE registering routes so the
+// encapsulated route plugin inherits this handler rather than the framework
+// default. Only fires for errors that reach the framework — handlers that send
+// their own reply are unaffected.
+app.setErrorHandler((error, request, reply) => {
+  const fsError = fsErrorResponse(error);
+
+  if (fsError) {
+    if (fsError.status >= 500) {
+      request.log.error({ err: error }, "request failed: filesystem error");
+    } else {
+      request.log.warn({ err: error }, "request failed: filesystem error");
+    }
+
+    return reply.code(fsError.status).send(fsError.body);
+  }
+
+  // Preserve an explicit 4xx (e.g. validation) the framework already set;
+  // otherwise treat as a 500 — but always include a message so the client never
+  // sees a blank error.
+  const statusCode =
+    typeof error.statusCode === "number" && error.statusCode >= 400
+      ? error.statusCode
+      : 500;
+
+  if (statusCode >= 500) {
+    request.log.error({ err: error }, "request failed");
+  }
+
+  return reply.code(statusCode).send({
+    error: statusCode >= 500 ? "Internal Server Error" : error.name || "Error",
+    message: error.message || "Something went wrong — please try again"
+  });
+});
+
 await app.register(sessionRoutes);
 
 app.get("/health", async () => ({

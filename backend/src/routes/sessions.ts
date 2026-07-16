@@ -19,6 +19,7 @@ import type { PoolClient } from "pg";
 import { config } from "../config.js";
 import { decryptSecret, encryptSecret } from "../crypto/secrets.js";
 import { pool } from "../db/pool.js";
+import { fsErrorResponse } from "../errors/fsErrors.js";
 import {
   deleteFromGSC,
   parseServiceAccount,
@@ -2073,6 +2074,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             error: "Not Found",
             message: "session not found"
           });
+        }
+
+        // The export is built on disk under EXPORT_DIR; a full disk (ENOSPC) or
+        // a missing source file (ENOENT) maps to a clear, actionable response.
+        const fsError = fsErrorResponse(error);
+
+        if (fsError) {
+          return reply.code(fsError.status).send(fsError.body);
         }
 
         return reply.code(500).send({
