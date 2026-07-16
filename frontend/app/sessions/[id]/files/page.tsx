@@ -356,9 +356,20 @@ export default function SitemapFilesPage({
                         onChange={() => toggleOne(file.id)}
                         aria-label={`Select ${file.filename}`}
                       />
-                      <span className="min-w-0 flex-1 truncate font-mono text-sm text-slate-800">
-                        {file.filename}
-                      </span>
+                      <div className="min-w-0 flex-1">
+                        <span className="block truncate font-mono text-sm text-slate-800">
+                          {file.filename}
+                        </span>
+                        {file.mismatched_url_count > 0 ? (
+                          <span className="mt-0.5 block truncate text-xs text-amber-700">
+                            {formatNumber(file.mismatched_url_count)} URL
+                            {file.mismatched_url_count === 1 ? "" : "s"} skipped
+                            {file.mismatched_hosts
+                              ? ` (${file.mismatched_hosts})`
+                              : " (different domain)"}
+                          </span>
+                        ) : null}
+                      </div>
                       <span className="w-28 text-right text-sm tabular-nums text-slate-500">
                         {formatNumber(file.total_urls)} URLs
                       </span>

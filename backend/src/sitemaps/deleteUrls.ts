@@ -68,23 +68,25 @@ function trailingWhitespaceLength(s: string): number {
   return count;
 }
 
-// Streaming transform that removes entire <url>…</url> blocks whose <loc> URL is
-// in `targets`, passing every other byte through unchanged. The indentation
-// whitespace immediately preceding a removed block is dropped with it so the
-// output has no orphaned blank lines. A <url> block is small and bounded, so at
-// most one block is buffered at a time — the whole file is never held in memory.
-class UrlBlockDeleteTransform extends Transform {
+// Streaming transform that removes entire <url>…</url> blocks for which
+// `shouldRemove(loc)` returns true, passing every other byte through unchanged.
+// The indentation whitespace immediately preceding a removed block is dropped
+// with it so the output has no orphaned blank lines. A <url> block is small and
+// bounded, so at most one block is buffered at a time — the whole file is never
+// held in memory. `loc` is the decoded <loc> URL, or null when the block has no
+// usable <loc>.
+export class UrlBlockFilterTransform extends Transform {
   private pending = "";
   private block = "";
   private inBlock = false;
   private readonly decoder = new StringDecoder("utf8");
 
   removedCount = 0;
-  // <url> blocks emitted (kept) — the authoritative post-delete URL count for
+  // <url> blocks emitted (kept) — the authoritative post-filter URL count for
   // this file, used to reset sitemap_files.total_urls without delta math.
   keptCount = 0;
 
-  constructor(private readonly targets: Set<string>) {
+  constructor(private readonly shouldRemove: (loc: string | null) => boolean) {
     super({ decodeStrings: false, encoding: "utf8" });
   }
 
@@ -185,7 +187,7 @@ class UrlBlockDeleteTransform extends Transform {
 
         const loc = locFromBlock(this.block);
 
-        if (loc !== null && this.targets.has(loc)) {
+        if (this.shouldRemove(loc)) {
           this.removedCount += 1;
           // Drop the whole block (and its captured lead whitespace).
         } else {
@@ -216,7 +218,10 @@ export async function removeUrlBlocksFromFile(options: {
   isGzip: boolean;
   targetUrls: Iterable<string>;
 }): Promise<UrlBlockDeleteResult> {
-  const transform = new UrlBlockDeleteTransform(new Set(options.targetUrls));
+  const targets = new Set(options.targetUrls);
+  const transform = new UrlBlockFilterTransform(
+    (loc) => loc !== null && targets.has(loc)
+  );
   const readable = createReadStream(options.inputPath);
   const writable = createWriteStream(options.outputPath);
   const stages = options.isGzip

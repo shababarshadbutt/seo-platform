@@ -9,6 +9,23 @@ export function normalizeHost(hostname: string): string {
   return hostname.toLowerCase().replace(/^www\./, "");
 }
 
+// Normalize the hostname of a single <loc> URL, or null when the value is not
+// an http(s) URL (relative locs, mailto:, garbage, …) — those can never be a
+// cross-domain signal so callers treat them as same-site.
+export function hostFromLoc(loc: string): string | null {
+  try {
+    const url = new URL(loc);
+
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return null;
+    }
+
+    return normalizeHost(url.hostname);
+  } catch {
+    return null;
+  }
+}
+
 // Whether a URL's host belongs to the same site as the session base URL.
 // Subdomains of the base host count as the same site — e.g. shop.example.com
 // and parts.example.com both belong to example.com — because SEO teams

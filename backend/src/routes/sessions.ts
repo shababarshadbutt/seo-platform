@@ -47,6 +47,7 @@ import {
 } from "../queue/bulkReplaceQueue.js";
 import { isSameDomain, normalizeHost } from "../sitemaps/domain.js";
 import { fetchSitemapPreview } from "../sitemaps/fetchPreview.js";
+import { streamSitemapWithoutForeignLocs } from "../sitemaps/foreignLocFilter.js";
 import {
   buildRedirectFixedStoredFilename,
   buildRenamedStoredFilename,
@@ -61,7 +62,6 @@ import {
   streamSitemapUrlLocs,
   type ParsedSitemap
 } from "../sitemaps/parser.js";
-import { detectForeignHostInFile } from "../sitemaps/domainScan.js";
 import { rebuildSessionDeletions } from "../sitemaps/urlDeletion.js";
 import { previewTrailingSlash } from "../sitemaps/trailingSlashApply.js";
 import {
@@ -1090,57 +1090,6 @@ function sitemapUrlDomainMismatchMessage(
   return `Sitemap URL appears to belong to ${detectedHost}, not ${expectedHost}. Please use sitemaps for the same site.`;
 }
 
-async function validateUploadedFileDomain(
-  upload: SavedSitemapUpload,
-  expectedHost: string
-): Promise<RejectedSitemapUpload | null> {
-  if (upload.source_role === "legacy") {
-    return null;
-  }
-
-  let foreignHost: string | null = null;
-
-  try {
-    foreignHost = await detectForeignHostInFile(
-      upload.stored_filename,
-      expectedHost
-    );
-  } catch {
-    // A parse/stream error before any mismatch means the file is malformed;
-    // stay lenient and let the parse job flag it as invalid rather than
-    // rejecting it here as a domain mismatch. (A real mismatch resolves the
-    // stream cleanly via early-exit, so it never lands in this catch.)
-  }
-
-  if (!foreignHost) {
-    return null;
-  }
-
-  return {
-    filename: upload.original_filename,
-    detected_host: foreignHost,
-    expected_host: expectedHost,
-    message: `File ${upload.original_filename} appears to belong to ${foreignHost}, not ${expectedHost}. Please upload sitemaps for the same site.`
-  };
-}
-
-async function removeRejectedUploadFile(
-  upload: SavedSitemapUpload,
-  logger: FastifyBaseLogger
-) {
-  try {
-    await unlink(upload.file_path);
-  } catch (error) {
-    logger.warn(
-      {
-        filename: upload.stored_filename,
-        error
-      },
-      "failed to delete rejected sitemap upload"
-    );
-  }
-}
-
 async function createStoredSitemapFile(
   sessionId: string,
   storedFilename: string,
@@ -1283,14 +1232,12 @@ async function processUploadedSitemapFile(
     return;
   }
 
+  // Mixed-domain files are NOT rejected here: a file may legitimately hold a
+  // few foreign-domain <loc>s alongside many valid ones. Those foreign URLs are
+  // filtered out per-URL during pattern extraction (parseLocForExtraction), counted
+  // as sitemap_files.mismatched_url_count, and recorded in mismatched_urls — so
+  // the valid URLs still enter the pipeline instead of the whole file being lost.
   const savedUpload = await storeUploadedSitemapFile(sessionId, uploadedFile);
-  const rejection = await validateUploadedFileDomain(savedUpload, expectedHost);
-
-  if (rejection) {
-    rejectedFiles.push(rejection);
-    await removeRejectedUploadFile(savedUpload, logger);
-    return;
-  }
 
   uploadedFiles.push(
     await createStoredSitemapFile(
@@ -3018,11 +2965,24 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       });
 
       // Stream each source file in under its clean display name (never loaded
-      // fully into memory), then append the regenerated index.
+      // fully into memory), then append the regenerated index. Foreign-domain
+      // <loc>s (accepted at upload, filtered out of pattern extraction) are
+      // stripped here too so the corrected sitemaps never carry another site's
+      // URLs. Domain-based, so it drops every foreign loc regardless of how many
+      // were sampled for the mismatch count.
+      const downloadExpectedHost = expectedHostFromBaseUrl(session.base_url);
+
       for (const file of zipFiles) {
-        archive.file(path.join(config.uploadDir, file.stored), {
-          name: file.display
-        });
+        const storedPath = path.join(config.uploadDir, file.stored);
+
+        archive.append(
+          streamSitemapWithoutForeignLocs({
+            inputPath: storedPath,
+            isGzip: file.stored.toLowerCase().endsWith(".gz"),
+            expectedHost: downloadExpectedHost
+          }),
+          { name: file.display }
+        );
       }
 
       archive.append(indexXml, { name: "sitemap-index.xml" });
@@ -3810,6 +3770,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         deleted_at: string | null;
         gsc_deletion_status: string | null;
         gsc_deletion_error: string | null;
+        mismatched_url_count: string;
+        mismatched_hosts: string | null;
       }>(
         `
           SELECT
@@ -3823,7 +3785,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             is_deleted,
             deleted_at,
             gsc_deletion_status,
-            gsc_deletion_error
+            gsc_deletion_error,
+            mismatched_url_count,
+            (
+              SELECT string_agg(DISTINCT mu.detected_host, ', '
+                ORDER BY mu.detected_host)
+              FROM mismatched_urls mu
+              WHERE mu.sitemap_file_id = sitemap_files.id
+            ) AS mismatched_hosts
           FROM sitemap_files
           WHERE session_id = $1
           ORDER BY is_index DESC, filename ASC, id ASC
@@ -3854,6 +3823,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             deleted_at: row.deleted_at,
             gsc_deletion_status: row.gsc_deletion_status,
             gsc_deletion_error: row.gsc_deletion_error,
+            mismatched_url_count: Number(row.mismatched_url_count),
+            mismatched_hosts: row.mismatched_hosts,
             status
           };
         })

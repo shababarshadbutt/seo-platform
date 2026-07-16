@@ -1066,6 +1066,8 @@ export type SessionFile = {
   deleted_at: string | null;
   gsc_deletion_status: GscDeletionStatus | null;
   gsc_deletion_error: string | null;
+  mismatched_url_count: number;
+  mismatched_hosts: string | null;
   status: SitemapFileStatus;
 };
 
