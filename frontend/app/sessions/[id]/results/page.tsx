@@ -15,6 +15,8 @@ import {
   Loader2,
   Pencil,
   ShieldAlert,
+  Slash,
+  Trash2,
   TriangleAlert,
   Undo2,
   Wrench,
@@ -52,12 +54,18 @@ import {
   getPatternSamples,
   getPatternSourceFiles,
   getPatterns,
+  getProblemUrls,
   getSession,
+  getDeleteProblemUrlsStatus,
+  getTrailingSlashStatus,
   numberValue,
   renamePatternTemplate,
+  restoreDeletedUrls,
+  restoreSampledUrlToFiles,
   transformPatternStructure,
   undoFindReplace,
   undoPatternTransform,
+  undoTrailingSlashes,
   type BulkReplaceStatus,
   type ExportFormat,
   type MismatchedUrl,
@@ -78,6 +86,9 @@ import {
   BulkReplaceDialog,
   type BulkReplacePattern
 } from "@/components/bulk-replace-dialog";
+import { DeleteUrlDialog } from "@/components/delete-url-dialog";
+import { ProblemUrlsDialog } from "@/components/problem-urls-dialog";
+import { FixTrailingSlashesDialog } from "@/components/fix-trailing-slashes-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -633,12 +644,45 @@ export default function ResultsDashboardPage({
   const [downloadingSitemaps, setDownloadingSitemaps] = useState<
     "edited" | "all" | null
   >(null);
+  const [deleteUrlTarget, setDeleteUrlTarget] = useState<SampledUrl | null>(
+    null
+  );
+  const [problemUrlsOpen, setProblemUrlsOpen] = useState(false);
+  const [trailingSlashOpen, setTrailingSlashOpen] = useState(false);
+  const [problemUrlCount, setProblemUrlCount] = useState(0);
+  const [hasDeletedUrls, setHasDeletedUrls] = useState(false);
+  const [slashApplied, setSlashApplied] = useState(false);
+  const [maintenanceBusy, setMaintenanceBusy] = useState(false);
+  const [restoringUrlId, setRestoringUrlId] = useState<string | null>(null);
 
   useEffect(() => {
     setIsPrintMode(
       new URLSearchParams(window.location.search).get("print") === "1"
     );
   }, []);
+
+  // Header state for the Delete URLs / Fix Trailing Slashes affordances: how
+  // many problem URLs remain, whether a bulk deletion has run (→ show undo),
+  // and whether a trailing-slash fix is in place (→ show undo).
+  const loadMaintenanceState = useCallback(async () => {
+    try {
+      const [problem, deleteJob, slashJob] = await Promise.all([
+        getProblemUrls(params.id).catch(() => ({ problem_urls: [] })),
+        getDeleteProblemUrlsStatus(params.id).catch(() => ({ job: null })),
+        getTrailingSlashStatus(params.id).catch(() => ({ job: null }))
+      ]);
+
+      setProblemUrlCount(problem.problem_urls.length);
+      setHasDeletedUrls(deleteJob.job?.status === "COMPLETE");
+      setSlashApplied(slashJob.job?.status === "COMPLETE");
+    } catch {
+      // Non-fatal: the buttons simply stay hidden.
+    }
+  }, [params.id]);
+
+  useEffect(() => {
+    void loadMaintenanceState();
+  }, [loadMaintenanceState]);
 
   const loadResults = useCallback(
     async (options: { silent?: boolean } = {}) => {
@@ -678,6 +722,60 @@ export default function ResultsDashboardPage({
   useEffect(() => {
     void loadResults().catch(() => undefined);
   }, [loadResults]);
+
+  // Refresh both the pattern data (so drawer strikethrough / counts update) and
+  // the header maintenance state after any delete / restore / slash operation.
+  const refreshAfterMaintenance = useCallback(async () => {
+    await Promise.all([
+      loadResults({ silent: true }).catch(() => undefined),
+      loadMaintenanceState()
+    ]);
+  }, [loadResults, loadMaintenanceState]);
+
+  const handleRestoreDeletedUrls = useCallback(async () => {
+    setMaintenanceBusy(true);
+
+    try {
+      await restoreDeletedUrls(params.id);
+      // The restore runs as a background job; give it a beat, then refresh.
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      await refreshAfterMaintenance();
+    } catch {
+      // Surfaced elsewhere; keep the UI responsive.
+    } finally {
+      setMaintenanceBusy(false);
+    }
+  }, [params.id, refreshAfterMaintenance]);
+
+  const handleUndoTrailingSlashes = useCallback(async () => {
+    setMaintenanceBusy(true);
+
+    try {
+      await undoTrailingSlashes(params.id);
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      await refreshAfterMaintenance();
+    } catch {
+      // Non-fatal.
+    } finally {
+      setMaintenanceBusy(false);
+    }
+  }, [params.id, refreshAfterMaintenance]);
+
+  const handleRestoreOneUrl = useCallback(
+    async (sample: SampledUrl) => {
+      setRestoringUrlId(sample.id);
+
+      try {
+        await restoreSampledUrlToFiles(params.id, sample.id);
+        await refreshAfterMaintenance();
+      } catch {
+        // Non-fatal.
+      } finally {
+        setRestoringUrlId(null);
+      }
+    },
+    [params.id, refreshAfterMaintenance]
+  );
 
   const rows = useMemo(
     () => buildRows(patterns, samplesByPattern),
@@ -1741,6 +1839,64 @@ export default function ResultsDashboardPage({
                   {bulkBusy ? "Bulk replace running" : "Bulk Replace"}
                 </Button>
               ) : null}
+              {(session?.status === "COMPLETE" ||
+                session?.status === "COMPLETED") &&
+              hasSitemapFiles ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="border-indigo-200 text-indigo-700 hover:bg-indigo-50 hover:text-indigo-800"
+                  onClick={() => setTrailingSlashOpen(true)}
+                >
+                  <Slash className="mr-2 h-4 w-4" />
+                  Fix Trailing Slashes
+                </Button>
+              ) : null}
+              {(session?.status === "COMPLETE" ||
+                session?.status === "COMPLETED") &&
+              problemUrlCount > 0 ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="border-red-200 text-red-700 hover:bg-red-50 hover:text-red-800"
+                  onClick={() => setProblemUrlsOpen(true)}
+                >
+                  <Trash2 className="mr-2 h-4 w-4" />
+                  Delete URLs ({formatNumber(problemUrlCount)})
+                </Button>
+              ) : null}
+              {hasDeletedUrls ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="border-amber-300 text-amber-700 hover:bg-amber-50 hover:text-amber-800"
+                  disabled={maintenanceBusy}
+                  onClick={() => void handleRestoreDeletedUrls()}
+                >
+                  {maintenanceBusy ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Undo2 className="mr-2 h-4 w-4" />
+                  )}
+                  Undo URL deletions
+                </Button>
+              ) : null}
+              {slashApplied ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="border-amber-300 text-amber-700 hover:bg-amber-50 hover:text-amber-800"
+                  disabled={maintenanceBusy}
+                  onClick={() => void handleUndoTrailingSlashes()}
+                >
+                  {maintenanceBusy ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Undo2 className="mr-2 h-4 w-4" />
+                  )}
+                  Undo Trailing Slashes
+                </Button>
+              ) : null}
               {bulkStatus?.status === "COMPLETE" ? (
                 <Button
                   type="button"
@@ -2355,23 +2511,40 @@ export default function ResultsDashboardPage({
                   {selectedSamples.map((sample) => {
                     const tone = sampleTone(sample);
                     const category = effectiveSampleCategory(sample);
+                    const isDeleted =
+                      sample.is_deleted_from_sitemap === true;
+                    const isDeletable =
+                      category === "redirect" ||
+                      (category === "failure" &&
+                        numberValue(sample.http_status) === 404);
 
                     return (
                       <div
                         key={sample.id}
                         className={cn(
                           "rounded-lg border border-slate-200 border-l-4 bg-white p-4 text-sm shadow-sm",
-                          tone.borderClass
+                          tone.borderClass,
+                          isDeleted && "opacity-70"
                         )}
                       >
                         <div className="flex flex-col gap-3">
                           <div className="min-w-0 space-y-2">
                             <p
-                              className="truncate font-mono text-xs font-semibold text-slate-900"
+                              className={cn(
+                                "truncate font-mono text-xs font-semibold",
+                                isDeleted
+                                  ? "text-slate-400 line-through"
+                                  : "text-slate-900"
+                              )}
                               title={sample.url}
                             >
                               {sample.url}
                             </p>
+                            {isDeleted ? (
+                              <p className="text-xs font-medium text-slate-400">
+                                Removed from sitemap
+                              </p>
+                            ) : null}
                             <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
                               <Badge
                                 variant={tone.badgeVariant}
@@ -2460,16 +2633,47 @@ export default function ResultsDashboardPage({
                                 "Unknown"}
                             </p>
                           </div>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            className="w-fit shrink-0 border-indigo-200 text-indigo-700 hover:bg-indigo-50 hover:text-indigo-800"
-                            onClick={() => void copyUrl(sample)}
-                          >
-                            <Clipboard className="mr-2 h-3.5 w-3.5" />
-                            {copiedSampleId === sample.id ? "Copied" : "Copy"}
-                          </Button>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="w-fit shrink-0 border-indigo-200 text-indigo-700 hover:bg-indigo-50 hover:text-indigo-800"
+                              onClick={() => void copyUrl(sample)}
+                            >
+                              <Clipboard className="mr-2 h-3.5 w-3.5" />
+                              {copiedSampleId === sample.id ? "Copied" : "Copy"}
+                            </Button>
+                            {isDeletable && !isDeleted ? (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="w-fit shrink-0 border-red-200 text-red-700 hover:bg-red-50 hover:text-red-800"
+                                onClick={() => setDeleteUrlTarget(sample)}
+                              >
+                                <Trash2 className="mr-2 h-3.5 w-3.5" />
+                                Delete from sitemap
+                              </Button>
+                            ) : null}
+                            {isDeleted ? (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="w-fit shrink-0 border-amber-300 text-amber-700 hover:bg-amber-50 hover:text-amber-800"
+                                disabled={restoringUrlId === sample.id}
+                                onClick={() => void handleRestoreOneUrl(sample)}
+                              >
+                                {restoringUrlId === sample.id ? (
+                                  <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <Undo2 className="mr-2 h-3.5 w-3.5" />
+                                )}
+                                Undo deletion
+                              </Button>
+                            ) : null}
+                          </div>
                         </div>
                       </div>
                     );
@@ -2992,6 +3196,35 @@ export default function ResultsDashboardPage({
           currentStatus={bulkStatus}
           onFinished={handleBulkFinished}
         />
+
+        <ProblemUrlsDialog
+          sessionId={params.id}
+          open={problemUrlsOpen}
+          onOpenChange={setProblemUrlsOpen}
+          onFinished={() => void refreshAfterMaintenance()}
+        />
+
+        <FixTrailingSlashesDialog
+          sessionId={params.id}
+          open={trailingSlashOpen}
+          onOpenChange={setTrailingSlashOpen}
+          onFinished={() => void refreshAfterMaintenance()}
+        />
+
+        {deleteUrlTarget ? (
+          <DeleteUrlDialog
+            sessionId={params.id}
+            urlId={deleteUrlTarget.id}
+            url={deleteUrlTarget.url}
+            open={deleteUrlTarget !== null}
+            onOpenChange={(open) => {
+              if (!open) {
+                setDeleteUrlTarget(null);
+              }
+            }}
+            onDeleted={() => void refreshAfterMaintenance()}
+          />
+        ) : null}
     </main>
   );
 }

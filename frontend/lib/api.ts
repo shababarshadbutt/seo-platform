@@ -142,6 +142,8 @@ export type SampledUrl = {
     | null;
   is_soft_404: boolean;
   source_file: string | null;
+  is_deleted_from_sitemap?: boolean;
+  deleted_from_files?: string[] | null;
 };
 
 export type MismatchedUrl = {
@@ -842,6 +844,188 @@ export async function undoBulkReplace(sessionId: string) {
   );
 
   return readJsonResponse<{ job_id: string }>(response);
+}
+
+export type SampledUrlFile = {
+  sitemap_file_id: string;
+  filename: string;
+  occurrence_count: number;
+};
+
+export type ProblemUrl = {
+  id: string;
+  url: string;
+  http_status: number | null;
+  source_file: string | null;
+};
+
+export type MaintenanceJob = {
+  id: string;
+  kind: string;
+  status: string;
+  files_total: number;
+  files_done: number;
+  items_changed: NumberLike;
+  error: string | null;
+};
+
+export type TrailingSlashPreview = {
+  files_affected: number;
+  urls_to_fix: number;
+  per_file: Array<{ filename: string; url_count: number }>;
+  sample_before_after: Array<{ before: string; after: string }>;
+};
+
+export async function getSampledUrlFiles(sessionId: string, urlId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/sampled-urls/${urlId}/files`),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<{ url: string; files: SampledUrlFile[] }>(response);
+}
+
+export async function deleteSampledUrlFromFiles(
+  sessionId: string,
+  urlId: string,
+  fileIds: string[]
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/sampled-urls/${urlId}/delete-from-files`
+    ),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file_ids: fileIds })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<{ deleted_from_files: number; urls_removed: number }>(
+    response
+  );
+}
+
+export async function restoreSampledUrlToFiles(
+  sessionId: string,
+  urlId: string
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/sampled-urls/${urlId}/restore-to-files`
+    ),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<{ restored: boolean }>(response);
+}
+
+export async function getProblemUrls(sessionId: string, statuses?: number[]) {
+  const query =
+    statuses && statuses.length > 0 ? `?status=${statuses.join(",")}` : "";
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/problem-urls${query}`),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<{ problem_urls: ProblemUrl[] }>(response);
+}
+
+export async function deleteProblemUrls(sessionId: string, urlIds: string[]) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/delete-problem-urls`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url_ids: urlIds })
+    }
+  );
+
+  return readJsonResponse<{ job_row_id: string; status: string }>(response);
+}
+
+export async function getDeleteProblemUrlsStatus(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/delete-problem-urls/status`),
+    { cache: "no-store" }
+  );
+
+  return readJsonResponse<{ job: MaintenanceJob | null }>(response);
+}
+
+export async function restoreDeletedUrls(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/restore-deleted-urls`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    }
+  );
+
+  return readJsonResponse<{ job_row_id: string; status: string }>(response);
+}
+
+export async function previewTrailingSlashes(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/fix-trailing-slashes/preview`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<TrailingSlashPreview>(response);
+}
+
+export async function applyTrailingSlashes(
+  sessionId: string,
+  selectedFiles?: string[]
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/fix-trailing-slashes/apply`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(
+        selectedFiles ? { selected_files: selectedFiles } : {}
+      )
+    }
+  );
+
+  return readJsonResponse<{ job_row_id: string; status: string }>(response);
+}
+
+export async function getTrailingSlashStatus(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/fix-trailing-slashes/status`),
+    { cache: "no-store" }
+  );
+
+  return readJsonResponse<{ job: MaintenanceJob | null }>(response);
+}
+
+export async function undoTrailingSlashes(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/fix-trailing-slashes/undo`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    }
+  );
+
+  return readJsonResponse<{ job_row_id: string; status: string }>(response);
 }
 
 export async function getBulkReplaceStatus(sessionId: string) {

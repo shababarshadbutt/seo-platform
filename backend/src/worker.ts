@@ -30,11 +30,31 @@ import {
   type BulkReplaceQueueData,
   type BulkReplaceJobName
 } from "./queue/bulkReplaceQueue.js";
+import {
+  DELETE_PROBLEM_URLS_JOB,
+  FIX_TRAILING_SLASHES_JOB,
+  FIX_TRAILING_SLASHES_UNDO_JOB,
+  MAINTENANCE_QUEUE_NAME,
+  RESTORE_DELETED_URLS_JOB,
+  closeMaintenanceQueue,
+  type DeleteProblemUrlsJobData,
+  type FixTrailingSlashesJobData,
+  type FixTrailingSlashesUndoJobData,
+  type MaintenanceJobName,
+  type MaintenanceQueueData,
+  type RestoreDeletedUrlsJobData
+} from "./queue/maintenanceQueue.js";
 import { redisConnectionOptions } from "./queue/redisConnection.js";
 import {
   processBulkReplaceJob,
   processBulkReplaceUndoJob
 } from "./jobs/bulkReplaceJob.js";
+import {
+  processDeleteProblemUrlsJob,
+  processFixTrailingSlashesJob,
+  processFixTrailingSlashesUndoJob,
+  processRestoreDeletedUrlsJob
+} from "./jobs/maintenanceJobs.js";
 import { processCleanupUploadsJob } from "./jobs/cleanupUploadsJob.js";
 import { processExtractPatternsJob } from "./jobs/extractPatternsJob.js";
 import { processParseSitemapJob } from "./jobs/parseSitemapJob.js";
@@ -58,6 +78,13 @@ let bulkReplaceWorker: Worker<
   BulkReplaceQueueData,
   void,
   BulkReplaceJobName
+> | null = null;
+// Session-level maintenance (bulk URL delete/restore, trailing-slash fix/undo)
+// on its own concurrency-1 queue, same isolation rationale as bulk replace.
+let maintenanceWorker: Worker<
+  MaintenanceQueueData,
+  void,
+  MaintenanceJobName
 > | null = null;
 
 function jobDataContext(data: SitemapJobData | undefined) {
@@ -190,6 +217,64 @@ async function start() {
         "bulk replace worker job failed"
       );
     });
+    maintenanceWorker = new Worker<
+      MaintenanceQueueData,
+      void,
+      MaintenanceJobName
+    >(
+      MAINTENANCE_QUEUE_NAME,
+      async (job) => {
+        if (job.name === DELETE_PROBLEM_URLS_JOB) {
+          await processDeleteProblemUrlsJob(
+            job.data as DeleteProblemUrlsJobData,
+            app.log
+          );
+          return;
+        }
+
+        if (job.name === RESTORE_DELETED_URLS_JOB) {
+          await processRestoreDeletedUrlsJob(
+            job.data as RestoreDeletedUrlsJobData,
+            app.log
+          );
+          return;
+        }
+
+        if (job.name === FIX_TRAILING_SLASHES_JOB) {
+          await processFixTrailingSlashesJob(
+            job.data as FixTrailingSlashesJobData,
+            app.log
+          );
+          return;
+        }
+
+        if (job.name === FIX_TRAILING_SLASHES_UNDO_JOB) {
+          await processFixTrailingSlashesUndoJob(
+            job.data as FixTrailingSlashesUndoJobData,
+            app.log
+          );
+          return;
+        }
+
+        throw new Error(`Unsupported job: ${job.name}`);
+      },
+      {
+        connection: redisConnectionOptions(),
+        concurrency: 1
+      }
+    );
+    maintenanceWorker.on("failed", (job, error) => {
+      app.log.error(
+        {
+          job_id: job?.id,
+          job_name: job?.name,
+          session_id: (job?.data as { session_id?: string } | undefined)
+            ?.session_id,
+          error
+        },
+        "maintenance worker job failed"
+      );
+    });
     await enqueueWatchdogStuckSessionsJob();
     await app.listen({
       port: config.workerHealthPort,
@@ -204,8 +289,10 @@ async function start() {
 async function close() {
   await parseWorker?.close();
   await bulkReplaceWorker?.close();
+  await maintenanceWorker?.close();
   await closeSitemapQueue();
   await closeBulkReplaceQueue();
+  await closeMaintenanceQueue();
   await app.close();
   await closePool();
 }

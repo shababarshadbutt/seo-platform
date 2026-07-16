@@ -34,7 +34,7 @@ export function isHttpUrl(value: string) {
 export function displaySourceFilename(sessionId: string, filename: string) {
   const sessionPrefix = `${sessionId}-`;
   const internalPrefix =
-    /^(?:(?:renamed|fixed|bulk|transformed)-[0-9a-f]+-)?(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-)?(?:fetched-\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-)?/i;
+    /^(?:(?:renamed|fixed|bulk|transformed|deleted|slashed)-[0-9a-f]+-)?(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-)?(?:fetched-\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-)?/i;
   const withoutSession = filename.startsWith(sessionPrefix)
     ? filename.slice(sessionPrefix.length)
     : filename;
@@ -91,4 +91,29 @@ export function buildTransformedStoredFilename(
   const hexToken = token.replace(/[^0-9a-f]/gi, "").slice(0, 8) || "0";
 
   return `${sessionId}-transformed-${hexToken}-${sanitizeUploadedFilename(displayName)}`;
+}
+
+// Build a unique stored filename for the URL-deleted copy of a source file (a
+// rebuild of the original with selected <url> blocks removed). Preserves the
+// stable display label so displaySourceFilename() maps it back to the original.
+export function buildDeletedUrlsStoredFilename(
+  sessionId: string,
+  displayName: string,
+  token: string
+) {
+  const hexToken = token.replace(/[^0-9a-f]/gi, "").slice(0, 8) || "0";
+
+  return `${sessionId}-deleted-${hexToken}-${sanitizeUploadedFilename(displayName)}`;
+}
+
+// Build a unique stored filename for the trailing-slash-fixed copy of a source
+// file. Preserves the stable display label like the other edited variants.
+export function buildTrailingSlashStoredFilename(
+  sessionId: string,
+  displayName: string,
+  token: string
+) {
+  const hexToken = token.replace(/[^0-9a-f]/gi, "").slice(0, 8) || "0";
+
+  return `${sessionId}-slashed-${hexToken}-${sanitizeUploadedFilename(displayName)}`;
 }

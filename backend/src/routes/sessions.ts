@@ -3,7 +3,6 @@ import { createReadStream, createWriteStream } from "node:fs";
 import {
   access,
   mkdir,
-  open,
   readdir,
   readFile,
   stat,
@@ -56,7 +55,20 @@ import {
   isHttpUrl
 } from "../sitemaps/filenames.js";
 import { peekRootElement } from "../sitemaps/peek.js";
-import { parseSitemapSource, type ParsedSitemap } from "../sitemaps/parser.js";
+import {
+  parseSitemapSource,
+  streamSitemapUrlLocs,
+  type ParsedSitemap
+} from "../sitemaps/parser.js";
+import { detectForeignHostInFile } from "../sitemaps/domainScan.js";
+import { rebuildSessionDeletions } from "../sitemaps/urlDeletion.js";
+import { previewTrailingSlash } from "../sitemaps/trailingSlashApply.js";
+import {
+  enqueueDeleteProblemUrlsJob,
+  enqueueFixTrailingSlashesJob,
+  enqueueFixTrailingSlashesUndoJob,
+  enqueueRestoreDeletedUrlsJob
+} from "../queue/maintenanceQueue.js";
 import {
   buildPatternTemplateRewriter,
   countTemplateParams,
@@ -188,7 +200,6 @@ type RejectedSitemapUpload = {
 type SitemapSourceRole = "current" | "legacy";
 
 const allowedSampleSizes = new Set([5, 10, 20]);
-const sitemapDomainSampleBytes = 500;
 const uploadFileWriteConcurrency = 5;
 const uploadRouteBodyLimitBytes = 10 * 1024 * 1024 * 1024;
 const uploadRouteTimeoutMs = 30 * 60 * 1000;
@@ -362,7 +373,10 @@ function isEditedStoredFilename(sessionId: string, filename: string) {
   return (
     filename.startsWith(`${sessionId}-fixed-`) ||
     filename.startsWith(`${sessionId}-renamed-`) ||
-    filename.startsWith(`${sessionId}-bulk-`)
+    filename.startsWith(`${sessionId}-bulk-`) ||
+    filename.startsWith(`${sessionId}-transformed-`) ||
+    filename.startsWith(`${sessionId}-deleted-`) ||
+    filename.startsWith(`${sessionId}-slashed-`)
   );
 }
 
@@ -1075,70 +1089,6 @@ function sitemapUrlDomainMismatchMessage(
   return `Sitemap URL appears to belong to ${detectedHost}, not ${expectedHost}. Please use sitemaps for the same site.`;
 }
 
-function decodeXmlText(value: string) {
-  return value
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&apos;/gi, "'");
-}
-
-function extractSampleLocValue(sample: string) {
-  const firstTagIndex = sample.indexOf("<");
-  const searchableSample =
-    firstTagIndex > 0 ? sample.slice(firstTagIndex) : sample;
-  const locMatch = searchableSample.match(
-    /<(?:[A-Za-z_][\w.-]*:)?loc\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?loc>/i
-  );
-
-  if (!locMatch) {
-    return null;
-  }
-
-  let locValue = locMatch[1].trim();
-
-  if (locValue.startsWith("<![CDATA[") && locValue.endsWith("]]>")) {
-    locValue = locValue.slice(9, -3).trim();
-  }
-
-  return decodeXmlText(locValue);
-}
-
-async function readFilePrefix(filePath: string, bytes: number) {
-  const fileHandle = await open(filePath, "r");
-
-  try {
-    const buffer = Buffer.alloc(bytes);
-    const { bytesRead } = await fileHandle.read(buffer, 0, bytes, 0);
-
-    return buffer.subarray(0, bytesRead).toString("utf8");
-  } finally {
-    await fileHandle.close();
-  }
-}
-
-async function detectedHostFromSitemapSample(filePath: string) {
-  const sample = await readFilePrefix(filePath, sitemapDomainSampleBytes);
-  const sampleLocValue = extractSampleLocValue(sample);
-
-  if (!sampleLocValue) {
-    return null;
-  }
-
-  try {
-    const sampleUrl = new URL(sampleLocValue);
-
-    if (sampleUrl.protocol !== "http:" && sampleUrl.protocol !== "https:") {
-      return null;
-    }
-
-    return normalizeHost(sampleUrl.hostname);
-  } catch {
-    return null;
-  }
-}
-
 async function validateUploadedFileDomain(
   upload: SavedSitemapUpload,
   expectedHost: string
@@ -1147,17 +1097,29 @@ async function validateUploadedFileDomain(
     return null;
   }
 
-  const detectedHost = await detectedHostFromSitemapSample(upload.file_path);
+  let foreignHost: string | null = null;
 
-  if (!detectedHost || isSameDomain(detectedHost, expectedHost)) {
+  try {
+    foreignHost = await detectForeignHostInFile(
+      upload.stored_filename,
+      expectedHost
+    );
+  } catch {
+    // A parse/stream error before any mismatch means the file is malformed;
+    // stay lenient and let the parse job flag it as invalid rather than
+    // rejecting it here as a domain mismatch. (A real mismatch resolves the
+    // stream cleanly via early-exit, so it never lands in this catch.)
+  }
+
+  if (!foreignHost) {
     return null;
   }
 
   return {
     filename: upload.original_filename,
-    detected_host: detectedHost,
+    detected_host: foreignHost,
     expected_host: expectedHost,
-    message: `File ${upload.original_filename} appears to belong to ${detectedHost}, not ${expectedHost}. Please upload sitemaps for the same site.`
+    message: `File ${upload.original_filename} appears to belong to ${foreignHost}, not ${expectedHost}. Please upload sitemaps for the same site.`
   };
 }
 
@@ -2219,7 +2181,9 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             final_url,
             redirect_count,
             http_status_category,
-            source_file
+            source_file,
+            is_deleted_from_sitemap,
+            deleted_from_files
           FROM sampled_urls
           WHERE pattern_id = $1
           ORDER BY checked_at ASC, id ASC
@@ -4159,6 +4123,388 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       return {
         sitemap_file: file
       };
+    }
+  );
+
+  // ---- URL deletion (Fix 2) + trailing-slash fix (Fix 3) ------------------
+
+  const PROBLEM_STATUSES = [301, 302, 307, 308, 404];
+
+  type SampledUrlParams = { id: string; urlId: string };
+
+  // Resolve a sampled URL that belongs to this session (via its pattern).
+  async function loadSessionSampledUrl(sessionId: string, urlId: string) {
+    const result = await pool.query<{
+      id: string;
+      url: string;
+      pattern_id: string;
+      deleted_from_files: string[] | null;
+    }>(
+      `
+        SELECT s.id, s.url, s.pattern_id, s.deleted_from_files
+        FROM sampled_urls s
+        JOIN patterns p ON p.id = s.pattern_id
+        WHERE p.session_id = $1 AND s.id = $2
+      `,
+      [sessionId, urlId]
+    );
+
+    return result.rows[0] ?? null;
+  }
+
+  // Current, local, non-deleted files for a session with their display labels.
+  async function loadDisplayFileMap(sessionId: string) {
+    const result = await pool.query<{ id: string; filename: string }>(
+      `
+        SELECT id, filename
+        FROM sitemap_files
+        WHERE session_id = $1 AND source_role = 'current' AND is_deleted = false
+      `,
+      [sessionId]
+    );
+
+    return result.rows
+      .filter((row) => !isHttpUrl(row.filename))
+      .map((row) => ({
+        id: row.id,
+        stored: row.filename,
+        display: displaySourceFilename(sessionId, row.filename)
+      }));
+  }
+
+  // Count exact <loc> occurrences of `url` in a stored file (streaming).
+  async function countUrlOccurrences(storedFilename: string, url: string) {
+    let count = 0;
+
+    await streamSitemapUrlLocs(storedFilename, (loc) => {
+      if (loc === url) {
+        count += 1;
+      }
+    });
+
+    return count;
+  }
+
+  // Which files a sampled URL appears in (+ occurrence counts) — powers the
+  // drawer "This URL appears in:" list.
+  app.get<{ Params: SampledUrlParams }>(
+    "/api/sessions/:id/sampled-urls/:urlId/files",
+    async (request, reply) => {
+      const sampled = await loadSessionSampledUrl(
+        request.params.id,
+        request.params.urlId
+      );
+
+      if (!sampled) {
+        return reply.code(404).send(badRequest("sampled url not found"));
+      }
+
+      // Narrow the scan to the files that contributed to this URL's pattern.
+      const occResult = await pool.query<{ source_file: string }>(
+        "SELECT DISTINCT source_file FROM pattern_file_occurrences WHERE pattern_id = $1",
+        [sampled.pattern_id]
+      );
+      const occ = new Set(occResult.rows.map((row) => row.source_file));
+      const files = await loadDisplayFileMap(request.params.id);
+      const candidates = occ.size > 0
+        ? files.filter((file) => occ.has(file.display))
+        : files;
+
+      const matches: Array<{
+        sitemap_file_id: string;
+        filename: string;
+        occurrence_count: number;
+      }> = [];
+
+      for (const file of candidates) {
+        try {
+          await access(path.join(config.uploadDir, file.stored));
+        } catch {
+          continue;
+        }
+
+        const count = await countUrlOccurrences(file.stored, sampled.url);
+
+        if (count > 0) {
+          matches.push({
+            sitemap_file_id: file.id,
+            filename: file.display,
+            occurrence_count: count
+          });
+        }
+      }
+
+      return { url: sampled.url, files: matches };
+    }
+  );
+
+  // Delete one sampled URL from selected files (synchronous — drawer flow).
+  app.post<{ Params: SampledUrlParams; Body: { file_ids?: unknown } }>(
+    "/api/sessions/:id/sampled-urls/:urlId/delete-from-files",
+    async (request, reply) => {
+      const sampled = await loadSessionSampledUrl(
+        request.params.id,
+        request.params.urlId
+      );
+
+      if (!sampled) {
+        return reply.code(404).send(badRequest("sampled url not found"));
+      }
+
+      const fileIds = Array.isArray(request.body?.file_ids)
+        ? (request.body.file_ids as unknown[]).filter(
+            (value): value is string => typeof value === "string"
+          )
+        : [];
+
+      if (fileIds.length === 0) {
+        return reply.code(400).send(badRequest("file_ids is required"));
+      }
+
+      const files = await loadDisplayFileMap(request.params.id);
+      const selectedDisplays = files
+        .filter((file) => fileIds.includes(file.id))
+        .map((file) => file.display);
+
+      if (selectedDisplays.length === 0) {
+        return reply.code(400).send(badRequest("no matching files"));
+      }
+
+      const merged = Array.from(
+        new Set([...(sampled.deleted_from_files ?? []), ...selectedDisplays])
+      );
+
+      await pool.query(
+        "UPDATE sampled_urls SET is_deleted_from_sitemap = true, deleted_from_files = $2 WHERE id = $1",
+        [sampled.id, merged]
+      );
+
+      const { urlsRemoved } = await rebuildSessionDeletions({
+        sessionId: request.params.id,
+        scope: selectedDisplays
+      });
+
+      return {
+        deleted_from_files: selectedDisplays.length,
+        urls_removed: urlsRemoved
+      };
+    }
+  );
+
+  // Restore one previously-deleted sampled URL back into its files.
+  app.post<{ Params: SampledUrlParams }>(
+    "/api/sessions/:id/sampled-urls/:urlId/restore-to-files",
+    async (request, reply) => {
+      const sampled = await loadSessionSampledUrl(
+        request.params.id,
+        request.params.urlId
+      );
+
+      if (!sampled) {
+        return reply.code(404).send(badRequest("sampled url not found"));
+      }
+
+      const affected = sampled.deleted_from_files ?? null;
+
+      await pool.query(
+        "UPDATE sampled_urls SET is_deleted_from_sitemap = false, deleted_from_files = NULL WHERE id = $1",
+        [sampled.id]
+      );
+
+      await rebuildSessionDeletions({
+        sessionId: request.params.id,
+        scope: affected ?? "all"
+      });
+
+      return { restored: true };
+    }
+  );
+
+  // All still-present problem URLs (redirects / 404s) for the top-level modal.
+  app.get<{ Params: SessionParams; Querystring: { status?: string } }>(
+    "/api/sessions/:id/problem-urls",
+    async (request) => {
+      const requested = (request.query.status ?? "")
+        .split(",")
+        .map((value) => Number.parseInt(value.trim(), 10))
+        .filter((value) => PROBLEM_STATUSES.includes(value));
+      const statuses = requested.length > 0 ? requested : PROBLEM_STATUSES;
+
+      const result = await pool.query<{
+        id: string;
+        url: string;
+        http_status: number | null;
+        source_file: string | null;
+      }>(
+        `
+          SELECT s.id, s.url, s.http_status, s.source_file
+          FROM sampled_urls s
+          JOIN patterns p ON p.id = s.pattern_id
+          WHERE p.session_id = $1
+            AND s.is_deleted_from_sitemap = false
+            AND s.http_status = ANY($2::int[])
+          ORDER BY s.http_status ASC, s.url ASC
+        `,
+        [request.params.id, statuses]
+      );
+
+      return { problem_urls: result.rows };
+    }
+  );
+
+  // Enqueue bulk deletion of many problem URLs (background job).
+  app.post<{ Params: SessionParams; Body: { url_ids?: unknown } }>(
+    "/api/sessions/:id/delete-problem-urls",
+    async (request, reply) => {
+      const urlIds = Array.isArray(request.body?.url_ids)
+        ? (request.body.url_ids as unknown[]).filter(
+            (value): value is string => typeof value === "string"
+          )
+        : [];
+
+      if (urlIds.length === 0) {
+        return reply.code(400).send(badRequest("url_ids is required"));
+      }
+
+      const jobRow = await pool.query<{ id: string }>(
+        "INSERT INTO maintenance_jobs (session_id, kind) VALUES ($1, 'delete-problem-urls') RETURNING id",
+        [request.params.id]
+      );
+      const jobRowId = jobRow.rows[0].id;
+
+      await enqueueDeleteProblemUrlsJob({
+        session_id: request.params.id,
+        job_row_id: jobRowId,
+        url_ids: urlIds
+      });
+
+      return { job_row_id: jobRowId, status: "PENDING" };
+    }
+  );
+
+  // Poll the latest bulk-deletion / restore job.
+  app.get<{ Params: SessionParams }>(
+    "/api/sessions/:id/delete-problem-urls/status",
+    async (request) => {
+      const result = await pool.query<{
+        id: string;
+        kind: string;
+        status: string;
+        files_total: number;
+        files_done: number;
+        items_changed: string;
+        error: string | null;
+      }>(
+        `
+          SELECT id, kind, status, files_total, files_done, items_changed, error
+          FROM maintenance_jobs
+          WHERE session_id = $1 AND kind IN ('delete-problem-urls', 'restore-deleted-urls')
+          ORDER BY started_at DESC
+          LIMIT 1
+        `,
+        [request.params.id]
+      );
+
+      return { job: result.rows[0] ?? null };
+    }
+  );
+
+  // Restore ALL deleted URLs for the session (background job).
+  app.post<{ Params: SessionParams }>(
+    "/api/sessions/:id/restore-deleted-urls",
+    async (request) => {
+      const jobRow = await pool.query<{ id: string }>(
+        "INSERT INTO maintenance_jobs (session_id, kind) VALUES ($1, 'restore-deleted-urls') RETURNING id",
+        [request.params.id]
+      );
+      const jobRowId = jobRow.rows[0].id;
+
+      await enqueueRestoreDeletedUrlsJob({
+        session_id: request.params.id,
+        job_row_id: jobRowId
+      });
+
+      return { job_row_id: jobRowId, status: "PENDING" };
+    }
+  );
+
+  // Preview the trailing-slash fix (synchronous scan).
+  app.post<{ Params: SessionParams }>(
+    "/api/sessions/:id/fix-trailing-slashes/preview",
+    async (request) => {
+      return previewTrailingSlash(request.params.id);
+    }
+  );
+
+  // Enqueue the trailing-slash fix (background job).
+  app.post<{ Params: SessionParams; Body: { selected_files?: unknown } }>(
+    "/api/sessions/:id/fix-trailing-slashes/apply",
+    async (request) => {
+      const selectedFiles = Array.isArray(request.body?.selected_files)
+        ? (request.body.selected_files as unknown[]).filter(
+            (value): value is string => typeof value === "string"
+          )
+        : null;
+
+      const jobRow = await pool.query<{ id: string }>(
+        "INSERT INTO maintenance_jobs (session_id, kind) VALUES ($1, 'fix-trailing-slashes') RETURNING id",
+        [request.params.id]
+      );
+      const jobRowId = jobRow.rows[0].id;
+
+      await enqueueFixTrailingSlashesJob({
+        session_id: request.params.id,
+        job_row_id: jobRowId,
+        selected_files: selectedFiles
+      });
+
+      return { job_row_id: jobRowId, status: "PENDING" };
+    }
+  );
+
+  // Poll the latest trailing-slash apply / undo job.
+  app.get<{ Params: SessionParams }>(
+    "/api/sessions/:id/fix-trailing-slashes/status",
+    async (request) => {
+      const result = await pool.query<{
+        id: string;
+        kind: string;
+        status: string;
+        files_total: number;
+        files_done: number;
+        items_changed: string;
+        error: string | null;
+      }>(
+        `
+          SELECT id, kind, status, files_total, files_done, items_changed, error
+          FROM maintenance_jobs
+          WHERE session_id = $1 AND kind IN ('fix-trailing-slashes', 'fix-trailing-slashes-undo')
+          ORDER BY started_at DESC
+          LIMIT 1
+        `,
+        [request.params.id]
+      );
+
+      return { job: result.rows[0] ?? null };
+    }
+  );
+
+  // Undo the most recent trailing-slash fix (background job).
+  app.post<{ Params: SessionParams }>(
+    "/api/sessions/:id/fix-trailing-slashes/undo",
+    async (request) => {
+      const jobRow = await pool.query<{ id: string }>(
+        "INSERT INTO maintenance_jobs (session_id, kind) VALUES ($1, 'fix-trailing-slashes-undo') RETURNING id",
+        [request.params.id]
+      );
+      const jobRowId = jobRow.rows[0].id;
+
+      await enqueueFixTrailingSlashesUndoJob({
+        session_id: request.params.id,
+        job_row_id: jobRowId
+      });
+
+      return { job_row_id: jobRowId, status: "PENDING" };
     }
   );
 };

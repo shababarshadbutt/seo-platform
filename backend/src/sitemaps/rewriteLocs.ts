@@ -107,6 +107,110 @@ export function buildPatternTemplateRewriter(
   };
 }
 
+// A path's last segment looks like a file when it ends in a short extension
+// (".xml", ".html", ".pdf", ".jpg", …). Such URLs are left alone by the
+// trailing-slash rule — you never append "/" after a file.
+function lastSegmentHasFileExtension(pathname: string): boolean {
+  const segments = pathname.split("/").filter(Boolean);
+  const last = segments[segments.length - 1];
+
+  return last !== undefined && /\.[A-Za-z0-9]{1,8}$/.test(last);
+}
+
+// Build a rewriter that appends a trailing slash to the path of any URL whose
+// path is missing one, and returns null (no change) otherwise. Rules:
+//   - path already ending in "/"                       -> skip
+//   - path whose last segment is a file (has ext)      -> skip
+//   - domain-only URL (path is "/" or empty)           -> skip
+//   - a query string                                   -> slash goes BEFORE "?"
+//     e.g. example.com/path?q=1 -> example.com/path/?q=1
+// Host, scheme, query and fragment are otherwise preserved.
+export function buildTrailingSlashRewriter(): LocUrlRewriter {
+  return (rawUrl: string) => {
+    let url: URL;
+
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return null;
+    }
+
+    // new URL() normalizes a bare host to pathname "/", so domain-only URLs are
+    // covered by the endsWith("/") check.
+    if (url.pathname.endsWith("/")) {
+      return null;
+    }
+
+    if (lastSegmentHasFileExtension(url.pathname)) {
+      return null;
+    }
+
+    url.pathname = `${url.pathname}/`;
+
+    const nextUrl = url.toString();
+
+    return nextUrl === rawUrl ? null : nextUrl;
+  };
+}
+
+// Reverse of buildTrailingSlashRewriter for a full URL: strip exactly one
+// trailing slash from a non-root path (moving it back before any query), used
+// to undo a trailing-slash fix on sampled_urls.url. Returns null when there is
+// nothing to strip.
+export function stripTrailingSlashFromUrl(rawUrl: string): string | null {
+  let url: URL;
+
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+
+  if (url.pathname === "/" || !url.pathname.endsWith("/")) {
+    return null;
+  }
+
+  url.pathname = url.pathname.slice(0, -1);
+
+  const nextUrl = url.toString();
+
+  return nextUrl === rawUrl ? null : nextUrl;
+}
+
+// Path-string variant of the trailing-slash rule for pattern_urls.path /
+// patterns.template (which hold a path, not a full URL). Same rules: skip a path
+// already ending "/", skip a file-extension last segment, keep any query after
+// the inserted slash. Returns null when unchanged.
+export function addTrailingSlashToPathString(value: string): string | null {
+  const queryIndex = value.indexOf("?");
+  const pathPart = queryIndex === -1 ? value : value.slice(0, queryIndex);
+  const query = queryIndex === -1 ? "" : value.slice(queryIndex);
+
+  if (pathPart === "" || pathPart === "/" || pathPart.endsWith("/")) {
+    return null;
+  }
+
+  if (lastSegmentHasFileExtension(pathPart)) {
+    return null;
+  }
+
+  return `${pathPart}/${query}`;
+}
+
+// Reverse of addTrailingSlashToPathString: strip one trailing slash from the
+// path part (before any query). Returns null when there is nothing to strip.
+export function stripTrailingSlashFromPathString(value: string): string | null {
+  const queryIndex = value.indexOf("?");
+  const pathPart = queryIndex === -1 ? value : value.slice(0, queryIndex);
+  const query = queryIndex === -1 ? "" : value.slice(queryIndex);
+
+  if (pathPart === "/" || !pathPart.endsWith("/")) {
+    return null;
+  }
+
+  return `${pathPart.slice(0, -1)}${query}`;
+}
+
 function decodeXmlText(value: string) {
   return value
     .replace(/&lt;/g, "<")

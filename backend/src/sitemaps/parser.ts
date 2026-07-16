@@ -291,19 +291,33 @@ export async function parseSitemapSource(
   }
 }
 
+type StreamLocOptions = {
+  // When true, <loc> values inside a <sitemapindex> (child sitemap URLs) are
+  // reported in addition to <urlset> page URLs. Defaults to urlset-only so the
+  // pattern-extraction / rewrite callers keep seeing page URLs exclusively.
+  includeIndexLocs?: boolean;
+};
+
 export async function streamSitemapUrlLocs(
   filename: string,
-  onUrl: LocCallback
+  onUrl: LocCallback,
+  options: StreamLocOptions = {}
 ): Promise<void> {
   const source = await openSitemapSource(filename);
 
-  return streamSitemapUrlLocsFromSource(source.stream, source.isGzip, onUrl);
+  return streamSitemapUrlLocsFromSource(
+    source.stream,
+    source.isGzip,
+    onUrl,
+    options
+  );
 }
 
 async function streamSitemapUrlLocsFromSource(
   source: Readable,
   isGzip: boolean,
-  onUrl: LocCallback
+  onUrl: LocCallback,
+  options: StreamLocOptions = {}
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const parser = sax.parser(true, {});
@@ -368,8 +382,11 @@ async function streamSitemapUrlLocsFromSource(
       }
 
       const loc = locText.trim();
+      const rootAccepted =
+        rootElement === "urlset" ||
+        (options.includeIndexLocs === true && rootElement === "sitemapindex");
 
-      if (loc && rootElement === "urlset") {
+      if (loc && rootAccepted) {
         const shouldContinue = onUrl(loc);
 
         if (shouldContinue === false) {

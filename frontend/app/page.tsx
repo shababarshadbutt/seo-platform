@@ -48,6 +48,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
+import { UploadRejections } from "@/components/upload-rejections";
 
 const sampleSizeOptions = [5, 10, 20];
 const MAX_SITEMAP_URL_FIELDS = 20;
@@ -1309,29 +1310,10 @@ export default function Home() {
                           <span>{multiFileGuidanceMessage}</span>
                         </div>
                       ) : null}
-                      {fileRejections.length > 0 ? (
-                        <div
-                          className="space-y-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-500"
-                          role="alert"
-                        >
-                          <div className="flex items-start gap-2">
-                            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                            <p className="font-medium">
-                              Some files were not uploaded
-                            </p>
-                          </div>
-                          <ul className="space-y-1 pl-6">
-                            {fileRejections.map((rejection, index) => (
-                              <li
-                                key={`${rejection.filename}:${index}`}
-                                className="list-disc"
-                              >
-                                {rejection.message}
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      ) : null}
+                      <UploadRejections
+                        rejections={fileRejections}
+                        baseUrl={trimmedBaseUrl}
+                      />
                       {fileError ? (
                         <p className="text-sm text-red-500">{fileError}</p>
                       ) : null}
