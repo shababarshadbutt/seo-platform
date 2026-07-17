@@ -18,7 +18,10 @@ export type DeleteProblemUrlsJobData = {
   session_id: string;
   // maintenance_jobs.id — the progress/status row this job drives.
   job_row_id: string;
-  url_ids: string[];
+  // Display filenames to delete problem URLs from (file-first modal).
+  file_displays: string[];
+  // Which confirmed HTTP statuses to delete (subset of 301/302/307/308/404).
+  statuses: number[];
 };
 
 export type RestoreDeletedUrlsJobData = {

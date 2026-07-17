@@ -1,21 +1,20 @@
 "use client";
 
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type UIEvent
-} from "react";
-import { CheckCircle2, Loader2, Trash2 } from "lucide-react";
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Loader2,
+  Trash2
+} from "lucide-react";
 
 import {
   deleteProblemUrls,
   getDeleteProblemUrlsStatus,
-  getProblemUrls,
+  getProblemFiles,
   type MaintenanceJob,
-  type ProblemUrl
+  type ProblemFile
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
@@ -37,16 +36,13 @@ type Props = {
 
 const ALL_STATUSES = [301, 302, 307, 308, 404];
 const IN_FLIGHT = ["PENDING", "RUNNING", "UNDOING"];
-const ROW_HEIGHT = 40;
-const VIEWPORT_HEIGHT = 400;
-const VIRTUALIZE_THRESHOLD = 100;
-const OVERSCAN = 8;
+const MAX_PATTERNS_SHOWN = 3;
 
 function formatNumber(value: number) {
   return new Intl.NumberFormat("en-US").format(value);
 }
 
-function statusBadgeClass(status: number | null) {
+function statusBadgeClass(status: number) {
   return status === 404
     ? "bg-red-100 text-red-700"
     : "bg-amber-100 text-amber-700";
@@ -61,49 +57,80 @@ export function ProblemUrlsDialog({
   onFinished
 }: Props) {
   const [phase, setPhase] = useState<Phase>("loading");
-  const [urls, setUrls] = useState<ProblemUrl[]>([]);
+  const [files, setFiles] = useState<ProblemFile[]>([]);
   const [activeStatuses, setActiveStatuses] = useState<Set<number>>(new Set());
-  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [listLoading, setListLoading] = useState(false);
   const [status, setStatus] = useState<MaintenanceJob | null>(null);
   const [error, setError] = useState("");
-  const [scrollTop, setScrollTop] = useState(0);
   const finishedRef = useRef(false);
 
+  // "All" (empty set) means every problem status.
+  const effectiveStatuses = useMemo(
+    () =>
+      activeStatuses.size > 0
+        ? ALL_STATUSES.filter((code) => activeStatuses.has(code))
+        : ALL_STATUSES,
+    [activeStatuses]
+  );
+  const statusKey = effectiveStatuses.join(",");
+
+  // Reset everything when the dialog opens.
   useEffect(() => {
     if (!open) {
       return;
     }
 
     setPhase("loading");
-    setUrls([]);
+    setFiles([]);
     setActiveStatuses(new Set());
-    setSelected(new Set());
+    setSelectedFiles(new Set());
+    setExpanded(new Set());
     setStatus(null);
     setError("");
-    setScrollTop(0);
     finishedRef.current = false;
+  }, [open]);
+
+  // Fetch (re-fetch on filter change) so counts + deletion stay aligned to the
+  // active statuses.
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
 
     let cancelled = false;
 
+    setListLoading(true);
+    setError("");
+
     void (async () => {
       try {
-        const { problem_urls } = await getProblemUrls(sessionId);
+        const result = await getProblemFiles(
+          sessionId,
+          activeStatuses.size > 0 ? effectiveStatuses : undefined
+        );
 
         if (cancelled) {
           return;
         }
 
-        setUrls(problem_urls);
-        setSelected(new Set(problem_urls.map((row) => row.id)));
+        setFiles(result.files);
+        // Default to every shown file selected.
+        setSelectedFiles(new Set(result.files.map((file) => file.file_id)));
         setPhase("list");
       } catch (nextError) {
         if (!cancelled) {
           setError(
             nextError instanceof Error
               ? nextError.message
-              : "Unable to load URLs."
+              : "Unable to load files."
           );
           setPhase("list");
+        }
+      } finally {
+        if (!cancelled) {
+          setListLoading(false);
         }
       }
     })();
@@ -111,7 +138,8 @@ export function ProblemUrlsDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, sessionId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, sessionId, statusKey]);
 
   const handleFinished = useCallback(() => {
     if (finishedRef.current) {
@@ -122,6 +150,7 @@ export function ProblemUrlsDialog({
     onFinished?.();
   }, [onFinished]);
 
+  // Poll the deletion job while it runs.
   useEffect(() => {
     if (phase !== "progress") {
       return;
@@ -160,21 +189,6 @@ export function ProblemUrlsDialog({
     };
   }, [phase, sessionId, handleFinished]);
 
-  const visibleUrls = useMemo(() => {
-    if (activeStatuses.size === 0) {
-      return urls;
-    }
-
-    return urls.filter(
-      (row) => row.http_status != null && activeStatuses.has(row.http_status)
-    );
-  }, [urls, activeStatuses]);
-
-  const selectedVisibleCount = useMemo(
-    () => visibleUrls.filter((row) => selected.has(row.id)).length,
-    [visibleUrls, selected]
-  );
-
   function toggleStatus(code: number) {
     setActiveStatuses((current) => {
       const next = new Set(current);
@@ -189,31 +203,36 @@ export function ProblemUrlsDialog({
     });
   }
 
-  function toggleRow(id: string) {
-    setSelected((current) => {
+  function toggleFile(fileId: string) {
+    setSelectedFiles((current) => {
       const next = new Set(current);
 
-      if (next.has(id)) {
-        next.delete(id);
+      if (next.has(fileId)) {
+        next.delete(fileId);
       } else {
-        next.add(id);
+        next.add(fileId);
       }
 
       return next;
     });
   }
 
-  function toggleAllVisible() {
-    setSelected((current) => {
-      const next = new Set(current);
-      const allSelected = visibleUrls.every((row) => next.has(row.id));
+  function toggleAllFiles() {
+    setSelectedFiles((current) =>
+      current.size === files.length
+        ? new Set()
+        : new Set(files.map((file) => file.file_id))
+    );
+  }
 
-      for (const row of visibleUrls) {
-        if (allSelected) {
-          next.delete(row.id);
-        } else {
-          next.add(row.id);
-        }
+  function toggleExpanded(fileId: string) {
+    setExpanded((current) => {
+      const next = new Set(current);
+
+      if (next.has(fileId)) {
+        next.delete(fileId);
+      } else {
+        next.add(fileId);
       }
 
       return next;
@@ -221,9 +240,9 @@ export function ProblemUrlsDialog({
   }
 
   async function handleDelete() {
-    const ids = visibleUrls
-      .filter((row) => selected.has(row.id))
-      .map((row) => row.id);
+    const ids = files
+      .filter((file) => selectedFiles.has(file.file_id))
+      .map((file) => file.file_id);
 
     if (ids.length === 0) {
       return;
@@ -232,12 +251,12 @@ export function ProblemUrlsDialog({
     setError("");
 
     try {
-      await deleteProblemUrls(sessionId, ids);
+      await deleteProblemUrls(sessionId, ids, effectiveStatuses);
       setStatus({
         id: "",
         kind: "delete-problem-urls",
         status: "PENDING",
-        files_total: 0,
+        files_total: ids.length,
         files_done: 0,
         items_changed: 0,
         error: null
@@ -250,22 +269,11 @@ export function ProblemUrlsDialog({
     }
   }
 
-  const onScroll = (event: UIEvent<HTMLDivElement>) => {
-    setScrollTop(event.currentTarget.scrollTop);
-  };
-
-  // Virtualize only when the list is long enough to matter.
-  const virtualize = visibleUrls.length > VIRTUALIZE_THRESHOLD;
-  const startIndex = virtualize
-    ? Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
-    : 0;
-  const endIndex = virtualize
-    ? Math.min(
-        visibleUrls.length,
-        Math.ceil((scrollTop + VIEWPORT_HEIGHT) / ROW_HEIGHT) + OVERSCAN
-      )
-    : visibleUrls.length;
-  const renderedRows = visibleUrls.slice(startIndex, endIndex);
+  const selectedCount = useMemo(
+    () => files.filter((file) => selectedFiles.has(file.file_id)).length,
+    [files, selectedFiles]
+  );
+  const allSelected = files.length > 0 && selectedCount === files.length;
 
   const filesTotal = status?.files_total ?? 0;
   const filesDone = status?.files_done ?? 0;
@@ -276,26 +284,38 @@ export function ProblemUrlsDialog({
   const isFailed = status?.status === "FAILED";
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (phase === "progress" && isInFlight && !next) {
+          return;
+        }
+
+        onOpenChange(next);
+      }}
+    >
       <DialogContent className="max-w-2xl">
         <DialogHeader>
           <DialogTitle>Delete Problem URLs from Sitemaps</DialogTitle>
           <DialogDescription>
-            URLs returning redirects or 404 errors across all patterns. Select
-            which ones to remove from your sitemap files.
+            Remove all redirecting or 404 URLs from selected sitemap files.
           </DialogDescription>
         </DialogHeader>
 
         {phase === "loading" ? (
           <div className="flex items-center gap-2 py-8 text-sm text-slate-500">
             <Loader2 className="h-4 w-4 animate-spin" />
-            Loading problem URLs…
+            Loading problem files…
           </div>
         ) : null}
 
         {phase === "list" ? (
           <div className="space-y-3">
+            {/* Status filter */}
             <div className="flex flex-wrap items-center gap-1.5">
+              <span className="mr-1 text-xs font-medium text-slate-500">
+                Filter:
+              </span>
               <button
                 type="button"
                 onClick={() => setActiveStatuses(new Set())}
@@ -321,82 +341,136 @@ export function ProblemUrlsDialog({
                   {code}
                 </button>
               ))}
+              {listLoading ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-slate-400" />
+              ) : null}
             </div>
 
+            {/* Select all */}
             <label className="flex items-center gap-2 border-y border-slate-200 py-2 text-sm font-medium text-slate-700">
               <input
                 type="checkbox"
-                checked={
-                  visibleUrls.length > 0 &&
-                  selectedVisibleCount === visibleUrls.length
-                }
-                onChange={toggleAllVisible}
+                checked={allSelected}
+                onChange={toggleAllFiles}
+                disabled={files.length === 0}
                 className="h-4 w-4 rounded border-slate-300"
               />
-              Select all ({formatNumber(visibleUrls.length)} URLs)
+              Select all ({formatNumber(files.length)}{" "}
+              {files.length === 1 ? "file" : "files"})
             </label>
 
-            <div
-              onScroll={onScroll}
-              className="overflow-y-auto rounded-lg border border-slate-200"
-              style={{ maxHeight: VIEWPORT_HEIGHT }}
-            >
-              {visibleUrls.length === 0 ? (
+            {/* File list */}
+            <div className="max-h-[400px] overflow-y-auto rounded-lg border border-slate-200">
+              {files.length === 0 ? (
                 <p className="px-3 py-6 text-center text-sm text-slate-500">
-                  No matching URLs.
+                  No files with problem URLs.
                 </p>
               ) : (
-                <div
-                  style={
-                    virtualize
-                      ? { height: visibleUrls.length * ROW_HEIGHT, position: "relative" }
-                      : undefined
-                  }
-                >
-                  <div
-                    style={
-                      virtualize
-                        ? {
-                            position: "absolute",
-                            top: startIndex * ROW_HEIGHT,
-                            left: 0,
-                            right: 0
-                          }
-                        : undefined
-                    }
-                  >
-                    {renderedRows.map((row) => (
-                      <label
-                        key={row.id}
-                        className="flex items-center gap-2 px-3 text-sm hover:bg-slate-50"
-                        style={{ height: ROW_HEIGHT }}
-                      >
+                files.map((file) => {
+                  const isExpanded = expanded.has(file.file_id);
+                  const hiddenCount =
+                    file.problem_url_count - file.sample_urls.length;
+
+                  return (
+                    <div
+                      key={file.file_id}
+                      className="border-b border-slate-100 last:border-b-0"
+                    >
+                      <div className="flex items-center gap-2 px-3 py-2 text-sm hover:bg-slate-50">
                         <input
                           type="checkbox"
-                          checked={selected.has(row.id)}
-                          onChange={() => toggleRow(row.id)}
+                          checked={selectedFiles.has(file.file_id)}
+                          onChange={() => toggleFile(file.file_id)}
                           className="h-4 w-4 shrink-0 rounded border-slate-300"
                         />
-                        <span className="flex-1 truncate font-mono text-xs text-slate-700">
-                          {row.url}
+                        <div className="min-w-0 flex-1">
+                          <p
+                            className="truncate font-mono text-xs text-slate-800"
+                            title={file.filename}
+                          >
+                            {file.filename}
+                          </p>
+                          {file.patterns.length > 0 ? (
+                            <p className="mt-0.5 truncate text-xs text-slate-400">
+                              {file.patterns.length === 1
+                                ? "Pattern: "
+                                : "Patterns: "}
+                              <span className="font-mono text-slate-500">
+                                {file.patterns
+                                  .slice(
+                                    0,
+                                    file.patterns.length > MAX_PATTERNS_SHOWN
+                                      ? 2
+                                      : file.patterns.length
+                                  )
+                                  .map((pattern) => pattern.template)
+                                  .join(" · ")}
+                              </span>
+                              {file.patterns.length > MAX_PATTERNS_SHOWN ? (
+                                <span className="text-slate-400">
+                                  {" "}
+                                  + {file.patterns.length - 2} more
+                                </span>
+                              ) : null}
+                            </p>
+                          ) : null}
+                        </div>
+                        <span className="shrink-0 text-xs text-slate-500">
+                          {formatNumber(file.problem_url_count)} problem{" "}
+                          {file.problem_url_count === 1 ? "URL" : "URLs"}
                         </span>
-                        <span
-                          className={`shrink-0 rounded px-1.5 py-0.5 text-xs font-semibold ${statusBadgeClass(
-                            row.http_status
-                          )}`}
+                        <button
+                          type="button"
+                          onClick={() => toggleExpanded(file.file_id)}
+                          className="shrink-0 rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                          aria-label={isExpanded ? "Collapse" : "Expand"}
                         >
-                          {row.http_status ?? "—"}
-                        </span>
-                      </label>
-                    ))}
-                  </div>
-                </div>
+                          {isExpanded ? (
+                            <ChevronDown className="h-4 w-4" />
+                          ) : (
+                            <ChevronRight className="h-4 w-4" />
+                          )}
+                        </button>
+                      </div>
+
+                      {isExpanded ? (
+                        <div className="space-y-1 bg-slate-50 px-3 pb-2 pl-9">
+                          {file.sample_urls.map((sample) => (
+                            <div
+                              key={sample.url}
+                              className="flex items-center gap-2 text-xs"
+                            >
+                              <span
+                                className="min-w-0 flex-1 truncate font-mono text-slate-600"
+                                title={sample.url}
+                              >
+                                {sample.url}
+                              </span>
+                              <span
+                                className={`shrink-0 rounded px-1.5 py-0.5 font-semibold ${statusBadgeClass(
+                                  sample.http_status
+                                )}`}
+                              >
+                                {sample.http_status}
+                              </span>
+                            </div>
+                          ))}
+                          {hiddenCount > 0 ? (
+                            <p className="pt-0.5 text-xs text-slate-400">
+                              + {formatNumber(hiddenCount)} more
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })
               )}
             </div>
 
             <p className="text-sm text-slate-600">
-              {formatNumber(selectedVisibleCount)} of{" "}
-              {formatNumber(visibleUrls.length)} selected
+              Deleting from {formatNumber(selectedCount)}{" "}
+              {selectedCount === 1 ? "file" : "files"}
             </p>
 
             {error ? <p className="text-sm text-red-500">{error}</p> : null}
@@ -408,8 +482,9 @@ export function ProblemUrlsDialog({
             {isDone ? (
               <div className="flex items-center gap-2 text-sm text-emerald-600">
                 <CheckCircle2 className="h-5 w-5" />
-                Removed {formatNumber(Number(status?.items_changed ?? 0))} URLs
-                from {formatNumber(filesDone)} sitemap files.
+                Deleted problem URLs from {formatNumber(filesDone)}{" "}
+                {filesDone === 1 ? "file" : "files"} (
+                {formatNumber(Number(status?.items_changed ?? 0))} URLs removed).
               </div>
             ) : isFailed ? (
               <p className="text-sm text-red-500">
@@ -419,8 +494,8 @@ export function ProblemUrlsDialog({
               <>
                 <div className="flex items-center gap-2 text-sm text-slate-600">
                   <Loader2 className="h-4 w-4 animate-spin" />
-                  Deleting URLs… {formatNumber(filesDone)} /{" "}
-                  {formatNumber(filesTotal)} files updated
+                  Processing file {formatNumber(Math.min(filesDone + 1, filesTotal))}{" "}
+                  of {formatNumber(filesTotal)}…
                 </div>
                 <Progress value={progressValue} />
               </>
@@ -437,14 +512,15 @@ export function ProblemUrlsDialog({
               <Button
                 variant="destructive"
                 onClick={handleDelete}
-                disabled={selectedVisibleCount === 0}
+                disabled={selectedCount === 0}
                 className="gap-1"
               >
                 <Trash2 className="h-4 w-4" />
-                Delete {formatNumber(selectedVisibleCount)} URLs from sitemaps
+                Delete from {formatNumber(selectedCount)}{" "}
+                {selectedCount === 1 ? "file" : "files"}
               </Button>
             </>
-          ) : (
+          ) : phase === "progress" ? (
             <Button
               variant="ghost"
               onClick={() => onOpenChange(false)}
@@ -452,7 +528,7 @@ export function ProblemUrlsDialog({
             >
               {isInFlight ? "Working…" : "Close"}
             </Button>
-          )}
+          ) : null}
         </DialogFooter>
       </DialogContent>
     </Dialog>

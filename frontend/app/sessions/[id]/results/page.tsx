@@ -54,7 +54,7 @@ import {
   getPatternSamples,
   getPatternSourceFiles,
   getPatterns,
-  getProblemUrls,
+  getProblemUrlCount,
   getSession,
   getDeleteProblemUrlsStatus,
   getTrailingSlashStatus,
@@ -653,12 +653,12 @@ export default function ResultsDashboardPage({
   const loadMaintenanceState = useCallback(async () => {
     try {
       const [problem, deleteJob, slashJob] = await Promise.all([
-        getProblemUrls(params.id).catch(() => ({ problem_urls: [] })),
+        getProblemUrlCount(params.id).catch(() => ({ count: 0 })),
         getDeleteProblemUrlsStatus(params.id).catch(() => ({ job: null })),
         getTrailingSlashStatus(params.id).catch(() => ({ job: null }))
       ]);
 
-      setProblemUrlCount(problem.problem_urls.length);
+      setProblemUrlCount(problem.count);
       setHasDeletedUrls(deleteJob.job?.status === "COMPLETE");
       setSlashApplied(slashJob.job?.status === "COMPLETE");
     } catch {

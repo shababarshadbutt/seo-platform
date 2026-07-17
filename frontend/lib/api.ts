@@ -869,11 +869,29 @@ export type SampledUrlFile = {
   occurrence_count: number;
 };
 
-export type ProblemUrl = {
+export type ProblemFilePattern = {
   id: string;
+  template: string;
+};
+
+export type ProblemFileSampleUrl = {
   url: string;
-  http_status: number | null;
-  source_file: string | null;
+  http_status: number;
+};
+
+export type ProblemFile = {
+  file_id: string;
+  filename: string;
+  problem_url_count: number;
+  sample_urls: ProblemFileSampleUrl[];
+  statuses: number[];
+  patterns: ProblemFilePattern[];
+};
+
+export type ProblemFilesResponse = {
+  files: ProblemFile[];
+  total_files: number;
+  total_problem_urls: number;
 };
 
 export type MaintenanceJob = {
@@ -944,25 +962,38 @@ export async function restoreSampledUrlToFiles(
   return readJsonResponse<{ restored: boolean }>(response);
 }
 
-export async function getProblemUrls(sessionId: string, statuses?: number[]) {
+export async function getProblemUrlCount(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/problem-urls/count`),
+    { cache: "no-store" }
+  );
+
+  return readJsonResponse<{ count: number }>(response);
+}
+
+export async function getProblemFiles(sessionId: string, statuses?: number[]) {
   const query =
     statuses && statuses.length > 0 ? `?status=${statuses.join(",")}` : "";
   const response = await fetchWithTimeout(
-    backendUrl(`/api/sessions/${sessionId}/problem-urls${query}`),
+    backendUrl(`/api/sessions/${sessionId}/problem-files${query}`),
     { cache: "no-store" },
     EXPORT_API_TIMEOUT_MS
   );
 
-  return readJsonResponse<{ problem_urls: ProblemUrl[] }>(response);
+  return readJsonResponse<ProblemFilesResponse>(response);
 }
 
-export async function deleteProblemUrls(sessionId: string, urlIds: string[]) {
+export async function deleteProblemUrls(
+  sessionId: string,
+  fileIds: string[],
+  statuses: number[]
+) {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/delete-problem-urls`),
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ url_ids: urlIds })
+      body: JSON.stringify({ file_ids: fileIds, statuses })
     }
   );
 

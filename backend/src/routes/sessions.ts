@@ -63,6 +63,7 @@ import {
   type ParsedSitemap
 } from "../sitemaps/parser.js";
 import { rebuildSessionDeletions } from "../sitemaps/urlDeletion.js";
+import { collectProblemFileGroups } from "../sitemaps/problemFiles.js";
 import { previewTrailingSlash } from "../sitemaps/trailingSlashApply.js";
 import {
   enqueueDeleteProblemUrlsJob,
@@ -4300,50 +4301,110 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     }
   );
 
-  // All still-present problem URLs (redirects / 404s) for the top-level modal.
-  app.get<{ Params: SessionParams; Querystring: { status?: string } }>(
-    "/api/sessions/:id/problem-urls",
-    async (request) => {
-      const requested = (request.query.status ?? "")
-        .split(",")
-        .map((value) => Number.parseInt(value.trim(), 10))
-        .filter((value) => PROBLEM_STATUSES.includes(value));
-      const statuses = requested.length > 0 ? requested : PROBLEM_STATUSES;
+  function parseStatusQuery(raw: string | undefined) {
+    const requested = (raw ?? "")
+      .split(",")
+      .map((value) => Number.parseInt(value.trim(), 10))
+      .filter((value) => PROBLEM_STATUSES.includes(value));
 
-      const result = await pool.query<{
-        id: string;
-        url: string;
-        http_status: number | null;
-        source_file: string | null;
-      }>(
+    return requested.length > 0 ? requested : PROBLEM_STATUSES;
+  }
+
+  // Lightweight count of still-present confirmed problem URLs (redirects / 404s)
+  // for the results-page "Delete URLs (N)" badge. Cheap query — no file scan —
+  // so it is safe to call on every page load.
+  app.get<{ Params: SessionParams; Querystring: { status?: string } }>(
+    "/api/sessions/:id/problem-urls/count",
+    async (request) => {
+      const statuses = parseStatusQuery(request.query.status);
+
+      const result = await pool.query<{ count: string }>(
         `
-          SELECT s.id, s.url, s.http_status, s.source_file
+          SELECT COUNT(*)::text AS count
           FROM sampled_urls s
           JOIN patterns p ON p.id = s.pattern_id
           WHERE p.session_id = $1
             AND s.is_deleted_from_sitemap = false
             AND s.http_status = ANY($2::int[])
-          ORDER BY s.http_status ASC, s.url ASC
         `,
         [request.params.id, statuses]
       );
 
-      return { problem_urls: result.rows };
+      return { count: Number(result.rows[0]?.count ?? 0) };
     }
   );
 
-  // Enqueue bulk deletion of many problem URLs (background job).
-  app.post<{ Params: SessionParams; Body: { url_ids?: unknown } }>(
+  // Still-present problem URLs (redirects / 404s) grouped by the file their
+  // <loc> physically appears in, for the file-first "Delete Problem URLs" modal.
+  // Only confirmed (sampled) problem URLs are counted — those are the ones
+  // deletion can act on. Each file also carries the distinct pattern(s) its
+  // problem URLs came from (info-only) and up to 5 sample URLs for the
+  // expandable preview. Scans candidate files, so open behind a spinner.
+  app.get<{ Params: SessionParams; Querystring: { status?: string } }>(
+    "/api/sessions/:id/problem-files",
+    async (request) => {
+      const statuses = parseStatusQuery(request.query.status);
+
+      const groups = await collectProblemFileGroups({
+        sessionId: request.params.id,
+        statuses
+      });
+
+      const files = groups.map((group) => ({
+        file_id: group.file_id,
+        filename: group.filename,
+        problem_url_count: group.problem_url_count,
+        sample_urls: group.sample_urls,
+        statuses: group.statuses,
+        patterns: group.patterns
+      }));
+
+      return {
+        files,
+        total_files: files.length,
+        total_problem_urls: files.reduce(
+          (sum, file) => sum + file.problem_url_count,
+          0
+        )
+      };
+    }
+  );
+
+  // Enqueue file-first deletion: remove every confirmed problem URL (matching
+  // the selected statuses) from the selected files (background job).
+  app.post<{
+    Params: SessionParams;
+    Body: { file_ids?: unknown; statuses?: unknown };
+  }>(
     "/api/sessions/:id/delete-problem-urls",
     async (request, reply) => {
-      const urlIds = Array.isArray(request.body?.url_ids)
-        ? (request.body.url_ids as unknown[]).filter(
+      const fileIds = Array.isArray(request.body?.file_ids)
+        ? (request.body.file_ids as unknown[]).filter(
             (value): value is string => typeof value === "string"
           )
         : [];
 
-      if (urlIds.length === 0) {
-        return reply.code(400).send(badRequest("url_ids is required"));
+      if (fileIds.length === 0) {
+        return reply.code(400).send(badRequest("file_ids is required"));
+      }
+
+      const requestedStatuses = Array.isArray(request.body?.statuses)
+        ? (request.body.statuses as unknown[])
+            .map((value) => Number(value))
+            .filter((value) => PROBLEM_STATUSES.includes(value))
+        : [];
+      const statuses =
+        requestedStatuses.length > 0 ? requestedStatuses : PROBLEM_STATUSES;
+
+      // Resolve selected file ids to the display filenames sampled URLs are
+      // keyed under.
+      const files = await loadDisplayFileMap(request.params.id);
+      const fileDisplays = files
+        .filter((file) => fileIds.includes(file.id))
+        .map((file) => file.display);
+
+      if (fileDisplays.length === 0) {
+        return reply.code(400).send(badRequest("no matching files"));
       }
 
       const jobRow = await pool.query<{ id: string }>(
@@ -4355,7 +4416,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       await enqueueDeleteProblemUrlsJob({
         session_id: request.params.id,
         job_row_id: jobRowId,
-        url_ids: urlIds
+        file_displays: fileDisplays,
+        statuses
       });
 
       return { job_row_id: jobRowId, status: "PENDING" };

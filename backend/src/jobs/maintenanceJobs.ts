@@ -1,6 +1,7 @@
 import type { FastifyBaseLogger } from "fastify";
 
 import { pool } from "../db/pool.js";
+import { collectProblemFileGroups } from "../sitemaps/problemFiles.js";
 import { rebuildSessionDeletions } from "../sitemaps/urlDeletion.js";
 import {
   applyTrailingSlash,
@@ -61,45 +62,67 @@ export async function processDeleteProblemUrlsJob(
   data: DeleteProblemUrlsJobData,
   logger: FastifyBaseLogger
 ) {
-  const { session_id: sessionId, job_row_id: jobRowId, url_ids: urlIds } = data;
+  const {
+    session_id: sessionId,
+    job_row_id: jobRowId,
+    file_displays: fileDisplays,
+    statuses
+  } = data;
 
   logger.info(
-    { session_id: sessionId, job_row_id: jobRowId, urls: urlIds.length },
+    {
+      session_id: sessionId,
+      job_row_id: jobRowId,
+      files: fileDisplays.length,
+      statuses
+    },
     "delete problem urls job started"
   );
 
   try {
-    // Mark the selected URLs deleted GLOBALLY (deleted_from_files NULL = removed
-    // from every file they appear in). Guarded to this session's patterns.
-    await pool.query(
-      `
-        UPDATE sampled_urls AS s
-        SET is_deleted_from_sitemap = true, deleted_from_files = NULL
-        FROM patterns p
-        WHERE p.id = s.pattern_id
-          AND p.session_id = $1
-          AND s.id = ANY($2::uuid[])
-      `,
-      [sessionId, urlIds]
+    // Scan the selected files to find exactly which confirmed problem URLs (of
+    // the requested statuses) physically appear in them — the same match the
+    // rebuild uses. Then mark only those URLs deleted, scoped to the selected
+    // files. This keeps the is_deleted_from_sitemap flag honest (set only for
+    // URLs actually removed) even for multi-file patterns whose source_file is a
+    // comma-joined list.
+    const groups = await collectProblemFileGroups({
+      sessionId,
+      statuses,
+      restrictToDisplays: fileDisplays
+    });
+
+    const urlIds = Array.from(
+      new Set(groups.flatMap((group) => group.url_ids))
     );
 
-    const filesResult = await pool.query<{ count: string }>(
-      `
-        SELECT COUNT(*)::text AS count
-        FROM sitemap_files
-        WHERE session_id = $1 AND source_role = 'current' AND is_deleted = false
-      `,
-      [sessionId]
-    );
-    await markRunning(jobRowId, Number(filesResult.rows[0]?.count ?? 0));
+    await markRunning(jobRowId, fileDisplays.length);
 
+    if (urlIds.length > 0) {
+      await pool.query(
+        `
+          UPDATE sampled_urls AS s
+          SET is_deleted_from_sitemap = true,
+              deleted_from_files = $2::text[]
+          FROM patterns p
+          WHERE p.id = s.pattern_id
+            AND p.session_id = $1
+            AND s.id = ANY($3::uuid[])
+        `,
+        [sessionId, fileDisplays, urlIds]
+      );
+    }
+
+    // Rebuild only the selected files from their originals against the updated
+    // deleted-set. removeUrlBlocksFromFile strips EVERY matching <loc>, so all
+    // confirmed problem URLs in each file go, not just the sampled preview.
     const { urlsRemoved } = await rebuildSessionDeletions({
       sessionId,
-      scope: "all",
+      scope: fileDisplays,
       onProgress: progressFlusher(jobRowId)
     });
 
-    await markComplete(jobRowId, Number(filesResult.rows[0]?.count ?? 0), urlsRemoved);
+    await markComplete(jobRowId, fileDisplays.length, urlsRemoved);
     logger.info(
       { session_id: sessionId, job_row_id: jobRowId, urlsRemoved },
       "delete problem urls job complete"
