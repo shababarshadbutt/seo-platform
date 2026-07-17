@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream, existsSync } from "node:fs";
 import {
   access,
   mkdir,
@@ -63,6 +63,8 @@ import {
   type ParsedSitemap
 } from "../sitemaps/parser.js";
 import { rebuildSessionDeletions } from "../sitemaps/urlDeletion.js";
+import { invalidateSessionZipCache } from "../exports/sessionZipCache.js";
+import { enqueuePreGenerateZipJob } from "../queue/preGenerateZipQueue.js";
 import { collectProblemFileGroups } from "../sitemaps/problemFiles.js";
 import { previewTrailingSlash } from "../sitemaps/trailingSlashApply.js";
 import {
@@ -515,6 +517,112 @@ async function buildSitemapIndexXml(options: {
     .join("\n");
 
   return `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${entries}\n</sitemapindex>\n`;
+}
+
+// A URL-safe slug of a session name, for the download filename.
+export function sessionSlug(name: string) {
+  return (
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 60) || "session"
+  );
+}
+
+// Shared builder for the download ZIP, used by BOTH the on-demand download
+// endpoint and the background pre-generation job. Streams each surviving source
+// file in under its clean display name (foreign-domain <loc>s stripped) plus a
+// regenerated sitemap-index.xml. Returns a not-yet-finalized archive (the caller
+// attaches an error handler, finalizes, and pipes it) and the download filename,
+// or null when the session has no local sitemap files of the requested type.
+export async function buildSessionZipArchive(
+  sessionId: string,
+  downloadType: "all" | "edited"
+): Promise<{ archive: ZipArchive; zipName: string } | null> {
+  const sessionResult = await pool.query<{ name: string; base_url: string }>(
+    "SELECT name, base_url FROM sessions WHERE id = $1",
+    [sessionId]
+  );
+
+  if (sessionResult.rowCount === 0) {
+    return null;
+  }
+
+  const session = sessionResult.rows[0];
+
+  const filesResult = await pool.query<{
+    filename: string;
+    is_index: boolean;
+  }>(
+    `
+      SELECT filename, is_index
+      FROM sitemap_files
+      WHERE session_id = $1 AND source_role = 'current' AND is_deleted = false
+      ORDER BY filename ASC
+    `,
+    [sessionId]
+  );
+
+  const localRows = filesResult.rows.filter((row) => !isHttpUrl(row.filename));
+  const indexStoredFilename =
+    localRows.find((row) => row.is_index)?.filename ?? null;
+  let childRows = localRows.filter((row) => !row.is_index);
+
+  if (downloadType === "edited") {
+    childRows = childRows.filter((row) =>
+      isEditedStoredFilename(sessionId, row.filename)
+    );
+  }
+
+  const zipFiles: Array<{ stored: string; display: string }> = [];
+
+  for (const row of childRows) {
+    try {
+      await access(path.join(config.uploadDir, row.filename));
+    } catch {
+      continue;
+    }
+
+    zipFiles.push({
+      stored: row.filename,
+      display: downloadDisplayName(sessionId, row.filename)
+    });
+  }
+
+  if (zipFiles.length === 0) {
+    return null;
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const indexXml = await buildSitemapIndexXml({
+    baseUrl: session.base_url,
+    indexStoredFilename,
+    displayNames: zipFiles.map((file) => file.display),
+    today
+  });
+
+  const zipName = `${sessionSlug(session.name)}-${downloadType}-sitemaps-${today}.zip`;
+
+  const archive = new ZipArchive({ zlib: { level: 9 } });
+  const downloadExpectedHost = expectedHostFromBaseUrl(session.base_url);
+
+  for (const file of zipFiles) {
+    const storedPath = path.join(config.uploadDir, file.stored);
+
+    archive.append(
+      streamSitemapWithoutForeignLocs({
+        inputPath: storedPath,
+        isGzip: file.stored.toLowerCase().endsWith(".gz"),
+        expectedHost: downloadExpectedHost
+      }),
+      { name: file.display }
+    );
+  }
+
+  archive.append(indexXml, { name: "sitemap-index.xml" });
+
+  return { archive, zipName };
 }
 
 // Literal find/replace (never regex from the user's perspective). A function
@@ -1859,6 +1967,9 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           sessions.status,
           sessions.upload_complete,
           sessions.created_at,
+          sessions.zip_all_path,
+          sessions.zip_edited_path,
+          sessions.zip_generated_at,
           COALESCE(
             SUM(sitemap_files.mismatched_url_count)
               FILTER (WHERE sitemap_files.source_role = 'current'),
@@ -1913,6 +2024,35 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       `,
       [request.params.id]
     );
+
+    // A pre-generated ZIP is "ready" only if the recorded path still exists on
+    // disk. Expose the flag (+ timestamp for polling) and drop the raw paths.
+    const zipReady = Boolean(session.zip_all_path && existsSync(session.zip_all_path));
+    const zipGeneratedAt = session.zip_generated_at;
+
+    delete session.zip_all_path;
+    delete session.zip_edited_path;
+    delete session.zip_generated_at;
+    session.zip_ready = zipReady;
+    session.zip_generated_at = zipGeneratedAt;
+
+    // Self-heal: a completed session with no ready ZIP (e.g. one that finished
+    // before this feature, or whose cache was invalidated) gets its download
+    // ZIPs (re)generated in the background. Idempotent — the singleton job
+    // coalesces and skips when a fresh cache already exists.
+    if (
+      !zipReady &&
+      (session.status === "COMPLETE" || session.status === "COMPLETED")
+    ) {
+      void enqueuePreGenerateZipJob({
+        session_id: request.params.id,
+        type: "all"
+      }).catch(() => {});
+      void enqueuePreGenerateZipJob({
+        session_id: request.params.id,
+        type: "edited"
+      }).catch(() => {});
+    }
 
     return {
       session,
@@ -2342,6 +2482,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         await client.query("COMMIT");
         committed = true;
         await unlinkQuietly(filesToDeleteAfterCommit, request.log);
+        await invalidateSessionZipCache(request.params.id);
 
         return reply.send({
           old_template: currentTemplate,
@@ -2634,6 +2775,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
         await client.query("COMMIT");
         committed = true;
+        await invalidateSessionZipCache(request.params.id);
 
         return reply.send({
           urls_transformed: rewrite.rewrittenLocCount,
@@ -2769,6 +2911,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         await client.query("COMMIT");
         committed = true;
         await unlinkQuietly(filesToDeleteAfterCommit, request.log);
+        await invalidateSessionZipCache(request.params.id);
 
         return reply.send({
           undo: true,
@@ -2862,68 +3005,48 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     async (request, reply) => {
       const downloadType = request.query.type === "all" ? "all" : "edited";
 
-      const sessionResult = await pool.query<{
+      // Fast path: serve a pre-generated ZIP if one exists and is still on disk.
+      const cacheResult = await pool.query<{
         name: string;
-        base_url: string;
-      }>("SELECT name, base_url FROM sessions WHERE id = $1", [
-        request.params.id
-      ]);
+        zip_all_path: string | null;
+        zip_edited_path: string | null;
+      }>(
+        "SELECT name, zip_all_path, zip_edited_path FROM sessions WHERE id = $1",
+        [request.params.id]
+      );
 
-      if (sessionResult.rowCount === 0) {
+      if (cacheResult.rowCount === 0) {
         return reply.code(404).send({
           error: "Not Found",
           message: "session not found"
         });
       }
 
-      const session = sessionResult.rows[0];
+      const cachedPath =
+        downloadType === "all"
+          ? cacheResult.rows[0].zip_all_path
+          : cacheResult.rows[0].zip_edited_path;
 
-      const filesResult = await pool.query<{
-        filename: string;
-        is_index: boolean;
-      }>(
-        `
-          SELECT filename, is_index
-          FROM sitemap_files
-          WHERE session_id = $1 AND source_role = 'current'
-            AND is_deleted = false
-          ORDER BY filename ASC
-        `,
-        [request.params.id]
-      );
+      if (cachedPath && existsSync(cachedPath)) {
+        const dateMatch = cachedPath.match(/(\d{4}-\d{2}-\d{2})\.zip$/);
+        const zipName = `${sessionSlug(cacheResult.rows[0].name)}-${downloadType}-sitemaps-${
+          dateMatch?.[1] ?? new Date().toISOString().slice(0, 10)
+        }.zip`;
 
-      // Only real on-disk files (URL-sourced sitemaps have no local copy). The
-      // index is handled separately (regenerated), so exclude it from children.
-      const localRows = filesResult.rows.filter(
-        (row) => !isHttpUrl(row.filename)
-      );
-      const indexStoredFilename =
-        localRows.find((row) => row.is_index)?.filename ?? null;
-      let childRows = localRows.filter((row) => !row.is_index);
-
-      if (downloadType === "edited") {
-        childRows = childRows.filter((row) =>
-          isEditedStoredFilename(request.params.id, row.filename)
+        reply.header("content-type", "application/zip");
+        reply.header(
+          "content-disposition",
+          `attachment; filename="${zipName}"`
         );
+
+        return reply.send(createReadStream(cachedPath));
       }
 
-      // Confirm each file still exists on disk before including it.
-      const zipFiles: Array<{ stored: string; display: string }> = [];
+      // Fallback: generate on demand (sessions that completed before this
+      // feature, or whose cache is mid-regeneration).
+      const built = await buildSessionZipArchive(request.params.id, downloadType);
 
-      for (const row of childRows) {
-        try {
-          await access(path.join(config.uploadDir, row.filename));
-        } catch {
-          continue;
-        }
-
-        zipFiles.push({
-          stored: row.filename,
-          display: downloadDisplayName(request.params.id, row.filename)
-        });
-      }
-
-      if (zipFiles.length === 0) {
+      if (!built) {
         return reply.code(404).send(
           badRequest(
             downloadType === "edited"
@@ -2933,63 +3056,20 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         );
       }
 
-      const today = new Date().toISOString().slice(0, 10);
-      const indexXml = await buildSitemapIndexXml({
-        baseUrl: session.base_url,
-        indexStoredFilename,
-        displayNames: zipFiles.map((file) => file.display),
-        today
-      });
-
-      const slug =
-        session.name
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/g, "-")
-          .replace(/^-+|-+$/g, "")
-          .slice(0, 60) || "session";
-      const zipName = `${slug}-${
-        downloadType === "all" ? "all" : "edited"
-      }-sitemaps-${today}.zip`;
-
       reply.header("content-type", "application/zip");
       reply.header(
         "content-disposition",
-        `attachment; filename="${zipName}"`
+        `attachment; filename="${built.zipName}"`
       );
 
-      // archiver v8 exports classes (no callable factory); use ZipArchive.
-      const archive = new ZipArchive({ zlib: { level: 9 } });
-
-      archive.on("error", (error) => {
+      built.archive.on("error", (error) => {
         request.log.error({ error }, "download-sitemaps archive error");
         reply.raw.destroy(error);
       });
 
-      // Stream each source file in under its clean display name (never loaded
-      // fully into memory), then append the regenerated index. Foreign-domain
-      // <loc>s (accepted at upload, filtered out of pattern extraction) are
-      // stripped here too so the corrected sitemaps never carry another site's
-      // URLs. Domain-based, so it drops every foreign loc regardless of how many
-      // were sampled for the mismatch count.
-      const downloadExpectedHost = expectedHostFromBaseUrl(session.base_url);
+      void built.archive.finalize();
 
-      for (const file of zipFiles) {
-        const storedPath = path.join(config.uploadDir, file.stored);
-
-        archive.append(
-          streamSitemapWithoutForeignLocs({
-            inputPath: storedPath,
-            isGzip: file.stored.toLowerCase().endsWith(".gz"),
-            expectedHost: downloadExpectedHost
-          }),
-          { name: file.display }
-        );
-      }
-
-      archive.append(indexXml, { name: "sitemap-index.xml" });
-      void archive.finalize();
-
-      return reply.send(archive);
+      return reply.send(built.archive);
     }
   );
 
@@ -3095,6 +3175,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         await client.query("COMMIT");
         committed = true;
         await unlinkQuietly(filesToDeleteAfterCommit, request.log);
+        await invalidateSessionZipCache(request.params.id);
 
         return reply.send({ updated: updateResult.rowCount ?? 0 });
       } catch (error) {
@@ -3371,6 +3452,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       } finally {
         client.release();
       }
+
+      await invalidateSessionZipCache(request.params.id);
 
       return reply.send({ restored });
     }
@@ -4023,6 +4106,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         });
       }
 
+      await invalidateSessionZipCache(request.params.id);
+
       return reply.send({ results });
     }
   );
@@ -4063,6 +4148,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         `,
         [request.params.id, fileIds]
       );
+
+      await invalidateSessionZipCache(request.params.id);
 
       return reply.send({ restored: restoreResult.rowCount ?? 0 });
     }
@@ -4265,6 +4352,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         scope: selectedDisplays
       });
 
+      await invalidateSessionZipCache(request.params.id);
+
       return {
         deleted_from_files: selectedDisplays.length,
         urls_removed: urlsRemoved
@@ -4296,6 +4385,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         sessionId: request.params.id,
         scope: affected ?? "all"
       });
+
+      await invalidateSessionZipCache(request.params.id);
 
       return { restored: true };
     }

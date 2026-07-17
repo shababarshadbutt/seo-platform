@@ -3,6 +3,7 @@ import type { FastifyBaseLogger } from "fastify";
 import { pool } from "../db/pool.js";
 import { collectProblemFileGroups } from "../sitemaps/problemFiles.js";
 import { rebuildSessionDeletions } from "../sitemaps/urlDeletion.js";
+import { invalidateSessionZipCache } from "../exports/sessionZipCache.js";
 import {
   applyTrailingSlash,
   undoTrailingSlash
@@ -123,6 +124,7 @@ export async function processDeleteProblemUrlsJob(
     });
 
     await markComplete(jobRowId, fileDisplays.length, urlsRemoved);
+    await invalidateSessionZipCache(sessionId);
     logger.info(
       { session_id: sessionId, job_row_id: jobRowId, urlsRemoved },
       "delete problem urls job complete"
@@ -177,6 +179,7 @@ export async function processRestoreDeletedUrlsJob(
     });
 
     await markComplete(jobRowId, Number(filesResult.rows[0]?.count ?? 0), 0);
+    await invalidateSessionZipCache(sessionId);
     logger.info(
       { session_id: sessionId, job_row_id: jobRowId },
       "restore deleted urls job complete"
@@ -223,6 +226,7 @@ export async function processFixTrailingSlashesJob(
       `,
       [jobRowId, urlsFixed]
     );
+    await invalidateSessionZipCache(sessionId);
     logger.info(
       { session_id: sessionId, job_row_id: jobRowId, urlsFixed },
       "fix trailing slashes job complete"
@@ -265,6 +269,7 @@ export async function processFixTrailingSlashesUndoJob(
       "UPDATE maintenance_jobs SET status = 'UNDONE', completed_at = now() WHERE id = $1",
       [jobRowId]
     );
+    await invalidateSessionZipCache(sessionId);
     logger.info(
       { session_id: sessionId, job_row_id: jobRowId },
       "fix trailing slashes undo job complete"

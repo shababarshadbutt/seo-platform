@@ -106,9 +106,16 @@ function normalizeForDedup(url: string): string {
   }
 }
 
-function buildUrlsetXml(locs: string[]) {
+function buildUrlsetXml(locs: string[], today: string) {
+  // Every surviving <url> gets a fresh <lastmod> of today (after <loc>),
+  // regardless of whether the source had one.
   const entries = locs
-    .map((loc) => `  <url>\n    <loc>${escapeXml(loc)}</loc>\n  </url>`)
+    .map(
+      (loc) =>
+        `  <url>\n    <loc>${escapeXml(
+          loc
+        )}</loc>\n    <lastmod>${today}</lastmod>\n  </url>`
+    )
     .join("\n");
 
   return `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${entries}\n</urlset>\n`;
@@ -291,7 +298,7 @@ export async function cleanSitemaps(options: {
   const duplicateUrls = Array.from(dupReport.values());
   const outputFiles: CleanerOutputFile[] = survivors.map((file) => ({
     filename: file.filename,
-    content: buildUrlsetXml(file.urls)
+    content: buildUrlsetXml(file.urls, options.today)
   }));
 
   outputFiles.push({ filename: INDEX_FILENAME, content: indexXml });

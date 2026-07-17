@@ -44,11 +44,25 @@ import {
   type MaintenanceQueueData,
   type RestoreDeletedUrlsJobData
 } from "./queue/maintenanceQueue.js";
+import {
+  CLEANUP_ZIPS_JOB,
+  PRE_GENERATE_ZIP_JOB,
+  PRE_GENERATE_ZIP_QUEUE_NAME,
+  closePreGenerateZipQueue,
+  enqueueCleanupZipsJob,
+  type PreGenerateZipJobData,
+  type PreGenerateZipJobName,
+  type PreGenerateZipQueueData
+} from "./queue/preGenerateZipQueue.js";
 import { redisConnectionOptions } from "./queue/redisConnection.js";
 import {
   processBulkReplaceJob,
   processBulkReplaceUndoJob
 } from "./jobs/bulkReplaceJob.js";
+import {
+  processCleanupZipsJob,
+  processPreGenerateZipJob
+} from "./jobs/preGenerateZipJob.js";
 import {
   processDeleteProblemUrlsJob,
   processFixTrailingSlashesJob,
@@ -85,6 +99,13 @@ let maintenanceWorker: Worker<
   MaintenanceQueueData,
   void,
   MaintenanceJobName
+> | null = null;
+// Download-ZIP pre-generation + daily cleanup on its own concurrency-1 queue, so
+// a heavy 1000-file archive write never starves the other workers.
+let preGenerateZipWorker: Worker<
+  PreGenerateZipQueueData,
+  void,
+  PreGenerateZipJobName
 > | null = null;
 
 function jobDataContext(data: SitemapJobData | undefined) {
@@ -275,7 +296,47 @@ async function start() {
         "maintenance worker job failed"
       );
     });
+    preGenerateZipWorker = new Worker<
+      PreGenerateZipQueueData,
+      void,
+      PreGenerateZipJobName
+    >(
+      PRE_GENERATE_ZIP_QUEUE_NAME,
+      async (job) => {
+        if (job.name === PRE_GENERATE_ZIP_JOB) {
+          await processPreGenerateZipJob(
+            job.data as PreGenerateZipJobData,
+            app.log
+          );
+          return;
+        }
+
+        if (job.name === CLEANUP_ZIPS_JOB) {
+          await processCleanupZipsJob(app.log);
+          return;
+        }
+
+        throw new Error(`Unsupported job: ${job.name}`);
+      },
+      {
+        connection: redisConnectionOptions(),
+        concurrency: 1
+      }
+    );
+    preGenerateZipWorker.on("failed", (job, error) => {
+      app.log.error(
+        {
+          job_id: job?.id,
+          job_name: job?.name,
+          session_id: (job?.data as { session_id?: string } | undefined)
+            ?.session_id,
+          error
+        },
+        "pre-generate-zip worker job failed"
+      );
+    });
     await enqueueWatchdogStuckSessionsJob();
+    await enqueueCleanupZipsJob();
     await app.listen({
       port: config.workerHealthPort,
       host: "0.0.0.0"
@@ -290,9 +351,11 @@ async function close() {
   await parseWorker?.close();
   await bulkReplaceWorker?.close();
   await maintenanceWorker?.close();
+  await preGenerateZipWorker?.close();
   await closeSitemapQueue();
   await closeBulkReplaceQueue();
   await closeMaintenanceQueue();
+  await closePreGenerateZipQueue();
   await app.close();
   await closePool();
 }

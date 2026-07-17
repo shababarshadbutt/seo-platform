@@ -7,6 +7,7 @@ import {
   enqueueParseSitemapJobs,
   sitemapQueue
 } from "../queue/sitemapQueue.js";
+import { enqueuePreGenerateZipJob } from "../queue/preGenerateZipQueue.js";
 
 type SessionReadinessRow = {
   id: string;
@@ -254,4 +255,8 @@ export async function markSessionComplete(sessionId: string) {
   await enqueueCleanupUploadsJob({
     session_id: sessionId
   });
+  // Pre-generate both download ZIPs in the background so the first download is
+  // instant instead of building a fresh archive on demand.
+  await enqueuePreGenerateZipJob({ session_id: sessionId, type: "all" });
+  await enqueuePreGenerateZipJob({ session_id: sessionId, type: "edited" });
 }

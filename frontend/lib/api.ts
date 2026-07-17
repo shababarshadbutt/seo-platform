@@ -24,6 +24,9 @@ export type Session = {
   upload_complete: boolean;
   created_at: string;
   mismatched_url_count?: NumberLike;
+  // Pre-generated download ZIP status (Fix 3, v1.26).
+  zip_ready?: boolean;
+  zip_generated_at?: string | null;
 };
 
 export type SitemapFile = {

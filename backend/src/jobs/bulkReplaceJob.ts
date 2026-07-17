@@ -6,6 +6,7 @@ import type { FastifyBaseLogger } from "fastify";
 
 import { config } from "../config.js";
 import { pool } from "../db/pool.js";
+import { invalidateSessionZipCache } from "../exports/sessionZipCache.js";
 import {
   buildBulkReplacedStoredFilename,
   displaySourceFilename,
@@ -250,6 +251,7 @@ export async function processBulkReplaceUndoJob(
       [jobRowId, files.length]
     );
 
+    await invalidateSessionZipCache(sessionId);
     logger.info(
       { session_id: sessionId, job_row_id: jobRowId },
       "bulk replace undo complete"
@@ -457,6 +459,7 @@ export async function processBulkReplaceJob(
       [jobRowId, filesDone, urlsRewritten]
     );
 
+    await invalidateSessionZipCache(sessionId);
     logger.info(
       {
         session_id: sessionId,

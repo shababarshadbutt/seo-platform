@@ -670,6 +670,42 @@ export default function ResultsDashboardPage({
     void loadMaintenanceState();
   }, [loadMaintenanceState]);
 
+  // Poll for the pre-generated download ZIP so the Download Sitemaps button
+  // flips from "Preparing download…" to enabled once the background job lands.
+  const sessionStatus = sessionData?.session.status;
+  const sessionZipReady = sessionData?.session.zip_ready ?? false;
+  useEffect(() => {
+    if (
+      (sessionStatus !== "COMPLETE" && sessionStatus !== "COMPLETED") ||
+      sessionZipReady
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const tick = async () => {
+      try {
+        const next = await getSession(params.id);
+
+        if (!cancelled) {
+          setSessionData((prev) =>
+            prev ? { ...prev, session: next.session } : next
+          );
+        }
+      } catch {
+        // ignore; retry next tick
+      }
+    };
+
+    const interval = window.setInterval(() => void tick(), 5000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [params.id, sessionStatus, sessionZipReady]);
+
   const loadResults = useCallback(
     async (options: { silent?: boolean } = {}) => {
       if (!options.silent) {
@@ -1627,6 +1663,7 @@ export default function ResultsDashboardPage({
       : [];
 
   const session = sessionData?.session;
+  const zipReady = session?.zip_ready ?? false;
   const hadPreambleStripped =
     sessionData?.sitemap_files.some((file) => file.had_preamble_stripped) ??
     false;
@@ -1916,16 +1953,23 @@ export default function ResultsDashboardPage({
                   <DropdownMenuTrigger asChild>
                     <Button
                       variant="outline"
-                      disabled={downloadingSitemaps !== null}
+                      disabled={downloadingSitemaps !== null || !zipReady}
+                      title={
+                        !zipReady
+                          ? "The download is being prepared in the background"
+                          : undefined
+                      }
                     >
-                      {downloadingSitemaps ? (
+                      {downloadingSitemaps || !zipReady ? (
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                       ) : (
                         <Download className="mr-2 h-4 w-4" />
                       )}
                       {downloadingSitemaps
                         ? "Preparing ZIP"
-                        : "Download Sitemaps"}
+                        : !zipReady
+                          ? "Preparing download…"
+                          : "Download Sitemaps"}
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
