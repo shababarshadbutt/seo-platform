@@ -1228,11 +1228,59 @@ export async function downloadSitemapsZip(
   }
 
   const blob = await response.blob();
+  const filename = downloadFilename(response, `${type}-sitemaps.zip`);
+
+  // Chrome/Edge: open the native Save As dialog so the user chooses the folder
+  // and filename regardless of their browser's download settings. Feature-check
+  // first; browsers without the File System Access API (Firefox/Safari) fall
+  // through to the anchor download below and save straight to Downloads.
+  const showSaveFilePicker = (
+    window as unknown as {
+      showSaveFilePicker?: (options: {
+        suggestedName?: string;
+        types?: Array<{
+          description?: string;
+          accept: Record<string, string[]>;
+        }>;
+      }) => Promise<{
+        createWritable: () => Promise<{
+          write: (data: Blob) => Promise<void>;
+          close: () => Promise<void>;
+        }>;
+      }>;
+    }
+  ).showSaveFilePicker;
+
+  if (typeof showSaveFilePicker === "function") {
+    try {
+      const handle = await showSaveFilePicker({
+        suggestedName: filename,
+        types: [
+          {
+            description: "ZIP Archive",
+            accept: { "application/zip": [".zip"] }
+          }
+        ]
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return;
+    } catch (pickerError) {
+      // User dismissed the dialog — treat as a no-op, not a failure.
+      if ((pickerError as { name?: string })?.name === "AbortError") {
+        return;
+      }
+      // Anything else (unsupported context, permission denied, secure-context
+      // requirement): fall through to the anchor download below.
+    }
+  }
+
   const objectUrl = URL.createObjectURL(blob);
   const link = document.createElement("a");
 
   link.href = objectUrl;
-  link.download = downloadFilename(response, `${type}-sitemaps.zip`);
+  link.download = filename;
   document.body.appendChild(link);
   link.click();
   link.remove();
