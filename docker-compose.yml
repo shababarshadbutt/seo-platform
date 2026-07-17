@@ -5,6 +5,7 @@ services:
     environment:
       NEXT_TELEMETRY_DISABLED: "1"
       NEXT_PUBLIC_BACKEND_URL: http://localhost:${BACKEND_PORT:-3001}
+      NEXT_PUBLIC_SEO_DESK_URL: ${NEXT_PUBLIC_SEO_DESK_URL:-http://localhost:4000}
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
     depends_on:

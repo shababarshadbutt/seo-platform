@@ -8,6 +8,7 @@ import { closePool } from "./db/pool.js";
 import { runMigrations } from "./db/migrate.js";
 import { fsErrorResponse } from "./errors/fsErrors.js";
 import { sessionRoutes } from "./routes/sessions.js";
+import { cleanerRoutes } from "./routes/cleaner.js";
 
 const app = Fastify({
   logger: true
@@ -61,6 +62,7 @@ app.setErrorHandler((error, request, reply) => {
 });
 
 await app.register(sessionRoutes);
+await app.register(cleanerRoutes);
 
 app.get("/health", async () => ({
   ok: true,

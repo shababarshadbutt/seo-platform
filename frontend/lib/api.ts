@@ -1376,3 +1376,254 @@ export function numberValue(value: NumberLike) {
 
   return Number.isFinite(parsed) ? parsed : 0;
 }
+
+// ---- Sitemap Cleaner (stateless) ---------------------------------------
+
+export type CleanerDropReason = "empty" | "wrong_domain" | "unparsable";
+
+export type CleanerSummary = {
+  files_processed: number;
+  files_kept: number;
+  files_dropped: number;
+  dropped_files: { filename: string; reason: CleanerDropReason }[];
+  duplicates_removed: number;
+  duplicate_urls: { url: string; kept_in: string; also_in: string[] }[];
+  output_files: { filename: string; url_count: number }[];
+  index_files_detected: number;
+};
+
+export type CleanerProgressEvent =
+  | {
+      type: "progress";
+      stage: string;
+      message: string;
+      current?: number;
+      total?: number;
+    }
+  | {
+      type: "done";
+      summary: CleanerSummary;
+      download_token: string;
+      zip_filename: string;
+    }
+  | { type: "error"; message: string };
+
+export type CleanerDone = {
+  summary: CleanerSummary;
+  download_token: string;
+  zip_filename: string;
+};
+
+// POST the upload to the cleaner and consume the Server-Sent Events stream,
+// invoking onEvent for each progress/done/error event. Resolves with the final
+// done payload (summary + download token).
+export async function processCleaner(
+  formData: FormData,
+  onEvent: (event: CleanerProgressEvent) => void,
+  signal?: AbortSignal
+): Promise<CleanerDone> {
+  const response = await fetch(backendUrl("/api/cleaner/process"), {
+    method: "POST",
+    body: formData,
+    signal
+  });
+
+  if (!response.ok || !response.body) {
+    const text = await response.text().catch(() => "");
+    let message = `Cleaning failed with status ${response.status}`;
+
+    try {
+      const payload = text ? JSON.parse(text) : null;
+
+      if (typeof payload?.message === "string") {
+        message = payload.message;
+      }
+    } catch {
+      if (text) {
+        message = text;
+      }
+    }
+
+    throw new ApiError(message, response.status, null);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let done: CleanerDone | null = null;
+  let errorMessage: string | null = null;
+
+  const handleEvent = (raw: string) => {
+    const dataLine = raw
+      .split("\n")
+      .find((line) => line.startsWith("data:"));
+
+    if (!dataLine) {
+      return;
+    }
+
+    const json = dataLine.slice(5).trim();
+
+    if (!json) {
+      return;
+    }
+
+    let event: CleanerProgressEvent;
+
+    try {
+      event = JSON.parse(json) as CleanerProgressEvent;
+    } catch {
+      return;
+    }
+
+    onEvent(event);
+
+    if (event.type === "done") {
+      done = {
+        summary: event.summary,
+        download_token: event.download_token,
+        zip_filename: event.zip_filename
+      };
+    } else if (event.type === "error") {
+      errorMessage = event.message;
+    }
+  };
+
+  for (;;) {
+    const { value, done: streamDone } = await reader.read();
+
+    if (streamDone) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf("\n\n");
+
+    while (boundary !== -1) {
+      handleEvent(buffer.slice(0, boundary));
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+    }
+  }
+
+  if (buffer.trim()) {
+    handleEvent(buffer);
+  }
+
+  if (errorMessage) {
+    throw new ApiError(errorMessage, 500, null);
+  }
+
+  if (!done) {
+    throw new ApiError("Cleaning ended unexpectedly", 500, null);
+  }
+
+  return done;
+}
+
+// Save a blob via the native Save As dialog on Chrome/Edge (File System Access
+// API), falling back to a standard anchor download elsewhere. Mirrors the
+// Download Sitemaps behaviour shipped in v1.24.
+export async function saveBlobWithPicker(
+  blob: Blob,
+  filename: string,
+  accept: Record<string, string[]>
+) {
+  const showSaveFilePicker = (
+    window as unknown as {
+      showSaveFilePicker?: (options: {
+        suggestedName?: string;
+        types?: Array<{
+          description?: string;
+          accept: Record<string, string[]>;
+        }>;
+      }) => Promise<{
+        createWritable: () => Promise<{
+          write: (data: Blob) => Promise<void>;
+          close: () => Promise<void>;
+        }>;
+      }>;
+    }
+  ).showSaveFilePicker;
+
+  if (typeof showSaveFilePicker === "function") {
+    try {
+      const handle = await showSaveFilePicker({
+        suggestedName: filename,
+        types: [{ description: "File", accept }]
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return;
+    } catch (pickerError) {
+      if ((pickerError as { name?: string })?.name === "AbortError") {
+        return;
+      }
+      // Otherwise fall through to the anchor download.
+    }
+  }
+
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+export async function downloadCleanerZip(token: string, filename: string) {
+  const response = await fetch(backendUrl(`/api/cleaner/download/${token}`), {
+    cache: "no-store"
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+
+    throw new ApiError(
+      text || `Download failed with status ${response.status}`,
+      response.status,
+      null
+    );
+  }
+
+  const blob = await response.blob();
+
+  await saveBlobWithPicker(blob, filename, { "application/zip": [".zip"] });
+}
+
+function csvField(value: string) {
+  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+}
+
+// Build the duplicates CSV client-side from the summary (same columns the
+// backend writes into the ZIP), so the standalone CSV download needs no extra
+// round-trip or server state.
+export function buildDuplicatesCsv(
+  rows: { url: string; kept_in: string; also_in: string[] }[]
+) {
+  const header = "url,kept_in_file,duplicate_in_files";
+  const lines = rows.map(
+    (row) =>
+      `${csvField(row.url)},${csvField(row.kept_in)},${csvField(
+        row.also_in.join("; ")
+      )}`
+  );
+
+  return `${[header, ...lines].join("\r\n")}\r\n`;
+}
+
+export async function downloadDuplicatesCsv(
+  rows: { url: string; kept_in: string; also_in: string[] }[],
+  filename: string
+) {
+  const blob = new Blob([buildDuplicatesCsv(rows)], {
+    type: "text/csv;charset=utf-8"
+  });
+
+  await saveBlobWithPicker(blob, filename, { "text/csv": [".csv"] });
+}

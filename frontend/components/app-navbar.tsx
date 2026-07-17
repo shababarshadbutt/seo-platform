@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Loader2, StopCircle } from "lucide-react";
+import { ExternalLink, Loader2, StopCircle } from "lucide-react";
 
 import {
   cancelSession,
@@ -106,6 +106,22 @@ export function AppNavbar() {
 
   const showStop = Boolean(sessionId) && isActive;
 
+  // SEO Desk lives in a separate app on its own port; make it configurable so
+  // the link works across machines. Cleaner + Migration are this same app, so
+  // they use relative hrefs (portable) and just open in a new tab.
+  const seoDeskUrl =
+    process.env.NEXT_PUBLIC_SEO_DESK_URL ?? "http://localhost:4000";
+  const isCleanerActive = pathname === "/cleaner";
+  const isMigrationActive =
+    pathname === "/" || (pathname?.startsWith("/sessions") ?? false);
+
+  const toolLinkClass = (active: boolean) =>
+    `inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-xs font-medium transition-colors ${
+      active
+        ? "bg-indigo-500/20 text-indigo-200 ring-1 ring-inset ring-indigo-400/50"
+        : "text-slate-300 hover:bg-slate-800 hover:text-white"
+    }`;
+
   return (
     <>
       <nav className="sticky top-0 z-50 h-14 border-b border-slate-800 bg-slate-900">
@@ -120,6 +136,36 @@ export function AppNavbar() {
             </span>
           </Link>
           <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1.5">
+              <a
+                href="/cleaner"
+                target="_blank"
+                rel="noopener noreferrer"
+                className={toolLinkClass(isCleanerActive)}
+              >
+                🧹 Cleaner
+                <ExternalLink className="h-3 w-3" aria-hidden="true" />
+              </a>
+              <a
+                href="/"
+                target="_blank"
+                rel="noopener noreferrer"
+                className={toolLinkClass(isMigrationActive)}
+              >
+                🗺️ Migration
+                <ExternalLink className="h-3 w-3" aria-hidden="true" />
+              </a>
+              <a
+                href={seoDeskUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={toolLinkClass(false)}
+              >
+                📋 SEO Desk
+                <ExternalLink className="h-3 w-3" aria-hidden="true" />
+              </a>
+            </div>
+            <span className="h-5 w-px bg-slate-700" aria-hidden="true" />
             <Link
               href="/sessions"
               className="text-sm font-medium text-slate-300 transition-colors hover:text-white"
