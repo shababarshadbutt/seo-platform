@@ -121,8 +121,37 @@ services:
       timeout: 5s
       retries: 10
 
+  # SEO Team Desk — separate Next.js + MongoDB app, linked from the sitemap
+  # tool navbar (NEXT_PUBLIC_SEO_DESK_URL). Its own auth context (NextAuth).
+  seo-desk:
+    build:
+      context: ./apps/seo-desk
+    environment:
+      NODE_ENV: production
+      MONGODB_URI: mongodb://mongo:27017/seo_desk
+      NEXTAUTH_URL: http://localhost:${SEO_DESK_PORT:-4000}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-dev-insecure-nextauth-secret-change-me}
+      PYTHON_EXECUTABLE: python3
+      CRON_SECRET: ${CRON_SECRET:-dev-insecure-cron-secret}
+    ports:
+      - "${SEO_DESK_PORT:-4000}:3000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  mongo:
+    image: mongo:7
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
 volumes:
   uploads:
   exports:
   postgres_data:
   redis_data:
+  mongo_data:

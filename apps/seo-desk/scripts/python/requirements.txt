@@ -1,0 +1,19 @@
+# Google API core
+google-auth==2.29.0
+google-auth-httplib2==0.2.0
+google-api-python-client==2.128.0
+
+# Google Analytics Data API (GA4)
+google-analytics-data==0.18.9
+
+# Google Sheets
+gspread==6.1.2
+oauth2client==4.1.3
+
+# Sitemap / XML parsing
+requests==2.31.0
+lxml>=5.3.0
+urllib3==2.2.1
+
+# CSV / data handling
+pandas>=3.0.0
