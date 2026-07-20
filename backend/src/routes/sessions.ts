@@ -1967,6 +1967,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           sessions.status,
           sessions.upload_complete,
           sessions.created_at,
+          sessions.completed_at,
           sessions.zip_all_path,
           sessions.zip_edited_path,
           sessions.zip_generated_at,
@@ -2027,13 +2028,24 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
     // A pre-generated ZIP is "ready" only if the recorded path still exists on
     // disk. Expose the flag (+ timestamp for polling) and drop the raw paths.
+    // `zip_generating` is true only for a short window right after completion, so
+    // the UI shows a spinner while the background job runs but falls back to an
+    // (always-available) on-demand download once it's clearly not coming — the
+    // download button must NEVER be blocked indefinitely on ZIP readiness.
     const zipReady = Boolean(session.zip_all_path && existsSync(session.zip_all_path));
     const zipGeneratedAt = session.zip_generated_at;
+    const completedAt = session.completed_at;
+    const ZIP_GENERATING_WINDOW_MS = 5 * 60 * 1000;
+    const zipGenerating =
+      !zipReady &&
+      Boolean(completedAt) &&
+      Date.now() - new Date(completedAt).getTime() < ZIP_GENERATING_WINDOW_MS;
 
     delete session.zip_all_path;
     delete session.zip_edited_path;
     delete session.zip_generated_at;
     session.zip_ready = zipReady;
+    session.zip_generating = zipGenerating;
     session.zip_generated_at = zipGeneratedAt;
 
     // Self-heal: a completed session with no ready ZIP (e.g. one that finished

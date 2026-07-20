@@ -249,14 +249,22 @@ export async function tryFinalizeParsedSession(
 }
 
 export async function markSessionComplete(sessionId: string) {
-  await pool.query("UPDATE sessions SET status = 'COMPLETE' WHERE id = $1::uuid", [
-    sessionId
-  ]);
+  await pool.query(
+    "UPDATE sessions SET status = 'COMPLETE', completed_at = now() WHERE id = $1::uuid",
+    [sessionId]
+  );
   await enqueueCleanupUploadsJob({
     session_id: sessionId
   });
   // Pre-generate both download ZIPs in the background so the first download is
-  // instant instead of building a fresh archive on demand.
-  await enqueuePreGenerateZipJob({ session_id: sessionId, type: "all" });
-  await enqueuePreGenerateZipJob({ session_id: sessionId, type: "edited" });
+  // instant instead of building a fresh archive on demand. Fire-and-forget: a
+  // Redis/queue hiccup here must NEVER throw into (and fail-then-retry) the
+  // sample job that called us, and must never block session completion. If the
+  // enqueue fails, the download simply falls back to on-demand streaming.
+  void enqueuePreGenerateZipJob({ session_id: sessionId, type: "all" }).catch(
+    () => {}
+  );
+  void enqueuePreGenerateZipJob({ session_id: sessionId, type: "edited" }).catch(
+    () => {}
+  );
 }

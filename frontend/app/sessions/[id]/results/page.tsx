@@ -671,13 +671,18 @@ export default function ResultsDashboardPage({
   }, [loadMaintenanceState]);
 
   // Poll for the pre-generated download ZIP so the Download Sitemaps button
-  // flips from "Preparing download…" to enabled once the background job lands.
+  // flips from the "Preparing…" spinner to the instant-download label once the
+  // background job lands. We only poll while the ZIP is actively being generated
+  // (a short post-completion window); once that window closes we stop — the
+  // button then works on-demand, so there's nothing left to wait for.
   const sessionStatus = sessionData?.session.status;
   const sessionZipReady = sessionData?.session.zip_ready ?? false;
+  const sessionZipGenerating = sessionData?.session.zip_generating ?? false;
   useEffect(() => {
     if (
       (sessionStatus !== "COMPLETE" && sessionStatus !== "COMPLETED") ||
-      sessionZipReady
+      sessionZipReady ||
+      !sessionZipGenerating
     ) {
       return;
     }
@@ -704,7 +709,7 @@ export default function ResultsDashboardPage({
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [params.id, sessionStatus, sessionZipReady]);
+  }, [params.id, sessionStatus, sessionZipReady, sessionZipGenerating]);
 
   const loadResults = useCallback(
     async (options: { silent?: boolean } = {}) => {
@@ -1664,6 +1669,10 @@ export default function ResultsDashboardPage({
 
   const session = sessionData?.session;
   const zipReady = session?.zip_ready ?? false;
+  // The pre-generated ZIP is still being built in the background (recently
+  // completed). We show a spinner label for this but NEVER disable the button —
+  // clicking always works and falls back to on-demand streaming server-side.
+  const zipGenerating = session?.zip_generating ?? false;
   const hadPreambleStripped =
     sessionData?.sitemap_files.some((file) => file.had_preamble_stripped) ??
     false;
@@ -1953,22 +1962,22 @@ export default function ResultsDashboardPage({
                   <DropdownMenuTrigger asChild>
                     <Button
                       variant="outline"
-                      disabled={downloadingSitemaps !== null || !zipReady}
+                      disabled={downloadingSitemaps !== null}
                       title={
-                        !zipReady
-                          ? "The download is being prepared in the background"
+                        !zipReady && zipGenerating
+                          ? "The download is being prepared in the background — you can click to download now (it may take a little longer)"
                           : undefined
                       }
                     >
-                      {downloadingSitemaps || !zipReady ? (
+                      {downloadingSitemaps || (!zipReady && zipGenerating) ? (
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                       ) : (
                         <Download className="mr-2 h-4 w-4" />
                       )}
                       {downloadingSitemaps
                         ? "Preparing ZIP"
-                        : !zipReady
-                          ? "Preparing download…"
+                        : !zipReady && zipGenerating
+                          ? "Preparing… (click to download)"
                           : "Download Sitemaps"}
                     </Button>
                   </DropdownMenuTrigger>

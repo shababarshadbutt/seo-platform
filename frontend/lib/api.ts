@@ -23,9 +23,15 @@ export type Session = {
   status: SessionStatus;
   upload_complete: boolean;
   created_at: string;
+  completed_at?: string | null;
   mismatched_url_count?: NumberLike;
-  // Pre-generated download ZIP status (Fix 3, v1.26).
+  // Pre-generated download ZIP status (Fix 3, v1.26; zip_generating added v1.27).
+  // zip_ready → cached ZIP on disk (instant download); zip_generating → the
+  // background job is still building it (recently completed). When both are
+  // false the download falls back to on-demand streaming — the button is never
+  // blocked on ZIP readiness.
   zip_ready?: boolean;
+  zip_generating?: boolean;
   zip_generated_at?: string | null;
 };
 
