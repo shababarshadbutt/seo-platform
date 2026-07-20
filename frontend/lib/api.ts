@@ -1237,12 +1237,54 @@ export async function downloadCorrectedSitemap(
   URL.revokeObjectURL(objectUrl);
 }
 
-export async function downloadSitemapsZip(
+// One file whose <loc>s point at a domain other than the session's base URL;
+// the filtered download strips those URLs. `foreign_url_count` is a sampled
+// LOWER BOUND (see the backend preview endpoint) — `foreign_url_count_is_minimum`
+// marks when the true number is higher; `will_be_empty` is only set when the
+// file is provably all-foreign.
+export type DownloadForeignFile = {
+  filename: string;
+  total_urls: number;
+  foreign_url_count: number;
+  foreign_url_count_is_minimum: boolean;
+  will_be_empty: boolean;
+};
+
+export type DownloadPreview = {
+  has_foreign_urls: boolean;
+  session_base_url: string;
+  total_affected_files: number;
+  total_foreign_urls_min: number;
+  counts_are_sampled: boolean;
+  affected_files: DownloadForeignFile[];
+};
+
+export async function getDownloadPreview(
   sessionId: string,
   type: "edited" | "all"
-) {
+): Promise<DownloadPreview> {
   const response = await fetchWithTimeout(
-    backendUrl(`/api/sessions/${sessionId}/download-sitemaps?type=${type}`),
+    backendUrl(
+      `/api/sessions/${sessionId}/download-sitemaps/preview?type=${type}`
+    ),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<DownloadPreview>(response);
+}
+
+export async function downloadSitemapsZip(
+  sessionId: string,
+  type: "edited" | "all",
+  options: { filter?: boolean } = {}
+) {
+  // filter=false → raw originals (cross-domain URLs kept). Default: filtered.
+  const filterParam = options.filter === false ? "&filter=false" : "";
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/download-sitemaps?type=${type}${filterParam}`
+    ),
     { cache: "no-store" },
     EXPORT_API_TIMEOUT_MS
   );

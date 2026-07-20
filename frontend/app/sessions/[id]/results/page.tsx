@@ -48,6 +48,7 @@ import {
   downloadCorrectedSitemap,
   downloadSessionExport,
   downloadSitemapsZip,
+  getDownloadPreview,
   friendlyApiErrorMessage,
   getBulkReplaceStatus,
   getMismatchedUrls,
@@ -67,6 +68,7 @@ import {
   undoPatternTransform,
   undoTrailingSlashes,
   type BulkReplaceStatus,
+  type DownloadPreview,
   type ExportFormat,
   type MismatchedUrl,
   type Pattern,
@@ -630,6 +632,13 @@ export default function ResultsDashboardPage({
   const [downloadingSitemaps, setDownloadingSitemaps] = useState<
     "edited" | "all" | null
   >(null);
+  const [previewingDownload, setPreviewingDownload] = useState<
+    "edited" | "all" | null
+  >(null);
+  const [foreignWarning, setForeignWarning] = useState<{
+    type: "edited" | "all";
+    preview: DownloadPreview;
+  } | null>(null);
   const [deleteUrlTarget, setDeleteUrlTarget] = useState<SampledUrl | null>(
     null
   );
@@ -1702,7 +1711,13 @@ export default function ResultsDashboardPage({
   const estimateZipBytes = (files: typeof currentSitemapFiles) =>
     files.reduce((sum, file) => sum + Number(file.total_urls ?? 0) * 100, 0);
 
-  async function handleDownloadSitemaps(type: "edited" | "all") {
+  // Actually fetch + save the ZIP. `filtered` false → include cross-domain URLs
+  // (raw originals). Called directly when no foreign URLs are present, or from
+  // the foreign-URL warning modal's two download buttons.
+  async function runDownloadSitemaps(
+    type: "edited" | "all",
+    filtered: boolean
+  ) {
     if (downloadingSitemaps) {
       return;
     }
@@ -1728,7 +1743,7 @@ export default function ResultsDashboardPage({
     setDownloadingSitemaps(type);
 
     try {
-      await downloadSitemapsZip(params.id, type);
+      await downloadSitemapsZip(params.id, type, { filter: filtered });
     } catch (nextError) {
       setFindReplaceToast({
         tone: "error",
@@ -1740,6 +1755,37 @@ export default function ResultsDashboardPage({
     } finally {
       setDownloadingSitemaps(null);
     }
+  }
+
+  // Entry point for the Download Sitemaps menu items. First checks whether any
+  // files contain foreign-domain URLs the filtered download would strip; if so,
+  // shows a warning modal (so a near-empty file is never a silent surprise),
+  // otherwise downloads immediately with filtering as before.
+  async function handleDownloadSitemaps(type: "edited" | "all") {
+    if (downloadingSitemaps || previewingDownload) {
+      return;
+    }
+
+    setPreviewingDownload(type);
+
+    let preview: DownloadPreview | null = null;
+
+    try {
+      preview = await getDownloadPreview(params.id, type);
+    } catch {
+      // Preview is best-effort: if it fails, fall back to a normal filtered
+      // download rather than blocking the user.
+      preview = null;
+    } finally {
+      setPreviewingDownload(null);
+    }
+
+    if (preview && preview.has_foreign_urls) {
+      setForeignWarning({ type, preview });
+      return;
+    }
+
+    await runDownloadSitemaps(type, true);
   }
   const safeHealthScore = Math.max(0, Math.min(100, dashboard.healthScore));
   const summaryCards = [
@@ -1962,23 +2008,30 @@ export default function ResultsDashboardPage({
                   <DropdownMenuTrigger asChild>
                     <Button
                       variant="outline"
-                      disabled={downloadingSitemaps !== null}
+                      disabled={
+                        downloadingSitemaps !== null ||
+                        previewingDownload !== null
+                      }
                       title={
                         !zipReady && zipGenerating
                           ? "The download is being prepared in the background — you can click to download now (it may take a little longer)"
                           : undefined
                       }
                     >
-                      {downloadingSitemaps || (!zipReady && zipGenerating) ? (
+                      {downloadingSitemaps ||
+                      previewingDownload ||
+                      (!zipReady && zipGenerating) ? (
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                       ) : (
                         <Download className="mr-2 h-4 w-4" />
                       )}
                       {downloadingSitemaps
                         ? "Preparing ZIP"
-                        : !zipReady && zipGenerating
-                          ? "Preparing… (click to download)"
-                          : "Download Sitemaps"}
+                        : previewingDownload
+                          ? "Checking…"
+                          : !zipReady && zipGenerating
+                            ? "Preparing… (click to download)"
+                            : "Download Sitemaps"}
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
@@ -3177,6 +3230,112 @@ export default function ResultsDashboardPage({
                 ) : (
                   "Undo replace"
                 )}
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+
+        <Dialog
+          open={foreignWarning !== null}
+          onOpenChange={(open) => {
+            if (!open) setForeignWarning(null);
+          }}
+        >
+          <DialogContent className="sm:max-w-lg">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <TriangleAlert className="h-5 w-5 text-amber-600" />
+                Download warning
+              </DialogTitle>
+              <DialogDescription>
+                Some files in this session contain URLs from other domains.
+                Those URLs are stripped from the standard (filtered) download,
+                so the affected files come out nearly empty.
+              </DialogDescription>
+            </DialogHeader>
+
+            {foreignWarning ? (
+              <div className="space-y-3">
+                <div className="max-h-56 overflow-y-auto rounded-md border border-slate-200">
+                  <ul className="divide-y divide-slate-100 text-sm">
+                    {foreignWarning.preview.affected_files
+                      .slice(0, 5)
+                      .map((file) => (
+                        <li
+                          key={file.filename}
+                          className="flex items-center justify-between gap-3 px-3 py-2"
+                        >
+                          <span className="min-w-0 flex-1 truncate font-mono text-xs">
+                            {file.filename}
+                          </span>
+                          <span className="shrink-0 text-xs text-amber-700">
+                            {file.foreign_url_count_is_minimum ? "≥" : ""}
+                            {formatNumber(file.foreign_url_count)} of{" "}
+                            {formatNumber(file.total_urls)} URLs removed
+                          </span>
+                        </li>
+                      ))}
+                  </ul>
+                  {foreignWarning.preview.total_affected_files > 5 ? (
+                    <p className="px-3 py-2 text-xs text-slate-500">
+                      + {formatNumber(
+                        foreignWarning.preview.total_affected_files - 5
+                      )}{" "}
+                      more affected{" "}
+                      {foreignWarning.preview.total_affected_files - 5 === 1
+                        ? "file"
+                        : "files"}
+                    </p>
+                  ) : null}
+                </div>
+
+                <div className="rounded-md bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                  <p>
+                    Session domain:{" "}
+                    <span className="font-mono">
+                      {foreignWarning.preview.session_base_url}
+                    </span>
+                  </p>
+                  <p className="mt-1">
+                    Only URLs on this domain are kept in the filtered download.
+                    {foreignWarning.preview.counts_are_sampled
+                      ? " Counts are sampled minimums — affected files often lose every URL."
+                      : ""}{" "}
+                    Foreign URLs are excluded to protect your sitemap from
+                    cross-domain contamination.
+                  </p>
+                </div>
+              </div>
+            ) : null}
+
+            <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setForeignWarning(null)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  const type = foreignWarning?.type ?? "all";
+                  setForeignWarning(null);
+                  void runDownloadSitemaps(type, true);
+                }}
+              >
+                Download anyway
+              </Button>
+              <Button
+                type="button"
+                onClick={() => {
+                  const type = foreignWarning?.type ?? "all";
+                  setForeignWarning(null);
+                  void runDownloadSitemaps(type, false);
+                }}
+              >
+                Download all URLs (unfiltered)
               </Button>
             </div>
           </DialogContent>

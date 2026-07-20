@@ -635,8 +635,15 @@ export async function resolveSessionZipPlan(
 // off-thread via the piscina pool (see jobs/zipPool.ts + workers/zipWorker.ts).
 export async function buildSessionZipArchive(
   sessionId: string,
-  downloadType: "all" | "edited"
+  downloadType: "all" | "edited",
+  options: { filtered?: boolean } = {}
 ): Promise<{ archive: ZipArchive; zipName: string } | null> {
+  // filtered (default): strip foreign-domain <loc>s per file (the corrected
+  // sitemaps the SEO team publishes). unfiltered: copy each source file in
+  // verbatim, so cross-domain migration sitemaps download intact — used by the
+  // "Download all URLs (unfiltered)" option. Unfiltered downloads are never
+  // cached (they are just the raw originals).
+  const filtered = options.filtered !== false;
   const plan = await resolveSessionZipPlan(sessionId, downloadType);
 
   if (!plan) {
@@ -655,6 +662,14 @@ export async function buildSessionZipArchive(
 
   for (const file of plan.files) {
     const index = entryIndex++;
+
+    if (!filtered) {
+      // Raw copy — archive.file() uses a lazystream wrapper internally, so files
+      // are still opened one at a time (no eager-stream truncation).
+      archive.file(file.sourcePath, { name: file.displayName });
+      continue;
+    }
+
     const sourceBytes = debugZip
       ? await stat(file.sourcePath).then((s) => s.size).catch(() => -1)
       : 0;
@@ -686,7 +701,7 @@ export async function buildSessionZipArchive(
   if (debugZip) {
     // eslint-disable-next-line no-console
     console.log(
-      `[DEBUG_ZIP] session=${sessionId} type=${downloadType} entries=${plan.files.length}`
+      `[DEBUG_ZIP] session=${sessionId} type=${downloadType} filtered=${filtered} entries=${plan.files.length}`
     );
   }
 
@@ -3082,12 +3097,19 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
   // were rewritten (fixed / renamed / bulk-replaced); type=all → every current
   // file (edited ones use their corrected version). A regenerated
   // sitemap-index.xml listing the included files is always added at the root.
-  app.get<{ Params: SessionParams; Querystring: { type?: string } }>(
+  app.get<{
+    Params: SessionParams;
+    Querystring: { type?: string; filter?: string };
+  }>(
     "/api/sessions/:id/download-sitemaps",
     async (request, reply) => {
       const downloadType = request.query.type === "all" ? "all" : "edited";
+      // filter=false → raw originals, no foreign-<loc> stripping. Default true.
+      const filtered = request.query.filter !== "false";
 
-      // Fast path: serve a pre-generated ZIP if one exists and is still on disk.
+      // Fast path (filtered downloads only): serve a pre-generated ZIP if one
+      // exists on disk. Unfiltered downloads are always built on demand — the
+      // cache holds the filtered/corrected sitemaps, not the raw originals.
       const cacheResult = await pool.query<{
         name: string;
         zip_all_path: string | null;
@@ -3109,7 +3131,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           ? cacheResult.rows[0].zip_all_path
           : cacheResult.rows[0].zip_edited_path;
 
-      if (cachedPath && existsSync(cachedPath)) {
+      if (filtered && cachedPath && existsSync(cachedPath)) {
         const dateMatch = cachedPath.match(/(\d{4}-\d{2}-\d{2})\.zip$/);
         const zipName = `${sessionSlug(cacheResult.rows[0].name)}-${downloadType}-sitemaps-${
           dateMatch?.[1] ?? new Date().toISOString().slice(0, 10)
@@ -3124,9 +3146,13 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         return reply.send(createReadStream(cachedPath));
       }
 
-      // Fallback: generate on demand (sessions that completed before this
-      // feature, or whose cache is mid-regeneration).
-      const built = await buildSessionZipArchive(request.params.id, downloadType);
+      // Fallback: generate on demand (unfiltered downloads always land here; also
+      // sessions that completed before caching, or whose cache is regenerating).
+      const built = await buildSessionZipArchive(
+        request.params.id,
+        downloadType,
+        { filtered }
+      );
 
       if (!built) {
         return reply.code(404).send(
@@ -3152,6 +3178,105 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       void built.archive.finalize();
 
       return reply.send(built.archive);
+    }
+  );
+
+  // Pre-download check: which files in this session contain foreign-domain
+  // <loc>s that the (filtered) download will strip? Fast — reads the per-file
+  // mismatched_url_count recorded at extraction, no re-scan. NOTE: that count is
+  // a capped SAMPLE (up to ~500 example URLs), so it is a reliable "this file
+  // has foreign URLs" signal and a LOWER BOUND on how many will be removed — the
+  // true count can be anywhere up to total_urls. `foreign_url_count_is_minimum`
+  // flags that; `will_be_empty` is only asserted when provably all-foreign.
+  app.get<{ Params: SessionParams; Querystring: { type?: string } }>(
+    "/api/sessions/:id/download-sitemaps/preview",
+    async (request, reply) => {
+      const downloadType = request.query.type === "all" ? "all" : "edited";
+
+      const sessionResult = await pool.query<{ base_url: string }>(
+        "SELECT base_url FROM sessions WHERE id = $1",
+        [request.params.id]
+      );
+
+      if (sessionResult.rowCount === 0) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "session not found"
+        });
+      }
+
+      const filesResult = await pool.query<{
+        filename: string;
+        is_index: boolean;
+        total_urls: string | number | null;
+        mismatched_url_count: string | number | null;
+      }>(
+        `
+          SELECT filename, is_index, total_urls, mismatched_url_count
+          FROM sitemap_files
+          WHERE session_id = $1
+            AND source_role = 'current'
+            AND is_deleted = false
+          ORDER BY filename ASC
+        `,
+        [request.params.id]
+      );
+
+      const affected: Array<{
+        filename: string;
+        total_urls: number;
+        foreign_url_count: number;
+        foreign_url_count_is_minimum: boolean;
+        will_be_empty: boolean;
+      }> = [];
+
+      for (const row of filesResult.rows) {
+        if (row.is_index || isHttpUrl(row.filename)) {
+          continue;
+        }
+
+        if (
+          downloadType === "edited" &&
+          !isEditedStoredFilename(request.params.id, row.filename)
+        ) {
+          continue;
+        }
+
+        const foreign = Number(row.mismatched_url_count ?? 0);
+
+        if (foreign <= 0) {
+          continue;
+        }
+
+        const total = Number(row.total_urls ?? 0);
+
+        affected.push({
+          filename: downloadDisplayName(request.params.id, row.filename),
+          total_urls: total,
+          foreign_url_count: foreign,
+          // Sampled counts cap out below the file total; the real number can be
+          // higher (often the whole file).
+          foreign_url_count_is_minimum: total > foreign,
+          // Only assert emptiness when the (exact, unsampled) count covers every
+          // URL — for large sampled files we cannot prove it here.
+          will_be_empty: total > 0 && foreign >= total
+        });
+      }
+
+      // Largest impact first.
+      affected.sort((a, b) => b.foreign_url_count - a.foreign_url_count);
+
+      return {
+        has_foreign_urls: affected.length > 0,
+        session_base_url: sessionResult.rows[0].base_url,
+        total_affected_files: affected.length,
+        total_foreign_urls_min: affected.reduce(
+          (sum, f) => sum + f.foreign_url_count,
+          0
+        ),
+        counts_are_sampled: affected.some((f) => f.foreign_url_count_is_minimum),
+        affected_files: affected
+      };
     }
   );
 
