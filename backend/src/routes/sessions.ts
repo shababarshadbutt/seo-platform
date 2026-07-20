@@ -530,16 +530,28 @@ export function sessionSlug(name: string) {
   );
 }
 
-// Shared builder for the download ZIP, used by BOTH the on-demand download
-// endpoint and the background pre-generation job. Streams each surviving source
-// file in under its clean display name (foreign-domain <loc>s stripped) plus a
-// regenerated sitemap-index.xml. Returns a not-yet-finalized archive (the caller
-// attaches an error handler, finalizes, and pipes it) and the download filename,
-// or null when the session has no local sitemap files of the requested type.
-export async function buildSessionZipArchive(
+// A fully-resolved plan for one download ZIP: the concrete source files to
+// include (with clean display names + gzip flag), the base-URL host used to
+// strip foreign <loc>s, and the regenerated sitemap-index.xml. Deliberately
+// plain, structured-clone-serialisable data so the same plan can be handed to
+// the piscina ZIP worker thread (see workers/zipWorker.ts) as well as the
+// on-demand streamer below. Null when the session has no local sitemap files of
+// the requested type.
+export type SessionZipPlan = {
+  expectedHost: string;
+  indexXml: string;
+  indexName: string;
+  zipName: string;
+  files: Array<{ sourcePath: string; displayName: string; isGzip: boolean }>;
+};
+
+// Do all the DB / filesystem lookups for a download ZIP and return a serialisable
+// plan. Kept separate from the archiving so the CPU-heavy archive build can run
+// off the main thread (worker) or be streamed inline (on-demand endpoint).
+export async function resolveSessionZipPlan(
   sessionId: string,
   downloadType: "all" | "edited"
-): Promise<{ archive: ZipArchive; zipName: string } | null> {
+): Promise<SessionZipPlan | null> {
   const sessionResult = await pool.query<{ name: string; base_url: string }>(
     "SELECT name, base_url FROM sessions WHERE id = $1",
     [sessionId]
@@ -575,22 +587,25 @@ export async function buildSessionZipArchive(
     );
   }
 
-  const zipFiles: Array<{ stored: string; display: string }> = [];
+  const files: SessionZipPlan["files"] = [];
 
   for (const row of childRows) {
+    const sourcePath = path.join(config.uploadDir, row.filename);
+
     try {
-      await access(path.join(config.uploadDir, row.filename));
+      await access(sourcePath);
     } catch {
       continue;
     }
 
-    zipFiles.push({
-      stored: row.filename,
-      display: downloadDisplayName(sessionId, row.filename)
+    files.push({
+      sourcePath,
+      displayName: downloadDisplayName(sessionId, row.filename),
+      isGzip: row.filename.toLowerCase().endsWith(".gz")
     });
   }
 
-  if (zipFiles.length === 0) {
+  if (files.length === 0) {
     return null;
   }
 
@@ -598,14 +613,37 @@ export async function buildSessionZipArchive(
   const indexXml = await buildSitemapIndexXml({
     baseUrl: session.base_url,
     indexStoredFilename,
-    displayNames: zipFiles.map((file) => file.display),
+    displayNames: files.map((file) => file.displayName),
     today
   });
 
-  const zipName = `${sessionSlug(session.name)}-${downloadType}-sitemaps-${today}.zip`;
+  return {
+    expectedHost: expectedHostFromBaseUrl(session.base_url),
+    indexXml,
+    indexName: "sitemap-index.xml",
+    zipName: `${sessionSlug(session.name)}-${downloadType}-sitemaps-${today}.zip`,
+    files
+  };
+}
+
+// Shared builder for the download ZIP used by the on-demand download endpoint:
+// streams each surviving source file in under its clean display name (foreign-
+// domain <loc>s stripped) plus a regenerated sitemap-index.xml. Returns a
+// not-yet-finalized archive (the caller attaches an error handler, finalizes,
+// and pipes it) and the download filename, or null when there are no files of
+// the requested type. The background pre-generation job builds the same archive
+// off-thread via the piscina pool (see jobs/zipPool.ts + workers/zipWorker.ts).
+export async function buildSessionZipArchive(
+  sessionId: string,
+  downloadType: "all" | "edited"
+): Promise<{ archive: ZipArchive; zipName: string } | null> {
+  const plan = await resolveSessionZipPlan(sessionId, downloadType);
+
+  if (!plan) {
+    return null;
+  }
 
   const archive = new ZipArchive({ zlib: { level: 9 } });
-  const downloadExpectedHost = expectedHostFromBaseUrl(session.base_url);
 
   // Opt-in per-file diagnostics (DEBUG_ZIP=1). Logs each entry's source size,
   // bytes actually streamed out, and kept/removed <url> counts so a truncated
@@ -615,11 +653,10 @@ export async function buildSessionZipArchive(
 
   let entryIndex = 0;
 
-  for (const file of zipFiles) {
-    const storedPath = path.join(config.uploadDir, file.stored);
+  for (const file of plan.files) {
     const index = entryIndex++;
     const sourceBytes = debugZip
-      ? await stat(storedPath).then((s) => s.size).catch(() => -1)
+      ? await stat(file.sourcePath).then((s) => s.size).catch(() => -1)
       : 0;
 
     // Lazy source: archiver opens/streams each file only when it reaches that
@@ -627,35 +664,35 @@ export async function buildSessionZipArchive(
     // truncated every entry past ~#37 to near-empty in large multi-file ZIPs.
     archive.append(
       lazyStreamSitemapWithoutForeignLocs({
-        inputPath: storedPath,
-        isGzip: file.stored.toLowerCase().endsWith(".gz"),
-        expectedHost: downloadExpectedHost,
+        inputPath: file.sourcePath,
+        isGzip: file.isGzip,
+        expectedHost: plan.expectedHost,
         onComplete: debugZip
           ? (streamStats) => {
               // eslint-disable-next-line no-console
               console.log(
                 `[DEBUG_ZIP] session=${sessionId} type=${downloadType} ` +
-                  `#${index} name=${file.display} sourceBytes=${sourceBytes} ` +
+                  `#${index} name=${file.displayName} sourceBytes=${sourceBytes} ` +
                   `bytesOut=${streamStats.bytesOut} kept=${streamStats.keptCount} ` +
-                  `removed=${streamStats.removedCount} host=${downloadExpectedHost}`
+                  `removed=${streamStats.removedCount} host=${plan.expectedHost}`
               );
             }
           : undefined
       }),
-      { name: file.display }
+      { name: file.displayName }
     );
   }
 
   if (debugZip) {
     // eslint-disable-next-line no-console
     console.log(
-      `[DEBUG_ZIP] session=${sessionId} type=${downloadType} entries=${zipFiles.length}`
+      `[DEBUG_ZIP] session=${sessionId} type=${downloadType} entries=${plan.files.length}`
     );
   }
 
-  archive.append(indexXml, { name: "sitemap-index.xml" });
+  archive.append(plan.indexXml, { name: plan.indexName });
 
-  return { archive, zipName };
+  return { archive, zipName: plan.zipName };
 }
 
 // Literal find/replace (never regex from the user's perspective). A function

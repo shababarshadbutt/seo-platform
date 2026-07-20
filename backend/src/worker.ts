@@ -69,6 +69,7 @@ import {
   processFixTrailingSlashesUndoJob,
   processRestoreDeletedUrlsJob
 } from "./jobs/maintenanceJobs.js";
+import { destroyZipPool } from "./jobs/zipPool.js";
 import { processCleanupUploadsJob } from "./jobs/cleanupUploadsJob.js";
 import { processExtractPatternsJob } from "./jobs/extractPatternsJob.js";
 import { processParseSitemapJob } from "./jobs/parseSitemapJob.js";
@@ -352,6 +353,7 @@ async function close() {
   await bulkReplaceWorker?.close();
   await maintenanceWorker?.close();
   await preGenerateZipWorker?.close();
+  await destroyZipPool();
   await closeSitemapQueue();
   await closeBulkReplaceQueue();
   await closeMaintenanceQueue();

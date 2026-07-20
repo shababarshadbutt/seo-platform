@@ -1,4 +1,4 @@
-import { createWriteStream, existsSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { readdir, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 
@@ -6,11 +6,18 @@ import type { FastifyBaseLogger } from "fastify";
 
 import { config } from "../config.js";
 import { pool } from "../db/pool.js";
-import { buildSessionZipArchive } from "../routes/sessions.js";
+import { resolveSessionZipPlan } from "../routes/sessions.js";
+import { runZipJob } from "./zipPool.js";
 import {
   ZIP_MAX_AGE_MS,
   type PreGenerateZipJobData
 } from "../queue/preGenerateZipQueue.js";
+
+// Compression level for pre-generated ZIPs — kept at archiver's max (matches the
+// on-demand download) so cached and streamed downloads are byte-for-byte the
+// same size. The build runs off the main thread (piscina), so the CPU cost no
+// longer blocks other queues.
+const ZIP_COMPRESSION_LEVEL = 9;
 
 // A cached ZIP younger than this is reused instead of being regenerated.
 const FRESH_MS = 24 * 60 * 60 * 1000;
@@ -54,9 +61,9 @@ export async function processPreGenerateZipJob(
     return;
   }
 
-  const built = await buildSessionZipArchive(sessionId, type);
+  const plan = await resolveSessionZipPlan(sessionId, type);
 
-  if (!built) {
+  if (!plan) {
     // No files of this type (e.g. no edited files) — clear any stale path.
     await pool.query(`UPDATE sessions SET ${column} = NULL WHERE id = $1`, [
       sessionId
@@ -66,19 +73,23 @@ export async function processPreGenerateZipJob(
 
   const today = new Date().toISOString().slice(0, 10);
   const outPath = path.join(config.exportDir, `${sessionId}-${type}-${today}.zip`);
-  const out = createWriteStream(outPath);
 
-  const done = new Promise<void>((resolve, reject) => {
-    out.on("finish", () => resolve());
-    out.on("error", reject);
-    built.archive.on("error", reject);
-  });
-
-  built.archive.pipe(out);
-  await built.archive.finalize();
+  // Build the archive off the main thread via the piscina pool. The worker
+  // writes directly to outPath; on any failure remove the partial file so a
+  // half-written ZIP is never recorded as the cache.
+  let result: { entries: number; bytes: number };
 
   try {
-    await done;
+    result = await runZipJob({
+      sessionId,
+      type,
+      outputPath: outPath,
+      zlibLevel: ZIP_COMPRESSION_LEVEL,
+      expectedHost: plan.expectedHost,
+      indexXml: plan.indexXml,
+      indexName: plan.indexName,
+      files: plan.files
+    });
   } catch (error) {
     await unlink(outPath).catch(() => {});
     throw error;
@@ -90,7 +101,13 @@ export async function processPreGenerateZipJob(
   );
 
   logger.info(
-    { session_id: sessionId, type, path: outPath },
+    {
+      session_id: sessionId,
+      type,
+      path: outPath,
+      entries: result.entries,
+      bytes: result.bytes
+    },
     "pre-generate-zip complete"
   );
 }
