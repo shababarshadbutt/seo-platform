@@ -47,7 +47,7 @@ import {
 } from "../queue/bulkReplaceQueue.js";
 import { isSameDomain, normalizeHost } from "../sitemaps/domain.js";
 import { fetchSitemapPreview } from "../sitemaps/fetchPreview.js";
-import { streamSitemapWithoutForeignLocs } from "../sitemaps/foreignLocFilter.js";
+import { lazyStreamSitemapWithoutForeignLocs } from "../sitemaps/foreignLocFilter.js";
 import {
   buildRedirectFixedStoredFilename,
   buildRenamedStoredFilename,
@@ -607,16 +607,49 @@ export async function buildSessionZipArchive(
   const archive = new ZipArchive({ zlib: { level: 9 } });
   const downloadExpectedHost = expectedHostFromBaseUrl(session.base_url);
 
+  // Opt-in per-file diagnostics (DEBUG_ZIP=1). Logs each entry's source size,
+  // bytes actually streamed out, and kept/removed <url> counts so a truncated
+  // entry (bytesOut far below sourceBytes) can be told apart from a fully
+  // domain-stripped one (keptCount === 0). Off by default → zero overhead.
+  const debugZip = process.env.DEBUG_ZIP === "1";
+
+  let entryIndex = 0;
+
   for (const file of zipFiles) {
     const storedPath = path.join(config.uploadDir, file.stored);
+    const index = entryIndex++;
+    const sourceBytes = debugZip
+      ? await stat(storedPath).then((s) => s.size).catch(() => -1)
+      : 0;
 
+    // Lazy source: archiver opens/streams each file only when it reaches that
+    // entry. Appending eagerly-created streams here opened all files at once and
+    // truncated every entry past ~#37 to near-empty in large multi-file ZIPs.
     archive.append(
-      streamSitemapWithoutForeignLocs({
+      lazyStreamSitemapWithoutForeignLocs({
         inputPath: storedPath,
         isGzip: file.stored.toLowerCase().endsWith(".gz"),
-        expectedHost: downloadExpectedHost
+        expectedHost: downloadExpectedHost,
+        onComplete: debugZip
+          ? (streamStats) => {
+              // eslint-disable-next-line no-console
+              console.log(
+                `[DEBUG_ZIP] session=${sessionId} type=${downloadType} ` +
+                  `#${index} name=${file.display} sourceBytes=${sourceBytes} ` +
+                  `bytesOut=${streamStats.bytesOut} kept=${streamStats.keptCount} ` +
+                  `removed=${streamStats.removedCount} host=${downloadExpectedHost}`
+              );
+            }
+          : undefined
       }),
       { name: file.display }
+    );
+  }
+
+  if (debugZip) {
+    // eslint-disable-next-line no-console
+    console.log(
+      `[DEBUG_ZIP] session=${sessionId} type=${downloadType} entries=${zipFiles.length}`
     );
   }
 
