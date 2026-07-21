@@ -36,7 +36,9 @@ function baseName(name: string) {
 // Pack the cleaned outputs into a ZIP buffer (archiver v8 exports classes).
 function archiveToBuffer(files: CleanerOutputFile[]): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const archive = new ZipArchive({ zlib: { level: 9 } });
+    // Level 0 = STORE (no compression) — speed over size, matching the session
+    // download ZIPs (v1.34).
+    const archive = new ZipArchive({ zlib: { level: 0 } });
     const chunks: Buffer[] = [];
 
     archive.on("data", (chunk: Buffer) => chunks.push(chunk));

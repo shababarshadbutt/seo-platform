@@ -13,11 +13,12 @@ import {
   type PreGenerateZipJobData
 } from "../queue/preGenerateZipQueue.js";
 
-// Compression level for pre-generated ZIPs — kept at archiver's max (matches the
-// on-demand download) so cached and streamed downloads are byte-for-byte the
-// same size. The build runs off the main thread (piscina), so the CPU cost no
-// longer blocks other queues.
-const ZIP_COMPRESSION_LEVEL = 9;
+// Compression level for pre-generated ZIPs. Level 0 = STORE (no compression):
+// the SEO team prioritises generation speed over download size — level 9 took
+// ~40 min for a 1,000+ file session, level 0 brings it down to a couple of
+// minutes (v1.34). Must match the on-demand build (buildSessionZipArchive) so
+// cached and streamed downloads are byte-for-byte identical.
+const ZIP_COMPRESSION_LEVEL = 0;
 
 // A cached ZIP younger than this is reused instead of being regenerated.
 const FRESH_MS = 24 * 60 * 60 * 1000;

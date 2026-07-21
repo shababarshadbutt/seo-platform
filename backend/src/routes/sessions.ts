@@ -679,7 +679,9 @@ export async function buildSessionZipArchive(
       .catch(() => {});
   }
 
-  const archive = new ZipArchive({ zlib: { level: 9 } });
+  // Level 0 = STORE (no compression): speed over size for large sessions, and
+  // byte-for-byte identical to the pre-generated cache (v1.34).
+  const archive = new ZipArchive({ zlib: { level: 0 } });
 
   if (options.trackProgress) {
     let entriesDone = 0;
