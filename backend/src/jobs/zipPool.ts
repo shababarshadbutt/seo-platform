@@ -23,7 +23,10 @@ function getPool(): Piscina {
     pool = new Piscina({
       filename: fileURLToPath(new URL("../workers/zipWorker.ts", import.meta.url)),
       minThreads: 1,
-      maxThreads: 2,
+      // 4 threads (was 2) so pre-generation for large sessions keeps up and a
+      // ready cached ZIP is far more likely to exist by the time the user clicks
+      // Download (v1.33 Fix 3).
+      maxThreads: 4,
       // Let idle threads exit so they don't hold the process open at shutdown.
       idleTimeout: 30_000,
       execArgv: ["--import", "tsx"]

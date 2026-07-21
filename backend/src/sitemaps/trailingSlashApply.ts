@@ -20,7 +20,6 @@ import {
   stripTrailingSlashFromPathString,
   stripTrailingSlashFromUrl
 } from "./rewriteLocs.js";
-import { streamSitemapUrlLocs } from "./parser.js";
 
 export type TrailingSlashProgress = (
   filesDone: number,
@@ -32,6 +31,7 @@ type CurrentFileRow = {
   id: string;
   filename: string;
   trailing_slash_original_path: string | null;
+  total_urls: number | string | null;
 };
 
 export type TrailingSlashPreview = {
@@ -46,7 +46,7 @@ async function loadCurrentLocalFiles(
 ): Promise<Array<CurrentFileRow & { displayName: string }>> {
   const result = await pool.query<CurrentFileRow>(
     `
-      SELECT id, filename, trailing_slash_original_path
+      SELECT id, filename, trailing_slash_original_path, total_urls
       FROM sitemap_files
       WHERE session_id = $1 AND source_role = 'current' AND is_deleted = false
       ORDER BY filename ASC
@@ -62,53 +62,49 @@ async function loadCurrentLocalFiles(
     }));
 }
 
-// Stream every current file and count how many <loc> URLs are missing a
-// trailing slash, collecting a few before/after examples. Authoritative (reads
-// the real files), same rule the apply pass uses.
+// List the session's current sitemap files so the "Fix Trailing Slashes" modal
+// can show a file list + Apply button. This is a cheap DB-only read (v1.33
+// Fix 1): the previous version streamed and parsed EVERY <loc> in EVERY file to
+// count fixable URLs, which took ~1s per ~65k URLs — minutes on a large session
+// (900 files × tens of thousands of URLs) — and blew past the preview request's
+// timeout, so the modal ended up with no files and only a Close button.
+// Parallelising that parse (piscina) or switching to the byte-level scanner both
+// gave no real speedup — the cost is per-URL `new URL()` parsing, O(total URLs).
+//
+// `url_count` here is the file's TOTAL URL count (an upper bound on what a fix
+// touches), not an exact fixable count; the apply pass is authoritative and
+// reports how many URLs it actually changed. `sampleLimit` is accepted for
+// signature compatibility but unused (no parsing happens here).
 export async function previewTrailingSlash(
   sessionId: string,
-  sampleLimit = 5
+  _sampleLimit = 5
 ): Promise<TrailingSlashPreview> {
   const files = await loadCurrentLocalFiles(sessionId);
-  const rewrite = buildTrailingSlashRewriter();
+
   const perFile: Array<{ filename: string; url_count: number }> = [];
-  const samples: Array<{ before: string; after: string }> = [];
-  let urlsToFix = 0;
+  let totalUrls = 0;
 
   for (const file of files) {
-    const storedPath = path.join(config.uploadDir, file.filename);
-
+    // Only files still present on disk can be fixed.
     try {
-      await access(storedPath);
+      await access(path.join(config.uploadDir, file.filename));
     } catch {
       continue;
     }
 
-    let count = 0;
+    const count = Number(file.total_urls ?? 0);
 
-    await streamSitemapUrlLocs(file.filename, (loc) => {
-      const next = rewrite(loc);
-
-      if (next !== null) {
-        count += 1;
-
-        if (samples.length < sampleLimit) {
-          samples.push({ before: loc, after: next });
-        }
-      }
-    });
-
-    if (count > 0) {
-      perFile.push({ filename: file.displayName, url_count: count });
-      urlsToFix += count;
-    }
+    perFile.push({ filename: file.displayName, url_count: count });
+    totalUrls += count;
   }
 
   return {
     files_affected: perFile.length,
-    urls_to_fix: urlsToFix,
+    urls_to_fix: totalUrls,
     per_file: perFile,
-    sample_before_after: samples
+    // Samples would require parsing files (the exact cost this endpoint now
+    // avoids), so none are returned; the modal's sample section is optional.
+    sample_before_after: []
   };
 }
 

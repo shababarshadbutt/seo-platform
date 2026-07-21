@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream, existsSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, statSync } from "node:fs";
 import {
   access,
   mkdir,
@@ -3203,6 +3203,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           "content-disposition",
           `attachment; filename="${zipName}"`
         );
+        // Set Content-Length from the cached file so the browser shows a real
+        // progress bar and doesn't fall back to slow chunked transfer (v1.33
+        // Fix 3). Best-effort — if the stat fails, stream without it.
+        try {
+          reply.header("content-length", statSync(cachedPath).size);
+        } catch {
+          // ignore — stream without an explicit length
+        }
 
         return reply.send(createReadStream(cachedPath));
       }

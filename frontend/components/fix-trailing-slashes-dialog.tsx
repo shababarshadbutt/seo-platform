@@ -164,12 +164,6 @@ export function FixTrailingSlashesDialog({
     });
   }
 
-  const selectedUrlCount = preview
-    ? preview.per_file
-        .filter((file) => selected.has(file.filename))
-        .reduce((sum, file) => sum + file.url_count, 0)
-    : 0;
-
   async function handleApply() {
     if (!preview || selected.size === 0) {
       return;
@@ -231,7 +225,7 @@ export function FixTrailingSlashesDialog({
                 </div>
               </div>
               <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                <div className="text-xs text-slate-500">URLs to fix</div>
+                <div className="text-xs text-slate-500">Total URLs</div>
                 <div className="text-lg font-semibold text-slate-800">
                   {formatNumber(preview.urls_to_fix)}
                 </div>
@@ -240,7 +234,7 @@ export function FixTrailingSlashesDialog({
 
             {preview.per_file.length === 0 ? (
               <p className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
-                All URLs already have a trailing slash. Nothing to fix.
+                No sitemap files to fix.
               </p>
             ) : (
               <>
@@ -272,7 +266,7 @@ export function FixTrailingSlashesDialog({
                           </span>
                         </span>
                         <span className="text-xs text-slate-500">
-                          {formatNumber(file.url_count)} URLs to fix
+                          {formatNumber(file.url_count)} URLs
                         </span>
                       </label>
                     ))}
@@ -344,8 +338,8 @@ export function FixTrailingSlashesDialog({
                 disabled={selected.size === 0}
                 className="gap-1"
               >
-                Fix {formatNumber(selectedUrlCount)} URLs in {selected.size}{" "}
-                files
+                Fix trailing slashes in {selected.size}{" "}
+                {selected.size === 1 ? "file" : "files"}
                 <ArrowRight className="h-4 w-4" />
               </Button>
             </>

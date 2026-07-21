@@ -77,7 +77,10 @@ import { processParseSitemapJob } from "./jobs/parseSitemapJob.js";
 import { processSamplePatternsJob } from "./jobs/samplePatternsJob.js";
 import { processWatchdogStuckSessionsJob } from "./jobs/watchdogStuckSessionsJob.js";
 
-const SITEMAP_WORKER_CONCURRENCY = 5;
+// Parse/extract/sample jobs run here. Raised 5 → 10 so large sessions (hundreds
+// of independent per-file parse jobs) drain the queue about twice as fast
+// (v1.33 Fix 2).
+const SITEMAP_WORKER_CONCURRENCY = 10;
 
 const app = Fastify({
   logger: true

@@ -52,7 +52,10 @@ import { UploadRejections } from "@/components/upload-rejections";
 
 const sampleSizeOptions = [5, 10, 20];
 const MAX_SITEMAP_URL_FIELDS = 20;
-const UPLOAD_BATCH_SIZE = 500;
+// Upload in small chunks sent a few at a time, so a large session's files go up
+// in parallel streams instead of one giant request (v1.33 Fix 2).
+const UPLOAD_BATCH_SIZE = 50;
+const MAX_CONCURRENT_UPLOADS = 3;
 const LARGE_UPLOAD_WARNING_THRESHOLD = 500;
 const SITEMAP_URL_FETCH_ERROR =
   "Could not fetch sitemap — check the URL and try again";
@@ -236,6 +239,11 @@ export default function Home() {
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(
     null
   );
+  // Chunked-upload batch progress ("Uploading batch X of Y") — v1.33 Fix 2.
+  const [uploadBatchInfo, setUploadBatchInfo] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
   const [uploadStorageText, setUploadStorageText] = useState("");
 
   const trimmedSessionName = sessionName.trim();
@@ -799,59 +807,69 @@ export default function Home() {
         ];
         const rejectedFiles: UploadRejectedFile[] = [];
         let acceptedCount = 0;
-        let transferredFilesBeforeBatch = 0;
+        let transferredFiles = 0;
+        let completedBatches = 0;
 
         uploadedBatchIndexesRef.current = new Set();
+        setUploadBatchInfo({ done: 0, total: uploadBatches.length });
 
-        for (let batchIndex = 0; batchIndex < uploadBatches.length; batchIndex += 1) {
-          const batch = uploadBatches[batchIndex];
+        // Send up to MAX_CONCURRENT_UPLOADS batches at once. Each worker pulls
+        // the next un-uploaded batch index off a shared cursor until they run
+        // out. `nextBatch++` is a single synchronous step, so no two workers
+        // grab the same batch. Progress updates as each batch completes.
+        let nextBatch = 0;
+        const uploadWorker = async () => {
+          for (;;) {
+            const batchIndex = nextBatch;
+            nextBatch += 1;
 
-          if (uploadedBatchIndexesRef.current.has(batchIndex)) {
-            continue;
-          }
-
-          const batchFileCount = batch.files.length + batch.legacyFiles.length;
-          const uploadResult = await uploadSitemap(
-            created.session_id,
-            batch.files,
-            batch.legacyFiles,
-            {
-              onProgress: (progress) => {
-                const transferredFiles = Math.min(
-                  uploadFileCount,
-                  transferredFilesBeforeBatch + progress.transferredFiles
-                );
-
-                setUploadProgress({
-                  ...progress,
-                  transferredFiles,
-                  totalFiles: uploadFileCount,
-                  percent:
-                    uploadFileCount === 0
-                      ? 0
-                      : Math.round((transferredFiles / uploadFileCount) * 100)
-                });
-              }
+            if (batchIndex >= uploadBatches.length) {
+              return;
             }
-          );
 
-          uploadedBatchIndexesRef.current.add(batchIndex);
-          transferredFilesBeforeBatch += batchFileCount;
-          acceptedCount += uploadResult.sitemap_files?.length ?? 0;
-          rejectedFiles.push(...(uploadResult.rejected_files ?? []));
-          setUploadProgress({
-            loadedBytes: 0,
-            totalBytes: 0,
-            transferredFiles: transferredFilesBeforeBatch,
-            totalFiles: uploadFileCount,
-            percent:
-              uploadFileCount === 0
-                ? 0
-                : Math.round(
-                    (transferredFilesBeforeBatch / uploadFileCount) * 100
-                  )
-          });
-        }
+            // Skip batches already uploaded by a previous attempt (retry).
+            if (uploadedBatchIndexesRef.current.has(batchIndex)) {
+              continue;
+            }
+
+            const batch = uploadBatches[batchIndex];
+            const batchFileCount =
+              batch.files.length + batch.legacyFiles.length;
+            const uploadResult = await uploadSitemap(
+              created.session_id,
+              batch.files,
+              batch.legacyFiles
+            );
+
+            uploadedBatchIndexesRef.current.add(batchIndex);
+            acceptedCount += uploadResult.sitemap_files?.length ?? 0;
+            rejectedFiles.push(...(uploadResult.rejected_files ?? []));
+            transferredFiles += batchFileCount;
+            completedBatches += 1;
+
+            setUploadBatchInfo({
+              done: completedBatches,
+              total: uploadBatches.length
+            });
+            setUploadProgress({
+              loadedBytes: 0,
+              totalBytes: 0,
+              transferredFiles,
+              totalFiles: uploadFileCount,
+              percent:
+                uploadFileCount === 0
+                  ? 0
+                  : Math.round((transferredFiles / uploadFileCount) * 100)
+            });
+          }
+        };
+
+        await Promise.all(
+          Array.from(
+            { length: Math.min(MAX_CONCURRENT_UPLOADS, uploadBatches.length) },
+            () => uploadWorker()
+          )
+        );
 
         await completeSitemapUpload(created.session_id);
 
@@ -889,6 +907,7 @@ export default function Home() {
 
       setFormError(friendlyApiErrorMessage(error, "Unable to start analysis."));
       setUploadProgress(null);
+      setUploadBatchInfo(null);
       uploadedBatchIndexesRef.current = new Set();
       uploadStartedRef.current = false;
       setIsSubmitting(false);
@@ -1548,7 +1567,13 @@ export default function Home() {
                   >
                     <div className="flex items-center justify-between gap-3">
                       <span>
-                        Uploading files... {uploadProgress.transferredFiles} of{" "}
+                        {uploadBatchInfo && uploadBatchInfo.total > 1
+                          ? `Uploading batch ${Math.min(
+                              uploadBatchInfo.done + 1,
+                              uploadBatchInfo.total
+                            )} of ${uploadBatchInfo.total}... `
+                          : "Uploading files... "}
+                        {uploadProgress.transferredFiles} of{" "}
                         {uploadProgress.totalFiles} transferred
                       </span>
                       <span className="font-medium text-slate-900">
