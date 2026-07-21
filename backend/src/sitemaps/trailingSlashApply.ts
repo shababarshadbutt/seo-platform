@@ -5,6 +5,10 @@ import path from "node:path";
 import { config } from "../config.js";
 import { pool } from "../db/pool.js";
 import {
+  FILE_REWRITE_PARALLEL_THRESHOLD,
+  runFileRewriteJob
+} from "../jobs/fileRewritePool.js";
+import {
   buildTrailingSlashStoredFilename,
   displaySourceFilename,
   isHttpUrl
@@ -230,44 +234,20 @@ export async function applyTrailingSlash(options: {
   let urlsFixed = 0;
   let filesDone = 0;
 
-  for (const file of targets) {
-    const inputPath = path.join(config.uploadDir, file.filename);
-
-    try {
-      await access(inputPath);
-    } catch {
-      filesDone += 1;
-      await options.onProgress?.(filesDone, targets.length, urlsFixed);
-      continue;
-    }
-
-    const isGzip = file.filename.toLowerCase().endsWith(".gz");
-    const newStored = buildTrailingSlashStoredFilename(
-      options.sessionId,
-      file.displayName,
-      randomUUID()
-    );
-    const outputPath = path.join(config.uploadDir, newStored);
-
-    let rewrittenCount = 0;
-
-    try {
-      rewrittenCount = await rewriteSitemapLocFile({
-        inputPath,
-        outputPath,
-        isGzip,
-        rewriteUrl: rewrite
-      });
-    } catch (error) {
-      await unlink(outputPath).catch(() => {});
-      throw error;
-    }
-
+  // Swap in the rewritten copy for one file and record its pre-fix original for
+  // undo. Runs on the MAIN thread only, so DB writes stay single-threaded even
+  // when the file rewrites themselves ran in parallel worker threads (v1.32).
+  const finalizeRewrittenFile = async (
+    file: (typeof targets)[number],
+    inputPath: string,
+    newStored: string,
+    outputPath: string,
+    rewrittenCount: number
+  ) => {
     if (rewrittenCount === 0) {
       await unlink(outputPath).catch(() => {});
     } else {
-      const originalToKeep =
-        file.trailing_slash_original_path ?? file.filename;
+      const originalToKeep = file.trailing_slash_original_path ?? file.filename;
       const client = await pool.connect();
 
       try {
@@ -295,6 +275,76 @@ export async function applyTrailingSlash(options: {
 
     filesDone += 1;
     await options.onProgress?.(filesDone, targets.length, urlsFixed);
+  };
+
+  // Rewrite one file (missing trailing slashes → added) to a new stored copy,
+  // then finalize. `runRewrite` streams the file — inline (sequential) or via
+  // the piscina pool (parallel). Skips (still counts) a source that's gone.
+  const processFile = async (
+    file: (typeof targets)[number],
+    runRewrite: (input: {
+      inputPath: string;
+      outputPath: string;
+      isGzip: boolean;
+    }) => Promise<number>
+  ) => {
+    const inputPath = path.join(config.uploadDir, file.filename);
+
+    try {
+      await access(inputPath);
+    } catch {
+      filesDone += 1;
+      await options.onProgress?.(filesDone, targets.length, urlsFixed);
+      return;
+    }
+
+    const isGzip = file.filename.toLowerCase().endsWith(".gz");
+    const newStored = buildTrailingSlashStoredFilename(
+      options.sessionId,
+      file.displayName,
+      randomUUID()
+    );
+    const outputPath = path.join(config.uploadDir, newStored);
+
+    let rewrittenCount = 0;
+
+    try {
+      rewrittenCount = await runRewrite({ inputPath, outputPath, isGzip });
+    } catch (error) {
+      await unlink(outputPath).catch(() => {});
+      throw error;
+    }
+
+    await finalizeRewrittenFile(
+      file,
+      inputPath,
+      newStored,
+      outputPath,
+      rewrittenCount
+    );
+  };
+
+  if (targets.length >= FILE_REWRITE_PARALLEL_THRESHOLD) {
+    // Parallel: the piscina pool caps concurrent rewrites at its thread count,
+    // so mapping every target is safe — extra tasks queue. Each file's DB swap
+    // runs here as its rewrite resolves (bounded by the same cap in practice).
+    await Promise.all(
+      targets.map((file) =>
+        processFile(file, (input) =>
+          runFileRewriteJob({
+            ...input,
+            spec: { kind: "trailingSlash" }
+          }).then((result) => result.rewrittenCount)
+        )
+      )
+    );
+  } else {
+    // Sequential for small sessions — no worker-thread overhead.
+    for (const file of targets) {
+      await processFile(file, (input) =>
+        rewriteSitemapLocFile({ ...input, rewriteUrl: rewrite })
+      );
+    }
   }
 
   await applyTrailingSlashDbChanges(options.sessionId, selected);

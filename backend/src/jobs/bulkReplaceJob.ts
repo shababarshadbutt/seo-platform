@@ -16,6 +16,10 @@ import {
   buildPatternTemplateRewriter,
   rewriteSitemapLocFile
 } from "../sitemaps/rewriteLocs.js";
+import {
+  FILE_REWRITE_PARALLEL_THRESHOLD,
+  runFileRewriteJob
+} from "./fileRewritePool.js";
 import type {
   BulkReplaceJobData,
   BulkReplaceUndoJobData
@@ -355,92 +359,131 @@ export async function processBulkReplaceJob(
     );
   };
 
-  try {
-    for (let index = 0; index < targets.length; index += 1) {
-      // Resume: files below the cursor were handled by a prior run. (Even if a
-      // done file were reprocessed, its URLs already match to_pattern and would
-      // not re-match from_pattern, so the rewrite is a safe no-op.)
-      if (index < filesDone) {
-        continue;
-      }
+  // Swap in the rewritten copy for one file and preserve its pre-bulk original
+  // for undo. Main-thread only, so DB writes stay single-threaded even when the
+  // rewrites ran in parallel worker threads (v1.32).
+  const finalizeBulkFile = async (
+    file: SitemapFileRow,
+    inputPath: string,
+    newStored: string,
+    outputPath: string,
+    rewrittenCount: number
+  ) => {
+    if (rewrittenCount === 0) {
+      // No matching locs in this file — discard the identical copy.
+      await unlink(outputPath).catch(() => {});
+      return;
+    }
 
-      const file = targets[index];
-      const inputPath = path.join(config.uploadDir, file.filename);
+    // Preserve the TRUE pre-bulk original across chained applies so undo fully
+    // restores it. On the first apply the current filename IS the original.
+    const originalToKeep = file.bulk_replace_original_path ?? file.filename;
+    const client = await pool.connect();
 
-      try {
-        await access(inputPath);
-      } catch {
-        // File already gone — nothing to rewrite; count it and move on.
-        filesDone = index + 1;
-
-        if (filesDone % PROGRESS_FLUSH_EVERY === 0) {
-          await flushProgress();
-        }
-
-        continue;
-      }
-
-      const isGzip = file.filename.toLowerCase().endsWith(".gz");
-      const displayName = displaySourceFilename(sessionId, file.filename);
-      const newStored = buildBulkReplacedStoredFilename(
-        sessionId,
-        displayName,
-        randomUUID()
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        "UPDATE sitemap_files SET filename = $1, bulk_replace_original_path = $2 WHERE id = $3",
+        [newStored, originalToKeep, file.id]
       );
-      const outputPath = path.join(config.uploadDir, newStored);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      await unlink(outputPath).catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
 
-      let rewrittenCount = 0;
+    // Delete the previous intermediate copy — never the preserved original.
+    if (file.filename !== originalToKeep) {
+      await unlink(inputPath).catch(() => {});
+    }
 
-      try {
-        // Streaming rewrite — never loads the whole file into memory.
-        rewrittenCount = await rewriteSitemapLocFile({
-          inputPath,
-          outputPath,
-          isGzip,
-          rewriteUrl: rewrite
-        });
-      } catch (error) {
-        await unlink(outputPath).catch(() => {});
-        throw error;
-      }
+    urlsRewritten += rewrittenCount;
+  };
 
-      if (rewrittenCount === 0) {
-        // No matching locs in this file — discard the identical copy.
-        await unlink(outputPath).catch(() => {});
-      } else {
-        // Preserve the TRUE pre-bulk original across chained applies so undo
-        // fully restores it. On the first apply the current filename IS the
-        // original.
-        const originalToKeep = file.bulk_replace_original_path ?? file.filename;
-        const client = await pool.connect();
+  // Rewrite one file to a new stored copy via `runRewrite` (inline sequential,
+  // or the piscina pool in parallel), then finalize. Skips a source that's gone.
+  const processFile = async (
+    file: SitemapFileRow,
+    runRewrite: (input: {
+      inputPath: string;
+      outputPath: string;
+      isGzip: boolean;
+    }) => Promise<number>
+  ) => {
+    const inputPath = path.join(config.uploadDir, file.filename);
 
-        try {
-          await client.query("BEGIN");
-          await client.query(
-            "UPDATE sitemap_files SET filename = $1, bulk_replace_original_path = $2 WHERE id = $3",
-            [newStored, originalToKeep, file.id]
-          );
-          await client.query("COMMIT");
-        } catch (error) {
-          await client.query("ROLLBACK");
-          await unlink(outputPath).catch(() => {});
-          throw error;
-        } finally {
-          client.release();
-        }
-
-        // Delete the previous intermediate copy — never the preserved original.
-        if (file.filename !== originalToKeep) {
-          await unlink(inputPath).catch(() => {});
-        }
-
-        urlsRewritten += rewrittenCount;
-      }
-
-      filesDone = index + 1;
+    try {
+      await access(inputPath);
+    } catch {
+      // File already gone — nothing to rewrite; count it and move on.
+      filesDone += 1;
 
       if (filesDone % PROGRESS_FLUSH_EVERY === 0) {
         await flushProgress();
+      }
+
+      return;
+    }
+
+    const isGzip = file.filename.toLowerCase().endsWith(".gz");
+    const displayName = displaySourceFilename(sessionId, file.filename);
+    const newStored = buildBulkReplacedStoredFilename(
+      sessionId,
+      displayName,
+      randomUUID()
+    );
+    const outputPath = path.join(config.uploadDir, newStored);
+
+    let rewrittenCount = 0;
+
+    try {
+      rewrittenCount = await runRewrite({ inputPath, outputPath, isGzip });
+    } catch (error) {
+      await unlink(outputPath).catch(() => {});
+      throw error;
+    }
+
+    await finalizeBulkFile(file, inputPath, newStored, outputPath, rewrittenCount);
+
+    filesDone += 1;
+
+    if (filesDone % PROGRESS_FLUSH_EVERY === 0) {
+      await flushProgress();
+    }
+  };
+
+  try {
+    if (targets.length >= FILE_REWRITE_PARALLEL_THRESHOLD) {
+      // Parallel: the pool caps concurrent rewrites at its thread count, so
+      // mapping every target is safe. The resume cursor is not used here —
+      // re-running a completed file is a safe no-op (its URLs already match
+      // to_pattern and won't re-match from_pattern), so we recount from zero.
+      filesDone = 0;
+      urlsRewritten = 0;
+      await Promise.all(
+        targets.map((file) =>
+          processFile(file, (input) =>
+            runFileRewriteJob({
+              ...input,
+              spec: { kind: "patternTemplate", from: fromPattern, to: toPattern }
+            }).then((result) => result.rewrittenCount)
+          )
+        )
+      );
+    } else {
+      // Sequential for small sessions, with crash-resume via the files_done
+      // cursor. (Reprocessing a done file would be a safe no-op regardless.)
+      for (let index = 0; index < targets.length; index += 1) {
+        if (index < filesDone) {
+          continue;
+        }
+
+        await processFile(targets[index], (input) =>
+          rewriteSitemapLocFile({ ...input, rewriteUrl: rewrite })
+        );
       }
     }
 

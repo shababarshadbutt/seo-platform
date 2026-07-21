@@ -221,7 +221,10 @@ export async function processFixTrailingSlashesJob(
     await pool.query(
       `
         UPDATE maintenance_jobs
-        SET status = 'COMPLETE', items_changed = $2, completed_at = now()
+        SET status = 'COMPLETE',
+            files_done = files_total,
+            items_changed = $2,
+            completed_at = now()
         WHERE id = $1
       `,
       [jobRowId, urlsFixed]
