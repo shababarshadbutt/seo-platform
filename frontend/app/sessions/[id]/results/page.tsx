@@ -2687,8 +2687,13 @@ export default function ResultsDashboardPage({
 
             <Card data-testid="insight-block">
               <CardHeader>
-                <CardTitle className="text-base font-semibold text-slate-700">
+                <CardTitle className="flex items-center gap-2 text-base font-semibold text-slate-700">
                   What needs attention
+                  {dashboard.insights.length > 0 ? (
+                    <Badge variant="secondary">
+                      {formatNumber(dashboard.insights.length)}
+                    </Badge>
+                  ) : null}
                 </CardTitle>
                 <CardDescription className="text-sm text-slate-500">
                   Plain-English notes for patterns that may affect search traffic.
@@ -2696,29 +2701,50 @@ export default function ResultsDashboardPage({
               </CardHeader>
               <CardContent>
                 {dashboard.insights.length > 0 ? (
-                  <ul className="space-y-3 text-sm">
-                    {dashboard.insights.map((insight) => {
-                      const tone = insightTone(insight);
-                      const Icon = tone.Icon;
+                  // Cap the visible height so a long list (many patterns) doesn't
+                  // push the Pattern Details table far down — the overflow
+                  // scrolls. Only constrain when it actually overflows (~5+
+                  // insights) and never in print mode, so the PDF export isn't
+                  // clipped. maxHeight ≈ 5 insight rows. (v1.35)
+                  <div
+                    className={cn(
+                      !isPrintMode && dashboard.insights.length > 5
+                        ? "overflow-y-auto rounded-lg border border-slate-200 p-2 shadow-inner"
+                        : undefined
+                    )}
+                    style={
+                      !isPrintMode && dashboard.insights.length > 5
+                        ? { maxHeight: 320 }
+                        : undefined
+                    }
+                  >
+                    <ul className="space-y-3 text-sm">
+                      {dashboard.insights.map((insight) => {
+                        const tone = insightTone(insight);
+                        const Icon = tone.Icon;
 
-                      return (
-                        <li
-                          key={insight}
-                          className={cn(
-                            "flex items-start gap-3 rounded-lg border border-slate-200 border-l-4 px-4 py-3 text-slate-700",
-                            tone.borderClass,
-                            tone.bgClass
-                          )}
-                        >
-                          <Icon
-                            className={cn("mt-0.5 h-4 w-4 shrink-0", tone.iconClass)}
-                            aria-hidden="true"
-                          />
-                          <span>{insight}</span>
-                        </li>
-                      );
-                    })}
-                  </ul>
+                        return (
+                          <li
+                            key={insight}
+                            className={cn(
+                              "flex items-start gap-3 rounded-lg border border-slate-200 border-l-4 px-4 py-3 text-slate-700",
+                              tone.borderClass,
+                              tone.bgClass
+                            )}
+                          >
+                            <Icon
+                              className={cn(
+                                "mt-0.5 h-4 w-4 shrink-0",
+                                tone.iconClass
+                              )}
+                              aria-hidden="true"
+                            />
+                            <span>{insight}</span>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
                 ) : (
                   <p className="text-sm text-slate-500">
                     No urgent pattern issues found in the sampled URLs.
