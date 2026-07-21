@@ -224,7 +224,13 @@ async function start() {
       },
       {
         connection: redisConnectionOptions(),
-        concurrency: 1
+        concurrency: 1,
+        // Bulk replace can run for tens of minutes on 900+ file sessions. The
+        // default 30s job lock expires long before it finishes (the event loop
+        // is busy rewriting files), so BullMQ wrongly declares the job stalled
+        // and re-runs / fails it. A 60-minute lock covers the longest realistic
+        // run. (v1.32)
+        lockDuration: 60 * 60 * 1000
       }
     );
     bulkReplaceWorker.on("failed", (job, error) => {
@@ -282,7 +288,14 @@ async function start() {
       },
       {
         connection: redisConnectionOptions(),
-        concurrency: 1
+        concurrency: 1,
+        // Trailing-slash fix / URL delete on 900+ file sessions runs for many
+        // minutes. Without a long lock the default 30s expires mid-run, BullMQ
+        // marks the job stalled, and it gets re-run or failed even though the
+        // original execution is still working — which is how a fix could stamp
+        // trailing_slash_fixed_at without actually completing. 60-minute lock.
+        // (v1.32)
+        lockDuration: 60 * 60 * 1000
       }
     );
     maintenanceWorker.on("failed", (job, error) => {

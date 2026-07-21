@@ -240,6 +240,16 @@ export async function processFixTrailingSlashesJob(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await markFailed(jobRowId, message);
+    // The fix did not fully complete — make sure the session is NOT left looking
+    // "already applied" so the user can retry (v1.32). trailing_slash_fixed_at is
+    // only ever stamped on the success path above; clearing here also covers a
+    // stalled/re-run job that partially stamped before throwing.
+    await pool
+      .query(
+        "UPDATE sessions SET trailing_slash_fixed_at = NULL WHERE id = $1",
+        [sessionId]
+      )
+      .catch(() => {});
     throw error;
   }
 }
