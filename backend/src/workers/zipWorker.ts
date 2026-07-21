@@ -2,7 +2,9 @@ import { createWriteStream } from "node:fs";
 import { stat } from "node:fs/promises";
 
 import { ZipArchive } from "archiver";
+import pg from "pg";
 
+import { config } from "../config.js";
 import { lazyStreamSitemapWithoutForeignLocs } from "../sitemaps/foreignLocFilter.js";
 
 // piscina worker: builds one download ZIP to `outputPath` off the worker
@@ -57,6 +59,44 @@ export default async function buildZipFile(
     archive.on("error", reject);
   });
 
+  // Live progress (v1.31 Fix 2): report each entry as archiver processes it so
+  // the results-page overlay can track a background pre-generation. The worker
+  // runs in its own thread, so it opens a short-lived DB client of its own.
+  // Entirely best-effort — any DB failure here must never break the ZIP build.
+  const totalEntries = files.length + 1; // + regenerated sitemap-index.xml
+  let progressClient: pg.Client | null = null;
+
+  try {
+    progressClient = new pg.Client({ connectionString: config.databaseUrl });
+    await progressClient.connect();
+    await progressClient.query(
+      "UPDATE sessions SET zip_progress = 0, zip_progress_file = 0 WHERE id = $1",
+      [sessionId]
+    );
+  } catch {
+    if (progressClient) {
+      await progressClient.end().catch(() => {});
+    }
+    progressClient = null;
+  }
+
+  if (progressClient) {
+    let entriesDone = 0;
+    archive.on("entry", () => {
+      entriesDone += 1;
+      const percent = Math.min(
+        100,
+        Math.round((entriesDone / totalEntries) * 100)
+      );
+      progressClient
+        ?.query(
+          "UPDATE sessions SET zip_progress = $2, zip_progress_file = $3 WHERE id = $1",
+          [sessionId, percent, entriesDone]
+        )
+        .catch(() => {});
+    });
+  }
+
   archive.pipe(output);
 
   let entryIndex = 0;
@@ -92,6 +132,16 @@ export default async function buildZipFile(
 
   await archive.finalize();
   await done;
+
+  if (progressClient) {
+    await progressClient
+      .query(
+        "UPDATE sessions SET zip_progress = 100, zip_progress_file = $2 WHERE id = $1",
+        [sessionId, totalEntries]
+      )
+      .catch(() => {});
+    await progressClient.end().catch(() => {});
+  }
 
   const { size } = await stat(outputPath);
   return { entries: files.length + 1, bytes: size };

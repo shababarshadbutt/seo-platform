@@ -226,6 +226,12 @@ export async function processFixTrailingSlashesJob(
       `,
       [jobRowId, urlsFixed]
     );
+    // Stamp when this session last had trailing slashes applied, so the UI can
+    // warn before silently re-running the fix (v1.31 Fix 4).
+    await pool.query(
+      "UPDATE sessions SET trailing_slash_fixed_at = now() WHERE id = $1",
+      [sessionId]
+    );
     await invalidateSessionZipCache(sessionId);
     logger.info(
       { session_id: sessionId, job_row_id: jobRowId, urlsFixed },
@@ -268,6 +274,12 @@ export async function processFixTrailingSlashesUndoJob(
     await pool.query(
       "UPDATE maintenance_jobs SET status = 'UNDONE', completed_at = now() WHERE id = $1",
       [jobRowId]
+    );
+    // Slashes are no longer applied → clear the stamp so the re-run warning
+    // doesn't fire on a session that's back to its pre-fix state (v1.31 Fix 4).
+    await pool.query(
+      "UPDATE sessions SET trailing_slash_fixed_at = NULL WHERE id = $1",
+      [sessionId]
     );
     await invalidateSessionZipCache(sessionId);
     logger.info(

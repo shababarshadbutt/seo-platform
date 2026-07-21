@@ -29,7 +29,7 @@ export async function invalidateSessionZipCache(sessionId: string) {
     }
 
     await pool.query(
-      "UPDATE sessions SET zip_all_path = NULL, zip_edited_path = NULL, zip_generated_at = NULL WHERE id = $1",
+      "UPDATE sessions SET zip_all_path = NULL, zip_edited_path = NULL, zip_generated_at = NULL, zip_progress = 0, zip_progress_file = 0 WHERE id = $1",
       [sessionId]
     );
 

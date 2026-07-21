@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import {
   AlertCircle,
@@ -10,6 +10,7 @@ import {
   Download,
   ExternalLink,
   FileText,
+  Folder,
   Info,
   Layers,
   Loader2,
@@ -45,10 +46,14 @@ import {
 
 import {
   applyPatternRedirects,
+  chooseDownloadFolder,
   downloadCorrectedSitemap,
   downloadSessionExport,
-  downloadSitemapsZip,
+  fetchSitemapsZipBlob,
+  getDownloadFolderName,
   getDownloadPreview,
+  saveDownloadZip,
+  supportsDirectoryPicker,
   friendlyApiErrorMessage,
   getBulkReplaceStatus,
   getMismatchedUrls,
@@ -108,6 +113,7 @@ import {
   DialogTitle
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
 import {
   Sheet,
   SheetContent,
@@ -196,6 +202,31 @@ function formatNumber(value: number) {
 
 function formatPercent(value: number) {
   return `${Math.round(value)}%`;
+}
+
+// Human-readable ETA for the download overlay (e.g. "~2 min", "~30 sec").
+function formatEta(seconds: number) {
+  if (seconds >= 60) {
+    const minutes = Math.round(seconds / 60);
+
+    return `${minutes} min`;
+  }
+
+  return `${Math.max(1, Math.round(seconds))} sec`;
+}
+
+// When a trailing-slash fix was last applied — shown in the re-run warning.
+function formatTimestamp(value: string) {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return date.toLocaleString(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short"
+  });
 }
 
 function displayFilename(sessionId: string, filename: string) {
@@ -639,6 +670,29 @@ export default function ResultsDashboardPage({
     type: "edited" | "all";
     preview: DownloadPreview;
   } | null>(null);
+  // Files (by id) the user has ticked to exclude entirely from the download in
+  // the foreign-URL warning modal (v1.31 Fix 5). Ticked = excluded.
+  const [excludedFileIds, setExcludedFileIds] = useState<Set<string>>(
+    new Set()
+  );
+  // On-demand download progress overlay (v1.31 Fix 2).
+  const [downloadOverlay, setDownloadOverlay] = useState<{
+    type: "edited" | "all";
+    percent: number;
+    fileCurrent: number;
+    fileTotal: number;
+    etaSeconds: number | null;
+    cancelling: boolean;
+  } | null>(null);
+  // Persistent download-folder name for the dropdown label (v1.31 Fix 3). The
+  // actual directory handle lives at module level in lib/api.
+  const [downloadFolderName, setDownloadFolderName] = useState<string | null>(
+    () => getDownloadFolderName()
+  );
+  // "Fix Trailing Slashes" re-run confirmation (v1.31 Fix 4).
+  const [slashRerunOpen, setSlashRerunOpen] = useState(false);
+  const downloadAbortRef = useRef<AbortController | null>(null);
+  const switchToCacheRef = useRef(false);
   const [deleteUrlTarget, setDeleteUrlTarget] = useState<SampledUrl | null>(
     null
   );
@@ -1711,14 +1765,50 @@ export default function ResultsDashboardPage({
   const estimateZipBytes = (files: typeof currentSitemapFiles) =>
     files.reduce((sum, file) => sum + Number(file.total_urls ?? 0) * 100, 0);
 
-  // Actually fetch + save the ZIP. `filtered` false → include cross-domain URLs
-  // (raw originals). Called directly when no foreign URLs are present, or from
-  // the foreign-URL warning modal's two download buttons.
-  async function runDownloadSitemaps(
-    type: "edited" | "all",
-    filtered: boolean
-  ) {
-    if (downloadingSitemaps) {
+  function showDownloadError(nextError: unknown) {
+    setFindReplaceToast({
+      tone: "error",
+      message: friendlyApiErrorMessage(
+        nextError,
+        "Unable to download sitemaps."
+      )
+    });
+  }
+
+  // Save a fetched ZIP: show "100%" for a beat, hide the overlay, then write the
+  // file (directly to the saved folder, or via the Save As dialog). A success
+  // toast names the target when it went straight into a folder.
+  async function finishDownload(blob: Blob, filename: string) {
+    setDownloadOverlay((prev) =>
+      prev ? { ...prev, percent: 100, etaSeconds: 0, cancelling: false } : prev
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    setDownloadOverlay(null);
+
+    const savedTo = await saveDownloadZip(blob, filename);
+
+    if (savedTo) {
+      setFindReplaceToast({
+        tone: "success",
+        message: `Saved to ${savedTo}/${filename}`
+      });
+    }
+  }
+
+  // Fetch + save a sitemap ZIP. When the pre-generated (cached) ZIP is ready and
+  // no per-download options apply, the download is instant (no overlay). Any
+  // on-demand build shows the progress overlay and polls GET /api/sessions/:id
+  // for live progress, handing off to the instant cache download if it lands
+  // mid-flight.
+  async function performDownload(opts: {
+    type: "edited" | "all";
+    filtered: boolean;
+    excludeFileIds?: string[];
+  }) {
+    const { type, filtered } = opts;
+    const excludeFileIds = opts.excludeFileIds ?? [];
+
+    if (downloadingSitemaps || downloadOverlay) {
       return;
     }
 
@@ -1731,29 +1821,195 @@ export default function ResultsDashboardPage({
     if (estimatedBytes > 500 * 1024 * 1024) {
       const gb = (estimatedBytes / 1024 ** 3).toFixed(1);
 
-      if (
-        !window.confirm(
-          `This download is approximately ${gb} GB. Continue?`
-        )
-      ) {
+      if (!window.confirm(`This download is approximately ${gb} GB. Continue?`)) {
         return;
       }
     }
 
-    setDownloadingSitemaps(type);
+    const canUseCache = filtered && excludeFileIds.length === 0 && zipReady;
+
+    // Instant path: the pre-generated ZIP is ready — no overlay.
+    if (canUseCache) {
+      setDownloadingSitemaps(type);
+
+      try {
+        const { blob, filename } = await fetchSitemapsZipBlob(params.id, type, {
+          filter: filtered
+        });
+        const savedTo = await saveDownloadZip(blob, filename);
+
+        if (savedTo) {
+          setFindReplaceToast({
+            tone: "success",
+            message: `Saved to ${savedTo}/${filename}`
+          });
+        }
+      } catch (nextError) {
+        showDownloadError(nextError);
+      } finally {
+        setDownloadingSitemaps(null);
+      }
+
+      return;
+    }
+
+    // On-demand path: show the progress overlay and poll for build progress.
+    const controller = new AbortController();
+
+    downloadAbortRef.current = controller;
+    switchToCacheRef.current = false;
+
+    const startedAt = Date.now();
+
+    setDownloadOverlay({
+      type,
+      percent: 0,
+      fileCurrent: 0,
+      fileTotal: (type === "edited" ? editedSitemapCount : allSitemapCount) + 1,
+      etaSeconds: null,
+      cancelling: false
+    });
+
+    const poll = window.setInterval(() => {
+      void (async () => {
+        try {
+          const next = await getSession(params.id);
+
+          setSessionData((prev) =>
+            prev ? { ...prev, session: next.session } : next
+          );
+
+          // If the cached ZIP became ready and we could serve it, cancel the
+          // on-demand fetch and switch to the instant download.
+          if (
+            filtered &&
+            excludeFileIds.length === 0 &&
+            next.session.zip_ready &&
+            !switchToCacheRef.current
+          ) {
+            switchToCacheRef.current = true;
+            controller.abort();
+
+            return;
+          }
+
+          const percent = Math.max(
+            0,
+            Math.min(100, numberValue(next.session.zip_progress))
+          );
+          const fileCurrent = numberValue(next.session.zip_progress_file);
+          const elapsed = (Date.now() - startedAt) / 1000;
+          const etaSeconds =
+            percent > 3
+              ? Math.max(0, Math.round((elapsed / percent) * (100 - percent)))
+              : null;
+
+          setDownloadOverlay((prev) =>
+            prev && !prev.cancelling
+              ? {
+                  ...prev,
+                  percent,
+                  fileCurrent: fileCurrent || prev.fileCurrent,
+                  etaSeconds
+                }
+              : prev
+          );
+        } catch {
+          // ignore; retry next tick
+        }
+      })();
+    }, 2000);
 
     try {
-      await downloadSitemapsZip(params.id, type, { filter: filtered });
+      const { blob, filename } = await fetchSitemapsZipBlob(params.id, type, {
+        filter: filtered,
+        excludeFileIds,
+        signal: controller.signal
+      });
+
+      await finishDownload(blob, filename);
     } catch (nextError) {
+      if ((nextError as { name?: string })?.name === "AbortError") {
+        // Cache handoff: re-fetch the now-ready pre-generated ZIP instantly.
+        if (switchToCacheRef.current) {
+          try {
+            const cached = await fetchSitemapsZipBlob(params.id, type, {
+              filter: true
+            });
+
+            await finishDownload(cached.blob, cached.filename);
+          } catch (cacheError) {
+            showDownloadError(cacheError);
+          }
+        }
+        // Otherwise the user cancelled — silent no-op.
+      } else {
+        showDownloadError(nextError);
+      }
+    } finally {
+      window.clearInterval(poll);
+      downloadAbortRef.current = null;
+      setDownloadOverlay(null);
+    }
+  }
+
+  function handleCancelDownload() {
+    switchToCacheRef.current = false;
+    downloadAbortRef.current?.abort();
+    setDownloadOverlay((prev) =>
+      prev ? { ...prev, cancelling: true } : prev
+    );
+  }
+
+  function toggleExcludedFile(fileId: string) {
+    setExcludedFileIds((current) => {
+      const next = new Set(current);
+
+      if (next.has(fileId)) {
+        next.delete(fileId);
+      } else {
+        next.add(fileId);
+      }
+
+      return next;
+    });
+  }
+
+  function toggleAllExcluded(affected: { file_id: string }[]) {
+    setExcludedFileIds((current) =>
+      current.size === affected.length
+        ? new Set()
+        : new Set(affected.map((file) => file.file_id))
+    );
+  }
+
+  async function handleChangeDownloadFolder() {
+    if (!supportsDirectoryPicker()) {
       setFindReplaceToast({
         tone: "error",
-        message: friendlyApiErrorMessage(
-          nextError,
-          "Unable to download sitemaps."
-        )
+        message:
+          "Folder saving not supported in this browser — files will save to Downloads."
       });
-    } finally {
-      setDownloadingSitemaps(null);
+
+      return;
+    }
+
+    try {
+      const name = await chooseDownloadFolder();
+
+      setDownloadFolderName(name);
+
+      if (name) {
+        setFindReplaceToast({
+          tone: "success",
+          message: `Download folder set: ${name}`
+        });
+      }
+    } catch {
+      setFindReplaceToast({
+        tone: "error",
+        message: "Couldn't set the download folder."
+      });
     }
   }
 
@@ -1762,7 +2018,7 @@ export default function ResultsDashboardPage({
   // shows a warning modal (so a near-empty file is never a silent surprise),
   // otherwise downloads immediately with filtering as before.
   async function handleDownloadSitemaps(type: "edited" | "all") {
-    if (downloadingSitemaps || previewingDownload) {
+    if (downloadingSitemaps || previewingDownload || downloadOverlay) {
       return;
     }
 
@@ -1781,11 +2037,17 @@ export default function ResultsDashboardPage({
     }
 
     if (preview && preview.has_foreign_urls) {
+      // Default: every affected file ticked (i.e. excluded). The user unticks
+      // the ones they want kept (domain-filtered) in the ZIP.
+      setExcludedFileIds(
+        new Set(preview.affected_files.map((file) => file.file_id))
+      );
       setForeignWarning({ type, preview });
+
       return;
     }
 
-    await runDownloadSitemaps(type, true);
+    await performDownload({ type, filtered: true });
   }
   const safeHealthScore = Math.max(0, Math.min(100, dashboard.healthScore));
   const summaryCards = [
@@ -1924,7 +2186,15 @@ export default function ResultsDashboardPage({
                   type="button"
                   variant="outline"
                   className="border-indigo-200 text-indigo-700 hover:bg-indigo-50 hover:text-indigo-800"
-                  onClick={() => setTrailingSlashOpen(true)}
+                  onClick={() => {
+                    // If slashes were already applied, warn before re-running
+                    // (v1.31 Fix 4); otherwise go straight to the preview modal.
+                    if (session?.trailing_slash_fixed_at) {
+                      setSlashRerunOpen(true);
+                    } else {
+                      setTrailingSlashOpen(true);
+                    }
+                  }}
                 >
                   <Slash className="mr-2 h-4 w-4" />
                   Fix Trailing Slashes
@@ -2010,7 +2280,8 @@ export default function ResultsDashboardPage({
                       variant="outline"
                       disabled={
                         downloadingSitemaps !== null ||
-                        previewingDownload !== null
+                        previewingDownload !== null ||
+                        downloadOverlay !== null
                       }
                       title={
                         !zipReady && zipGenerating
@@ -2020,12 +2291,13 @@ export default function ResultsDashboardPage({
                     >
                       {downloadingSitemaps ||
                       previewingDownload ||
+                      downloadOverlay ||
                       (!zipReady && zipGenerating) ? (
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                       ) : (
                         <Download className="mr-2 h-4 w-4" />
                       )}
-                      {downloadingSitemaps
+                      {downloadingSitemaps || downloadOverlay
                         ? "Preparing ZIP"
                         : previewingDownload
                           ? "Checking…"
@@ -2055,6 +2327,40 @@ export default function ResultsDashboardPage({
                         excluded
                       </p>
                     ) : null}
+                    <div className="my-1 h-px bg-slate-100" aria-hidden="true" />
+                    {downloadFolderName ? (
+                      <div className="flex items-center justify-between gap-2 px-2 py-1.5 text-xs text-slate-600">
+                        <span className="flex min-w-0 items-center gap-1">
+                          <Folder className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                          <span className="truncate">
+                            Download folder:{" "}
+                            <span className="font-medium">
+                              {downloadFolderName}
+                            </span>
+                          </span>
+                        </span>
+                        <button
+                          type="button"
+                          className="shrink-0 font-medium text-indigo-600 hover:text-indigo-700"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            void handleChangeDownloadFolder();
+                          }}
+                        >
+                          Change
+                        </button>
+                      </div>
+                    ) : (
+                      <DropdownMenuItem
+                        onSelect={(event) => {
+                          event.preventDefault();
+                          void handleChangeDownloadFolder();
+                        }}
+                      >
+                        <Folder className="mr-2 h-4 w-4" aria-hidden="true" />
+                        Change download folder…
+                      </DropdownMenuItem>
+                    )}
                   </DropdownMenuContent>
                 </DropdownMenu>
               ) : null}
@@ -3241,53 +3547,73 @@ export default function ResultsDashboardPage({
             if (!open) setForeignWarning(null);
           }}
         >
-          <DialogContent className="sm:max-w-lg">
+          <DialogContent className="sm:max-w-xl">
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2">
                 <TriangleAlert className="h-5 w-5 text-amber-600" />
                 Download warning
               </DialogTitle>
               <DialogDescription>
-                Some files in this session contain URLs from other domains.
-                Those URLs are stripped from the standard (filtered) download,
-                so the affected files come out nearly empty.
+                Some files contain URLs from other domains. Select which files to
+                exclude from this download. Excluded files are skipped — nothing
+                is deleted from disk.
               </DialogDescription>
             </DialogHeader>
 
             {foreignWarning ? (
               <div className="space-y-3">
-                <div className="max-h-56 overflow-y-auto rounded-md border border-slate-200">
-                  <ul className="divide-y divide-slate-100 text-sm">
-                    {foreignWarning.preview.affected_files
-                      .slice(0, 5)
-                      .map((file) => (
-                        <li
-                          key={file.filename}
-                          className="flex items-center justify-between gap-3 px-3 py-2"
-                        >
-                          <span className="min-w-0 flex-1 truncate font-mono text-xs">
-                            {file.filename}
-                          </span>
-                          <span className="shrink-0 text-xs text-amber-700">
-                            {file.foreign_url_count_is_minimum ? "≥" : ""}
-                            {formatNumber(file.foreign_url_count)} of{" "}
-                            {formatNumber(file.total_urls)} URLs removed
-                          </span>
-                        </li>
-                      ))}
-                  </ul>
-                  {foreignWarning.preview.total_affected_files > 5 ? (
-                    <p className="px-3 py-2 text-xs text-slate-500">
-                      + {formatNumber(
-                        foreignWarning.preview.total_affected_files - 5
-                      )}{" "}
-                      more affected{" "}
-                      {foreignWarning.preview.total_affected_files - 5 === 1
-                        ? "file"
-                        : "files"}
-                    </p>
-                  ) : null}
-                </div>
+                {(() => {
+                  const affected = foreignWarning.preview.affected_files;
+                  const allChecked =
+                    affected.length > 0 &&
+                    affected.every((file) =>
+                      excludedFileIds.has(file.file_id)
+                    );
+
+                  return (
+                    <>
+                      <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+                        <input
+                          type="checkbox"
+                          checked={allChecked}
+                          onChange={() => toggleAllExcluded(affected)}
+                          className="h-4 w-4 rounded border-slate-300"
+                        />
+                        Select all ({affected.length}{" "}
+                        {affected.length === 1 ? "file" : "files"} affected)
+                      </label>
+
+                      <div className="max-h-[300px] overflow-y-auto rounded-md border border-slate-200">
+                        <ul className="divide-y divide-slate-100 text-sm">
+                          {affected.map((file) => (
+                            <li key={file.file_id}>
+                              <label className="flex items-center justify-between gap-3 px-3 py-2 hover:bg-slate-50">
+                                <span className="flex min-w-0 flex-1 items-center gap-2">
+                                  <input
+                                    type="checkbox"
+                                    checked={excludedFileIds.has(file.file_id)}
+                                    onChange={() =>
+                                      toggleExcludedFile(file.file_id)
+                                    }
+                                    className="h-4 w-4 shrink-0 rounded border-slate-300"
+                                  />
+                                  <span className="min-w-0 flex-1 truncate font-mono text-xs">
+                                    {file.filename}
+                                  </span>
+                                </span>
+                                <span className="shrink-0 text-xs text-amber-700">
+                                  {file.foreign_url_count_is_minimum ? "≥" : ""}
+                                  {formatNumber(file.foreign_url_count)} of{" "}
+                                  {formatNumber(file.total_urls)} URLs foreign
+                                </span>
+                              </label>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    </>
+                  );
+                })()}
 
                 <div className="rounded-md bg-slate-50 px-3 py-2 text-xs text-slate-600">
                   <p>
@@ -3300,43 +3626,65 @@ export default function ResultsDashboardPage({
                     Only URLs on this domain are kept in the filtered download.
                     {foreignWarning.preview.counts_are_sampled
                       ? " Counts are sampled minimums — affected files often lose every URL."
-                      : ""}{" "}
-                    Foreign URLs are excluded to protect your sitemap from
-                    cross-domain contamination.
+                      : ""}
                   </p>
                 </div>
               </div>
             ) : null}
 
-            <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setForeignWarning(null)}
-              >
-                Cancel
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => {
-                  const type = foreignWarning?.type ?? "all";
-                  setForeignWarning(null);
-                  void runDownloadSitemaps(type, true);
-                }}
-              >
-                Download anyway
-              </Button>
-              <Button
-                type="button"
-                onClick={() => {
-                  const type = foreignWarning?.type ?? "all";
-                  setForeignWarning(null);
-                  void runDownloadSitemaps(type, false);
-                }}
-              >
-                Download all URLs (unfiltered)
-              </Button>
+            <div className="flex flex-col gap-2">
+              <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setForeignWarning(null)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    const type = foreignWarning?.type ?? "all";
+                    setForeignWarning(null);
+                    void performDownload({ type, filtered: true });
+                  }}
+                >
+                  Download cleaned
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={excludedFileIds.size === 0}
+                  onClick={() => {
+                    const type = foreignWarning?.type ?? "all";
+                    const excludeFileIds = Array.from(excludedFileIds);
+                    setForeignWarning(null);
+                    void performDownload({
+                      type,
+                      filtered: true,
+                      excludeFileIds
+                    });
+                  }}
+                >
+                  Exclude {excludedFileIds.size}{" "}
+                  {excludedFileIds.size === 1 ? "file" : "files"} & download
+                </Button>
+                <Button
+                  type="button"
+                  onClick={() => {
+                    const type = foreignWarning?.type ?? "all";
+                    setForeignWarning(null);
+                    void performDownload({ type, filtered: false });
+                  }}
+                >
+                  Download original
+                </Button>
+              </div>
+              <p className="text-right text-xs text-slate-500">
+                Cleaned = session domain URLs only · Original = all URLs as
+                uploaded
+              </p>
             </div>
           </DialogContent>
         </Dialog>
@@ -3408,6 +3756,98 @@ export default function ResultsDashboardPage({
           onOpenChange={setTrailingSlashOpen}
           onFinished={() => void refreshAfterMaintenance()}
         />
+
+        {/* Trailing-slash re-run confirmation (v1.31 Fix 4). */}
+        <Dialog open={slashRerunOpen} onOpenChange={setSlashRerunOpen}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>Trailing slashes already applied</DialogTitle>
+              <DialogDescription>
+                This session already had trailing slashes fixed
+                {session?.trailing_slash_fixed_at
+                  ? ` on ${formatTimestamp(session.trailing_slash_fixed_at)}`
+                  : ""}
+                .
+              </DialogDescription>
+            </DialogHeader>
+            <p className="text-sm text-slate-600">
+              Running again will re-scan all files and apply slashes to any URLs
+              still missing them (e.g. added after the last fix).
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setSlashRerunOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                onClick={() => {
+                  setSlashRerunOpen(false);
+                  setTrailingSlashOpen(true);
+                }}
+              >
+                Run again
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+
+        {/* On-demand download progress overlay (v1.31 Fix 2) — non-blocking. */}
+        {downloadOverlay ? (
+          <div
+            className="fixed bottom-4 right-4 z-50 w-80 rounded-lg border border-slate-200 bg-background p-4 shadow-lg"
+            role="status"
+            aria-live="polite"
+          >
+            <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
+              <Download className="h-4 w-4 text-indigo-600" aria-hidden="true" />
+              {downloadOverlay.percent >= 100
+                ? "Starting download…"
+                : "Preparing download…"}
+            </div>
+            <div className="mt-3">
+              <Progress value={downloadOverlay.percent} />
+            </div>
+            <div className="mt-1.5 flex items-center justify-between text-xs text-slate-500">
+              <span>{Math.round(downloadOverlay.percent)}%</span>
+              {downloadOverlay.percent < 100 &&
+              downloadOverlay.fileTotal > 0 ? (
+                <span>
+                  Zipping file{" "}
+                  {formatNumber(
+                    Math.min(
+                      downloadOverlay.fileCurrent,
+                      downloadOverlay.fileTotal
+                    )
+                  )}{" "}
+                  of {formatNumber(downloadOverlay.fileTotal)}
+                </span>
+              ) : null}
+            </div>
+            {downloadOverlay.percent < 100 &&
+            downloadOverlay.etaSeconds != null ? (
+              <p className="mt-1 text-xs text-slate-500">
+                ~{formatEta(downloadOverlay.etaSeconds)} remaining
+              </p>
+            ) : null}
+            <div className="mt-3 flex justify-end">
+              <Button
+                type="button"
+                variant="ghost"
+                className="h-8 px-3 text-xs"
+                disabled={
+                  downloadOverlay.cancelling || downloadOverlay.percent >= 100
+                }
+                onClick={handleCancelDownload}
+              >
+                {downloadOverlay.cancelling ? "Cancelling…" : "Cancel"}
+              </Button>
+            </div>
+          </div>
+        ) : null}
 
         {deleteUrlTarget ? (
           <DeleteUrlDialog

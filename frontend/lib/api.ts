@@ -33,6 +33,14 @@ export type Session = {
   zip_ready?: boolean;
   zip_generating?: boolean;
   zip_generated_at?: string | null;
+  // On-demand download ZIP build progress (v1.31 Fix 2). zip_progress is 0-100;
+  // zip_progress_file is the number of files zipped so far. Both are updated by
+  // whichever builder (on-demand endpoint or background piscina job) is running.
+  zip_progress?: NumberLike;
+  zip_progress_file?: NumberLike;
+  // When trailing slashes were last applied to this session (v1.31 Fix 4) — null
+  // if never applied (or undone). Drives the "already applied" re-run warning.
+  trailing_slash_fixed_at?: string | null;
 };
 
 export type SitemapFile = {
@@ -1243,6 +1251,9 @@ export async function downloadCorrectedSitemap(
 // marks when the true number is higher; `will_be_empty` is only set when the
 // file is provably all-foreign.
 export type DownloadForeignFile = {
+  // sitemap_files.id — passed back as an exclusion when the user chooses
+  // "Exclude X files & download" (v1.31 Fix 5).
+  file_id: string;
   filename: string;
   total_urls: number;
   foreign_url_count: number;
@@ -1274,18 +1285,147 @@ export async function getDownloadPreview(
   return readJsonResponse<DownloadPreview>(response);
 }
 
-export async function downloadSitemapsZip(
+// Minimal shape of the File System Access API directory handle we rely on. The
+// DOM lib's FileSystemDirectoryHandle type isn't guaranteed in every TS lib
+// target, so we describe just what we use.
+type DirectoryHandle = {
+  name: string;
+  getFileHandle: (
+    name: string,
+    options?: { create?: boolean }
+  ) => Promise<{
+    createWritable: () => Promise<{
+      write: (data: Blob) => Promise<void>;
+      close: () => Promise<void>;
+    }>;
+  }>;
+  queryPermission?: (options: {
+    mode: "read" | "readwrite";
+  }) => Promise<PermissionState>;
+  requestPermission?: (options: {
+    mode: "read" | "readwrite";
+  }) => Promise<PermissionState>;
+};
+
+// Persistent (per browser session) download folder, chosen once via "Change
+// download folder…" (v1.31 Fix 3). Module-level so it survives re-renders and
+// route changes without React state. Chrome/Edge only (File System Access API).
+let savedDirectoryHandle: DirectoryHandle | null = null;
+
+export function supportsDirectoryPicker(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    typeof (window as unknown as { showDirectoryPicker?: unknown })
+      .showDirectoryPicker === "function"
+  );
+}
+
+export function getDownloadFolderName(): string | null {
+  return savedDirectoryHandle?.name ?? null;
+}
+
+// Open the directory picker and remember the chosen folder. Returns the folder
+// name, or null if the user dismissed the dialog. Throws if the browser has no
+// File System Access API (caller shows the unsupported message).
+export async function chooseDownloadFolder(): Promise<string | null> {
+  const showDirectoryPicker = (
+    window as unknown as {
+      showDirectoryPicker?: (options?: {
+        mode?: "read" | "readwrite";
+      }) => Promise<DirectoryHandle>;
+    }
+  ).showDirectoryPicker;
+
+  if (typeof showDirectoryPicker !== "function") {
+    throw new Error("Folder saving not supported in this browser");
+  }
+
+  try {
+    const handle = await showDirectoryPicker({ mode: "readwrite" });
+    savedDirectoryHandle = handle;
+    return handle.name;
+  } catch (pickerError) {
+    if ((pickerError as { name?: string })?.name === "AbortError") {
+      return getDownloadFolderName();
+    }
+    throw pickerError;
+  }
+}
+
+// Save a downloaded ZIP. If a download folder has been set, write straight into
+// it and return its name (for a success toast). Otherwise fall back to the Save
+// As dialog / anchor download (v1.24 behaviour) and return null. A stale or
+// permission-revoked folder handle is dropped and also falls back.
+export async function saveDownloadZip(
+  blob: Blob,
+  filename: string
+): Promise<string | null> {
+  if (savedDirectoryHandle) {
+    try {
+      if (savedDirectoryHandle.queryPermission) {
+        let permission = await savedDirectoryHandle.queryPermission({
+          mode: "readwrite"
+        });
+
+        if (permission !== "granted" && savedDirectoryHandle.requestPermission) {
+          permission = await savedDirectoryHandle.requestPermission({
+            mode: "readwrite"
+          });
+        }
+
+        if (permission !== "granted") {
+          throw new Error("permission not granted");
+        }
+      }
+
+      const fileHandle = await savedDirectoryHandle.getFileHandle(filename, {
+        create: true
+      });
+      const writable = await fileHandle.createWritable();
+
+      await writable.write(blob);
+      await writable.close();
+
+      return savedDirectoryHandle.name;
+    } catch {
+      // Folder handle expired or permission revoked — forget it and fall back.
+      savedDirectoryHandle = null;
+    }
+  }
+
+  await saveBlobWithPicker(blob, filename, { "application/zip": [".zip"] });
+
+  return null;
+}
+
+// Fetch a session's sitemap ZIP as a blob (no saving). Kept separate from saving
+// so the results page can drive a progress overlay + cancel around the fetch.
+// filter=false → raw originals (cross-domain URLs kept). excludeFileIds → files
+// skipped entirely (v1.31 Fix 5). Pass a signal to support cancel.
+export async function fetchSitemapsZipBlob(
   sessionId: string,
   type: "edited" | "all",
-  options: { filter?: boolean } = {}
-) {
-  // filter=false → raw originals (cross-domain URLs kept). Default: filtered.
-  const filterParam = options.filter === false ? "&filter=false" : "";
+  options: {
+    filter?: boolean;
+    excludeFileIds?: string[];
+    signal?: AbortSignal;
+  } = {}
+): Promise<{ blob: Blob; filename: string }> {
+  const query = new URLSearchParams({ type });
+
+  if (options.filter === false) {
+    query.set("filter", "false");
+  }
+
+  if (options.excludeFileIds && options.excludeFileIds.length > 0) {
+    query.set("exclude", options.excludeFileIds.join(","));
+  }
+
   const response = await fetchWithTimeout(
     backendUrl(
-      `/api/sessions/${sessionId}/download-sitemaps?type=${type}${filterParam}`
+      `/api/sessions/${sessionId}/download-sitemaps?${query.toString()}`
     ),
-    { cache: "no-store" },
+    { cache: "no-store", signal: options.signal },
     EXPORT_API_TIMEOUT_MS
   );
 
@@ -1312,61 +1452,18 @@ export async function downloadSitemapsZip(
   const blob = await response.blob();
   const filename = downloadFilename(response, `${type}-sitemaps.zip`);
 
-  // Chrome/Edge: open the native Save As dialog so the user chooses the folder
-  // and filename regardless of their browser's download settings. Feature-check
-  // first; browsers without the File System Access API (Firefox/Safari) fall
-  // through to the anchor download below and save straight to Downloads.
-  const showSaveFilePicker = (
-    window as unknown as {
-      showSaveFilePicker?: (options: {
-        suggestedName?: string;
-        types?: Array<{
-          description?: string;
-          accept: Record<string, string[]>;
-        }>;
-      }) => Promise<{
-        createWritable: () => Promise<{
-          write: (data: Blob) => Promise<void>;
-          close: () => Promise<void>;
-        }>;
-      }>;
-    }
-  ).showSaveFilePicker;
+  return { blob, filename };
+}
 
-  if (typeof showSaveFilePicker === "function") {
-    try {
-      const handle = await showSaveFilePicker({
-        suggestedName: filename,
-        types: [
-          {
-            description: "ZIP Archive",
-            accept: { "application/zip": [".zip"] }
-          }
-        ]
-      });
-      const writable = await handle.createWritable();
-      await writable.write(blob);
-      await writable.close();
-      return;
-    } catch (pickerError) {
-      // User dismissed the dialog — treat as a no-op, not a failure.
-      if ((pickerError as { name?: string })?.name === "AbortError") {
-        return;
-      }
-      // Anything else (unsupported context, permission denied, secure-context
-      // requirement): fall through to the anchor download below.
-    }
-  }
+// Convenience: fetch + save in one call (used for the instant, no-overlay path).
+export async function downloadSitemapsZip(
+  sessionId: string,
+  type: "edited" | "all",
+  options: { filter?: boolean; excludeFileIds?: string[] } = {}
+): Promise<string | null> {
+  const { blob, filename } = await fetchSitemapsZipBlob(sessionId, type, options);
 
-  const objectUrl = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-
-  link.href = objectUrl;
-  link.download = filename;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(objectUrl);
+  return saveDownloadZip(blob, filename);
 }
 
 function downloadFilename(response: Response, fallback: string) {

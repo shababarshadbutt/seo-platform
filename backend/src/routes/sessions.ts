@@ -550,7 +550,11 @@ export type SessionZipPlan = {
 // off the main thread (worker) or be streamed inline (on-demand endpoint).
 export async function resolveSessionZipPlan(
   sessionId: string,
-  downloadType: "all" | "edited"
+  downloadType: "all" | "edited",
+  // File IDs to skip entirely (v1.31 Fix 5 "Exclude X files & download"). Excluded
+  // files are dropped from the ZIP and from the regenerated index — not included
+  // as empty/filtered entries. Never used by the cached/pre-generated path.
+  excludeFileIds: string[] = []
 ): Promise<SessionZipPlan | null> {
   const sessionResult = await pool.query<{ name: string; base_url: string }>(
     "SELECT name, base_url FROM sessions WHERE id = $1",
@@ -564,11 +568,12 @@ export async function resolveSessionZipPlan(
   const session = sessionResult.rows[0];
 
   const filesResult = await pool.query<{
+    id: string;
     filename: string;
     is_index: boolean;
   }>(
     `
-      SELECT filename, is_index
+      SELECT id, filename, is_index
       FROM sitemap_files
       WHERE session_id = $1 AND source_role = 'current' AND is_deleted = false
       ORDER BY filename ASC
@@ -576,7 +581,10 @@ export async function resolveSessionZipPlan(
     [sessionId]
   );
 
-  const localRows = filesResult.rows.filter((row) => !isHttpUrl(row.filename));
+  const excluded = new Set(excludeFileIds);
+  const localRows = filesResult.rows.filter(
+    (row) => !isHttpUrl(row.filename) && !excluded.has(row.id)
+  );
   const indexStoredFilename =
     localRows.find((row) => row.is_index)?.filename ?? null;
   let childRows = localRows.filter((row) => !row.is_index);
@@ -636,21 +644,59 @@ export async function resolveSessionZipPlan(
 export async function buildSessionZipArchive(
   sessionId: string,
   downloadType: "all" | "edited",
-  options: { filtered?: boolean } = {}
+  options: {
+    filtered?: boolean;
+    excludeFileIds?: string[];
+    trackProgress?: boolean;
+  } = {}
 ): Promise<{ archive: ZipArchive; zipName: string } | null> {
   // filtered (default): strip foreign-domain <loc>s per file (the corrected
   // sitemaps the SEO team publishes). unfiltered: copy each source file in
   // verbatim, so cross-domain migration sitemaps download intact — used by the
-  // "Download all URLs (unfiltered)" option. Unfiltered downloads are never
-  // cached (they are just the raw originals).
+  // "Download original" option. Unfiltered downloads are never cached (they are
+  // just the raw originals).
   const filtered = options.filtered !== false;
-  const plan = await resolveSessionZipPlan(sessionId, downloadType);
+  const plan = await resolveSessionZipPlan(
+    sessionId,
+    downloadType,
+    options.excludeFileIds ?? []
+  );
 
   if (!plan) {
     return null;
   }
 
+  // On-demand progress (v1.31 Fix 2): report each entry as archiver processes it
+  // so the results page's download overlay can show a live percentage + file
+  // count. Best-effort — a failed progress write must never break the download.
+  const totalEntries = plan.files.length + 1; // + regenerated sitemap-index.xml
+  if (options.trackProgress) {
+    void pool
+      .query(
+        "UPDATE sessions SET zip_progress = 0, zip_progress_file = 0 WHERE id = $1",
+        [sessionId]
+      )
+      .catch(() => {});
+  }
+
   const archive = new ZipArchive({ zlib: { level: 9 } });
+
+  if (options.trackProgress) {
+    let entriesDone = 0;
+    archive.on("entry", () => {
+      entriesDone += 1;
+      const percent = Math.min(
+        100,
+        Math.round((entriesDone / totalEntries) * 100)
+      );
+      void pool
+        .query(
+          "UPDATE sessions SET zip_progress = $2, zip_progress_file = $3 WHERE id = $1",
+          [sessionId, percent, entriesDone]
+        )
+        .catch(() => {});
+    });
+  }
 
   // Opt-in per-file diagnostics (DEBUG_ZIP=1). Logs each entry's source size,
   // bytes actually streamed out, and kept/removed <url> counts so a truncated
@@ -2056,6 +2102,9 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           sessions.zip_all_path,
           sessions.zip_edited_path,
           sessions.zip_generated_at,
+          sessions.zip_progress,
+          sessions.zip_progress_file,
+          sessions.trailing_slash_fixed_at,
           COALESCE(
             SUM(sitemap_files.mismatched_url_count)
               FILTER (WHERE sitemap_files.source_role = 'current'),
@@ -3099,17 +3148,24 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
   // sitemap-index.xml listing the included files is always added at the root.
   app.get<{
     Params: SessionParams;
-    Querystring: { type?: string; filter?: string };
+    Querystring: { type?: string; filter?: string; exclude?: string };
   }>(
     "/api/sessions/:id/download-sitemaps",
     async (request, reply) => {
       const downloadType = request.query.type === "all" ? "all" : "edited";
       // filter=false → raw originals, no foreign-<loc> stripping. Default true.
       const filtered = request.query.filter !== "false";
+      // exclude=<id>,<id>,… → sitemap_files to drop entirely (v1.31 Fix 5). These
+      // downloads are always built on demand: the cache never accounts for a
+      // per-download exclusion set.
+      const excludeFileIds = (request.query.exclude ?? "")
+        .split(",")
+        .map((id) => id.trim())
+        .filter((id) => id.length > 0);
 
-      // Fast path (filtered downloads only): serve a pre-generated ZIP if one
-      // exists on disk. Unfiltered downloads are always built on demand — the
-      // cache holds the filtered/corrected sitemaps, not the raw originals.
+      // Fast path (filtered, non-excluded downloads only): serve a pre-generated
+      // ZIP if one exists on disk. Unfiltered / excluded downloads are always
+      // built on demand — the cache holds the filtered/corrected full set.
       const cacheResult = await pool.query<{
         name: string;
         zip_all_path: string | null;
@@ -3131,7 +3187,12 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           ? cacheResult.rows[0].zip_all_path
           : cacheResult.rows[0].zip_edited_path;
 
-      if (filtered && cachedPath && existsSync(cachedPath)) {
+      if (
+        filtered &&
+        excludeFileIds.length === 0 &&
+        cachedPath &&
+        existsSync(cachedPath)
+      ) {
         const dateMatch = cachedPath.match(/(\d{4}-\d{2}-\d{2})\.zip$/);
         const zipName = `${sessionSlug(cacheResult.rows[0].name)}-${downloadType}-sitemaps-${
           dateMatch?.[1] ?? new Date().toISOString().slice(0, 10)
@@ -3151,7 +3212,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       const built = await buildSessionZipArchive(
         request.params.id,
         downloadType,
-        { filtered }
+        { filtered, excludeFileIds, trackProgress: true }
       );
 
       if (!built) {
@@ -3206,13 +3267,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       }
 
       const filesResult = await pool.query<{
+        id: string;
         filename: string;
         is_index: boolean;
         total_urls: string | number | null;
         mismatched_url_count: string | number | null;
       }>(
         `
-          SELECT filename, is_index, total_urls, mismatched_url_count
+          SELECT id, filename, is_index, total_urls, mismatched_url_count
           FROM sitemap_files
           WHERE session_id = $1
             AND source_role = 'current'
@@ -3223,6 +3285,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       );
 
       const affected: Array<{
+        file_id: string;
         filename: string;
         total_urls: number;
         foreign_url_count: number;
@@ -3251,6 +3314,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         const total = Number(row.total_urls ?? 0);
 
         affected.push({
+          file_id: row.id,
           filename: downloadDisplayName(request.params.id, row.filename),
           total_urls: total,
           foreign_url_count: foreign,
