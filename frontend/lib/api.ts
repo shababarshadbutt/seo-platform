@@ -1675,21 +1675,36 @@ export async function processCleaner(
     }
   };
 
-  for (;;) {
-    const { value, done: streamDone } = await reader.read();
+  try {
+    for (;;) {
+      const { value, done: streamDone } = await reader.read();
 
-    if (streamDone) {
-      break;
+      if (streamDone) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+
+      let boundary = buffer.indexOf("\n\n");
+
+      while (boundary !== -1) {
+        handleEvent(buffer.slice(0, boundary));
+        buffer = buffer.slice(boundary + 2);
+        boundary = buffer.indexOf("\n\n");
+      }
     }
-
-    buffer += decoder.decode(value, { stream: true });
-
-    let boundary = buffer.indexOf("\n\n");
-
-    while (boundary !== -1) {
-      handleEvent(buffer.slice(0, boundary));
-      buffer = buffer.slice(boundary + 2);
-      boundary = buffer.indexOf("\n\n");
+  } catch (readError) {
+    // The socket dropped mid-stream (timeout, proxy close, network blip). Only
+    // treat it as a genuine interruption if we never received the final `done`
+    // event — otherwise the clean actually finished. Flagged so the caller can
+    // show a "stream closed" message instead of the misleading "Cannot connect
+    // to backend". (v1.37 Fix 1)
+    if (!done && !errorMessage) {
+      throw new ApiError(
+        "The processing stream closed before finishing.",
+        0,
+        { code: "stream_closed", cause: readError }
+      );
     }
   }
 
@@ -1702,10 +1717,63 @@ export async function processCleaner(
   }
 
   if (!done) {
-    throw new ApiError("Cleaning ended unexpectedly", 500, null);
+    // Stream ended cleanly but no `done` event arrived — the server closed the
+    // connection early (e.g. its request timeout fired). Distinct from a
+    // connectivity failure. (v1.37 Fix 1)
+    throw new ApiError("The processing stream closed before finishing.", 0, {
+      code: "stream_closed"
+    });
   }
 
   return done;
+}
+
+export type CleanerHandoffFile = {
+  index: number;
+  filename: string;
+  size: number;
+};
+
+export type CleanerHandoff = {
+  domain: string;
+  files: CleanerHandoffFile[];
+};
+
+// Fetch the metadata (domain + cleaned file list) for a cleaner run token so the
+// Migration New Analysis page can pre-fill from it. Throws ApiError(404) if the
+// token has expired. (v1.37 Fix 2)
+export async function getCleanerHandoff(token: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/cleaner/handoff/${token}`),
+    { cache: "no-store" }
+  );
+
+  return readJsonResponse<CleanerHandoff>(response);
+}
+
+// Download one cleaned file (by index) from a cleaner run token and return it as
+// a File so it can be dropped straight into the normal upload flow. (v1.37 Fix 2)
+export async function fetchCleanerHandoffFile(
+  token: string,
+  file: CleanerHandoffFile
+): Promise<File> {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/cleaner/handoff/${token}/file/${file.index}`),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  if (!response.ok) {
+    throw new ApiError(
+      `Could not load cleaned file ${file.filename}`,
+      response.status,
+      null
+    );
+  }
+
+  const blob = await response.blob();
+
+  return new File([blob], file.filename, { type: "application/xml" });
 }
 
 // Save a blob via the native Save As dialog on Chrome/Edge (File System Access

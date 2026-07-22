@@ -12,21 +12,48 @@ import {
 
 // The Sitemap Cleaner is stateless — nothing is written to the DB or disk. The
 // only server-side state is a short-lived in-memory cache holding each run's
-// generated ZIP so the SSE progress stream and the binary download can be two
-// separate HTTP requests (SSE can't also carry a binary body).
-const ZIP_TTL_MS = 10 * 60 * 1000;
+// generated ZIP (so the SSE progress stream and the binary download can be two
+// separate HTTP requests) plus the individual cleaned files + domain, which the
+// "hand off to Migration" flow re-fetches without a re-upload (v1.37 Fix 2).
+// TTL is 1 hour so the handoff token stays valid long enough for the user to
+// start a migration after downloading.
+const RUN_TTL_MS = 60 * 60 * 1000;
 
-type CachedZip = { zip: Buffer; filename: string };
-const zipCache = new Map<string, CachedZip>();
+// Keepalive comment ping cadence for the SSE stream. During a long clean (e.g.
+// 196 files) no progress data may flow for a while; without a periodic byte a
+// proxy or the browser can drop the idle connection, which the frontend used to
+// surface as the misleading "Cannot connect to backend". (v1.37 Fix 1)
+const SSE_KEEPALIVE_MS = 15 * 1000;
 
-function storeZip(token: string, zip: Buffer, filename: string) {
-  zipCache.set(token, { zip, filename });
-  const timer = setTimeout(() => zipCache.delete(token), ZIP_TTL_MS);
+// A single clean can run for many minutes on large file sets. Disable the
+// per-request socket timeout for this route so neither the upload of all files
+// nor the long processing phase is killed mid-stream. (v1.37 Fix 1)
+const CLEANER_TIMEOUT_MS = 30 * 60 * 1000;
+
+type CachedRun = {
+  zip: Buffer;
+  filename: string;
+  domain: string;
+  files: CleanerOutputFile[];
+};
+const runCache = new Map<string, CachedRun>();
+
+function storeRun(token: string, run: CachedRun) {
+  runCache.set(token, run);
+  const timer = setTimeout(() => runCache.delete(token), RUN_TTL_MS);
   timer.unref?.();
 }
 
 function isXmlName(name: string) {
   return /\.xml(\.gz)?$/i.test(name);
+}
+
+// The cleaned outputs the Migration tool can ingest: XML sitemaps only. The run
+// also bundles a duplicates-report.csv into the ZIP — that must not be handed
+// off as a "sitemap". Both handoff endpoints index into this same filtered list
+// so the metadata indices match the file-bytes route. (v1.37 Fix 2)
+function handoffFiles(files: CleanerOutputFile[]) {
+  return files.filter((file) => /\.xml$/i.test(file.filename));
 }
 
 function baseName(name: string) {
@@ -57,7 +84,19 @@ export async function cleanerRoutes(app: FastifyInstance) {
   // Stateless clean: accepts XML files (or a ZIP of them) + domain + subfolder,
   // streams SSE progress, and finishes with a `done` event carrying the summary
   // and a one-time download token for the generated ZIP.
-  app.post("/api/cleaner/process", async (request, reply) => {
+  app.post(
+    "/api/cleaner/process",
+    {
+      // Disable the default per-request socket timeout: a large file set can take
+      // many minutes to upload + clean, and the default would abort the request
+      // mid-stream. Mirrors the session upload route. (v1.37 Fix 1)
+      onRequest: (request, reply, done) => {
+        request.raw.setTimeout(CLEANER_TIMEOUT_MS);
+        reply.raw.setTimeout(CLEANER_TIMEOUT_MS);
+        done();
+      }
+    },
+    async (request, reply) => {
     const inputFiles: CleanerInputFile[] = [];
     let domain = "";
     let subfolder = "sitemaps";
@@ -153,6 +192,18 @@ export async function cleanerRoutes(app: FastifyInstance) {
       }
     };
 
+    // Periodic keepalive comment so an idle proxy/browser doesn't drop the
+    // connection during the long processing phase. Comment lines (": …") are
+    // ignored by the SSE parser. Cleared when the stream ends or the client
+    // disconnects. (v1.37 Fix 1)
+    const keepalive = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(": keepalive\n\n");
+      }
+    }, SSE_KEEPALIVE_MS);
+    keepalive.unref?.();
+    request.raw.on("close", () => clearInterval(keepalive));
+
     send({
       type: "progress",
       stage: "start",
@@ -177,7 +228,9 @@ export async function cleanerRoutes(app: FastifyInstance) {
       const token = randomUUID();
       const zipFilename = `cleaned-sitemaps-${today}.zip`;
 
-      storeZip(token, zip, zipFilename);
+      // Cache the ZIP plus the individual cleaned files + domain so both the
+      // binary download and the Migration handoff can use this one token.
+      storeRun(token, { zip, filename: zipFilename, domain, files });
 
       send({
         type: "done",
@@ -192,15 +245,17 @@ export async function cleanerRoutes(app: FastifyInstance) {
         message: error instanceof Error ? error.message : "Cleaning failed"
       });
     } finally {
+      clearInterval(keepalive);
       res.end();
     }
-  });
+  }
+  );
 
   // Stream a previously generated ZIP by its one-time token.
   app.get<{ Params: { token: string } }>(
     "/api/cleaner/download/:token",
     async (request, reply) => {
-      const entry = zipCache.get(request.params.token);
+      const entry = runCache.get(request.params.token);
 
       if (!entry) {
         return reply.code(404).send({
@@ -216,6 +271,69 @@ export async function cleanerRoutes(app: FastifyInstance) {
       );
 
       return reply.send(entry.zip);
+    }
+  );
+
+  // Migration handoff — metadata: the cleaned domain + the list of cleaned files
+  // (name + byte size) for a run token, so the Migration "New Analysis" page can
+  // pre-fill the base URL and show the file list. (v1.37 Fix 2)
+  app.get<{ Params: { token: string } }>(
+    "/api/cleaner/handoff/:token",
+    async (request, reply) => {
+      const entry = runCache.get(request.params.token);
+
+      if (!entry) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "cleaner session expired — please re-run the cleaner"
+        });
+      }
+
+      return {
+        domain: entry.domain,
+        files: handoffFiles(entry.files).map((file, index) => ({
+          index,
+          filename: file.filename,
+          size: Buffer.byteLength(file.content)
+        }))
+      };
+    }
+  );
+
+  // Migration handoff — bytes: stream one cleaned file (by its index in the
+  // run's file list) so the New Analysis page can rebuild it as an upload
+  // without the user re-selecting anything. (v1.37 Fix 2)
+  app.get<{ Params: { token: string; index: string } }>(
+    "/api/cleaner/handoff/:token/file/:index",
+    async (request, reply) => {
+      const entry = runCache.get(request.params.token);
+
+      if (!entry) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "cleaner session expired — please re-run the cleaner"
+        });
+      }
+
+      const index = Number(request.params.index);
+      const file = Number.isInteger(index)
+        ? handoffFiles(entry.files)[index]
+        : undefined;
+
+      if (!file) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "cleaned file not found"
+        });
+      }
+
+      reply.header("content-type", "application/xml; charset=utf-8");
+      reply.header(
+        "content-disposition",
+        `attachment; filename="${file.filename}"`
+      );
+
+      return reply.send(file.content);
     }
   );
 }

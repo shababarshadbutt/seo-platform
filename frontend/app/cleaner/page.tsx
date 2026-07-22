@@ -3,16 +3,19 @@
 import { ChangeEvent, DragEvent, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
+  ArrowRight,
   CheckCircle2,
   Download,
   FileText,
   Loader2,
+  Map as MapIcon,
   Sparkles,
   UploadCloud,
   X
 } from "lucide-react";
 
 import {
+  apiErrorPayload,
   downloadCleanerZip,
   downloadDuplicatesCsv,
   friendlyApiErrorMessage,
@@ -171,10 +174,27 @@ export default function CleanerPage() {
       setZipFilename(done.zip_filename);
       setPhase("done");
     } catch (nextError) {
-      setError(friendlyApiErrorMessage(nextError, "Cleaning failed."));
+      // A dropped SSE stream must NOT read as "Cannot connect to backend" — the
+      // backend is up, the long-running stream just closed. (v1.37 Fix 1)
+      const payload = apiErrorPayload(nextError) as { code?: string } | null;
+
+      if (payload?.code === "stream_closed") {
+        setError(
+          "Processing stream closed before finishing — the server may still be working. Wait a moment and try again, or upload fewer files at once."
+        );
+      } else {
+        setError(friendlyApiErrorMessage(nextError, "Cleaning failed."));
+      }
+
       setPhase("error");
     }
   }
+
+  const migrationHandoffUrl = downloadToken
+    ? `/?domain=${encodeURIComponent(domain.trim())}&source=cleaner&token=${encodeURIComponent(
+        downloadToken
+      )}`
+    : "";
 
   async function handleDownloadZip() {
     if (!downloadToken) {
@@ -505,6 +525,35 @@ export default function CleanerPage() {
                   Download duplicates report (CSV)
                 </Button>
               </div>
+
+              {/* Hand off the cleaned files to the Migration Health Checker with
+                  the domain + files pre-filled. Opens in a new tab so these
+                  results stay visible. (v1.37 Fix 2) */}
+              {migrationHandoffUrl ? (
+                <div className="mt-2 rounded-xl border border-indigo-200 bg-indigo-50/70 p-4">
+                  <p className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                    <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                    Cleaning complete — ready for migration?
+                  </p>
+                  <p className="mt-1 text-sm text-slate-600">
+                    Start the Sitemap Migration Health Checker with your{" "}
+                    {formatNumber(summary.files_kept)} cleaned file
+                    {summary.files_kept === 1 ? "" : "s"} and domain pre-filled.
+                  </p>
+                  <Button asChild className="mt-3 gap-2">
+                    <a
+                      href={migrationHandoffUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      data-testid="start-migration-handoff"
+                    >
+                      <MapIcon className="h-4 w-4" />
+                      Start Migration Analysis
+                      <ArrowRight className="h-4 w-4" />
+                    </a>
+                  </Button>
+                </div>
+              ) : null}
             </CardContent>
           </Card>
         ) : null}

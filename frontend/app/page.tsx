@@ -19,6 +19,7 @@ import {
   LinkIcon,
   Loader2,
   Search,
+  Sparkles,
   UploadCloud,
   X
 } from "lucide-react";
@@ -27,10 +28,13 @@ import {
   apiErrorPayload,
   completeSitemapUpload,
   createSession,
+  fetchCleanerHandoffFile,
   friendlyApiErrorMessage,
+  getCleanerHandoff,
   getSystemDiskUsage,
   previewSitemapUrl,
   submitSitemapUrls,
+  type CleanerHandoffFile,
   type SitemapUrlPreview,
   type UploadProgress,
   type UploadRejectedFile,
@@ -245,6 +249,15 @@ export default function Home() {
     total: number;
   } | null>(null);
   const [uploadStorageText, setUploadStorageText] = useState("");
+  // Sitemap Cleaner handoff (v1.37 Fix 2): when arriving with
+  // ?source=cleaner&token=…&domain=…, the cleaned files + domain are loaded and
+  // pre-filled so the user can start analysis without re-uploading.
+  const [cleanerHandoff, setCleanerHandoff] = useState<{
+    domain: string;
+    fileCount: number;
+  } | null>(null);
+  const [isLoadingHandoff, setIsLoadingHandoff] = useState(false);
+  const handoffStartedRef = useRef(false);
 
   const trimmedSessionName = sessionName.trim();
   const trimmedBaseUrl = baseUrl.trim();
@@ -332,6 +345,110 @@ export default function Home() {
     return () => {
       isCancelled = true;
     };
+  }, []);
+
+  // Sitemap Cleaner handoff: if the URL carries ?source=cleaner&token=&domain=,
+  // pull the cleaned files from the backend, pre-fill the domain, and stage the
+  // files exactly as if the user had selected them — then they just click Start
+  // Analysis. Runs once. (v1.37 Fix 2)
+  useEffect(() => {
+    if (handoffStartedRef.current) {
+      return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const source = params.get("source");
+    const token = params.get("token");
+    const domainParam = params.get("domain");
+
+    if (source !== "cleaner" || !token || !domainParam) {
+      return;
+    }
+
+    handoffStartedRef.current = true;
+
+    const clearHandoffParams = () => {
+      window.history.replaceState(null, "", window.location.pathname);
+    };
+
+    async function loadHandoff(handoffToken: string, handoffDomain: string) {
+      setIsLoadingHandoff(true);
+      setFormError("");
+
+      try {
+        const handoff = await getCleanerHandoff(handoffToken);
+
+        // Fetch the cleaned files (bounded concurrency) and rebuild them as File
+        // objects so they flow through the normal upload path on submit.
+        const orderedFiles = new Array<File>(handoff.files.length);
+        let cursor = 0;
+        const worker = async () => {
+          for (;;) {
+            const index = cursor;
+            cursor += 1;
+
+            if (index >= handoff.files.length) {
+              return;
+            }
+
+            const meta: CleanerHandoffFile = handoff.files[index];
+            orderedFiles[index] = await fetchCleanerHandoffFile(
+              handoffToken,
+              meta
+            );
+          }
+        };
+
+        await Promise.all(
+          Array.from(
+            { length: Math.min(6, handoff.files.length) },
+            () => worker()
+          )
+        );
+
+        const loadedFiles = orderedFiles.filter(Boolean);
+        let hostLabel = handoff.domain;
+
+        try {
+          hostLabel = new URL(handoff.domain).hostname;
+        } catch {
+          hostLabel = handoff.domain;
+        }
+
+        setBaseUrl(handoff.domain);
+        setSourceMode("file");
+        setSelectedFiles(loadedFiles);
+        setSessionName((current) =>
+          current.trim().length > 0 ? current : `Cleaned sitemaps — ${hostLabel}`
+        );
+        setCleanerHandoff({
+          domain: handoff.domain,
+          fileCount: loadedFiles.length
+        });
+      } catch (nextError) {
+        const status =
+          nextError && typeof nextError === "object" && "status" in nextError
+            ? (nextError as { status?: number }).status
+            : undefined;
+
+        setFormError(
+          status === 404
+            ? "Cleaner session expired — please re-run the cleaner."
+            : friendlyApiErrorMessage(
+                nextError,
+                "Could not load files from the Sitemap Cleaner."
+              )
+        );
+        setCleanerHandoff(null);
+        clearHandoffParams();
+      } finally {
+        setIsLoadingHandoff(false);
+      }
+    }
+
+    void loadHandoff(token, domainParam);
+    // Strip the token from the visible URL once consumed (kept out of history).
+    clearHandoffParams();
   }, []);
 
   const baseUrlError = useMemo(() => {
@@ -542,6 +659,16 @@ export default function Home() {
     setQueuedSessionId(null);
     setQueuedFileCount(null);
     setUploadProgress(null);
+  }
+
+  function clearCleanerHandoff() {
+    setCleanerHandoff(null);
+    setSelectedFiles([]);
+    setBaseUrl("");
+    setSessionName("");
+    setFolderXmlCount(null);
+    setFormError("");
+    setFileRejections([]);
   }
 
   function resetUrlSubmissionState() {
@@ -941,6 +1068,48 @@ export default function Home() {
             </CardHeader>
             <CardContent className="px-8 pb-8 pt-0">
               <form className="space-y-6" onSubmit={handleSubmit}>
+                {isLoadingHandoff ? (
+                  <div
+                    className="flex items-center gap-2 rounded-xl border border-indigo-100 bg-indigo-50 px-3 py-2 text-sm text-slate-700"
+                    role="status"
+                  >
+                    <Loader2 className="h-4 w-4 shrink-0 animate-spin text-indigo-500" />
+                    <span>Loading cleaned files from the Sitemap Cleaner…</span>
+                  </div>
+                ) : null}
+
+                {cleanerHandoff ? (
+                  <div
+                    className="flex items-start gap-3 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-slate-700"
+                    role="status"
+                    data-testid="cleaner-handoff-banner"
+                  >
+                    <Sparkles
+                      className="mt-0.5 h-4 w-4 shrink-0 text-indigo-500"
+                      aria-hidden="true"
+                    />
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <p className="font-semibold text-slate-900">
+                        Files loaded from Sitemap Cleaner (
+                        {formatCount(cleanerHandoff.fileCount)} cleaned file
+                        {cleanerHandoff.fileCount === 1 ? "" : "s"})
+                      </p>
+                      <p className="break-all text-xs text-slate-600">
+                        Domain: {cleanerHandoff.domain}
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="shrink-0"
+                      onClick={clearCleanerHandoff}
+                    >
+                      Clear and start fresh
+                    </Button>
+                  </div>
+                ) : null}
+
                 <div className="grid gap-4 sm:grid-cols-2">
                   <div className="space-y-2">
                     <label
