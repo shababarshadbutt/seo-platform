@@ -510,8 +510,34 @@ async function persistPatternSamples(
   return score;
 }
 
+async function patternAlreadySampled(patternId: string) {
+  const result = await pool.query(
+    "SELECT 1 FROM sampled_urls WHERE pattern_id = $1 LIMIT 1",
+    [patternId]
+  );
+
+  return result.rowCount !== null && result.rowCount > 0;
+}
+
+// Mark every parsed, non-index file as sample-complete once sampling finishes.
+// Sampling itself is pattern-scoped (sampled_urls key off pattern_id, not a
+// file), so this is a coarse per-file checkpoint used by the resume endpoint to
+// tell that the sample phase completed for the session. (v1.36 Fix 2)
+async function markSampledFilesDone(sessionId: string) {
+  await pool.query(
+    `
+      UPDATE sitemap_files
+      SET sample_status = 'done'
+      WHERE session_id = $1
+        AND parsed_at IS NOT NULL
+        AND is_index = FALSE
+    `,
+    [sessionId]
+  );
+}
+
 export async function processSamplePatternsJob(
-  data: { session_id: string; sitemap_file_id?: string },
+  data: { session_id: string; sitemap_file_id?: string; resume?: boolean },
   logger: FastifyBaseLogger
 ) {
   if (await isSessionCancelled(data.session_id)) {
@@ -560,8 +586,16 @@ export async function processSamplePatternsJob(
       [data.session_id]
     );
     let sampledUrlCount = 0;
+    let skippedPatternCount = 0;
 
     for (const pattern of patternsResult.rows) {
+      // On a resumed run, patterns that already have sampled URLs completed on a
+      // previous pass — skip their (expensive, network-bound) re-sampling.
+      if (data.resume && (await patternAlreadySampled(pattern.id))) {
+        skippedPatternCount += 1;
+        continue;
+      }
+
       const totalUrls = Number(pattern.total_urls);
       const sampleLimit = Math.min(session.sample_size, totalUrls);
       const samplePool = await loadSamplePool(pattern.id, sampleLimit);
@@ -611,21 +645,27 @@ export async function processSamplePatternsJob(
       );
     }
 
+    await markSampledFilesDone(data.session_id);
     await markSessionComplete(data.session_id);
 
     logger.info(
       {
         session_id: data.session_id,
         sitemap_file_id: data.sitemap_file_id,
+        resume: Boolean(data.resume),
         pattern_count: patternsResult.rowCount,
+        skipped_pattern_count: skippedPatternCount,
         sampled_url_count: sampledUrlCount
       },
       "sample patterns job completed"
     );
   } catch (error) {
-    await pool.query("UPDATE sessions SET status = 'FAILED' WHERE id = $1", [
-      data.session_id
-    ]);
+    // Record the failure so the UI can offer a Resume that re-samples only the
+    // patterns that never completed. (v1.36 Fix 2)
+    await pool.query(
+      "UPDATE sessions SET status = 'FAILED', last_failed_at = now() WHERE id = $1",
+      [data.session_id]
+    );
     throw error;
   }
 }

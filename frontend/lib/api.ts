@@ -41,6 +41,11 @@ export type Session = {
   // When trailing slashes were last applied to this session (v1.31 Fix 4) — null
   // if never applied (or undone). Drives the "already applied" re-run warning.
   trailing_slash_fixed_at?: string | null;
+  // Resumable-processing state (v1.36 Fix 2). resume_count is how many times the
+  // session was resumed after a failure (shown on the results page); the
+  // Resume button is offered whenever status is FAILED.
+  resume_count?: NumberLike;
+  last_failed_at?: string | null;
 };
 
 export type SitemapFile = {
@@ -62,6 +67,10 @@ export type SitemapFile = {
   gsc_deletion_error?: string | null;
   mismatched_url_count?: NumberLike;
   is_edited?: boolean;
+  // Per-file resume checkpoints (v1.36 Fix 2): 'pending' | 'done' through the
+  // extract and sample phases. Parse's checkpoint is parsed_at (not null = done).
+  extract_status?: string;
+  sample_status?: string;
 };
 
 export type SitemapFileStatus = "active" | "deleted" | "empty" | "invalid";
@@ -597,6 +606,30 @@ export async function cancelSession(sessionId: string) {
   return readJsonResponse<CancelSessionResult>(response);
 }
 
+export type ResumeSessionResult = {
+  resumed: boolean;
+  session_id: string;
+  phase: "parse" | "extract" | "sample" | "complete";
+  requeued_count: number;
+};
+
+export async function resumeSession(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/resume`),
+    {
+      method: "POST"
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<ResumeSessionResult>(response);
+}
+
+// Timeout (ms) for the pattern-drawer sample fetch. Kept longer than the default
+// API timeout so a large pattern gets a fair chance to load, but bounded so the
+// drawer never spins forever — on timeout it shows an error + Retry. (v1.36 Fix 1)
+export const DRAWER_SAMPLES_TIMEOUT_MS = 15000;
+
 export async function getPatterns(sessionId: string) {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/patterns`),
@@ -609,12 +642,17 @@ export async function getPatterns(sessionId: string) {
   return data.patterns;
 }
 
-export async function getPatternSamples(sessionId: string, patternId: string) {
+export async function getPatternSamples(
+  sessionId: string,
+  patternId: string,
+  timeoutMs = DEFAULT_API_TIMEOUT_MS
+) {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/samples`),
     {
       cache: "no-store"
-    }
+    },
+    timeoutMs
   );
   const data = await readJsonResponse<SamplesResponse>(response);
 

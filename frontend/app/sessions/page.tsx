@@ -8,6 +8,7 @@ import {
   CalendarDays,
   Loader2,
   Plus,
+  RefreshCw,
   Trash2
 } from "lucide-react";
 
@@ -16,6 +17,7 @@ import {
   friendlyApiErrorMessage,
   getSessions,
   numberValue,
+  resumeSession,
   type SessionHistoryItem,
   type SessionStatus
 } from "@/lib/api";
@@ -96,6 +98,21 @@ export default function SessionsHistoryPage() {
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [resumingId, setResumingId] = useState<string | null>(null);
+
+  async function handleResume(sessionId: string) {
+    setResumingId(sessionId);
+
+    try {
+      await resumeSession(sessionId);
+      router.push(`/sessions/${sessionId}`);
+    } catch (nextError) {
+      setError(
+        friendlyApiErrorMessage(nextError, "Unable to resume this session.")
+      );
+      setResumingId(null);
+    }
+  }
 
   async function loadSessions() {
     setIsLoading(true);
@@ -401,6 +418,25 @@ export default function SessionsHistoryPage() {
                           </td>
                           <td className="px-3 py-3">
                             <div className="flex items-center gap-2">
+                              {session.status === "FAILED" ? (
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  className="bg-indigo-600 text-white hover:bg-indigo-700"
+                                  disabled={resumingId === session.id}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void handleResume(session.id);
+                                  }}
+                                >
+                                  {resumingId === session.id ? (
+                                    <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                                  ) : (
+                                    <RefreshCw className="mr-2 h-3.5 w-3.5" />
+                                  )}
+                                  Resume
+                                </Button>
+                              ) : null}
                               {canOpen ? (
                                 <Button
                                   asChild

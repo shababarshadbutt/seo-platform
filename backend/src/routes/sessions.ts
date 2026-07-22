@@ -32,13 +32,16 @@ import {
 } from "../exports/sessionExports.js";
 import {
   enqueuePendingParseSitemapJobs,
+  markSessionComplete,
   resetParsedSitemapCount,
   syncParsedSitemapCountToDb,
   tryFinalizeParsedSession
 } from "../jobs/sessionCompletion.js";
 import {
+  enqueueExtractPatternsJob,
   enqueueParseSitemapJob,
   enqueueParseSitemapJobs,
+  enqueueSamplePatternsJob,
   removeSessionJobs
 } from "../queue/sitemapQueue.js";
 import {
@@ -2107,6 +2110,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           sessions.zip_progress,
           sessions.zip_progress_file,
           sessions.trailing_slash_fixed_at,
+          sessions.resume_count,
+          sessions.last_failed_at,
           COALESCE(
             SUM(sitemap_files.mismatched_url_count)
               FILTER (WHERE sitemap_files.source_role = 'current'),
@@ -2150,6 +2155,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           gsc_deletion_status,
           gsc_deletion_error,
           mismatched_url_count,
+          extract_status,
+          sample_status,
           (
             filename LIKE (session_id::text || '-fixed-%')
             OR filename LIKE (session_id::text || '-renamed-%')
@@ -2276,6 +2283,191 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       return reply.send({
         cancelled: true,
         session_id: sessionId
+      });
+    }
+  );
+
+  // Resume a session that FAILED (or got stuck) partway through processing.
+  // Rather than restart from scratch, re-queue only the work that never
+  // completed, picking up from the earliest incomplete phase. Each phase
+  // auto-chains to the next on completion (parse → extract → sample), so kicking
+  // off the earliest incomplete phase is enough to drive the session to
+  // COMPLETE. (v1.36 Fix 2)
+  app.post<{ Params: SessionParams }>(
+    "/api/sessions/:id/resume",
+    async (request, reply) => {
+      const sessionId = request.params.id;
+      const sessionResult = await pool.query<{
+        status: string;
+        upload_complete: boolean;
+      }>(
+        "SELECT status, upload_complete FROM sessions WHERE id = $1::uuid",
+        [sessionId]
+      );
+      const session = sessionResult.rows[0];
+
+      if (!session) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "session not found"
+        });
+      }
+
+      // Only sessions that stalled short of completion can be resumed. COMPLETE
+      // has nothing left to do; CANCELLED discarded its analysis data; PENDING
+      // never began.
+      const resumableStates = [
+        "FAILED",
+        "PROCESSING",
+        "EXTRACTING",
+        "EXTRACTED",
+        "SAMPLING"
+      ];
+
+      if (!resumableStates.includes(session.status)) {
+        return reply.code(409).send({
+          error: "Conflict",
+          message: `session cannot be resumed from status ${session.status}`
+        });
+      }
+
+      // Count the work outstanding in each phase. `extractable` mirrors the
+      // predicate loadExtractableFiles / the extract & sample checkpoints use.
+      const [unparsed, extractable, patterns] = await Promise.all([
+        pool.query<{ id: string }>(
+          `
+            SELECT id
+            FROM sitemap_files
+            WHERE session_id = $1::uuid
+              AND parsed_at IS NULL
+              AND is_valid = TRUE
+            ORDER BY id ASC
+          `,
+          [sessionId]
+        ),
+        pool.query<{
+          total: string;
+          extract_done: string;
+          sample_done: string;
+          fallback_file_id: string | null;
+        }>(
+          `
+            SELECT
+              COUNT(*)::bigint AS total,
+              COUNT(*) FILTER (WHERE extract_status = 'done')::bigint
+                AS extract_done,
+              COUNT(*) FILTER (WHERE sample_status = 'done')::bigint
+                AS sample_done,
+              MIN(id::text) AS fallback_file_id
+            FROM sitemap_files
+            WHERE session_id = $1::uuid
+              AND parsed_at IS NOT NULL
+              AND is_index = FALSE
+              AND (
+                (is_valid = TRUE AND is_empty = FALSE)
+                OR EXISTS (
+                  SELECT 1
+                  FROM sitemap_partial_urls
+                  WHERE sitemap_partial_urls.sitemap_file_id = sitemap_files.id
+                )
+              )
+          `,
+          [sessionId]
+        ),
+        pool.query<{ count: string }>(
+          "SELECT COUNT(*)::bigint AS count FROM patterns WHERE session_id = $1::uuid AND source_role = 'current'",
+          [sessionId]
+        )
+      ]);
+
+      const unparsedCount = unparsed.rowCount ?? 0;
+      const extractableTotal = Number(extractable.rows[0]?.total ?? 0);
+      const extractDone = Number(extractable.rows[0]?.extract_done ?? 0);
+      const sampleDone = Number(extractable.rows[0]?.sample_done ?? 0);
+      const patternCount = Number(patterns.rows[0]?.count ?? 0);
+      const fallbackFileId = extractable.rows[0]?.fallback_file_id ?? null;
+
+      // Flip back to PROCESSING and record the resume before enqueueing so the
+      // processing screen immediately reflects the retry.
+      await pool.query(
+        `
+          UPDATE sessions
+          SET status = 'PROCESSING',
+              resume_count = resume_count + 1,
+              last_failed_at = NULL
+          WHERE id = $1::uuid
+        `,
+        [sessionId]
+      );
+      // Realign the Redis parsed-count with what's actually on disk so the
+      // finalize gate (parsed_count >= total_file_count) is accurate on resume.
+      await syncParsedSitemapCountToDb(sessionId);
+
+      let phase: "parse" | "extract" | "sample" | "complete";
+      let requeuedCount = 0;
+
+      if (unparsedCount > 0) {
+        // Earliest incomplete phase is parsing. Re-queue only the unparsed
+        // files; the parse → extract → sample chain resumes automatically.
+        await enqueueParseSitemapJobs(
+          unparsed.rows.map((row) => ({
+            sitemap_file_id: row.id,
+            session_id: sessionId
+          }))
+        );
+        // In case every remaining file is already terminal, nudge finalization.
+        await tryFinalizeParsedSession(sessionId, request.log);
+        phase = "parse";
+        requeuedCount = unparsedCount;
+      } else if (extractableTotal === 0) {
+        // No content to extract or sample (e.g. every file empty/invalid).
+        await markSessionComplete(sessionId);
+        phase = "complete";
+      } else if (extractDone < extractableTotal || patternCount === 0) {
+        // Extraction never finished — re-run it (idempotent). It chains to
+        // sampling once complete.
+        await enqueueExtractPatternsJob({
+          sitemap_file_id: fallbackFileId ?? "",
+          session_id: sessionId
+        });
+        phase = "extract";
+        requeuedCount = extractableTotal - extractDone;
+      } else if (sampleDone < extractableTotal) {
+        // Everything extracted; sampling stalled. Re-run sampling with resume so
+        // patterns that already have sampled URLs are skipped.
+        await enqueueSamplePatternsJob({
+          session_id: sessionId,
+          resume: true
+        });
+        phase = "sample";
+        requeuedCount = extractableTotal - sampleDone;
+      } else {
+        // All phases report done but the session was left non-complete — just
+        // finalize it.
+        await markSessionComplete(sessionId);
+        phase = "complete";
+      }
+
+      request.log.info(
+        {
+          session_id: sessionId,
+          resumed_from: session.status,
+          phase,
+          requeued_count: requeuedCount,
+          unparsed_count: unparsedCount,
+          extractable_total: extractableTotal,
+          extract_done: extractDone,
+          sample_done: sampleDone,
+          pattern_count: patternCount
+        },
+        "session resume requested"
+      );
+
+      return reply.send({
+        resumed: true,
+        session_id: sessionId,
+        phase,
+        requeued_count: requeuedCount
       });
     }
   );

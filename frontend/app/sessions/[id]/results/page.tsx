@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   AlertCircle,
   ArrowUpDown,
@@ -15,6 +16,7 @@ import {
   Layers,
   Loader2,
   Pencil,
+  RefreshCw,
   ShieldAlert,
   Slash,
   Trash2,
@@ -68,10 +70,12 @@ import {
   renamePatternTemplate,
   restoreDeletedUrls,
   restoreSampledUrlToFiles,
+  resumeSession,
   transformPatternStructure,
   undoFindReplace,
   undoPatternTransform,
   undoTrailingSlashes,
+  DRAWER_SAMPLES_TIMEOUT_MS,
   type BulkReplaceStatus,
   type DownloadPreview,
   type ExportFormat,
@@ -599,8 +603,11 @@ export default function ResultsDashboardPage({
 }: {
   params: { id: string };
 }) {
+  const router = useRouter();
   const [sessionData, setSessionData] = useState<SessionResponse | null>(null);
   const [patterns, setPatterns] = useState<Pattern[]>([]);
+  const [isResuming, setIsResuming] = useState(false);
+  const [resumeError, setResumeError] = useState("");
   const [samplesByPattern, setSamplesByPattern] = useState<SamplesByPattern>({});
   const [mismatches, setMismatches] = useState<MismatchedUrl[]>([]);
   const [error, setError] = useState("");
@@ -614,6 +621,11 @@ export default function ResultsDashboardPage({
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("ALL");
   const [selectedRow, setSelectedRow] = useState<PatternRow | null>(null);
   const [isSheetOpen, setIsSheetOpen] = useState(false);
+  // Pattern-drawer sample loading (v1.36 Fix 1). The drawer fetches its pattern's
+  // sampled URLs on open with a bounded (15s) timeout so it can never spin
+  // forever — on timeout/error it shows an error message + Retry instead.
+  const [drawerLoading, setDrawerLoading] = useState(false);
+  const [drawerError, setDrawerError] = useState("");
   const [copiedSampleId, setCopiedSampleId] = useState<string | null>(null);
   const [isPrintMode, setIsPrintMode] = useState(false);
   const [exportError, setExportError] = useState("");
@@ -866,6 +878,75 @@ export default function ResultsDashboardPage({
     },
     [params.id, refreshAfterMaintenance]
   );
+
+  // Fetch a pattern's sampled URLs for the drawer with a hard 15s timeout. If it
+  // times out (or errors) and we have no cached samples, surface an error so the
+  // drawer shows a Retry button instead of an endless spinner. If we DO have
+  // cached samples (from the initial dashboard load), keep showing them silently.
+  const loadDrawerSamples = useCallback(
+    async (patternId: string) => {
+      setDrawerError("");
+      setDrawerLoading(true);
+
+      try {
+        const samples = await getPatternSamples(
+          params.id,
+          patternId,
+          DRAWER_SAMPLES_TIMEOUT_MS
+        );
+
+        setSamplesByPattern((current) => ({
+          ...current,
+          [patternId]: samples
+        }));
+      } catch (nextError) {
+        setSamplesByPattern((current) => {
+          if (current[patternId]?.length) {
+            // Keep the cached samples; the refresh failure is non-fatal.
+            return current;
+          }
+
+          setDrawerError(
+            friendlyApiErrorMessage(
+              nextError,
+              "Could not load URL details for this pattern."
+            )
+          );
+
+          return current;
+        });
+      } finally {
+        setDrawerLoading(false);
+      }
+    },
+    [params.id]
+  );
+
+  const openPatternDrawer = useCallback(
+    (row: PatternRow) => {
+      setSelectedRow(row);
+      setIsSheetOpen(true);
+      void loadDrawerSamples(row.id);
+    },
+    [loadDrawerSamples]
+  );
+
+  // Re-queue only the incomplete work for a FAILED session, then send the user
+  // to the processing screen to watch it finish. (v1.36 Fix 2)
+  const handleResume = useCallback(async () => {
+    setResumeError("");
+    setIsResuming(true);
+
+    try {
+      await resumeSession(params.id);
+      router.push(`/sessions/${params.id}`);
+    } catch (nextError) {
+      setResumeError(
+        friendlyApiErrorMessage(nextError, "Could not resume this session.")
+      );
+      setIsResuming(false);
+    }
+  }, [params.id, router]);
 
   const rows = useMemo(
     () => buildRows(patterns, samplesByPattern),
@@ -2403,6 +2484,48 @@ export default function ResultsDashboardPage({
               </div>
             ) : null}
 
+            {session?.status === "FAILED" ? (
+              <div
+                className="flex flex-col gap-3 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
+                role="alert"
+                data-testid="results-failed-banner"
+              >
+                <div className="flex items-start gap-2 text-sm text-amber-900">
+                  <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>
+                    This session failed during processing — results may be
+                    incomplete.
+                  </span>
+                </div>
+                <div className="flex flex-col items-start gap-1 sm:items-end">
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="bg-amber-600 hover:bg-amber-700"
+                    disabled={isResuming}
+                    onClick={() => void handleResume()}
+                  >
+                    {isResuming ? (
+                      <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="mr-2 h-3.5 w-3.5" />
+                    )}
+                    {isResuming ? "Resuming…" : "Resume processing"}
+                  </Button>
+                  {resumeError ? (
+                    <span className="text-xs text-red-600">{resumeError}</span>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+
+            {numberValue(session?.resume_count) > 0 ? (
+              <p className="text-xs text-slate-500">
+                Session was resumed {formatNumber(numberValue(session?.resume_count))}{" "}
+                {numberValue(session?.resume_count) === 1 ? "time" : "times"}.
+              </p>
+            ) : null}
+
             {isLoading ? (
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -2830,14 +2953,12 @@ export default function ResultsDashboardPage({
                             tabIndex={0}
                             className="group cursor-pointer border-b border-slate-100 odd:bg-slate-50 even:bg-white transition-colors hover:bg-indigo-50/60 focus:bg-indigo-50/60 focus:outline-none"
                             onClick={() => {
-                              setSelectedRow(row.original);
-                              setIsSheetOpen(true);
+                              openPatternDrawer(row.original);
                             }}
                             onKeyDown={(event) => {
                               if (event.key === "Enter" || event.key === " ") {
                                 event.preventDefault();
-                                setSelectedRow(row.original);
-                                setIsSheetOpen(true);
+                                openPatternDrawer(row.original);
                               }
                             }}
                           >
@@ -2930,7 +3051,45 @@ export default function ResultsDashboardPage({
                   </Button>
                 </div>
               ) : null}
-              {selectedSamples.length > 0 ? (
+              {drawerLoading && selectedSamples.length === 0 ? (
+                <div
+                  className="flex flex-col items-center justify-center gap-3 py-16 text-sm text-slate-500"
+                  data-testid="drawer-loading"
+                >
+                  <Loader2 className="h-6 w-6 animate-spin text-indigo-500" />
+                  <span>Loading URL details…</span>
+                </div>
+              ) : drawerError && selectedSamples.length === 0 ? (
+                <div
+                  className="flex flex-col items-center justify-center gap-3 rounded-lg border border-amber-200 bg-amber-50 px-6 py-12 text-center"
+                  role="alert"
+                  data-testid="drawer-error"
+                >
+                  <TriangleAlert className="h-7 w-7 text-amber-600" />
+                  <p className="text-sm font-semibold text-amber-900">
+                    Could not load URL details
+                  </p>
+                  <p className="max-w-xs text-xs text-amber-800">
+                    {drawerError} This pattern may have too many URLs to load
+                    quickly.
+                  </p>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="border-amber-300 text-amber-800 hover:bg-amber-100 hover:text-amber-900"
+                    disabled={drawerLoading}
+                    onClick={() => {
+                      if (selectedRow) {
+                        void loadDrawerSamples(selectedRow.id);
+                      }
+                    }}
+                  >
+                    <RefreshCw className="mr-2 h-3.5 w-3.5" />
+                    Retry
+                  </Button>
+                </div>
+              ) : selectedSamples.length > 0 ? (
                 <div className="space-y-3" data-testid="sample-url-list">
                   {selectedSamples.map((sample) => {
                     const tone = sampleTone(sample);

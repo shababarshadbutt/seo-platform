@@ -26,6 +26,9 @@ export type ExtractPatternsJobData = {
 export type SamplePatternsJobData = {
   session_id: string;
   sitemap_file_id?: string;
+  // Set by the resume endpoint: skip patterns that already have sampled_urls so
+  // a resumed sample job re-fetches only patterns that never completed.
+  resume?: boolean;
 };
 
 export type CleanupUploadsJobData = {

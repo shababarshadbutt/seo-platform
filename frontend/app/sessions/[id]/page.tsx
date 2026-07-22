@@ -9,6 +9,8 @@ import {
   FileText,
   Hourglass,
   Loader2,
+  RefreshCw,
+  RotateCcw,
   StopCircle
 } from "lucide-react";
 
@@ -18,6 +20,7 @@ import {
   getPatterns,
   getSession,
   numberValue,
+  resumeSession,
   type SessionResponse,
   type SessionStatus
 } from "@/lib/api";
@@ -165,6 +168,8 @@ export default function SessionProcessingPage({
   const [isStopOpen, setIsStopOpen] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [stopError, setStopError] = useState("");
+  const [isResuming, setIsResuming] = useState(false);
+  const [resumeError, setResumeError] = useState("");
   const dataRef = useRef<SessionResponse | null>(null);
   const failedPollsRef = useRef(0);
 
@@ -396,6 +401,31 @@ export default function SessionProcessingPage({
     }
   }
 
+  async function handleResume() {
+    if (isResuming) {
+      return;
+    }
+
+    setIsResuming(true);
+    setResumeError("");
+
+    try {
+      await resumeSession(params.id);
+      // Stay on the processing screen; the poll picks up the PROCESSING status
+      // and the new "Resuming…" state below.
+      const nextData = await getSession(params.id);
+
+      setData(nextData);
+      dataRef.current = nextData;
+    } catch (resumeException) {
+      setResumeError(
+        friendlyApiErrorMessage(resumeException, "Unable to resume the session.")
+      );
+    } finally {
+      setIsResuming(false);
+    }
+  }
+
   return (
     <main className="min-h-[calc(100vh-56px)] bg-slate-50">
       <section className="mx-auto flex w-full max-w-6xl flex-col px-4 py-8 sm:px-6 lg:px-8">
@@ -415,6 +445,13 @@ export default function SessionProcessingPage({
                   </CardDescription>
                 </div>
                 <div className="flex flex-wrap items-center gap-3">
+                  {isLiveStatus && numberValue(data?.session.resume_count) > 0 ? (
+                    <div className="flex items-center gap-2 rounded-full bg-amber-50 px-3 py-1.5 text-sm font-medium text-amber-700">
+                      <RefreshCw className="h-4 w-4" />
+                      Resuming — {fileProgress.pendingFiles} file
+                      {fileProgress.pendingFiles === 1 ? "" : "s"} remaining
+                    </div>
+                  ) : null}
                   {isLiveStatus ? (
                     <div className="flex items-center gap-2 rounded-full bg-indigo-50 px-3 py-1.5 text-sm font-medium text-indigo-700">
                       <Loader2 className="h-4 w-4 animate-spin" />
@@ -734,11 +771,50 @@ export default function SessionProcessingPage({
 
               {isFailedStatus(status) ? (
                 <div
-                  className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+                  className="flex flex-col gap-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-3 text-sm text-destructive"
                   role="alert"
                 >
-                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                  <span>Session ended with status {status}.</span>
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>Session ended with status {status}.</span>
+                  </div>
+                  {status === "FAILED" ? (
+                    <>
+                      <p className="text-xs text-destructive/90">
+                        {fileProgress.completedFiles} of {fileProgress.totalFiles}{" "}
+                        files completed before the error. Resume to re-queue only
+                        the work that didn&apos;t finish.
+                      </p>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          className="bg-indigo-600 text-white hover:bg-indigo-700"
+                          disabled={isResuming}
+                          onClick={() => void handleResume()}
+                        >
+                          {isResuming ? (
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          ) : (
+                            <RefreshCw className="mr-2 h-4 w-4" />
+                          )}
+                          {isResuming ? "Resuming…" : "Resume processing"}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => router.push("/")}
+                        >
+                          <RotateCcw className="mr-2 h-4 w-4" />
+                          Start over
+                        </Button>
+                      </div>
+                      {resumeError ? (
+                        <span className="text-xs text-red-600">{resumeError}</span>
+                      ) : null}
+                    </>
+                  ) : null}
                 </div>
               ) : null}
 

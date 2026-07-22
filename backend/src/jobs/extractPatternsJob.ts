@@ -1107,6 +1107,31 @@ async function loadExtractableFiles(
   }));
 }
 
+// Mark every parsed, non-index, extractable file as extract-complete. The
+// predicate mirrors loadExtractableFiles (parsed + not an index + either valid &
+// non-empty, or has partial URLs) so resume knows exactly which files still owe
+// extraction work.
+async function markExtractedFilesDone(sessionId: string) {
+  await pool.query(
+    `
+      UPDATE sitemap_files
+      SET extract_status = 'done'
+      WHERE session_id = $1
+        AND parsed_at IS NOT NULL
+        AND is_index = FALSE
+        AND (
+          (is_valid = TRUE AND is_empty = FALSE)
+          OR EXISTS (
+            SELECT 1
+            FROM sitemap_partial_urls
+            WHERE sitemap_partial_urls.sitemap_file_id = sitemap_files.id
+          )
+        )
+    `,
+    [sessionId]
+  );
+}
+
 async function updateMissingContentFlags(sessionId: string) {
   await pool.query(
     `
@@ -1218,6 +1243,11 @@ export async function processExtractPatternsJob(
 
     await updateMissingContentFlags(data.session_id);
 
+    // Checkpoint: mark every file that just went through pattern extraction as
+    // extract-complete. Uses the same predicate as loadExtractableFiles so the
+    // resume endpoint can tell which files still need extracting. (v1.36 Fix 2)
+    await markExtractedFilesDone(data.session_id);
+
     const hasPendingFiles = await hasPendingSitemapFiles(data.session_id);
 
     if (!hasPendingFiles) {
@@ -1238,9 +1268,12 @@ export async function processExtractPatternsJob(
       "extract patterns job completed"
     );
   } catch (error) {
-    await pool.query("UPDATE sessions SET status = 'FAILED' WHERE id = $1", [
-      data.session_id
-    ]);
+    // Record the failure so the results/processing screens can offer a Resume
+    // that picks up from the incomplete extract phase. (v1.36 Fix 2)
+    await pool.query(
+      "UPDATE sessions SET status = 'FAILED', last_failed_at = now() WHERE id = $1",
+      [data.session_id]
+    );
     throw error;
   }
 }
