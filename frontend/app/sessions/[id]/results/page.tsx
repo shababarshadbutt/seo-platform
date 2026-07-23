@@ -366,6 +366,24 @@ function sampleTone(sample: SampledUrl) {
   };
 }
 
+// Convert a pattern template's {param} placeholders to positional {A}, {B},
+// {C}… names for the Update Pattern modal's structure fields, so the SEO team
+// doesn't have to retype a structure that's already on screen. Every static
+// segment and the trailing slash are preserved untouched. (v1.40)
+//   /manufacturer/{param}/{param}/       -> /manufacturer/{A}/{B}/
+//   /rfq/{param}/{param}/{param}/{param}/ -> /rfq/{A}/{B}/{C}/{D}/
+function convertParamToABC(template: string): string {
+  let index = 0;
+
+  return template.replace(/\{param\}/g, () => {
+    const letter = String.fromCharCode(65 + index);
+
+    index += 1;
+
+    return `{${letter}}`;
+  });
+}
+
 function staticSegmentsForTemplate(template: string) {
   return new Set(
     template
@@ -1385,8 +1403,15 @@ export default function ResultsDashboardPage({
     setFindReplaceToast(null);
     setRenameRow(rowData);
     setRenameValue(rowData.template);
-    setTransformCurrentStructure("");
-    setTransformNewStructure("");
+    // Pre-populate the URL-structure fields from the pattern that's already on
+    // screen, with {param} → {A}, {B}, {C}… so the user edits from a starting
+    // point instead of retyping. "New pattern name" keeps the raw {param}
+    // template. Both fields stay fully editable; clearing them falls back to a
+    // label-only rename (wantsTransform === false). (v1.40)
+    const convertedStructure = convertParamToABC(rowData.template);
+
+    setTransformCurrentStructure(convertedStructure);
+    setTransformNewStructure(convertedStructure);
     setTransformStep("form");
     setRenameSourceFiles([]);
     setSelectedRenameFiles(new Set());
@@ -3111,6 +3136,22 @@ export default function ResultsDashboardPage({
               <SheetDescription className="text-slate-300">
                 Sampled URLs checked for this pattern.
               </SheetDescription>
+              {selectedRow ? (
+                <button
+                  type="button"
+                  aria-label={`Edit pattern ${selectedRow.template}`}
+                  onClick={() => {
+                    const row = selectedRow;
+
+                    setIsSheetOpen(false);
+                    void openRenameModal(row);
+                  }}
+                  className="mt-3 inline-flex w-fit items-center gap-1.5 rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700"
+                >
+                  <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
+                  Edit pattern
+                </button>
+              ) : null}
             </SheetHeader>
             <div className="flex-1 overflow-y-auto bg-slate-50 px-6 py-5">
               {redirectSamples.length > 0 ? (
