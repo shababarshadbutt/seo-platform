@@ -384,6 +384,94 @@ function convertParamToABC(template: string): string {
   });
 }
 
+// Which {param} position (0 = A, 1 = B, …) holds the suspicious segment, found
+// by scanning sampled URLs' values at each param slot. Returns null when no
+// sampled value contains it (e.g. it's a static segment, not inside a param) —
+// the caller then falls back to the first placeholder. (v1.41 Feature 1)
+function findSuspiciousPosition(
+  template: string,
+  suspiciousSegment: string,
+  sampledUrls: string[]
+): number | null {
+  const templateSegments = template.split("/").filter(Boolean);
+  const paramPositions = templateSegments
+    .map((segment, index) => (segment === "{param}" ? index : -1))
+    .filter((index) => index !== -1);
+
+  for (const url of sampledUrls) {
+    let urlSegments: string[];
+
+    try {
+      urlSegments = new URL(url).pathname.split("/").filter(Boolean);
+    } catch {
+      continue;
+    }
+
+    for (let i = 0; i < paramPositions.length; i += 1) {
+      const value = urlSegments[paramPositions[i]] ?? "";
+
+      if (value.includes(suspiciousSegment)) {
+        return i;
+      }
+    }
+  }
+
+  return null;
+}
+
+// Place a strip expression on the placeholder at `suspiciousPosition`, e.g.
+// ("/manufacturer/{A}/{B}/", "parts-catalog", 0) -> "/manufacturer/{A|-parts-catalog|}/{B}/".
+// (v1.41 Feature 1)
+function buildNewUrlStructure(
+  convertedTemplate: string,
+  suspiciousSegment: string,
+  suspiciousPosition: number
+): string {
+  const letter = String.fromCharCode(65 + suspiciousPosition);
+
+  return convertedTemplate.replace(
+    `{${letter}}`,
+    `{${letter}|-${suspiciousSegment}|}`
+  );
+}
+
+// Infer a pattern template from a set of URLs: segments that are identical
+// across all URLs stay static, segments that vary become {param}. Used to
+// pre-fill the new name from redirect destinations. (v1.41 Feature 2)
+//   [".../product/", ".../product/"]                 -> "/product/"
+//   [".../manufacturer/acme/", ".../manufacturer/bosch/"] -> "/manufacturer/{param}/"
+function extractPatternFromUrls(urls: string[]): string | null {
+  if (urls.length === 0) {
+    return null;
+  }
+
+  const segmentArrays = urls.map((url) => {
+    try {
+      return new URL(url).pathname.split("/").filter(Boolean);
+    } catch {
+      return url.split("/").filter(Boolean);
+    }
+  });
+  const maxLen = Math.max(...segmentArrays.map((segments) => segments.length));
+
+  if (maxLen === 0) {
+    return "/";
+  }
+
+  const patternSegments: string[] = [];
+
+  for (let i = 0; i < maxLen; i += 1) {
+    const values = segmentArrays
+      .map((segments) => segments[i])
+      .filter((value): value is string => Boolean(value));
+    const allSame = values.every((value) => value === values[0]);
+
+    patternSegments.push(allSame ? values[0] : "{param}");
+  }
+
+  return `/${patternSegments.join("/")}/`;
+}
+
 function staticSegmentsForTemplate(template: string) {
   return new Set(
     template
@@ -670,6 +758,12 @@ export default function ResultsDashboardPage({
   } | null>(null);
   const [renameRow, setRenameRow] = useState<PatternRow | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  // Helper-note state for the Update Pattern modal's auto pre-population (v1.41).
+  // renameStripNote: the "-artifact appears in segment X" note under New URL
+  // structure; renameRedirectNote: the redirect-destination note under New
+  // pattern name.
+  const [renameStripNote, setRenameStripNote] = useState<string | null>(null);
+  const [renameRedirectNote, setRenameRedirectNote] = useState(false);
   const [renameSourceFiles, setRenameSourceFiles] = useState<
     PatternSourceFile[]
   >([]);
@@ -1399,19 +1493,83 @@ export default function ResultsDashboardPage({
     }
   }
 
-  async function openRenameModal(rowData: PatternRow) {
+  async function openRenameModal(
+    rowData: PatternRow,
+    options: { fromDrawer?: boolean } = {}
+  ) {
     setFindReplaceToast(null);
     setRenameRow(rowData);
-    setRenameValue(rowData.template);
+
     // Pre-populate the URL-structure fields from the pattern that's already on
     // screen, with {param} → {A}, {B}, {C}… so the user edits from a starting
-    // point instead of retyping. "New pattern name" keeps the raw {param}
-    // template. Both fields stay fully editable; clearing them falls back to a
-    // label-only rename (wantsTransform === false). (v1.40)
+    // point instead of retyping. Both fields stay fully editable; clearing them
+    // falls back to a label-only rename (wantsTransform === false). (v1.40)
     const convertedStructure = convertParamToABC(rowData.template);
+    const samples = samplesByPattern[rowData.id] ?? [];
 
     setTransformCurrentStructure(convertedStructure);
-    setTransformNewStructure(convertedStructure);
+
+    // Feature 1 (v1.41): if the pattern has a suspicious segment, auto-place a
+    // strip expression on the placeholder whose sampled values contain it, so
+    // the New URL structure is a ready-to-apply transform rather than a copy of
+    // the current one. Falls back to the first placeholder when the position
+    // can't be pinpointed; both cases surface a "edit if incorrect" note.
+    const suspicious = rowData.suspiciousSegmentValue;
+    let newStructure = convertedStructure;
+    let stripNote: string | null = null;
+
+    if (suspicious) {
+      const detectedPosition = findSuspiciousPosition(
+        rowData.template,
+        suspicious,
+        samples.map((sample) => sample.url)
+      );
+      const position = detectedPosition ?? 0;
+      const letter = String.fromCharCode(65 + position);
+
+      newStructure = buildNewUrlStructure(
+        convertedStructure,
+        suspicious,
+        position
+      );
+      stripNote =
+        detectedPosition === null
+          ? `Auto-added a strip for "-${suspicious}" on segment ${letter} — couldn't pinpoint the segment, so edit if this is incorrect.`
+          : `Auto-detected: "-${suspicious}" appears in segment ${letter}. Edit if this is incorrect.`;
+    }
+
+    setTransformNewStructure(newStructure);
+    setRenameStripNote(stripNote);
+
+    // Feature 2 (v1.41): when opened from the drawer and 80%+ of sampled URLs
+    // redirect to a single destination pattern, pre-fill the new name with that
+    // destination instead of the current template. Table-opened modals keep the
+    // current template.
+    let nameValue = rowData.template;
+    let redirectNote = false;
+
+    if (options.fromDrawer && samples.length > 0) {
+      const destinations = samples
+        .filter(
+          (sample) =>
+            effectiveSampleCategory(sample) === "redirect" &&
+            Boolean(sample.final_url) &&
+            sample.url !== sample.final_url
+        )
+        .map((sample) => sample.final_url as string);
+
+      if (destinations.length / samples.length >= 0.8) {
+        const detected = extractPatternFromUrls(destinations);
+
+        if (detected) {
+          nameValue = detected;
+          redirectNote = true;
+        }
+      }
+    }
+
+    setRenameValue(nameValue);
+    setRenameRedirectNote(redirectNote);
     setTransformStep("form");
     setRenameSourceFiles([]);
     setSelectedRenameFiles(new Set());
@@ -3144,7 +3302,7 @@ export default function ResultsDashboardPage({
                     const row = selectedRow;
 
                     setIsSheetOpen(false);
-                    void openRenameModal(row);
+                    void openRenameModal(row, { fromDrawer: true });
                   }}
                   className="mt-3 inline-flex w-fit items-center gap-1.5 rounded-md border border-slate-600 bg-slate-800 px-2.5 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700"
                 >
@@ -3580,6 +3738,12 @@ export default function ResultsDashboardPage({
                       URL structure transformation below
                     </p>
                   ) : null}
+                  {renameRedirectNote ? (
+                    <p className="text-xs text-indigo-700">
+                      ℹ️ Auto-detected from redirect destinations. Edit if
+                      incorrect.
+                    </p>
+                  ) : null}
                 </div>
 
                 <div className="space-y-3 rounded-md border border-dashed border-slate-300 p-3">
@@ -3622,6 +3786,11 @@ export default function ResultsDashboardPage({
                       className="font-mono text-sm"
                       aria-invalid={Boolean(transformError)}
                     />
+                    {renameStripNote ? (
+                      <p className="text-xs text-indigo-700">
+                        ℹ️ {renameStripNote}
+                      </p>
+                    ) : null}
                   </div>
                   <p className="text-xs text-slate-500">
                     Use {"{A}"}, {"{B}"}, {"{C}"}… to name each segment. You can
