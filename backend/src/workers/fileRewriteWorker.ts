@@ -1,4 +1,5 @@
 import {
+  buildLocMapRewriter,
   buildPatternTemplateRewriter,
   buildTrailingSlashRewriter,
   rewriteSitemapLocFile,
@@ -22,7 +23,10 @@ import {
 
 export type FileRewriteSpec =
   | { kind: "trailingSlash" }
-  | { kind: "patternTemplate"; from: string; to: string };
+  | { kind: "patternTemplate"; from: string; to: string }
+  // Exact whole-URL replacements (apply-redirects, v1.42). Passed as [old, new]
+  // pairs because a Map isn't structured-clone friendly across the thread edge.
+  | { kind: "locMap"; replacements: [string, string][] };
 
 export type FileRewriteInput = {
   inputPath: string;
@@ -36,6 +40,10 @@ export type FileRewriteResult = { rewrittenCount: number };
 function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
   if (spec.kind === "patternTemplate") {
     return buildPatternTemplateRewriter(spec.from, spec.to);
+  }
+
+  if (spec.kind === "locMap") {
+    return buildLocMapRewriter(new Map(spec.replacements));
   }
 
   return buildTrailingSlashRewriter();

@@ -3,6 +3,11 @@ import { unlink } from "node:fs/promises";
 import { pool } from "../db/pool.js";
 import { enqueuePreGenerateZipJob } from "../queue/preGenerateZipQueue.js";
 
+// Re-export the pure freshness decision (defined side-effect-free so it can be
+// unit-tested without opening a DB pool / Redis connection). Shared by the
+// download endpoint and the pre-gen skip-if-fresh guard so they can't disagree.
+export { isZipCacheFresh } from "./zipCacheFreshness.js";
+
 // Clear a session's pre-generated download ZIPs and re-enqueue their generation.
 // Call after ANY operation that mutates the session's sitemap files (bulk
 // replace, pattern rename/transform, apply-redirects, trailing-slash fix, URL
@@ -28,8 +33,12 @@ export async function invalidateSessionZipCache(sessionId: string) {
       }
     }
 
+    // Stamp files_mutated_at so a pre-gen build already in flight can detect it
+    // raced this mutation (and rebuild), and the download endpoint won't serve a
+    // cache older than this. This is the single choke point every file-mutation
+    // path already funnels through, so it is the one place to record the edit.
     await pool.query(
-      "UPDATE sessions SET zip_all_path = NULL, zip_edited_path = NULL, zip_generated_at = NULL, zip_progress = 0, zip_progress_file = 0 WHERE id = $1",
+      "UPDATE sessions SET zip_all_path = NULL, zip_edited_path = NULL, zip_generated_at = NULL, zip_progress = 0, zip_progress_file = 0, files_mutated_at = now() WHERE id = $1",
       [sessionId]
     );
 

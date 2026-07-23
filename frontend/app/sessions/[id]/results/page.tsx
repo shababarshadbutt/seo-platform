@@ -48,6 +48,8 @@ import {
 
 import {
   applyPatternRedirects,
+  getRedirectCandidates,
+  deleteRedirectUrls,
   chooseDownloadFolder,
   downloadCorrectedSitemap,
   downloadSessionExport,
@@ -82,6 +84,7 @@ import {
   type MismatchedUrl,
   type Pattern,
   type PatternSourceFile,
+  type RedirectCandidate,
   type SampledUrl,
   type SessionResponse
 } from "@/lib/api";
@@ -177,6 +180,25 @@ type PatternRow = {
 };
 
 type SamplesByPattern = Record<string, SampledUrl[]>;
+
+// Rows per page in the Fix Redirect URLs modal — caps the DOM so a pattern with
+// thousands of URLs never freezes the tab. (v1.42)
+const FIX_MODAL_PAGE_SIZE = 200;
+
+type FixAction = "fix" | "delete" | "skip";
+
+// Default per-row action in the Fix Redirect URLs modal (v1.42.1):
+//   • inferred (unsampled) → Skip — its destination is a guess AND it can't be
+//     deleted anyway, so it's excluded from both actions until reviewed;
+//   • verified + not-found destination → Delete;
+//   • verified + normal → Fix.
+function defaultFixAction(candidate: RedirectCandidate): FixAction {
+  if (!candidate.is_sampled) {
+    return "skip";
+  }
+
+  return candidate.destination_not_found ? "delete" : "fix";
+}
 
 const statusColors: Record<PatternStatus, string> = {
   GOOD: "#10B981",
@@ -789,7 +811,22 @@ export default function ResultsDashboardPage({
   const [isApplyingRedirects, setIsApplyingRedirects] = useState(false);
   const [usingRedirectId, setUsingRedirectId] = useState<string | null>(null);
   const [fixRow, setFixRow] = useState<PatternRow | null>(null);
-  const [selectedFixIds, setSelectedFixIds] = useState<Set<string>>(new Set());
+  // Fix Redirect URLs modal now lists EVERY URL in the pattern (v1.42), fetched
+  // on open — the HTTP-verified sampled redirects plus inferred ones. Selection
+  // is keyed by candidate.key (sampled_url_id for verified rows, "inferred:<url>"
+  // for the rest).
+  const [fixCandidates, setFixCandidates] = useState<RedirectCandidate[]>([]);
+  const [fixLoading, setFixLoading] = useState(false);
+  const [fixInferredWithoutRule, setFixInferredWithoutRule] = useState(false);
+  // Per-row action (v1.42.1): "fix" (adopt the redirect destination), "delete"
+  // (remove the source URL — for not-found destinations), or "skip" (leave it
+  // untouched — the inferred-row default). Keyed by candidate.key.
+  const [fixActions, setFixActions] = useState<Record<string, FixAction>>({});
+  const [isDeletingRedirects, setIsDeletingRedirects] = useState(false);
+  // Paginate the candidate list so a pattern with thousands of URLs never
+  // renders thousands of checkbox rows at once (would hang the tab). Selection
+  // is keyed, so it survives paging; "Select all" still spans every page.
+  const [fixPage, setFixPage] = useState(0);
   const [isFixing, setIsFixing] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkMode, setBulkMode] = useState<"apply" | "undo">("apply");
@@ -1794,10 +1831,11 @@ export default function ResultsDashboardPage({
 
       // Full reload so the pattern row's recomputed redirect/confidence show too.
       await loadResults({ silent: true });
+      const updatedCount = result.updated ?? 0;
       setFindReplaceToast({
         tone: "success",
-        message: `${formatNumber(result.updated)} URL${
-          result.updated === 1 ? "" : "s"
+        message: `${formatNumber(updatedCount)} URL${
+          updatedCount === 1 ? "" : "s"
         } updated to their redirect destinations`
       });
     } catch (nextError) {
@@ -1860,62 +1898,93 @@ export default function ResultsDashboardPage({
     ? ["PENDING", "RUNNING", "UNDOING"].includes(bulkStatus.status)
     : false;
 
-  const fixRedirectSamples = fixRow
-    ? (samplesByPattern[fixRow.id] ?? []).filter(
-        (sample) =>
-          effectiveSampleCategory(sample) === "redirect" &&
-          Boolean(sample.final_url) &&
-          sample.url !== sample.final_url
-      )
-    : [];
-
-  // Default every redirect row to selected whenever the Fix modal opens.
+  // Fetch every redirect candidate for the pattern when the Fix modal opens.
+  // Only the HTTP-verified (sampled) rows are pre-selected; inferred rows start
+  // unchecked so a user opts into them deliberately (per-row or "Select all").
+  // (v1.42)
+  const fixPatternId = fixRow?.id ?? null;
   useEffect(() => {
-    if (!fixRow) {
+    if (!fixPatternId) {
       return;
     }
 
-    setSelectedFixIds(
-      new Set(
-        (samplesByPattern[fixRow.id] ?? [])
-          .filter(
-            (sample) =>
-              effectiveSampleCategory(sample) === "redirect" &&
-              Boolean(sample.final_url) &&
-              sample.url !== sample.final_url
+    let cancelled = false;
+
+    setFixLoading(true);
+    setFixCandidates([]);
+    setFixActions({});
+    setFixInferredWithoutRule(false);
+    setFixPage(0);
+
+    void getRedirectCandidates(params.id, fixPatternId)
+      .then((data) => {
+        if (cancelled) {
+          return;
+        }
+
+        setFixCandidates(data.candidates);
+        // Default action per row (see defaultFixAction): verified-normal → Fix,
+        // verified-not-found → Delete, inferred → Skip (excluded from both
+        // actions until someone reviews it). (v1.42.1)
+        setFixActions(
+          Object.fromEntries(
+            data.candidates.map((candidate) => [
+              candidate.key,
+              defaultFixAction(candidate)
+            ])
           )
-          .map((sample) => sample.id)
-      )
-    );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fixRow]);
+        );
+        // The pattern has unsampled URLs but the samples were too varied to
+        // distil a single rule, so only the verified rows can be listed.
+        setFixInferredWithoutRule(
+          data.rule === null &&
+            data.pattern_total_urls > data.sampled_redirect_count
+        );
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setFixCandidates([]);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setFixLoading(false);
+        }
+      });
 
-  function toggleFixId(sampleId: string) {
-    setSelectedFixIds((current) => {
-      const next = new Set(current);
+    return () => {
+      cancelled = true;
+    };
+  }, [params.id, fixPatternId]);
 
-      if (next.has(sampleId)) {
-        next.delete(sampleId);
-      } else {
-        next.add(sampleId);
-      }
-
-      return next;
-    });
+  function setFixAction(key: string, action: FixAction) {
+    setFixActions((current) => ({ ...current, [key]: action }));
   }
 
-  function toggleAllFix() {
-    setSelectedFixIds((current) =>
-      current.size === fixRedirectSamples.length
-        ? new Set()
-        : new Set(fixRedirectSamples.map((sample) => sample.id))
+  // Top-level default: reset every row to Fix (per-row toggles stay overridable).
+  function setAllFix() {
+    setFixActions(
+      Object.fromEntries(fixCandidates.map((candidate) => [candidate.key, "fix"]))
     );
   }
 
   async function handleAcceptFixes() {
-    if (!fixRow || selectedFixIds.size === 0 || isFixing) {
+    if (!fixRow || fixCount === 0 || isFixing || isDeletingRedirects) {
       return;
     }
+
+    // Only the rows toggled Fix. Split into HTTP-verified sampled rows (applied
+    // by their confirmed destination) and inferred rows (server recomputes rule).
+    const selected = fixCandidates.filter(
+      (candidate) =>
+        (fixActions[candidate.key] ?? defaultFixAction(candidate)) === "fix"
+    );
+    const sampledIds = selected
+      .filter((candidate) => candidate.is_sampled && candidate.sampled_url_id)
+      .map((candidate) => candidate.sampled_url_id as string);
+    const inferredUrls = selected
+      .filter((candidate) => !candidate.is_sampled)
+      .map((candidate) => candidate.url);
 
     setIsFixing(true);
 
@@ -1923,16 +1992,37 @@ export default function ResultsDashboardPage({
       const result = await applyPatternRedirects(
         params.id,
         fixRow.id,
-        Array.from(selectedFixIds)
+        sampledIds,
+        inferredUrls
       );
 
-      await loadResults({ silent: true });
       setFixRow(null);
+
+      if (result.queued) {
+        // Large whole-pattern fix routed to a background job — no synchronous
+        // result. Tell the user and refresh shortly so the recomputed pattern
+        // + rewritten files show once the worker finishes.
+        setFindReplaceToast({
+          tone: "success",
+          message: `Applying redirect fixes across ${formatNumber(
+            result.files_total ?? 0
+          )} files in the background — results will update shortly.`
+        });
+        window.setTimeout(() => void loadResults({ silent: true }), 6000);
+        return;
+      }
+
+      await loadResults({ silent: true });
+      const changed = (result.updated ?? 0) + (result.inferred_applied ?? 0);
       setFindReplaceToast({
         tone: "success",
-        message: `${formatNumber(result.updated)} URL${
-          result.updated === 1 ? "" : "s"
-        } updated to their redirect destinations`
+        message: `${formatNumber(changed)} URL${
+          changed === 1 ? "" : "s"
+        } updated to their redirect destinations${
+          result.inferred_applied
+            ? ` (${formatNumber(result.inferred_applied)} inferred)`
+            : ""
+        }`
       });
     } catch (nextError) {
       setFindReplaceToast({
@@ -1947,9 +2037,62 @@ export default function ResultsDashboardPage({
     }
   }
 
-  const fixAllSelected =
-    fixRedirectSamples.length > 0 &&
-    selectedFixIds.size === fixRedirectSamples.length;
+  // Delete the source URLs of the rows toggled Delete (all verified/sampled —
+  // Delete is disabled for inferred rows). Reuses the Delete Problem URLs job,
+  // so it runs in the background; we toast + refresh shortly. (v1.42.1)
+  async function handleDeleteRedirects() {
+    if (!fixRow || deleteCount === 0 || isFixing || isDeletingRedirects) {
+      return;
+    }
+
+    const urls = fixCandidates
+      .filter(
+        (candidate) =>
+          (fixActions[candidate.key] ?? defaultFixAction(candidate)) === "delete"
+      )
+      .map((candidate) => candidate.url);
+
+    setIsDeletingRedirects(true);
+
+    try {
+      await deleteRedirectUrls(params.id, fixRow.id, urls);
+      setFixRow(null);
+      setFindReplaceToast({
+        tone: "success",
+        message: `Removing ${formatNumber(urls.length)} URL${
+          urls.length === 1 ? "" : "s"
+        } from the sitemap in the background — results will update shortly.`
+      });
+      window.setTimeout(() => void refreshAfterMaintenance(), 6000);
+    } catch (nextError) {
+      setFindReplaceToast({
+        tone: "error",
+        message: friendlyApiErrorMessage(nextError, "Unable to delete URLs.")
+      });
+    } finally {
+      setIsDeletingRedirects(false);
+    }
+  }
+
+  const fixActionFor = (candidate: RedirectCandidate): FixAction =>
+    fixActions[candidate.key] ?? defaultFixAction(candidate);
+  const fixCount = fixCandidates.filter(
+    (candidate) => fixActionFor(candidate) === "fix"
+  ).length;
+  const deleteCount = fixCandidates.filter(
+    (candidate) => fixActionFor(candidate) === "delete"
+  ).length;
+  const skipCount = fixCandidates.length - fixCount - deleteCount;
+  const fixPageCount = Math.max(
+    1,
+    Math.ceil(fixCandidates.length / FIX_MODAL_PAGE_SIZE)
+  );
+  const fixPageSafe = Math.min(fixPage, fixPageCount - 1);
+  const fixPageStart = fixPageSafe * FIX_MODAL_PAGE_SIZE;
+  const pagedFixCandidates = fixCandidates.slice(
+    fixPageStart,
+    fixPageStart + FIX_MODAL_PAGE_SIZE
+  );
 
   const renameSelectedOccurrences = renameSourceFiles
     .filter((file) => selectedRenameFiles.has(file.source_file))
@@ -3576,91 +3719,231 @@ export default function ResultsDashboardPage({
             }
           }}
         >
-          <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
-            <DialogHeader>
+          <DialogContent className="max-h-[85vh] min-w-0 overflow-y-auto sm:max-w-2xl">
+            <DialogHeader className="min-w-0">
               <DialogTitle>Fix Redirect URLs</DialogTitle>
               <DialogDescription>
                 These URLs are redirecting to a different address. Accept the
                 changes to update them to their final destinations.
               </DialogDescription>
             </DialogHeader>
-            <div className="space-y-4">
+            {/* min-w-0: DialogContent is a CSS grid, and a grid item's default
+                min-width:auto lets long <loc> URLs force the column wider than
+                the dialog (clipping the footer). min-w-0 here + truncation on
+                the URL rows keeps everything within the dialog width. */}
+            <div className="min-w-0 space-y-4">
               <div className="space-y-1">
                 <p className="text-sm font-semibold text-slate-700">Pattern</p>
                 <p className="break-all rounded-md border border-slate-200 bg-slate-100 px-3 py-2 font-mono text-sm text-slate-500">
                   {fixRow?.template}
                 </p>
               </div>
+              <p className="text-xs text-slate-500">
+                Sampled URLs were HTTP-checked and confirmed redirecting; the
+                rest match this pattern and get the same confirmed rewrite
+                applied by inference (not individually verified).
+              </p>
+              {fixInferredWithoutRule ? (
+                <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  Only the sampled URLs are listed — the confirmed redirects were
+                  too varied to infer a single rewrite rule for the rest.
+                </p>
+              ) : null}
               <div className="rounded-md border border-slate-200">
                 <div className="flex items-center justify-between border-b border-slate-200 px-3 py-2">
-                  <label className="flex items-center gap-2 text-sm font-semibold text-slate-700">
-                    <input
-                      type="checkbox"
-                      className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                      checked={fixAllSelected}
-                      onChange={toggleAllFix}
-                      disabled={fixRedirectSamples.length === 0}
-                    />
-                    Select all
-                  </label>
+                  <button
+                    type="button"
+                    className="text-sm font-semibold text-indigo-600 hover:text-indigo-700 disabled:opacity-40"
+                    onClick={setAllFix}
+                    disabled={fixCandidates.length === 0}
+                  >
+                    Set all to Fix
+                  </button>
                   <span className="text-xs text-slate-500">
-                    {fixRedirectSamples.length} redirect URL
-                    {fixRedirectSamples.length === 1 ? "" : "s"} found
+                    {fixCandidates.length} URL
+                    {fixCandidates.length === 1 ? "" : "s"}
                   </span>
                 </div>
                 <div className="max-h-[320px] overflow-y-auto">
-                  {fixRedirectSamples.length === 0 ? (
+                  {fixLoading ? (
+                    <div className="flex items-center justify-center gap-2 px-3 py-6 text-sm text-slate-500">
+                      <Loader2 className="h-4 w-4 animate-spin text-indigo-500" />
+                      Loading URLs…
+                    </div>
+                  ) : fixCandidates.length === 0 ? (
                     <p className="px-3 py-3 text-sm text-slate-500">
                       No redirect URLs remain for this pattern.
                     </p>
                   ) : (
                     <ul>
-                      {fixRedirectSamples.map((sample) => (
+                      {pagedFixCandidates.map((candidate) => (
                         <li
-                          key={sample.id}
-                          className="flex items-start gap-2 border-b border-slate-100 px-3 py-2 last:border-b-0"
+                          key={candidate.key}
+                          className="flex items-start gap-3 border-b border-slate-100 px-3 py-2 last:border-b-0"
                         >
-                          <input
-                            type="checkbox"
-                            className="mt-0.5 h-4 w-4 shrink-0 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                            checked={selectedFixIds.has(sample.id)}
-                            onChange={() => toggleFixId(sample.id)}
-                          />
                           <div className="min-w-0 flex-1 space-y-1">
-                            <div className="flex items-center gap-2">
+                            <div className="flex min-w-0 items-center gap-2">
                               <span aria-hidden="true">❌</span>
                               <span
-                                className="truncate font-mono text-xs text-slate-700"
-                                title={sample.url}
+                                className="min-w-0 flex-1 truncate font-mono text-xs text-slate-700"
+                                title={candidate.url}
                               >
-                                {sample.url}
+                                {candidate.url}
                               </span>
-                              <Badge variant="warning" className="shrink-0">
-                                {numberValue(sample.http_status)}
-                              </Badge>
+                              {candidate.destination_not_found ? (
+                                <Badge
+                                  variant="destructive"
+                                  className="shrink-0 gap-1"
+                                  title="The redirect destination looks like a not-found page — remove the source URL instead of adopting it."
+                                >
+                                  <span aria-hidden="true">⚠️</span>
+                                  Not Found
+                                </Badge>
+                              ) : candidate.is_sampled ? (
+                                <>
+                                  {numberValue(candidate.http_status) ? (
+                                    <Badge
+                                      variant="warning"
+                                      className="shrink-0"
+                                    >
+                                      {numberValue(candidate.http_status)}
+                                    </Badge>
+                                  ) : null}
+                                  <Badge
+                                    variant="success"
+                                    className="shrink-0 gap-1"
+                                  >
+                                    <span aria-hidden="true">✓</span>
+                                    Verified
+                                  </Badge>
+                                </>
+                              ) : (
+                                <Badge
+                                  variant="secondary"
+                                  className="shrink-0"
+                                  title="Not individually HTTP-checked — inferred from the confirmed pattern rule"
+                                >
+                                  Unverified
+                                </Badge>
+                              )}
                             </div>
-                            <div className="flex items-center gap-2">
+                            <div className="flex min-w-0 items-center gap-2">
                               <span aria-hidden="true">✅</span>
                               <span
-                                className="truncate font-mono text-xs text-emerald-700"
-                                title={sample.final_url ?? ""}
+                                className="min-w-0 flex-1 truncate font-mono text-xs text-emerald-700"
+                                title={candidate.final_url}
                               >
-                                {sample.final_url}
+                                {candidate.final_url}
                               </span>
                             </div>
+                          </div>
+                          {/* Per-row Fix / Delete / Skip toggle. Delete is
+                              disabled for inferred rows — the deletion engine can
+                              only remove sampled URLs (see the footer note) — so
+                              inferred rows can only be Skip (default) or Fix. */}
+                          <div className="mt-0.5 flex shrink-0 overflow-hidden rounded-md border border-slate-300 text-xs font-semibold">
+                            <button
+                              type="button"
+                              className={cn(
+                                "px-2 py-1",
+                                fixActionFor(candidate) === "fix"
+                                  ? "bg-indigo-600 text-white"
+                                  : "bg-white text-slate-600 hover:bg-slate-50"
+                              )}
+                              onClick={() => setFixAction(candidate.key, "fix")}
+                            >
+                              Fix
+                            </button>
+                            <button
+                              type="button"
+                              disabled={!candidate.is_sampled}
+                              title={
+                                candidate.is_sampled
+                                  ? undefined
+                                  : "Only sampled URLs can be deleted from the sitemap"
+                              }
+                              className={cn(
+                                "border-l border-slate-300 px-2 py-1",
+                                fixActionFor(candidate) === "delete"
+                                  ? "bg-red-600 text-white"
+                                  : "bg-white text-slate-600 hover:bg-slate-50",
+                                !candidate.is_sampled &&
+                                  "cursor-not-allowed opacity-40 hover:bg-white"
+                              )}
+                              onClick={() =>
+                                candidate.is_sampled &&
+                                setFixAction(candidate.key, "delete")
+                              }
+                            >
+                              Delete
+                            </button>
+                            <button
+                              type="button"
+                              className={cn(
+                                "border-l border-slate-300 px-2 py-1",
+                                fixActionFor(candidate) === "skip"
+                                  ? "bg-slate-500 text-white"
+                                  : "bg-white text-slate-600 hover:bg-slate-50"
+                              )}
+                              onClick={() => setFixAction(candidate.key, "skip")}
+                            >
+                              Skip
+                            </button>
                           </div>
                         </li>
                       ))}
                     </ul>
                   )}
                 </div>
+                {!fixLoading && fixPageCount > 1 ? (
+                  <div className="flex items-center justify-between border-t border-slate-200 px-3 py-2 text-xs text-slate-500">
+                    <span>
+                      Showing {formatNumber(fixPageStart + 1)}–
+                      {formatNumber(
+                        Math.min(
+                          fixPageStart + FIX_MODAL_PAGE_SIZE,
+                          fixCandidates.length
+                        )
+                      )}{" "}
+                      of {formatNumber(fixCandidates.length)}
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        className="rounded border border-slate-300 px-2 py-0.5 disabled:opacity-40"
+                        disabled={fixPageSafe === 0}
+                        onClick={() => setFixPage((p) => Math.max(0, p - 1))}
+                      >
+                        Prev
+                      </button>
+                      <span className="px-1">
+                        {fixPageSafe + 1} / {fixPageCount}
+                      </span>
+                      <button
+                        type="button"
+                        className="rounded border border-slate-300 px-2 py-0.5 disabled:opacity-40"
+                        disabled={fixPageSafe >= fixPageCount - 1}
+                        onClick={() =>
+                          setFixPage((p) => Math.min(fixPageCount - 1, p + 1))
+                        }
+                      >
+                        Next
+                      </button>
+                    </span>
+                  </div>
+                ) : null}
               </div>
               <p className="rounded-md bg-indigo-50 px-3 py-2 text-sm font-medium text-indigo-800">
-                {selectedFixIds.size} of {fixRedirectSamples.length} selected
-                {"  •  "}Changing {selectedFixIds.size} URL
-                {selectedFixIds.size === 1 ? "" : "s"}
+                {formatNumber(fixCount)} to update, {formatNumber(deleteCount)}{" "}
+                to delete
+                {skipCount > 0 ? (
+                  <span className="font-normal text-indigo-500">
+                    {" "}
+                    · {formatNumber(skipCount)} skipped
+                  </span>
+                ) : null}
               </p>
-              <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+              <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
                 <Button
                   type="button"
                   variant="outline"
@@ -3670,8 +3953,24 @@ export default function ResultsDashboardPage({
                 </Button>
                 <Button
                   type="button"
+                  variant="outline"
+                  className="border-red-300 text-red-700 hover:bg-red-50 hover:text-red-800"
+                  disabled={deleteCount === 0 || isFixing || isDeletingRedirects}
+                  onClick={() => void handleDeleteRedirects()}
+                >
+                  {isDeletingRedirects ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Deleting
+                    </>
+                  ) : (
+                    `Delete Selected (${formatNumber(deleteCount)})`
+                  )}
+                </Button>
+                <Button
+                  type="button"
                   className="bg-amber-600 hover:bg-amber-700"
-                  disabled={selectedFixIds.size === 0 || isFixing}
+                  disabled={fixCount === 0 || isFixing || isDeletingRedirects}
                   onClick={() => void handleAcceptFixes()}
                 >
                   {isFixing ? (
@@ -3680,7 +3979,7 @@ export default function ResultsDashboardPage({
                       Applying
                     </>
                   ) : (
-                    "Accept Selected Changes"
+                    `Accept Selected Changes (${formatNumber(fixCount)})`
                   )}
                 </Button>
               </div>

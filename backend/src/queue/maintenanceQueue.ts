@@ -21,7 +21,12 @@ export type DeleteProblemUrlsJobData = {
   // Display filenames to delete problem URLs from (file-first modal).
   file_displays: string[];
   // Which confirmed HTTP statuses to delete (subset of 301/302/307/308/404).
+  // Ignored when `urls` is set.
   statuses: number[];
+  // Explicit source URLs to delete instead of a status filter — used by the Fix
+  // Redirect URLs modal's Delete action (v1.42.1). Reuses the same deletion
+  // pipeline; only URLs backed by a sampled_urls row are removable.
+  urls?: string[];
 };
 
 export type RestoreDeletedUrlsJobData = {

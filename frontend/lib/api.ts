@@ -821,22 +821,103 @@ export async function undoPatternTransform(
   }>(response);
 }
 
+// A single row in the Fix Redirect URLs modal (v1.42): every URL in the
+// pattern, not just the sampled subset. `is_sampled` rows were HTTP-verified
+// (their final_url is the observed destination); the rest are inferred by
+// applying the confirmed rule, so they carry no http_status.
+export type RedirectCandidate = {
+  key: string;
+  url: string;
+  final_url: string;
+  is_sampled: boolean;
+  sampled_url_id: string | null;
+  http_status: NumberLike;
+  // The destination itself looks like a not-found / soft-404 page (v1.42.1), so
+  // the source URL is a delete candidate rather than a rewrite one.
+  destination_not_found: boolean;
+};
+
+export type RedirectCandidatesResponse = {
+  rule: { find: string; replace: string } | null;
+  pattern_total_urls: number;
+  sampled_redirect_count: number;
+  inferred_count: number;
+  candidates: RedirectCandidate[];
+};
+
+export async function getRedirectCandidates(
+  sessionId: string,
+  patternId: string
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/redirect-candidates`
+    ),
+    { method: "GET" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<RedirectCandidatesResponse>(response);
+}
+
+// Delete the given source URLs from the sitemap (Fix Redirect URLs modal's
+// Delete action, v1.42.1). Reuses the Delete Problem URLs job/pipeline; returns
+// its maintenance job id. Only sampled/verified URLs are removable server-side.
+export async function deleteRedirectUrls(
+  sessionId: string,
+  patternId: string,
+  urls: string[]
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/delete-redirect-urls`
+    ),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ urls })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<{ job_row_id: string; status: string }>(response);
+}
+
 export async function applyPatternRedirects(
   sessionId: string,
   patternId: string,
-  urlIds?: string[]
+  urlIds?: string[],
+  inferredUrls?: string[]
 ) {
+  const body: { url_ids?: string[]; inferred_urls?: string[] } = {};
+
+  if (urlIds) {
+    body.url_ids = urlIds;
+  }
+
+  if (inferredUrls && inferredUrls.length > 0) {
+    body.inferred_urls = inferredUrls;
+  }
+
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/apply-redirects`),
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(urlIds ? { url_ids: urlIds } : {})
+      body: JSON.stringify(body)
     },
     EXPORT_API_TIMEOUT_MS
   );
 
-  return readJsonResponse<{ updated: number }>(response);
+  return readJsonResponse<{
+    updated?: number;
+    inferred_applied?: number;
+    rewritten_loc_count?: number;
+    // Set when a widened whole-pattern fix was too large to run inline and was
+    // routed to a background job instead. (v1.42)
+    queued?: boolean;
+    files_total?: number;
+  }>(response);
 }
 
 export type BulkReplaceFile = {

@@ -5,6 +5,7 @@ import { request } from "undici";
 
 import { pool } from "../db/pool.js";
 import { tlsAwareDispatcher } from "../http/tlsDispatcher.js";
+import { SOFT_404_TEXT_SIGNALS } from "../sitemaps/softNotFound.js";
 import { isSessionCancelled, markSessionComplete } from "./sessionCompletion.js";
 
 // Short, stable codes describing WHY a sample got no HTTP status, persisted on
@@ -51,15 +52,8 @@ export function classifyRequestError(error: unknown): SampleErrorReason {
 const HTTP_TIMEOUT_MS = 5000;
 const SOFT_404_BODY_SAMPLE_BYTES = 64 * 1024;
 const SOFT_404_SHORT_BODY_BYTES = 1000;
-const SOFT_404_TEXT_SIGNALS = [
-  "no entity selected",
-  "page not found",
-  "404",
-  "not found",
-  "no results",
-  "no data found",
-  "does not exist"
-];
+// SOFT_404_TEXT_SIGNALS lives in sitemaps/softNotFound.js so the Fix Redirect
+// URLs modal's destination check reuses the exact same vocabulary.
 
 type SessionRow = {
   id: string;

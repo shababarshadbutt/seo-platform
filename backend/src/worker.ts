@@ -24,10 +24,12 @@ import {
   type SitemapJobName
 } from "./queue/sitemapQueue.js";
 import {
+  APPLY_REDIRECTS_JOB,
   BULK_REPLACE_JOB,
   BULK_REPLACE_QUEUE_NAME,
   BULK_REPLACE_UNDO_JOB,
   closeBulkReplaceQueue,
+  type ApplyRedirectsJobData,
   type BulkReplaceJobData,
   type BulkReplaceUndoJobData,
   type BulkReplaceQueueData,
@@ -62,6 +64,7 @@ import {
   processBulkReplaceJob,
   processBulkReplaceUndoJob
 } from "./jobs/bulkReplaceJob.js";
+import { processApplyRedirectsJob } from "./jobs/applyRedirectsJob.js";
 import {
   processCleanupZipsJob,
   processPreGenerateZipJob
@@ -222,6 +225,14 @@ async function start() {
         if (job.name === BULK_REPLACE_UNDO_JOB) {
           await processBulkReplaceUndoJob(
             job.data as BulkReplaceUndoJobData,
+            app.log
+          );
+          return;
+        }
+
+        if (job.name === APPLY_REDIRECTS_JOB) {
+          await processApplyRedirectsJob(
+            job.data as ApplyRedirectsJobData,
             app.log
           );
           return;

@@ -1,0 +1,311 @@
+import { randomUUID } from "node:crypto";
+import { access, unlink } from "node:fs/promises";
+import path from "node:path";
+
+import type { FastifyBaseLogger } from "fastify";
+
+import { config } from "../config.js";
+import { pool } from "../db/pool.js";
+import { invalidateSessionZipCache } from "../exports/sessionZipCache.js";
+import {
+  buildRedirectFixedStoredFilename,
+  displaySourceFilename,
+  isHttpUrl
+} from "../sitemaps/filenames.js";
+import {
+  buildLocMapRewriter,
+  rewriteSitemapLocFile
+} from "../sitemaps/rewriteLocs.js";
+import {
+  applyRedirectRule,
+  deriveRedirectRule
+} from "../sitemaps/redirectRule.js";
+import { recomputePatternStatsSql } from "../sitemaps/redirectApply.js";
+import {
+  FILE_REWRITE_PARALLEL_THRESHOLD,
+  runFileRewriteJob
+} from "./fileRewritePool.js";
+import type { ApplyRedirectsJobData } from "../queue/bulkReplaceQueue.js";
+
+// Background "apply redirects" for a widened whole-pattern fix (v1.42). The
+// synchronous route handles small patterns inline; anything spanning more than
+// FILE_REWRITE_PARALLEL_THRESHOLD files is routed here so the (potentially
+// hundreds-of-files) rewrite never blocks the API event loop or trips the HTTP
+// timeout — the same failure mode that burned the ZIP path (v1.27) and the
+// Cleaner (v1.38). This mirrors processBulkReplaceJob: rewrites run in the
+// piscina fileRewritePool, every DB write stays on this thread, and the copy-
+// on-write file swap + fixed_file_path bookkeeping is identical to the inline
+// rewriteRedirectSourceFilesOnDisk (so the shared undo reverts either path).
+//
+// Server-authoritative by design: the client only says WHICH rows to change;
+// the rule and every inferred destination are recomputed here.
+
+type SitemapFileRow = {
+  id: string;
+  filename: string;
+  fixed_file_path: string | null;
+};
+
+export async function processApplyRedirectsJob(
+  data: ApplyRedirectsJobData,
+  logger: FastifyBaseLogger
+) {
+  const { session_id: sessionId, pattern_id: patternId } = data;
+  const urlIds = data.url_ids;
+  const inferredUrls = data.inferred_urls ?? [];
+
+  const patternResult = await pool.query<{ source_role: string }>(
+    "SELECT source_role FROM patterns WHERE id = $1",
+    [patternId]
+  );
+
+  if (patternResult.rowCount === 0) {
+    logger.warn(
+      { session_id: sessionId, pattern_id: patternId },
+      "apply-redirects job: pattern missing"
+    );
+    return;
+  }
+
+  const sourceRole = patternResult.rows[0].source_role;
+
+  // Derive the rule from the confirmed redirect samples BEFORE the UPDATE below
+  // flips the selected rows to 'success' (which would erase the evidence).
+  const ruleSamples = await pool.query<{ url: string; final_url: string }>(
+    `
+      SELECT url, final_url
+      FROM sampled_urls
+      WHERE pattern_id = $1
+        AND http_status_category = 'redirect'
+        AND final_url IS NOT NULL
+        AND final_url <> url
+    `,
+    [patternId]
+  );
+  const rule = deriveRedirectRule(
+    ruleSamples.rows.map((row) => ({ source: row.url, dest: row.final_url }))
+  );
+
+  // Adopt the confirmed sampled destinations + recompute stats (one txn), then
+  // build the replacement map (sampled confirmed pairs + inferred pairs).
+  const replacements = new Map<string, string>();
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const updateResult = await client.query<{
+      original_url: string;
+      url: string;
+    }>(
+      `
+        UPDATE sampled_urls
+        SET original_url = COALESCE(original_url, url),
+            original_http_status_category =
+              COALESCE(original_http_status_category, http_status_category),
+            original_is_hit = COALESCE(original_is_hit, is_hit),
+            url = final_url,
+            http_status_category = 'success',
+            is_hit = TRUE
+        WHERE pattern_id = $1
+          AND http_status_category = 'redirect'
+          AND final_url IS NOT NULL
+          AND final_url <> url
+          AND ($2::uuid[] IS NULL OR id = ANY($2::uuid[]))
+        RETURNING original_url, url
+      `,
+      [patternId, urlIds]
+    );
+
+    await client.query(recomputePatternStatsSql, [patternId]);
+    await client.query("COMMIT");
+
+    for (const row of updateResult.rows) {
+      if (row.original_url && row.original_url !== row.url) {
+        replacements.set(row.original_url, row.url);
+      }
+    }
+  } catch (error) {
+    await client.query("ROLLBACK");
+    client.release();
+    throw error;
+  }
+
+  client.release();
+
+  if (rule) {
+    for (const url of inferredUrls) {
+      const dest = applyRedirectRule(url, rule);
+
+      if (dest && dest !== url && !replacements.has(url)) {
+        replacements.set(url, dest);
+      }
+    }
+  }
+
+  if (replacements.size === 0) {
+    logger.info(
+      { session_id: sessionId, pattern_id: patternId },
+      "apply-redirects job: nothing to rewrite"
+    );
+    await invalidateSessionZipCache(sessionId);
+    return;
+  }
+
+  // Target files: those this pattern's URLs actually live in.
+  const occurrenceResult = await pool.query<{ source_file: string }>(
+    "SELECT DISTINCT source_file FROM pattern_file_occurrences WHERE pattern_id = $1",
+    [patternId]
+  );
+  const targetDisplays = new Set(
+    occurrenceResult.rows.map((row) => row.source_file)
+  );
+
+  const filesResult = await pool.query<SitemapFileRow>(
+    `
+      SELECT id, filename, fixed_file_path
+      FROM sitemap_files
+      WHERE session_id = $1 AND source_role = $2
+      ORDER BY filename ASC
+    `,
+    [sessionId, sourceRole]
+  );
+  const targets = filesResult.rows.filter((file) => {
+    if (isHttpUrl(file.filename)) {
+      return false;
+    }
+
+    // Empty occurrence set (older sessions) → scan every file of the role.
+    return (
+      targetDisplays.size === 0 ||
+      targetDisplays.has(displaySourceFilename(sessionId, file.filename))
+    );
+  });
+
+  const replacementPairs: [string, string][] = Array.from(
+    replacements.entries()
+  );
+  let rewrittenLocCount = 0;
+
+  // Swap in the rewritten copy for one file and preserve its pre-fix original
+  // for undo — main-thread DB writes only, even when rewrites ran in parallel.
+  const finalize = async (
+    file: SitemapFileRow,
+    inputPath: string,
+    newStored: string,
+    outputPath: string,
+    rewrittenCount: number
+  ) => {
+    if (rewrittenCount === 0) {
+      await unlink(outputPath).catch(() => {});
+      return;
+    }
+
+    const originalToKeep = file.fixed_file_path ?? file.filename;
+    const swapClient = await pool.connect();
+
+    try {
+      await swapClient.query("BEGIN");
+      await swapClient.query(
+        "UPDATE sitemap_files SET filename = $1, fixed_file_path = $2 WHERE id = $3",
+        [newStored, originalToKeep, file.id]
+      );
+      await swapClient.query("COMMIT");
+    } catch (error) {
+      await swapClient.query("ROLLBACK");
+      await unlink(outputPath).catch(() => {});
+      throw error;
+    } finally {
+      swapClient.release();
+    }
+
+    if (file.filename !== originalToKeep) {
+      await unlink(inputPath).catch(() => {});
+    }
+
+    rewrittenLocCount += rewrittenCount;
+  };
+
+  const processFile = async (
+    file: SitemapFileRow,
+    runRewrite: (input: {
+      inputPath: string;
+      outputPath: string;
+      isGzip: boolean;
+    }) => Promise<number>
+  ) => {
+    const inputPath = path.join(config.uploadDir, file.filename);
+
+    try {
+      await access(inputPath);
+    } catch {
+      return;
+    }
+
+    const isGzip = file.filename.toLowerCase().endsWith(".gz");
+    const displayName = displaySourceFilename(sessionId, file.filename);
+    const newStored = buildRedirectFixedStoredFilename(
+      sessionId,
+      displayName,
+      randomUUID()
+    );
+    const outputPath = path.join(config.uploadDir, newStored);
+
+    let rewrittenCount = 0;
+
+    try {
+      rewrittenCount = await runRewrite({ inputPath, outputPath, isGzip });
+    } catch (error) {
+      await unlink(outputPath).catch(() => {});
+      throw error;
+    }
+
+    await finalize(file, inputPath, newStored, outputPath, rewrittenCount);
+  };
+
+  logger.info(
+    {
+      session_id: sessionId,
+      pattern_id: patternId,
+      files: targets.length,
+      replacements: replacements.size,
+      parallel: targets.length >= FILE_REWRITE_PARALLEL_THRESHOLD
+    },
+    "apply-redirects job started"
+  );
+
+  if (targets.length >= FILE_REWRITE_PARALLEL_THRESHOLD) {
+    // Parallel: the pool caps concurrency at its thread count, so mapping every
+    // target is safe. Re-running a file is a no-op (its <loc> no longer matches
+    // the old URL), so a retry after a crash is harmless.
+    await Promise.all(
+      targets.map((file) =>
+        processFile(file, (input) =>
+          runFileRewriteJob({
+            ...input,
+            spec: { kind: "locMap", replacements: replacementPairs }
+          }).then((result) => result.rewrittenCount)
+        )
+      )
+    );
+  } else {
+    const rewriter = buildLocMapRewriter(replacements);
+
+    for (const file of targets) {
+      await processFile(file, (input) =>
+        rewriteSitemapLocFile({ ...input, rewriteUrl: rewriter })
+      );
+    }
+  }
+
+  await invalidateSessionZipCache(sessionId);
+
+  logger.info(
+    {
+      session_id: sessionId,
+      pattern_id: patternId,
+      rewritten_loc_count: rewrittenLocCount
+    },
+    "apply-redirects job complete"
+  );
+}

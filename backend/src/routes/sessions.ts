@@ -45,14 +45,15 @@ import {
   removeSessionJobs
 } from "../queue/sitemapQueue.js";
 import {
+  enqueueApplyRedirectsJob,
   enqueueBulkReplaceJob,
   enqueueBulkReplaceUndoJob
 } from "../queue/bulkReplaceQueue.js";
+import { FILE_REWRITE_PARALLEL_THRESHOLD } from "../jobs/fileRewritePool.js";
 import { isSameDomain, normalizeHost } from "../sitemaps/domain.js";
 import { fetchSitemapPreview } from "../sitemaps/fetchPreview.js";
 import { lazyStreamSitemapWithoutForeignLocs } from "../sitemaps/foreignLocFilter.js";
 import {
-  buildRedirectFixedStoredFilename,
   buildRenamedStoredFilename,
   buildStoredUploadFilename,
   buildTransformedStoredFilename,
@@ -66,7 +67,10 @@ import {
   type ParsedSitemap
 } from "../sitemaps/parser.js";
 import { rebuildSessionDeletions } from "../sitemaps/urlDeletion.js";
-import { invalidateSessionZipCache } from "../exports/sessionZipCache.js";
+import {
+  invalidateSessionZipCache,
+  isZipCacheFresh
+} from "../exports/sessionZipCache.js";
 import { enqueuePreGenerateZipJob } from "../queue/preGenerateZipQueue.js";
 import { collectProblemFileGroups } from "../sitemaps/problemFiles.js";
 import { previewTrailingSlash } from "../sitemaps/trailingSlashApply.js";
@@ -80,9 +84,19 @@ import {
   buildPatternTemplateRewriter,
   countTemplateParams,
   type LocUrlRewriter,
-  rewriteSitemapLocFile,
-  rewriteSpecificLocs
+  rewriteSitemapLocFile
 } from "../sitemaps/rewriteLocs.js";
+import {
+  applyRedirectRule,
+  deriveRedirectRule,
+  type RedirectRule
+} from "../sitemaps/redirectRule.js";
+import {
+  recomputePatternStatsSql,
+  rewriteRedirectSourceFilesOnDisk,
+  revertRedirectSourceFilesOnDisk
+} from "../sitemaps/redirectApply.js";
+import { looksLikeNotFoundUrl } from "../sitemaps/softNotFound.js";
 import {
   parseStructure,
   StructureSyntaxError,
@@ -780,33 +794,16 @@ function applyFindReplace(
 // same weighting as the sampling job (success=1, soft_404=0.25, redirect=0.5,
 // failure=0). Kept identical everywhere so apply-redirects and its undo are
 // exact inverses. $1 = pattern id.
-const recomputePatternStatsSql = `
-  UPDATE patterns
-  SET
-    redirect_pct = COALESCE((
-      SELECT ROUND(
-        100.0 * COUNT(*) FILTER (WHERE http_status_category = 'redirect')
-          / NULLIF(COUNT(*), 0),
-        2
-      )
-      FROM sampled_urls WHERE pattern_id = $1
-    ), redirect_pct),
-    confidence_pct = COALESCE((
-      SELECT ROUND(
-        100.0 * SUM(
-          CASE http_status_category
-            WHEN 'success' THEN 1
-            WHEN 'soft_404' THEN 0.25
-            WHEN 'redirect' THEN 0.5
-            ELSE 0
-          END
-        ) / NULLIF(COUNT(*), 0),
-        2
-      )
-      FROM sampled_urls WHERE pattern_id = $1
-    ), confidence_pct)
-  WHERE id = $1
-`;
+// Normalised path used to line up a sampled_urls.url (a full URL) with a
+// pattern_urls.path (a bare path), so redirect candidates can be flagged as
+// HTTP-verified vs inferred. (v1.42)
+function pathKey(value: string): string {
+  try {
+    return new URL(value).pathname;
+  } catch {
+    return value.startsWith("/") ? value : `/${value}`;
+  }
+}
 
 function urlContainsFind(value: string, find: string, matchCase: boolean) {
   if (find.length === 0) {
@@ -1059,157 +1056,6 @@ async function transformPatternSourceFilesOnDisk(
   }
 
   return result;
-}
-
-type RedirectFileRewrite = {
-  fixedStoredFilenames: string[];
-  // Previous files safe to delete after COMMIT (intermediate fixed copies only —
-  // never the preserved pre-fix original, which undo needs).
-  oldFilePaths: string[];
-  // Newly written fixed files to delete if the transaction rolls back.
-  newFilePaths: string[];
-  rewrittenLocCount: number;
-};
-
-// Rewrite the source XML files for a pattern's redirect fixes: every <loc>
-// matching a key in `replacements` is swapped for its redirect destination.
-// Unlike a rename (which swaps static path segments across all matching URLs),
-// this is a URL-level replacement of specific sampled URLs. `selectedDisplayFiles`
-// limits the scan to the files the affected URLs actually came from (a session
-// can hold thousands of sitemaps); when empty, all files for the role are
-// scanned as a fallback. A file is only rewritten and repointed if it truly
-// contains an affected URL, so an over-broad candidate list is harmless. Mirrors
-// the rename flow: the new file is fully written and sitemap_files.filename
-// repointed inside the transaction; old files are only deleted after COMMIT.
-async function rewriteRedirectSourceFilesOnDisk(
-  client: PoolClient,
-  options: {
-    sessionId: string;
-    sourceRole: string;
-    replacements: Map<string, string>;
-    selectedDisplayFiles: string[];
-  }
-): Promise<RedirectFileRewrite> {
-  const selectedSet = new Set(options.selectedDisplayFiles);
-  const filesResult = await client.query<{
-    id: string;
-    filename: string;
-    fixed_file_path: string | null;
-  }>(
-    `
-      SELECT id, filename, fixed_file_path
-      FROM sitemap_files
-      WHERE session_id = $1 AND source_role = $2
-    `,
-    [options.sessionId, options.sourceRole]
-  );
-  const result: RedirectFileRewrite = {
-    fixedStoredFilenames: [],
-    oldFilePaths: [],
-    newFilePaths: [],
-    rewrittenLocCount: 0
-  };
-
-  for (const file of filesResult.rows) {
-    // URL-sourced entries are not stored on disk as rewritable local files.
-    if (isHttpUrl(file.filename)) {
-      continue;
-    }
-
-    const displayName = displaySourceFilename(options.sessionId, file.filename);
-
-    if (selectedSet.size > 0 && !selectedSet.has(displayName)) {
-      continue;
-    }
-
-    const inputPath = path.join(config.uploadDir, file.filename);
-
-    try {
-      await access(inputPath);
-    } catch {
-      // File already cleaned up / missing — nothing to rewrite for this row.
-      continue;
-    }
-
-    const isGzip = file.filename.toLowerCase().endsWith(".gz");
-    const newStored = buildRedirectFixedStoredFilename(
-      options.sessionId,
-      displayName,
-      randomUUID()
-    );
-    const outputPath = path.join(config.uploadDir, newStored);
-
-    const rewrittenLocCount = await rewriteSpecificLocs({
-      inputPath,
-      outputPath,
-      isGzip,
-      replacements: options.replacements
-    });
-
-    if (rewrittenLocCount === 0) {
-      // This file contained none of the affected URLs — discard the identical
-      // copy and leave the row untouched.
-      await unlink(outputPath).catch(() => {});
-      continue;
-    }
-
-    // Preserve the true pre-fix original across chained applies so undo can
-    // restore it fully. On the first apply the current filename IS the original.
-    const originalToKeep = file.fixed_file_path ?? file.filename;
-
-    await client.query(
-      "UPDATE sitemap_files SET filename = $1, fixed_file_path = $2 WHERE id = $3",
-      [newStored, originalToKeep, file.id]
-    );
-
-    result.newFilePaths.push(outputPath);
-    result.fixedStoredFilenames.push(newStored);
-    // Delete the previous file after commit only when it is an intermediate
-    // fixed copy — never the preserved original (needed for undo).
-    if (file.filename !== originalToKeep) {
-      result.oldFilePaths.push(inputPath);
-    }
-    result.rewrittenLocCount += rewrittenLocCount;
-  }
-
-  return result;
-}
-
-// Revert every redirect-fixed file for a session back to its preserved pre-fix
-// original (the counterpart of rewriteRedirectSourceFilesOnDisk, driven by the
-// shared find-replace/apply-redirects undo). Repoints sitemap_files.filename in
-// the transaction; the now-orphaned fixed copies are deleted by the caller after
-// COMMIT.
-async function revertRedirectSourceFilesOnDisk(
-  client: PoolClient,
-  sessionId: string
-): Promise<{ oldFilePaths: string[] }> {
-  const filesResult = await client.query<{
-    id: string;
-    filename: string;
-    fixed_file_path: string;
-  }>(
-    `
-      SELECT id, filename, fixed_file_path
-      FROM sitemap_files
-      WHERE session_id = $1 AND fixed_file_path IS NOT NULL
-    `,
-    [sessionId]
-  );
-  const oldFilePaths: string[] = [];
-
-  for (const file of filesResult.rows) {
-    await client.query(
-      "UPDATE sitemap_files SET filename = $1, fixed_file_path = NULL WHERE id = $2",
-      [file.fixed_file_path, file.id]
-    );
-
-    if (file.filename !== file.fixed_file_path) {
-      oldFilePaths.push(path.join(config.uploadDir, file.filename));
-    }
-  }
-
-  return { oldFilePaths };
 }
 
 async function unlinkQuietly(filePaths: string[], logger: FastifyBaseLogger) {
@@ -3393,8 +3239,10 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         name: string;
         zip_all_path: string | null;
         zip_edited_path: string | null;
+        zip_generated_at: string | null;
+        files_mutated_at: string | null;
       }>(
-        "SELECT name, zip_all_path, zip_edited_path FROM sessions WHERE id = $1",
+        "SELECT name, zip_all_path, zip_edited_path, zip_generated_at, files_mutated_at FROM sessions WHERE id = $1",
         [request.params.id]
       );
 
@@ -3410,10 +3258,19 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           ? cacheResult.rows[0].zip_all_path
           : cacheResult.rows[0].zip_edited_path;
 
+      // Freshness gate (v1.42): never serve a cached ZIP that predates the last
+      // file mutation. Guards against a pre-gen build that recorded a path while
+      // racing an edit (the download used to serve the cache unconditionally).
+      const cacheIsFresh = isZipCacheFresh(
+        cacheResult.rows[0].zip_generated_at,
+        cacheResult.rows[0].files_mutated_at
+      );
+
       if (
         filtered &&
         excludeFileIds.length === 0 &&
         cachedPath &&
+        cacheIsFresh &&
         existsSync(cachedPath)
       ) {
         const dateMatch = cachedPath.match(/(\d{4}-\d{2}-\d{2})\.zip$/);
@@ -3575,7 +3432,141 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     }
   );
 
-  app.post<{ Params: PatternParams; Body: { url_ids?: unknown[] } }>(
+  // List EVERY URL in a pattern as a redirect-fix candidate (v1.42): the
+  // HTTP-verified sampled redirects (confirmed source→destination) plus every
+  // other URL in the pattern with an inferred destination, computed by applying
+  // the single rewrite rule distilled from the confirmed samples. The modal
+  // shows both, distinguishing verified from inferred; apply-redirects then
+  // rewrites the whole selected set.
+  app.get<{ Params: PatternParams }>(
+    "/api/sessions/:id/patterns/:patternId/redirect-candidates",
+    async (request, reply) => {
+      const patternResult = await pool.query<{ id: string }>(
+        "SELECT id FROM patterns WHERE session_id = $1 AND id = $2",
+        [request.params.id, request.params.patternId]
+      );
+
+      if (patternResult.rowCount === 0) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "pattern not found"
+        });
+      }
+
+      // Confirmed redirect samples — the evidence for the rule and the set of
+      // HTTP-verified rows.
+      const sampledResult = await pool.query<{
+        id: string;
+        url: string;
+        final_url: string;
+        http_status: number | null;
+      }>(
+        `
+          SELECT id, url, final_url, http_status
+          FROM sampled_urls
+          WHERE pattern_id = $1
+            AND http_status_category = 'redirect'
+            AND final_url IS NOT NULL
+            AND final_url <> url
+        `,
+        [request.params.patternId]
+      );
+
+      const rule = deriveRedirectRule(
+        sampledResult.rows.map((row) => ({
+          source: row.url,
+          dest: row.final_url
+        }))
+      );
+
+      const sampledByPath = new Map<
+        string,
+        { id: string; final_url: string; http_status: number | null }
+      >();
+
+      for (const row of sampledResult.rows) {
+        const key = pathKey(row.url);
+
+        if (!sampledByPath.has(key)) {
+          sampledByPath.set(key, {
+            id: row.id,
+            final_url: row.final_url,
+            http_status: row.http_status
+          });
+        }
+      }
+
+      const urlsResult = await pool.query<{ source_url: string; path: string }>(
+        "SELECT source_url, path FROM pattern_urls WHERE pattern_id = $1 ORDER BY source_url ASC",
+        [request.params.patternId]
+      );
+
+      const candidates: Array<{
+        key: string;
+        url: string;
+        final_url: string;
+        is_sampled: boolean;
+        sampled_url_id: string | null;
+        http_status: number | null;
+        // The destination itself looks like a not-found / soft-404 landing page
+        // — redirecting to it is useless, so the source URL is a delete
+        // candidate rather than a rewrite one. (v1.42.1)
+        destination_not_found: boolean;
+      }> = [];
+      const seen = new Set<string>();
+
+      for (const row of urlsResult.rows) {
+        if (seen.has(row.source_url)) {
+          continue;
+        }
+
+        seen.add(row.source_url);
+        const sampled = sampledByPath.get(pathKey(row.path));
+
+        if (sampled) {
+          candidates.push({
+            key: sampled.id,
+            url: row.source_url,
+            final_url: sampled.final_url,
+            is_sampled: true,
+            sampled_url_id: sampled.id,
+            http_status: sampled.http_status,
+            destination_not_found: looksLikeNotFoundUrl(sampled.final_url)
+          });
+        } else if (rule) {
+          const dest = applyRedirectRule(row.source_url, rule);
+
+          if (dest) {
+            candidates.push({
+              key: `inferred:${row.source_url}`,
+              url: row.source_url,
+              final_url: dest,
+              is_sampled: false,
+              sampled_url_id: null,
+              http_status: null,
+              destination_not_found: looksLikeNotFoundUrl(dest)
+            });
+          }
+        }
+      }
+
+      // Verified rows first, then inferred.
+      candidates.sort((a, b) => Number(b.is_sampled) - Number(a.is_sampled));
+
+      return {
+        rule: rule ?? null,
+        pattern_total_urls: urlsResult.rowCount ?? 0,
+        sampled_redirect_count: sampledResult.rowCount ?? 0,
+        inferred_count: candidates.filter((c) => !c.is_sampled).length,
+        candidates
+      };
+    }
+  );
+
+  app.post<{
+    Params: PatternParams;
+    Body: { url_ids?: unknown[]; inferred_urls?: unknown[] };
+  }>(
     "/api/sessions/:id/patterns/:patternId/apply-redirects",
     async (request, reply) => {
       const patternResult = await pool.query<{ source_role: string }>(
@@ -3598,6 +3589,71 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             (id): id is string => typeof id === "string"
           )
         : null;
+
+      // Optional (v1.42): unsampled URLs to also rewrite by inference. The
+      // client only sends WHICH urls; the server recomputes their destinations
+      // from the rule distilled from the confirmed samples, so it stays
+      // authoritative and a client can't inject arbitrary rewrites.
+      const inferredUrls = Array.isArray(request.body?.inferred_urls)
+        ? request.body!.inferred_urls.filter(
+            (url): url is string => typeof url === "string"
+          )
+        : [];
+
+      // Route a WIDENED apply that would rewrite more than the parallel
+      // threshold's worth of files to a background job (v1.42). The sampled-only
+      // path (no inferred URLs) only ever touches a handful of files, so it
+      // always stays inline; only the whole-pattern inference can span hundreds
+      // of files, and rewriting those synchronously here would block the API
+      // event loop / trip the request timeout — the failure mode that hit the
+      // ZIP path (v1.27) and Cleaner (v1.38). The job re-derives everything
+      // server-side and rewrites via the piscina pool.
+      if (inferredUrls.length > 0) {
+        const fileSpanResult = await pool.query<{ n: string }>(
+          "SELECT COUNT(DISTINCT source_file)::bigint AS n FROM pattern_file_occurrences WHERE pattern_id = $1",
+          [request.params.patternId]
+        );
+        const patternFileSpan = Number(fileSpanResult.rows[0]?.n ?? 0);
+
+        if (patternFileSpan > FILE_REWRITE_PARALLEL_THRESHOLD) {
+          await enqueueApplyRedirectsJob({
+            session_id: request.params.id,
+            pattern_id: request.params.patternId,
+            url_ids: urlIds,
+            inferred_urls: inferredUrls
+          });
+
+          return reply.send({
+            queued: true,
+            files_total: patternFileSpan
+          });
+        }
+      }
+
+      // Derive the rule BEFORE the UPDATE below flips the selected redirect rows
+      // to 'success' (which would erase the evidence).
+      let inferredRule: RedirectRule | null = null;
+
+      if (inferredUrls.length > 0) {
+        const ruleSamples = await pool.query<{ url: string; final_url: string }>(
+          `
+            SELECT url, final_url
+            FROM sampled_urls
+            WHERE pattern_id = $1
+              AND http_status_category = 'redirect'
+              AND final_url IS NOT NULL
+              AND final_url <> url
+          `,
+          [request.params.patternId]
+        );
+
+        inferredRule = deriveRedirectRule(
+          ruleSamples.rows.map((row) => ({
+            source: row.url,
+            dest: row.final_url
+          }))
+        );
+      }
 
       const client = await pool.connect();
       // Old files are removed only after COMMIT; new files are removed on
@@ -3662,16 +3718,64 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           }
         }
 
+        // Widen to the unsampled URLs (v1.42): apply the derived rule to each
+        // requested URL and add the source→inferred-destination pair to the same
+        // replacement map. These do not touch sampled_urls (there is no row for
+        // them); they change only the XML on disk, which undo reverts wholesale
+        // via fixed_file_path.
+        let inferredApplied = 0;
+
+        if (inferredUrls.length > 0 && inferredRule) {
+          for (const url of inferredUrls) {
+            const dest = applyRedirectRule(url, inferredRule);
+
+            if (dest && dest !== url && !replacements.has(url)) {
+              replacements.set(url, dest);
+              inferredApplied += 1;
+            }
+          }
+        }
+
+        // Unsampled URLs carry no per-URL source_file, so narrowing the disk
+        // scan to the sampled files could miss files. When inferring, add the
+        // pattern's actual file list from pattern_file_occurrences (the precise
+        // set of files this pattern's URLs live in — more accurate than the
+        // comma-joined patterns.source_file). If that is somehow empty we scan
+        // every file of the role below. rewriteSpecificLocs no-ops on files
+        // that contain none of the URLs, so a wider scan is correct, only
+        // slower — and this inline path only runs for patterns at or below
+        // FILE_REWRITE_PARALLEL_THRESHOLD files (larger ones route to the job).
+        if (inferredApplied > 0) {
+          const occurrenceResult = await client.query<{ source_file: string }>(
+            "SELECT DISTINCT source_file FROM pattern_file_occurrences WHERE pattern_id = $1",
+            [request.params.patternId]
+          );
+
+          for (const row of occurrenceResult.rows) {
+            candidateFiles.add(row.source_file);
+          }
+        }
+
+        // When inferring but the pattern has no recorded file list, scan all
+        // files of this source role (empty selectedDisplayFiles = no filter).
+        const selectedDisplayFiles =
+          inferredApplied > 0 && candidateFiles.size === 0
+            ? []
+            : Array.from(candidateFiles);
+
+        let rewrittenLocCount = 0;
+
         if (replacements.size > 0) {
           const rewrite = await rewriteRedirectSourceFilesOnDisk(client, {
             sessionId: request.params.id,
             sourceRole,
             replacements,
-            selectedDisplayFiles: Array.from(candidateFiles)
+            selectedDisplayFiles
           });
 
           filesToDeleteOnError = rewrite.newFilePaths;
           filesToDeleteAfterCommit = rewrite.oldFilePaths;
+          rewrittenLocCount = rewrite.rewrittenLocCount;
         }
 
         await client.query("COMMIT");
@@ -3679,7 +3783,11 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         await unlinkQuietly(filesToDeleteAfterCommit, request.log);
         await invalidateSessionZipCache(request.params.id);
 
-        return reply.send({ updated: updateResult.rowCount ?? 0 });
+        return reply.send({
+          updated: updateResult.rowCount ?? 0,
+          inferred_applied: inferredApplied,
+          rewritten_loc_count: rewrittenLocCount
+        });
       } catch (error) {
         await client.query("ROLLBACK");
 
@@ -3691,6 +3799,62 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       } finally {
         client.release();
       }
+    }
+  );
+
+  // Delete the SOURCE URLs of redirect rows whose destination is itself a
+  // not-found page (v1.42.1). Reuses the Delete Problem URLs pipeline verbatim —
+  // collectProblemFileGroups (now URL-driven) → mark sampled_urls deleted →
+  // rebuildSessionDeletions — via the same maintenance job, so there is no
+  // second deletion / file-mutation path and undo (Restore Deleted URLs) works
+  // unchanged. Only sampled (verified) URLs are removable; the modal only offers
+  // Delete on those, and any unsampled URL passed here is skipped by the pipeline.
+  app.post<{ Params: PatternParams; Body: { urls?: unknown[] } }>(
+    "/api/sessions/:id/patterns/:patternId/delete-redirect-urls",
+    async (request, reply) => {
+      const patternResult = await pool.query<{ id: string }>(
+        "SELECT id FROM patterns WHERE session_id = $1 AND id = $2",
+        [request.params.id, request.params.patternId]
+      );
+
+      if (patternResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "pattern not found" });
+      }
+
+      const urls = Array.isArray(request.body?.urls)
+        ? request.body!.urls.filter(
+            (url): url is string => typeof url === "string"
+          )
+        : [];
+
+      if (urls.length === 0) {
+        return reply.code(400).send(badRequest("urls is required"));
+      }
+
+      // Scope the deletion to the files this pattern's URLs live in.
+      const occurrenceResult = await pool.query<{ source_file: string }>(
+        "SELECT DISTINCT source_file FROM pattern_file_occurrences WHERE pattern_id = $1",
+        [request.params.patternId]
+      );
+      const fileDisplays = occurrenceResult.rows.map((row) => row.source_file);
+
+      const jobRow = await pool.query<{ id: string }>(
+        "INSERT INTO maintenance_jobs (session_id, kind) VALUES ($1, 'delete-problem-urls') RETURNING id",
+        [request.params.id]
+      );
+      const jobRowId = jobRow.rows[0].id;
+
+      await enqueueDeleteProblemUrlsJob({
+        session_id: request.params.id,
+        job_row_id: jobRowId,
+        file_displays: fileDisplays,
+        statuses: [],
+        urls
+      });
+
+      return { job_row_id: jobRowId, status: "PENDING" };
     }
   );
 

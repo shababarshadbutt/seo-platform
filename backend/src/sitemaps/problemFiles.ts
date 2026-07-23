@@ -39,12 +39,24 @@ type ProblemEntry = {
 // safely delete.
 export async function collectProblemFileGroups(options: {
   sessionId: string;
-  statuses: number[];
+  // Confirmed HTTP statuses to delete (the "Delete Problem URLs" feature).
+  statuses?: number[];
+  // OR an explicit set of URLs to delete (the Fix Redirect URLs modal's Delete
+  // action, v1.42.1). When set, this drives the selection instead of `statuses`
+  // — the second caller of this mechanism, reusing the exact same scan → mark →
+  // rebuild pipeline rather than a parallel deletion path. Only URLs that have a
+  // sampled_urls row can be resolved (the deletion engine keys off sampled_urls);
+  // unsampled URLs are silently skipped.
+  urls?: string[];
   // When set, only these display filenames are scanned (the delete path).
   restrictToDisplays?: string[];
 }): Promise<ProblemFileGroup[]> {
-  const { sessionId, statuses } = options;
+  const { sessionId } = options;
+  const byUrls = options.urls !== undefined;
 
+  // Select the confirmed problem set either by explicit URL list or by status.
+  // http_status is still returned (used for the sample preview + group.statuses)
+  // — for the URL-driven path it's whatever the sampled row happens to carry.
   const problemResult = await pool.query<{
     id: string;
     url: string;
@@ -53,15 +65,24 @@ export async function collectProblemFileGroups(options: {
     template: string;
     source_file: string | null;
   }>(
-    `
-      SELECT s.id, s.url, s.http_status, s.pattern_id, p.template, p.source_file
-      FROM sampled_urls s
-      JOIN patterns p ON p.id = s.pattern_id
-      WHERE p.session_id = $1
-        AND s.is_deleted_from_sitemap = false
-        AND s.http_status = ANY($2::int[])
-    `,
-    [sessionId, statuses]
+    byUrls
+      ? `
+        SELECT s.id, s.url, s.http_status, s.pattern_id, p.template, p.source_file
+        FROM sampled_urls s
+        JOIN patterns p ON p.id = s.pattern_id
+        WHERE p.session_id = $1
+          AND s.is_deleted_from_sitemap = false
+          AND s.url = ANY($2::text[])
+      `
+      : `
+        SELECT s.id, s.url, s.http_status, s.pattern_id, p.template, p.source_file
+        FROM sampled_urls s
+        JOIN patterns p ON p.id = s.pattern_id
+        WHERE p.session_id = $1
+          AND s.is_deleted_from_sitemap = false
+          AND s.http_status = ANY($2::int[])
+      `,
+    [sessionId, byUrls ? (options.urls ?? []) : (options.statuses ?? [])]
   );
 
   if (problemResult.rowCount === 0) {

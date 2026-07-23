@@ -67,7 +67,8 @@ export async function processDeleteProblemUrlsJob(
     session_id: sessionId,
     job_row_id: jobRowId,
     file_displays: fileDisplays,
-    statuses
+    statuses,
+    urls
   } = data;
 
   logger.info(
@@ -89,7 +90,9 @@ export async function processDeleteProblemUrlsJob(
     // comma-joined list.
     const groups = await collectProblemFileGroups({
       sessionId,
-      statuses,
+      // Explicit URL list (redirect-modal delete) takes precedence over the
+      // status filter (Delete Problem URLs feature).
+      ...(urls ? { urls } : { statuses }),
       restrictToDisplays: fileDisplays
     });
 
