@@ -2135,6 +2135,34 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       });
     }
 
+    // Connectivity warning (v1.39 Fix 2): when the vast majority of sampled URLs
+    // got no HTTP status, the results are almost certainly a network/proxy
+    // artifact (e.g. a corporate SSL-inspection proxy) rather than a broken
+    // site. sampled_urls has no session_id column, so reach the session through
+    // patterns. Only meaningful once enough URLs were actually sampled (>10).
+    const connectivityResult = await pool.query<{
+      total: string;
+      no_response: string;
+    }>(
+      `
+        SELECT
+          COUNT(*)::bigint AS total,
+          COUNT(*) FILTER (WHERE sampled_urls.http_status IS NULL)::bigint
+            AS no_response
+        FROM sampled_urls
+        JOIN patterns ON patterns.id = sampled_urls.pattern_id
+        WHERE patterns.session_id = $1::uuid
+      `,
+      [request.params.id]
+    );
+    const connectivityTotal = Number(connectivityResult.rows[0]?.total ?? 0);
+    const connectivityNoResponse = Number(
+      connectivityResult.rows[0]?.no_response ?? 0
+    );
+    session.connectivity_warning =
+      connectivityTotal > 10 &&
+      connectivityNoResponse / connectivityTotal > 0.9;
+
     const filesResult = await pool.query(
       `
         SELECT
@@ -2619,6 +2647,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             redirect_count,
             http_status_category,
             source_file,
+            error_reason,
             is_deleted_from_sitemap,
             deleted_from_files
           FROM sampled_urls

@@ -46,6 +46,10 @@ export type Session = {
   // Resume button is offered whenever status is FAILED.
   resume_count?: NumberLike;
   last_failed_at?: string | null;
+  // True when 90%+ of sampled URLs returned no HTTP status (>10 sampled) — a
+  // strong signal the results are a network/SSL-proxy artifact, not a broken
+  // site. Drives the connectivity warning banner. (v1.39 Fix 2)
+  connectivity_warning?: boolean;
 };
 
 export type SitemapFile = {
@@ -168,6 +172,9 @@ export type SampledUrl = {
     | null;
   is_soft_404: boolean;
   source_file: string | null;
+  // Why a sample got no HTTP status (v1.39 Fix 2) — powers the friendly drawer
+  // message. null when the URL returned a status.
+  error_reason?: "ssl_cert" | "timeout" | "no_response" | null;
   is_deleted_from_sitemap?: boolean;
   deleted_from_files?: string[] | null;
 };

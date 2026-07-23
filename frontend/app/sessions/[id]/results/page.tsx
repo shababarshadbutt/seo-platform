@@ -313,6 +313,17 @@ function effectiveSampleCategory(sample: SampledUrl) {
   return sample.is_soft_404 ? "soft_404" : sample.http_status_category;
 }
 
+// Friendly explanation for a sample that received no HTTP status (v1.39 Fix 2).
+// An SSL/cert failure almost always means a corporate SSL-inspection proxy, so
+// point the user straight at the fix; everything else reads as a timeout.
+function noResponseMessage(sample: SampledUrl) {
+  if (sample.error_reason === "ssl_cert") {
+    return "SSL certificate error — corporate proxy detected. Add NODE_TLS_REJECT_UNAUTHORIZED=0 to docker-compose.yml";
+  }
+
+  return "No response (timeout) — server unreachable or connection blocked";
+}
+
 function sampleTone(sample: SampledUrl) {
   const category = effectiveSampleCategory(sample);
 
@@ -715,12 +726,37 @@ export default function ResultsDashboardPage({
   const [slashApplied, setSlashApplied] = useState(false);
   const [maintenanceBusy, setMaintenanceBusy] = useState(false);
   const [restoringUrlId, setRestoringUrlId] = useState<string | null>(null);
+  // Connectivity warning banner dismissal (v1.39 Fix 2). Persisted per-session
+  // in localStorage so a dismissed banner stays dismissed across reloads.
+  const [connectivityDismissed, setConnectivityDismissed] = useState(false);
 
   useEffect(() => {
     setIsPrintMode(
       new URLSearchParams(window.location.search).get("print") === "1"
     );
   }, []);
+
+  const connectivityDismissKey = `connectivity-warning-dismissed-${params.id}`;
+
+  useEffect(() => {
+    try {
+      setConnectivityDismissed(
+        window.localStorage.getItem(connectivityDismissKey) === "1"
+      );
+    } catch {
+      setConnectivityDismissed(false);
+    }
+  }, [connectivityDismissKey]);
+
+  const dismissConnectivityWarning = useCallback(() => {
+    setConnectivityDismissed(true);
+
+    try {
+      window.localStorage.setItem(connectivityDismissKey, "1");
+    } catch {
+      // Non-fatal: the banner just reappears on reload if storage is blocked.
+    }
+  }, [connectivityDismissKey]);
 
   // Header state for the Delete URLs / Fix Trailing Slashes affordances: how
   // many problem URLs remain, whether a bulk deletion has run (→ show undo),
@@ -2646,6 +2682,63 @@ export default function ResultsDashboardPage({
               </div>
             ) : null}
 
+            {session?.connectivity_warning &&
+            !connectivityDismissed &&
+            !isPrintMode ? (
+              <div
+                role="alert"
+                data-testid="connectivity-warning"
+                className="relative rounded-lg border border-amber-300 bg-amber-50 p-4 pr-10 text-sm text-amber-900 shadow-sm"
+              >
+                <button
+                  type="button"
+                  aria-label="Dismiss connectivity warning"
+                  onClick={dismissConnectivityWarning}
+                  className="absolute right-2 top-2 rounded p-1 text-amber-700 hover:bg-amber-100 hover:text-amber-900"
+                >
+                  <span aria-hidden="true" className="text-lg leading-none">
+                    ×
+                  </span>
+                </button>
+                <div className="flex items-start gap-2">
+                  <TriangleAlert
+                    className="mt-0.5 h-5 w-5 shrink-0 text-amber-600"
+                    aria-hidden="true"
+                  />
+                  <div className="space-y-2">
+                    <p className="font-semibold">
+                      Network connectivity issue — results may be inaccurate
+                    </p>
+                    <p>90%+ of URLs could not be reached. This usually means:</p>
+                    <ul className="list-disc space-y-1 pl-5">
+                      <li>
+                        A corporate firewall or VPN is blocking outbound
+                        connections
+                      </li>
+                      <li>The Docker container cannot reach the internet</li>
+                      <li>The website may be temporarily down</li>
+                    </ul>
+                    <p>
+                      <span className="font-semibold">Quick fix:</span> add{" "}
+                      <code className="rounded bg-amber-100 px-1 font-mono text-xs">
+                        NODE_TLS_REJECT_UNAUTHORIZED=0
+                      </code>{" "}
+                      to your{" "}
+                      <span className="font-mono text-xs">
+                        docker-compose.yml
+                      </span>{" "}
+                      worker environment, then restart Docker and run a new
+                      analysis.
+                    </p>
+                    <p className="text-amber-800">
+                      Pattern structure analysis is still valid — only HTTP
+                      status checks are affected.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
             <div
               className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"
               data-testid="summary-cards"
@@ -3136,10 +3229,15 @@ export default function ResultsDashboardPage({
                                 <span aria-hidden="true">{tone.icon}</span>
                                 {categoryLabel(category)}
                               </Badge>
-                              <span>
-                                HTTP{" "}
-                                {numberValue(sample.http_status) || "No response"}
-                              </span>
+                              {numberValue(sample.http_status) ? (
+                                <span>
+                                  HTTP {numberValue(sample.http_status)}
+                                </span>
+                              ) : (
+                                <span className="font-medium text-red-600">
+                                  {noResponseMessage(sample)}
+                                </span>
+                              )}
                               <span>{numberValue(sample.response_ms)} ms</span>
                             </div>
                             {category === "redirect" &&

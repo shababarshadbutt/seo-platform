@@ -31,6 +31,10 @@ services:
       NODE_ENV: development
       PORT: "3001"
       NODE_OPTIONS: "--max-old-space-size=4096"
+      # Accept corporate SSL-inspection proxy certificates (v1.39). Defaults to
+      # "0" (verification off) so sampling works behind such proxies; override
+      # to "1" via the env if outbound TLS is not intercepted.
+      NODE_TLS_REJECT_UNAUTHORIZED: "${NODE_TLS_REJECT_UNAUTHORIZED:-0}"
       DATABASE_URL: postgresql://sitemap:sitemap@postgres:5432/sitemap_health
       REDIS_URL: redis://redis:6379
       UPLOAD_DIR: /uploads
@@ -69,6 +73,10 @@ services:
     environment:
       NODE_ENV: development
       WORKER_HEALTH_PORT: "3002"
+      # Accept corporate SSL-inspection proxy certificates (v1.39). The worker
+      # runs all outbound URL sampling, so this is the critical one — without it,
+      # sampling behind such a proxy fails and every URL reports "No response".
+      NODE_TLS_REJECT_UNAUTHORIZED: "${NODE_TLS_REJECT_UNAUTHORIZED:-0}"
       DATABASE_URL: postgresql://sitemap:sitemap@postgres:5432/sitemap_health
       REDIS_URL: redis://redis:6379
       UPLOAD_DIR: /uploads

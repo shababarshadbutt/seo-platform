@@ -1,6 +1,9 @@
 import Fastify from "fastify";
 import { Worker } from "bullmq";
 
+// Install the TLS policy (corporate SSL-proxy handling) before anything makes
+// an outbound request. (v1.39 Fix 1)
+import "./http/tlsDispatcher.js";
 import { config } from "./config.js";
 import { closePool } from "./db/pool.js";
 import { runMigrations } from "./db/migrate.js";

@@ -4,7 +4,49 @@ import type { FastifyBaseLogger } from "fastify";
 import { request } from "undici";
 
 import { pool } from "../db/pool.js";
+import { tlsAwareDispatcher } from "../http/tlsDispatcher.js";
 import { isSessionCancelled, markSessionComplete } from "./sessionCompletion.js";
+
+// Short, stable codes describing WHY a sample got no HTTP status, persisted on
+// the row so the results drawer can show an actionable message instead of a
+// bare "No response". (v1.39 Fix 2)
+export type SampleErrorReason = "ssl_cert" | "timeout" | "no_response";
+
+// Classify a thrown request error. SSL-inspection proxies surface as a
+// self-signed / untrusted-certificate error (message or the underlying
+// error.code, e.g. SELF_SIGNED_CERT_IN_CHAIN); undici timeouts surface as
+// UND_ERR_*_TIMEOUT or an AbortError from AbortSignal.timeout.
+export function classifyRequestError(error: unknown): SampleErrorReason {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const codes = [
+    (error as { code?: unknown })?.code,
+    (error as { cause?: { code?: unknown } })?.cause?.code
+  ]
+    .filter((code): code is string => typeof code === "string")
+    .join(" ");
+  const haystack = `${message} ${codes}`.toLowerCase();
+
+  if (
+    haystack.includes("cert") ||
+    haystack.includes("self-signed") ||
+    haystack.includes("self signed") ||
+    haystack.includes("ssl") ||
+    haystack.includes("unable to verify")
+  ) {
+    return "ssl_cert";
+  }
+
+  if (
+    haystack.includes("timeout") ||
+    haystack.includes("timed out") ||
+    haystack.includes("aborted") ||
+    haystack.includes("aborterror")
+  ) {
+    return "timeout";
+  }
+
+  return "no_response";
+}
 
 const HTTP_TIMEOUT_MS = 5000;
 const SOFT_404_BODY_SAMPLE_BYTES = 64 * 1024;
@@ -47,6 +89,7 @@ type HeadResult = {
   responseMs: number;
   location: string | null;
   timedOut: boolean;
+  errorReason: SampleErrorReason | null;
 };
 
 type SampleCheckResult = {
@@ -60,6 +103,7 @@ type SampleCheckResult = {
   httpStatusCategory: HttpStatusCategory;
   scoreWeight: number;
   timedOut: boolean;
+  errorReason: SampleErrorReason | null;
 };
 
 type BodyPrefixResult = {
@@ -106,6 +150,7 @@ async function headOnce(url: string, userAgent: string): Promise<HeadResult> {
     const response = await request(url, {
       method: "HEAD",
       maxRedirections: 0,
+      dispatcher: tlsAwareDispatcher,
       headers: {
         "user-agent": userAgent,
         accept:
@@ -123,14 +168,16 @@ async function headOnce(url: string, userAgent: string): Promise<HeadResult> {
       statusCode: response.statusCode,
       responseMs: Math.round(performance.now() - started),
       location: firstHeaderValue(response.headers.location),
-      timedOut: false
+      timedOut: false,
+      errorReason: null
     };
-  } catch {
+  } catch (error) {
     return {
       statusCode: null,
       responseMs: Math.round(performance.now() - started),
       location: null,
-      timedOut: true
+      timedOut: true,
+      errorReason: classifyRequestError(error)
     };
   }
 }
@@ -182,6 +229,7 @@ async function checkSoft404Signals(
     const response = await request(url, {
       method: "GET",
       maxRedirections: 0,
+      dispatcher: tlsAwareDispatcher,
       headers: {
         "user-agent": userAgent,
         accept:
@@ -295,7 +343,8 @@ async function checkSampleUrl(
       redirectCount: 0,
       httpStatusCategory: soft404Result.isSoft404 ? "soft_404" : "success",
       scoreWeight: soft404Result.isSoft404 ? 0.25 : 1,
-      timedOut: firstResult.timedOut || soft404Result.timedOut
+      timedOut: firstResult.timedOut || soft404Result.timedOut,
+      errorReason: null
     };
   } else if (isRedirectStatus(firstResult.statusCode)) {
     const finalUrl = resolveRedirectUrl(firstResult.location, url);
@@ -317,7 +366,8 @@ async function checkSampleUrl(
       redirectCount: 1,
       httpStatusCategory: "redirect",
       scoreWeight: 0.5,
-      timedOut: firstResult.timedOut
+      timedOut: firstResult.timedOut,
+      errorReason: null
     };
   } else {
     result = {
@@ -330,7 +380,8 @@ async function checkSampleUrl(
       redirectCount: 0,
       httpStatusCategory: "failure",
       scoreWeight: 0,
-      timedOut: firstResult.timedOut
+      timedOut: firstResult.timedOut,
+      errorReason: firstResult.errorReason
     };
   }
 
@@ -469,9 +520,10 @@ async function persistPatternSamples(
             final_url,
             redirect_count,
             http_status_category,
-            source_file
+            source_file,
+            error_reason
           )
-          VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10)
+          VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11)
         `,
         [
           patternId,
@@ -483,7 +535,8 @@ async function persistPatternSamples(
           result.finalUrl,
           result.redirectCount,
           result.httpStatusCategory,
-          sourceFile
+          sourceFile,
+          result.errorReason
         ]
       );
     }
