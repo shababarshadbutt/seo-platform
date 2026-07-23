@@ -438,6 +438,138 @@ async function streamSitemapUrlLocsFromSource(
   });
 }
 
+export type CleanerLocStreamResult = {
+  rootElement: string | null;
+  isValid: boolean;
+};
+
+// Streaming <loc> reader for the Sitemap Cleaner. Fires `onLoc` for every URL
+// inside a <urlset> WITHOUT ever accumulating the full URL list in memory (the
+// caller decides per-URL what to keep and writes it straight to disk), and
+// resolves with the detected root element + validity. Never throws on a parse
+// error — it resolves with `isValid: false`, mirroring parseSitemapStream so
+// the cleaner can classify the file as "unparsable" without a try/catch.
+// <sitemapindex> files report their root element with no `onLoc` calls (the
+// cleaner rebuilds the index from scratch, so their child locs are irrelevant).
+export async function streamUrlsetLocs(
+  source: Readable,
+  isGzip: boolean,
+  onLoc: (loc: string) => void
+): Promise<CleanerLocStreamResult> {
+  return new Promise((resolve) => {
+    const parser = sax.parser(true, {});
+    const { decodedInput, input } = createSitemapInput(source, isGzip);
+    let rootElement: string | null = null;
+    let isValid = true;
+    let inLoc = false;
+    let locText = "";
+    let settled = false;
+
+    function settle() {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      destroySitemapInput(source, decodedInput, input);
+      resolve({ rootElement, isValid });
+    }
+
+    function fail() {
+      if (settled) {
+        return;
+      }
+
+      isValid = false;
+      // Neutralise sax's sticky error so close()/resume() don't rethrow, then
+      // settle with whatever root element we managed to read.
+      (parser as unknown as { error: Error | null }).error = null;
+      try {
+        parser.resume();
+      } catch {
+        // ignore — we are tearing down regardless
+      }
+
+      settle();
+    }
+
+    parser.onopentag = (node) => {
+      const name = localName(node.name);
+
+      if (!rootElement) {
+        rootElement = name;
+      }
+
+      if (name === "loc") {
+        inLoc = true;
+        locText = "";
+      }
+    };
+
+    parser.ontext = (text) => {
+      if (inLoc) {
+        locText += text;
+      }
+    };
+
+    parser.oncdata = (text) => {
+      if (inLoc) {
+        locText += text;
+      }
+    };
+
+    parser.onclosetag = (name) => {
+      if (localName(name) !== "loc") {
+        return;
+      }
+
+      const loc = locText.trim();
+
+      if (loc && rootElement === "urlset") {
+        onLoc(loc);
+      }
+
+      inLoc = false;
+      locText = "";
+    };
+
+    parser.onerror = fail;
+
+    input.setEncoding("utf8");
+    input.on("data", (chunk) => {
+      if (settled) {
+        return;
+      }
+
+      try {
+        parser.write(chunk);
+      } catch {
+        fail();
+      }
+    });
+
+    source.on("error", fail);
+    if (decodedInput !== source) {
+      decodedInput.on("error", fail);
+    }
+    input.on("error", fail);
+    input.on("end", () => {
+      if (settled) {
+        return;
+      }
+
+      try {
+        parser.close();
+      } catch {
+        fail();
+        return;
+      }
+
+      settle();
+    });
+  });
+}
+
 export async function parseSitemapStream(
   source: Readable,
   isGzip: boolean,

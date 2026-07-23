@@ -30,6 +30,7 @@ services:
     environment:
       NODE_ENV: development
       PORT: "3001"
+      NODE_OPTIONS: "--max-old-space-size=4096"
       DATABASE_URL: postgresql://sitemap:sitemap@postgres:5432/sitemap_health
       REDIS_URL: redis://redis:6379
       UPLOAD_DIR: /uploads
