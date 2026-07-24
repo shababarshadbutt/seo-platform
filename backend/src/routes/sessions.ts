@@ -3145,8 +3145,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
   app.get<{ Params: PatternParams }>(
     "/api/sessions/:id/patterns/:patternId/download-sitemap",
     async (request, reply) => {
-      const patternResult = await pool.query(
-        "SELECT 1 FROM patterns WHERE session_id = $1 AND id = $2",
+      const patternResult = await pool.query<{ source_role: string }>(
+        "SELECT source_role FROM patterns WHERE session_id = $1 AND id = $2",
         [request.params.id, request.params.patternId]
       );
 
@@ -3157,25 +3157,55 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         });
       }
 
-      const renameResult = await pool.query<{ renamed_file_path: string | null }>(
-        `
-          SELECT renamed_file_path
-          FROM pattern_renames
-          WHERE pattern_id = $1
-          ORDER BY renamed_at DESC
-          LIMIT 1
-        `,
+      const sourceRole = patternResult.rows[0].source_role;
+
+      // Resolve the CURRENT stored filename(s) this pattern's URLs live in
+      // straight from sitemap_files — the single source of truth every
+      // mutation (plain rename, structure transform, redirect "Fix", bulk
+      // replace, trailing-slash fix) swaps in place. This used to read only
+      // the latest pattern_renames row, which went stale (or 404'd outright)
+      // the instant a pattern was corrected via the "Fix" button or the
+      // pencil-icon structure-transform modal instead of a plain rename —
+      // those write to pattern_transforms / sitemap_files directly and never
+      // touch pattern_renames, so the old lookup kept serving a pre-fix (or
+      // no) file. Going straight to sitemap_files fixes all edit paths at once.
+      const occurrenceResult = await pool.query<{ source_file: string }>(
+        "SELECT DISTINCT source_file FROM pattern_file_occurrences WHERE pattern_id = $1",
         [request.params.patternId]
       );
-      const renamedFilePath = renameResult.rows[0]?.renamed_file_path ?? null;
-      const storedFilenames = (renamedFilePath ?? "")
-        .split(",")
-        .map((name) => name.trim())
-        .filter(Boolean);
+      const targetDisplays = new Set(
+        occurrenceResult.rows.map((row) => row.source_file)
+      );
+
+      const filesResult = await pool.query<{ filename: string }>(
+        `
+          SELECT filename
+          FROM sitemap_files
+          WHERE session_id = $1 AND source_role = $2 AND is_deleted = false
+          ORDER BY filename ASC
+        `,
+        [request.params.id, sourceRole]
+      );
+
+      // Only ever surface an actually-edited copy — this endpoint means
+      // "download the CORRECTED sitemap," so an untouched pattern must still
+      // 404 with "apply a fix first" exactly as before, not silently serve
+      // the unedited original relabelled as corrected-*.xml.
+      const candidates = filesResult.rows
+        .map((row) => row.filename)
+        .filter((filename) => !isHttpUrl(filename))
+        .filter((filename) => isEditedStoredFilename(request.params.id, filename))
+        .filter(
+          (filename) =>
+            targetDisplays.size === 0 ||
+            targetDisplays.has(
+              displaySourceFilename(request.params.id, filename)
+            )
+        );
 
       let downloadName: string | null = null;
 
-      for (const candidate of storedFilenames) {
+      for (const candidate of candidates) {
         const candidatePath = path.join(config.uploadDir, candidate);
 
         try {
@@ -3183,7 +3213,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           downloadName = candidate;
           break;
         } catch {
-          // Try the next recorded file.
+          // Try the next candidate file.
         }
       }
 
@@ -3191,7 +3221,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         return reply.code(404).send({
           error: "Not Found",
           message:
-            "no corrected sitemap is available for this pattern — apply a rename first"
+            "no corrected sitemap is available for this pattern — apply a fix first"
         });
       }
 

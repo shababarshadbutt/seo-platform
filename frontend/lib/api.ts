@@ -838,7 +838,10 @@ export type RedirectCandidate = {
 };
 
 export type RedirectCandidatesResponse = {
-  rule: { find: string; replace: string } | null;
+  rule:
+    | { kind: "replace"; find: string; replace: string }
+    | { kind: "insert"; prefix: string; insert: string }
+    | null;
   pattern_total_urls: number;
   sampled_redirect_count: number;
   inferred_count: number;
