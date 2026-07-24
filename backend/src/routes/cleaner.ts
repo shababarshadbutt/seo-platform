@@ -3,6 +3,7 @@ import { mkdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { randomUUID } from "node:crypto";
+import type { ServerResponse } from "node:http";
 
 import AdmZip from "adm-zip";
 import type { FastifyInstance } from "fastify";
@@ -135,7 +136,100 @@ export async function cleanerRoutes(app: FastifyInstance) {
       const inputFiles: CleanerInputFile[] = [];
       let domain = "";
       let subfolder = "sitemaps";
+      // Client-reported selected-file count, used purely for the upload-stage
+      // progress denominator (the client knows files.length; the server only
+      // discovers it as parts stream in).
+      let uploadTotal = 0;
       let fileIndex = 0;
+      let spooled = 0;
+
+      // SSE is started LAZILY, the instant the first real file part arrives, so
+      // upload progress streams WHILE the remaining (2000+) files are still
+      // spooling to disk — the phase that used to show a frozen spinner with no
+      // count. Until the stream starts the response is a normal reply, so
+      // pre-stream validation still returns a plain 400 JSON. (v1.43)
+      let res: ServerResponse | null = null;
+      let keepalive: ReturnType<typeof setInterval> | null = null;
+
+      const send = (payload: unknown) => {
+        if (res && !res.writableEnded) {
+          res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        }
+      };
+
+      const stopKeepalive = () => {
+        if (keepalive) {
+          clearInterval(keepalive);
+          keepalive = null;
+        }
+      };
+
+      // Take over the socket and stream Server-Sent Events. The CORS plugin's
+      // onSend hook does not run on a hijacked response, so set the origin
+      // header manually. Returns the raw response so the caller assigns `res`
+      // linearly (keeps TS's narrowing working across the later branches).
+      const beginStream = (): ServerResponse => {
+        reply.hijack();
+        const stream = reply.raw;
+        stream.writeHead(200, {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+          Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
+          "Access-Control-Allow-Origin":
+            (request.headers.origin as string | undefined) ?? "*"
+        });
+
+        // Periodic keepalive comment so an idle proxy/browser doesn't drop the
+        // connection during the long upload or processing phase. Comment lines
+        // (": …") are ignored by the SSE parser. (v1.37 Fix 1)
+        keepalive = setInterval(() => {
+          if (!stream.writableEnded) {
+            stream.write(": keepalive\n\n");
+          }
+        }, SSE_KEEPALIVE_MS);
+        keepalive.unref?.();
+        request.raw.on("close", stopKeepalive);
+
+        return stream;
+      };
+
+      const badRequest = (message: string) => {
+        cleanupRunDir();
+
+        return reply.code(400).send({ error: "Bad Request", message });
+      };
+
+      const domainError = (): string | null => {
+        if (!domain) {
+          return "domain is required";
+        }
+
+        try {
+          // eslint-disable-next-line no-new
+          new URL(domain);
+        } catch {
+          return "domain must be a valid URL (e.g. https://www.example.com)";
+        }
+
+        return null;
+      };
+
+      const sendUploadProgress = () => {
+        const remaining =
+          uploadTotal > 0 ? Math.max(uploadTotal - spooled, 0) : null;
+
+        send({
+          type: "progress",
+          stage: "upload",
+          current: spooled,
+          total: uploadTotal || undefined,
+          message:
+            remaining !== null
+              ? `Uploaded ${spooled} of ${uploadTotal} file(s) — ${remaining} remaining`
+              : `Uploaded ${spooled} file(s)…`
+        });
+      };
 
       try {
         for await (const part of request.parts()) {
@@ -144,14 +238,51 @@ export async function cleanerRoutes(app: FastifyInstance) {
               domain = String(part.value).trim();
             } else if (part.fieldname === "subfolder") {
               subfolder = String(part.value).trim();
+            } else if (part.fieldname === "fileCount") {
+              const parsedCount = Number.parseInt(String(part.value), 10);
+
+              if (Number.isFinite(parsedCount) && parsedCount > 0) {
+                uploadTotal = parsedCount;
+              }
             }
 
             continue;
           }
 
           const name = baseName(part.filename ?? "upload");
+          const isZip = name.toLowerCase().endsWith(".zip");
+          const isXml = isXmlName(name);
 
-          if (name.toLowerCase().endsWith(".zip")) {
+          if (!isZip && !isXml) {
+            // Non-XML / non-ZIP upload: drain the part so iteration can advance.
+            await part.toBuffer();
+            continue;
+          }
+
+          // First accepted file: the client sends domain/subfolder/fileCount
+          // BEFORE the files, so domain is known here. Validate it (still a
+          // plain 400 if bad — nothing hijacked yet), then take over the socket
+          // and start streaming upload progress for every part that follows.
+          if (!res) {
+            const invalid = domainError();
+
+            if (invalid) {
+              return badRequest(invalid);
+            }
+
+            res = beginStream();
+            send({
+              type: "progress",
+              stage: "upload",
+              current: 0,
+              total: uploadTotal || undefined,
+              message: uploadTotal
+                ? `Uploading 0 of ${uploadTotal} file(s)…`
+                : "Uploading files…"
+            });
+          }
+
+          if (isZip) {
             // Spill the uploaded ZIP to disk, then extract only its XML entries
             // to individual input files. AdmZip decompresses one entry at a
             // time via extractEntryTo, so no full set of decompressed buffers
@@ -178,89 +309,67 @@ export async function cleanerRoutes(app: FastifyInstance) {
             }
 
             await rm(zipPath, { force: true });
-          } else if (isXmlName(name)) {
+          } else {
             // Stream the uploaded file straight to disk — never buffered.
             const dest = path.join(inDir, `${fileIndex}__${name}`);
             fileIndex += 1;
             await pipeline(part.file, createWriteStream(dest));
             inputFiles.push({ filename: name, path: dest });
-          } else {
-            // Non-XML / non-ZIP upload: drain the part so iteration can advance.
-            await part.toBuffer();
           }
+
+          // One part finished spooling — advance the upload progress bar. This
+          // is the feedback the old single-post-loop send() never gave. (v1.43)
+          spooled += 1;
+          sendUploadProgress();
         }
       } catch (error) {
+        const message =
+          error instanceof Error
+            ? `Could not read upload: ${error.message}`
+            : "Could not read upload";
+
+        if (res) {
+          // Already streaming — report as an SSE error and close; a 400 can't
+          // be sent on a hijacked socket.
+          send({ type: "error", message });
+          stopKeepalive();
+          res.end();
+          cleanupRunDir();
+
+          return;
+        }
+
         cleanupRunDir();
 
-        return reply.code(400).send({
-          error: "Bad Request",
-          message:
-            error instanceof Error
-              ? `Could not read upload: ${error.message}`
-              : "Could not read upload"
-        });
+        return reply.code(400).send({ error: "Bad Request", message });
       }
 
-      if (!domain) {
-        cleanupRunDir();
+      // Never started streaming ⇒ no accepted file was uploaded (or only junk
+      // parts). Report the reason as a plain 400.
+      if (!res) {
+        const invalid = domainError();
 
-        return reply
-          .code(400)
-          .send({ error: "Bad Request", message: "domain is required" });
+        if (invalid) {
+          return badRequest(invalid);
+        }
+
+        return badRequest(
+          "no XML sitemap files provided (upload .xml files or a .zip)"
+        );
       }
 
-      try {
-        // eslint-disable-next-line no-new
-        new URL(domain);
-      } catch {
-        cleanupRunDir();
-
-        return reply.code(400).send({
-          error: "Bad Request",
-          message: "domain must be a valid URL (e.g. https://www.example.com)"
-        });
-      }
-
+      // A ZIP part can arrive yet expand to zero XML entries.
       if (inputFiles.length === 0) {
-        cleanupRunDir();
-
-        return reply.code(400).send({
-          error: "Bad Request",
+        send({
+          type: "error",
           message: "no XML sitemap files provided (upload .xml files or a .zip)"
         });
+        stopKeepalive();
+        res.end();
+        cleanupRunDir();
+
+        return;
       }
-
-      // Take over the socket and stream Server-Sent Events. The CORS plugin's
-      // onSend hook does not run on a hijacked response, so set the origin header
-      // manually.
-      reply.hijack();
-      const res = reply.raw;
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive",
-        "X-Accel-Buffering": "no",
-        "Access-Control-Allow-Origin":
-          (request.headers.origin as string | undefined) ?? "*"
-      });
-
-      const send = (payload: unknown) => {
-        if (!res.writableEnded) {
-          res.write(`data: ${JSON.stringify(payload)}\n\n`);
-        }
-      };
-
-      // Periodic keepalive comment so an idle proxy/browser doesn't drop the
-      // connection during the long processing phase. Comment lines (": …") are
-      // ignored by the SSE parser. Cleared when the stream ends or the client
-      // disconnects. (v1.37 Fix 1)
-      const keepalive = setInterval(() => {
-        if (!res.writableEnded) {
-          res.write(": keepalive\n\n");
-        }
-      }, SSE_KEEPALIVE_MS);
-      keepalive.unref?.();
-      request.raw.on("close", () => clearInterval(keepalive));
 
       send({
         type: "progress",
@@ -318,8 +427,8 @@ export async function cleanerRoutes(app: FastifyInstance) {
           message: error instanceof Error ? error.message : "Cleaning failed"
         });
       } finally {
-        clearInterval(keepalive);
-        res.end();
+        stopKeepalive();
+        res?.end();
 
         // If the run never made it into the cache (error or client gone), the
         // working dir would otherwise leak — remove it now.

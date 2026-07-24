@@ -152,6 +152,10 @@ export default function CleanerPage() {
     const formData = new FormData();
     formData.append("domain", domain.trim());
     formData.append("subfolder", cleanSub || "sitemaps");
+    // Send the selected-file count BEFORE the files so the backend can show an
+    // "X of Y" upload progress bar as each file spools to disk, instead of a
+    // countless spinner during the (slow, for 2000+ files) upload phase. (v1.43)
+    formData.append("fileCount", String(files.length));
 
     for (const file of files) {
       formData.append("files", file, file.name);
@@ -421,6 +425,17 @@ export default function CleanerPage() {
               </p>
               {progressPercent !== null ? (
                 <Progress value={progressPercent} />
+              ) : null}
+              {progress && progress.total > 0 ? (
+                <p className="text-xs text-slate-500">
+                  {formatNumber(progress.current)} of{" "}
+                  {formatNumber(progress.total)} processed
+                  {progress.total - progress.current > 0
+                    ? ` · ${formatNumber(
+                        progress.total - progress.current
+                      )} remaining`
+                    : ""}
+                </p>
               ) : null}
             </CardContent>
           </Card>
