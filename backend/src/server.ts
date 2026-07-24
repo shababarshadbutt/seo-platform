@@ -7,6 +7,7 @@ import multipart from "@fastify/multipart";
 import "./http/tlsDispatcher.js";
 import { config } from "./config.js";
 import { closeSitemapQueue } from "./queue/sitemapQueue.js";
+import { destroyCleanerPools } from "./jobs/cleanerPool.js";
 import { closePool } from "./db/pool.js";
 import { runMigrations } from "./db/migrate.js";
 import { fsErrorResponse } from "./errors/fsErrors.js";
@@ -96,6 +97,7 @@ async function start() {
 async function close() {
   await app.close();
   await closeSitemapQueue();
+  await destroyCleanerPools();
   await closePool();
 }
 

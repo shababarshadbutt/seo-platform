@@ -1667,6 +1667,9 @@ export type CleanerSummary = {
   duplicate_urls: { url: string; kept_in: string; also_in: string[] }[];
   output_files: { filename: string; url_count: number }[];
   index_files_detected: number;
+  total_urls_kept_files: number;
+  clean_urls_remaining: number;
+  reduction_pct: number;
 };
 
 export type CleanerProgressEvent =

@@ -233,6 +233,20 @@ export default function CleanerPage() {
       ? Math.round((progress.current / progress.total) * 100)
       : null;
 
+  // Derived counts for the reference-style summary tiles. "Sitemaps found" is
+  // every uploaded sitemap: the processed files plus the index files (which are
+  // rebuilt, not "processed"). Wrong-domain / empty skip counts are broken out
+  // of dropped_files so they get their own visible tiles.
+  const wrongDomainSkipped =
+    summary?.dropped_files.filter((file) => file.reason === "wrong_domain")
+      .length ?? 0;
+  const emptySkipped =
+    summary?.dropped_files.filter((file) => file.reason === "empty").length ??
+    0;
+  const sitemapsFound = summary
+    ? summary.files_processed + summary.index_files_detected
+    : 0;
+
   return (
     <main className="min-h-[calc(100vh-56px)] bg-[#F8FAFC]">
       <section className="mx-auto w-full max-w-3xl px-4 py-8 sm:px-6 lg:px-8">
@@ -459,23 +473,37 @@ export default function CleanerPage() {
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+                <SummaryTile label="Sitemaps found" value={sitemapsFound} />
+                <SummaryTile label="Sitemaps saved" value={summary.files_kept} />
                 <SummaryTile
-                  label="Files processed"
-                  value={summary.files_processed}
+                  label="Sitemaps skipped (empty)"
+                  value={emptySkipped}
                 />
                 <SummaryTile
-                  label="Duplicates removed"
+                  label="Duplicate URLs removed"
                   value={summary.duplicates_removed}
                 />
                 <SummaryTile
-                  label="Files dropped"
-                  value={summary.files_dropped}
+                  label="Total URLs (kept files)"
+                  value={summary.total_urls_kept_files}
                 />
                 <SummaryTile
-                  label="Index rebuilt with"
-                  value={summary.files_kept}
-                  suffix={summary.files_kept === 1 ? "file" : "files"}
+                  label="Clean URLs remaining"
+                  value={summary.clean_urls_remaining}
+                />
+                <SummaryTile
+                  label="Reduction"
+                  value={summary.reduction_pct}
+                  display={`${summary.reduction_pct.toFixed(1)}%`}
+                />
+                <SummaryTile
+                  label="Sitemaps skipped (wrong domain)"
+                  value={wrongDomainSkipped}
+                />
+                <SummaryTile
+                  label="Extra index files skipped"
+                  value={summary.index_files_detected}
                 />
               </div>
 
@@ -580,15 +608,20 @@ export default function CleanerPage() {
 function SummaryTile({
   label,
   value,
-  suffix
+  suffix,
+  display
 }: {
   label: string;
   value: number;
   suffix?: string;
+  // Optional pre-formatted string (e.g. "3.3%"); falls back to formatNumber.
+  display?: string;
 }) {
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-3 text-center">
-      <p className="text-2xl font-bold text-slate-900">{formatNumber(value)}</p>
+      <p className="text-2xl font-bold text-slate-900">
+        {display ?? formatNumber(value)}
+      </p>
       <p className="mt-0.5 text-xs text-slate-500">
         {label}
         {suffix ? ` (${suffix})` : ""}
