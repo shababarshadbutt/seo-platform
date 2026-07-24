@@ -3471,8 +3471,11 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
   app.get<{ Params: PatternParams }>(
     "/api/sessions/:id/patterns/:patternId/redirect-candidates",
     async (request, reply) => {
-      const patternResult = await pool.query<{ id: string }>(
-        "SELECT id FROM patterns WHERE session_id = $1 AND id = $2",
+      const patternResult = await pool.query<{
+        id: string;
+        total_urls: string;
+      }>(
+        "SELECT id, total_urls FROM patterns WHERE session_id = $1 AND id = $2",
         [request.params.id, request.params.patternId]
       );
 
@@ -3583,9 +3586,20 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // Verified rows first, then inferred.
       candidates.sort((a, b) => Number(b.is_sampled) - Number(a.is_sampled));
 
+      // pattern_total_urls is the pattern's REAL occurrence count
+      // (patterns.total_urls === SUM(pattern_file_occurrences.occurrence_count)),
+      // NOT urlsResult.rowCount — that was the CAPPED pattern_urls sample pool
+      // (≤ ~1,000), which made the modal understate the true scope. `candidates`
+      // stays a bounded preview for spot-check review; accepting applies the
+      // confirmed rule to all pattern_total_urls matching URLs (v1.45.1).
+      const patternTotalUrls = Number(patternResult.rows[0].total_urls) || 0;
+
       return {
         rule: rule ?? null,
-        pattern_total_urls: urlsResult.rowCount ?? 0,
+        pattern_total_urls: patternTotalUrls,
+        // How many rows the review preview holds (bounded by the pattern_urls
+        // sample pool) — distinct from pattern_total_urls, the real rewrite scope.
+        preview_count: candidates.length,
         sampled_redirect_count: sampledResult.rowCount ?? 0,
         inferred_count: candidates.filter((c) => !c.is_sampled).length,
         candidates
@@ -3748,34 +3762,25 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           }
         }
 
-        // Widen to the unsampled URLs (v1.42): apply the derived rule to each
-        // requested URL and add the source→inferred-destination pair to the same
-        // replacement map. These do not touch sampled_urls (there is no row for
-        // them); they change only the XML on disk, which undo reverts wholesale
-        // via fixed_file_path.
-        let inferredApplied = 0;
+        // Whole-pattern widening (v1.42, fixed v1.45.1): when the client opted
+        // into the unsampled URLs AND the confirmed samples distil into a single
+        // rule, apply that rule to EVERY <loc> in the pattern's files via a
+        // streaming rewrite. The previous approach built a replacement map from
+        // the client's inferred_urls list — which was sourced from the CAPPED
+        // pattern_urls sample pool (≤ ~1,000 rows), so on a pattern with e.g.
+        // 92,643 real occurrences only the sampled ~1,000 were ever rewritten
+        // and the other ~91,000 were silently left broken. The rule is a pure
+        // per-URL transform, so it reaches all real occurrences independent of
+        // the pool/preview size. The confirmed sampled pairs (`replacements`)
+        // still win per-URL inside buildRedirectApplyRewriter.
+        const widen = inferredUrls.length > 0 && inferredRule !== null;
 
-        if (inferredUrls.length > 0 && inferredRule) {
-          for (const url of inferredUrls) {
-            const dest = applyRedirectRule(url, inferredRule);
-
-            if (dest && dest !== url && !replacements.has(url)) {
-              replacements.set(url, dest);
-              inferredApplied += 1;
-            }
-          }
-        }
-
-        // Unsampled URLs carry no per-URL source_file, so narrowing the disk
-        // scan to the sampled files could miss files. When inferring, add the
-        // pattern's actual file list from pattern_file_occurrences (the precise
-        // set of files this pattern's URLs live in — more accurate than the
-        // comma-joined patterns.source_file). If that is somehow empty we scan
-        // every file of the role below. rewriteSpecificLocs no-ops on files
-        // that contain none of the URLs, so a wider scan is correct, only
-        // slower — and this inline path only runs for patterns at or below
-        // FILE_REWRITE_PARALLEL_THRESHOLD files (larger ones route to the job).
-        if (inferredApplied > 0) {
+        if (widen) {
+          // Scan the pattern's real, complete file list (pattern_file_occurrences
+          // — the precise set of files this pattern's URLs live in), not just the
+          // files the sampled URLs came from. Empty (older sessions) → scan every
+          // file of the role via the [] fallback below; the rewriter no-ops on
+          // files with no matching <loc>, so an over-broad scan is only slower.
           const occurrenceResult = await client.query<{ source_file: string }>(
             "SELECT DISTINCT source_file FROM pattern_file_occurrences WHERE pattern_id = $1",
             [request.params.patternId]
@@ -3786,21 +3791,20 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           }
         }
 
-        // When inferring but the pattern has no recorded file list, scan all
-        // files of this source role (empty selectedDisplayFiles = no filter).
         const selectedDisplayFiles =
-          inferredApplied > 0 && candidateFiles.size === 0
-            ? []
-            : Array.from(candidateFiles);
+          widen && candidateFiles.size === 0 ? [] : Array.from(candidateFiles);
 
         let rewrittenLocCount = 0;
 
-        if (replacements.size > 0) {
+        // Rewrite when there are confirmed exact replacements to apply OR a rule
+        // to widen across the pattern's files.
+        if (replacements.size > 0 || widen) {
           const rewrite = await rewriteRedirectSourceFilesOnDisk(client, {
             sessionId: request.params.id,
             sourceRole,
             replacements,
-            selectedDisplayFiles
+            selectedDisplayFiles,
+            rule: widen ? inferredRule : null
           });
 
           filesToDeleteOnError = rewrite.newFilePaths;
@@ -3813,8 +3817,18 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         await unlinkQuietly(filesToDeleteAfterCommit, request.log);
         await invalidateSessionZipCache(request.params.id);
 
+        // The authoritative figure is rewritten_loc_count — the real number of
+        // <loc>s changed on disk from the streaming rewrite (NOT inferred_urls
+        // .length, which no longer reflects the true count). inferred_applied is
+        // the rule-driven remainder beyond the confirmed sampled rows, reported
+        // for the modal's "(N inferred)" note.
+        const updated = updateResult.rowCount ?? 0;
+        const inferredApplied = widen
+          ? Math.max(0, rewrittenLocCount - updated)
+          : 0;
+
         return reply.send({
-          updated: updateResult.rowCount ?? 0,
+          updated,
           inferred_applied: inferredApplied,
           rewritten_loc_count: rewrittenLocCount
         });

@@ -811,11 +811,15 @@ export default function ResultsDashboardPage({
   const [isApplyingRedirects, setIsApplyingRedirects] = useState(false);
   const [usingRedirectId, setUsingRedirectId] = useState<string | null>(null);
   const [fixRow, setFixRow] = useState<PatternRow | null>(null);
-  // Fix Redirect URLs modal now lists EVERY URL in the pattern (v1.42), fetched
-  // on open — the HTTP-verified sampled redirects plus inferred ones. Selection
-  // is keyed by candidate.key (sampled_url_id for verified rows, "inferred:<url>"
-  // for the rest).
+  // Fix Redirect URLs modal lists a BOUNDED review sample of the pattern's
+  // redirect candidates (HTTP-verified sampled rows + inferred ones), fetched on
+  // open — capped by the pattern_urls pool, so it is NOT the full set. Accepting
+  // applies the confirmed rule to all fixPatternTotal real occurrences on disk
+  // (v1.45.1), independent of how many rows are shown here. Selection is keyed by
+  // candidate.key (sampled_url_id for verified rows, "inferred:<url>" for rest).
   const [fixCandidates, setFixCandidates] = useState<RedirectCandidate[]>([]);
+  // The pattern's real total occurrence count — the true scope of an accept.
+  const [fixPatternTotal, setFixPatternTotal] = useState(0);
   const [fixLoading, setFixLoading] = useState(false);
   const [fixInferredWithoutRule, setFixInferredWithoutRule] = useState(false);
   // Per-row action (v1.42.1): "fix" (adopt the redirect destination), "delete"
@@ -1912,6 +1916,7 @@ export default function ResultsDashboardPage({
 
     setFixLoading(true);
     setFixCandidates([]);
+    setFixPatternTotal(0);
     setFixActions({});
     setFixInferredWithoutRule(false);
     setFixPage(0);
@@ -1923,6 +1928,7 @@ export default function ResultsDashboardPage({
         }
 
         setFixCandidates(data.candidates);
+        setFixPatternTotal(data.pattern_total_urls);
         // Default action per row (see defaultFixAction): verified-normal → Fix,
         // verified-not-found → Delete, inferred → Skip (excluded from both
         // actions until someone reviews it). (v1.42.1)
@@ -2013,14 +2019,19 @@ export default function ResultsDashboardPage({
       }
 
       await loadResults({ silent: true });
-      const changed = (result.updated ?? 0) + (result.inferred_applied ?? 0);
+      // rewritten_loc_count is the authoritative number of <loc>s actually
+      // changed on disk (the whole-pattern rule reaches far beyond the reviewed
+      // sample). Fall back to updated+inferred only if it is somehow absent.
+      const changed =
+        result.rewritten_loc_count ??
+        (result.updated ?? 0) + (result.inferred_applied ?? 0);
       setFindReplaceToast({
         tone: "success",
         message: `${formatNumber(changed)} URL${
           changed === 1 ? "" : "s"
         } updated to their redirect destinations${
           result.inferred_applied
-            ? ` (${formatNumber(result.inferred_applied)} inferred)`
+            ? ` (${formatNumber(result.inferred_applied)} by inferred rule)`
             : ""
         }`
       });
@@ -3743,6 +3754,14 @@ export default function ResultsDashboardPage({
                 rest match this pattern and get the same confirmed rewrite
                 applied by inference (not individually verified).
               </p>
+              {fixPatternTotal > fixCandidates.length ? (
+                <p className="rounded-md bg-indigo-50 px-3 py-2 text-xs text-indigo-800">
+                  Showing {formatNumber(fixCandidates.length)} for review —
+                  accepting applies the confirmed rule to all{" "}
+                  {formatNumber(fixPatternTotal)} matching URLs across this
+                  pattern&rsquo;s files.
+                </p>
+              ) : null}
               {fixInferredWithoutRule ? (
                 <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
                   Only the sampled URLs are listed — the confirmed redirects were
@@ -3760,8 +3779,13 @@ export default function ResultsDashboardPage({
                     Set all to Fix
                   </button>
                   <span className="text-xs text-slate-500">
-                    {fixCandidates.length} URL
-                    {fixCandidates.length === 1 ? "" : "s"}
+                    {fixPatternTotal > fixCandidates.length
+                      ? `${formatNumber(fixCandidates.length)} of ${formatNumber(
+                          fixPatternTotal
+                        )} shown`
+                      : `${fixCandidates.length} URL${
+                          fixCandidates.length === 1 ? "" : "s"
+                        }`}
                   </span>
                 </div>
                 <div className="max-h-[320px] overflow-y-auto">

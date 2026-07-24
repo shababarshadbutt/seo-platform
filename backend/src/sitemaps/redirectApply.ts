@@ -10,7 +10,11 @@ import {
   displaySourceFilename,
   isHttpUrl
 } from "./filenames.js";
-import { rewriteSpecificLocs } from "./rewriteLocs.js";
+import {
+  buildRedirectApplyRewriter,
+  rewriteSitemapLocFile
+} from "./rewriteLocs.js";
+import type { RedirectRule } from "./redirectRule.js";
 
 // Shared "apply redirects" disk + stats logic, used by BOTH the synchronous
 // apply-redirects route (small patterns) and the background apply-redirects job
@@ -76,8 +80,18 @@ export async function rewriteRedirectSourceFilesOnDisk(
     sourceRole: string;
     replacements: Map<string, string>;
     selectedDisplayFiles: string[];
+    // When set, the whole-pattern widening rule (v1.45.1): applied to EVERY
+    // <loc> in the scanned files, not just the pre-enumerated `replacements`
+    // keys — so the fix reaches all real occurrences regardless of the capped
+    // pattern_urls sample. `replacements` (confirmed sampled pairs) still wins
+    // per-URL. Null (or omitted) = exact-map-only, unchanged prior behaviour.
+    rule?: RedirectRule | null;
   }
 ): Promise<RedirectFileRewrite> {
+  const rewriteUrl = buildRedirectApplyRewriter(
+    options.replacements,
+    options.rule ?? null
+  );
   const selectedSet = new Set(options.selectedDisplayFiles);
   const filesResult = await client.query<{
     id: string;
@@ -127,11 +141,11 @@ export async function rewriteRedirectSourceFilesOnDisk(
     );
     const outputPath = path.join(config.uploadDir, newStored);
 
-    const rewrittenLocCount = await rewriteSpecificLocs({
+    const rewrittenLocCount = await rewriteSitemapLocFile({
       inputPath,
       outputPath,
       isGzip,
-      replacements: options.replacements
+      rewriteUrl
     });
 
     if (rewrittenLocCount === 0) {

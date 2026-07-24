@@ -1,10 +1,12 @@
 import {
   buildLocMapRewriter,
   buildPatternTemplateRewriter,
+  buildRedirectApplyRewriter,
   buildTrailingSlashRewriter,
   rewriteSitemapLocFile,
   type LocUrlRewriter
 } from "../sitemaps/rewriteLocs.js";
+import type { RedirectRule } from "../sitemaps/redirectRule.js";
 
 // piscina worker: streams ONE sitemap file through a <loc> rewriter from
 // inputPath to outputPath (copy-on-write) off the worker PROCESS's main thread,
@@ -26,7 +28,15 @@ export type FileRewriteSpec =
   | { kind: "patternTemplate"; from: string; to: string }
   // Exact whole-URL replacements (apply-redirects, v1.42). Passed as [old, new]
   // pairs because a Map isn't structured-clone friendly across the thread edge.
-  | { kind: "locMap"; replacements: [string, string][] };
+  | { kind: "locMap"; replacements: [string, string][] }
+  // Whole-pattern redirect widening (v1.45.1): confirmed exact pairs PLUS a
+  // general derived rule applied to every matching <loc>. The rule is a plain
+  // structured-clone-friendly object; `replacements` win per-URL.
+  | {
+      kind: "redirectApply";
+      replacements: [string, string][];
+      rule: RedirectRule | null;
+    };
 
 export type FileRewriteInput = {
   inputPath: string;
@@ -44,6 +54,10 @@ function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
 
   if (spec.kind === "locMap") {
     return buildLocMapRewriter(new Map(spec.replacements));
+  }
+
+  if (spec.kind === "redirectApply") {
+    return buildRedirectApplyRewriter(new Map(spec.replacements), spec.rule);
   }
 
   return buildTrailingSlashRewriter();

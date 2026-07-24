@@ -842,7 +842,12 @@ export type RedirectCandidatesResponse = {
     | { kind: "replace"; find: string; replace: string }
     | { kind: "insert"; prefix: string; insert: string }
     | null;
+  // The pattern's REAL total occurrence count (the true rewrite scope on
+  // accept). Distinct from the bounded review preview below.
   pattern_total_urls: number;
+  // How many rows the review preview holds (capped by the pattern_urls sample
+  // pool) — for messaging that separates "shown for review" from "will rewrite".
+  preview_count?: number;
   sampled_redirect_count: number;
   inferred_count: number;
   candidates: RedirectCandidate[];

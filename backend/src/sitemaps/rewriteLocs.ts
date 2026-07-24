@@ -4,6 +4,8 @@ import { Transform, type TransformCallback } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { createGunzip, createGzip } from "node:zlib";
 
+import { applyRedirectRule, type RedirectRule } from "./redirectRule.js";
+
 const PARAM_SEGMENT = "{param}";
 const LOC_OPEN = "<loc>";
 const LOC_CLOSE = "</loc>";
@@ -39,6 +41,38 @@ export function buildLocMapRewriter(
     const next = replacements.get(url);
 
     return next === undefined || next === url ? null : next;
+  };
+}
+
+// Build the rewriter used by apply-redirects' whole-pattern widening. For each
+// <loc> URL it applies, in order:
+//   1. an EXACT confirmed replacement (the HTTP-verified sampled source→dest
+//      pairs) — these carry an authoritative destination and win over the rule;
+//   2. otherwise the general derived rule (deriveRedirectRule) via
+//      applyRedirectRule, which reaches EVERY matching URL in a file — not just
+//      a pre-enumerated subset;
+//   3. otherwise null (the loc passes through byte-for-byte).
+// This is the core of the fix for the capped-pattern_urls bug: because the rule
+// is a pure transform over each <loc> streamed from disk, the rewrite reaches
+// all real occurrences regardless of how many rows the bounded pattern_urls
+// sample pool held. `rule` may be null (samples disagreed / none) — then this is
+// exactly buildLocMapRewriter over the confirmed exact pairs.
+export function buildRedirectApplyRewriter(
+  exactReplacements: Map<string, string>,
+  rule: RedirectRule | null
+): LocUrlRewriter {
+  return (url: string) => {
+    const exact = exactReplacements.get(url);
+
+    if (exact !== undefined) {
+      return exact === url ? null : exact;
+    }
+
+    if (rule) {
+      return applyRedirectRule(url, rule);
+    }
+
+    return null;
   };
 }
 

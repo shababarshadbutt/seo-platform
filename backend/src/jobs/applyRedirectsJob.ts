@@ -13,13 +13,10 @@ import {
   isHttpUrl
 } from "../sitemaps/filenames.js";
 import {
-  buildLocMapRewriter,
+  buildRedirectApplyRewriter,
   rewriteSitemapLocFile
 } from "../sitemaps/rewriteLocs.js";
-import {
-  applyRedirectRule,
-  deriveRedirectRule
-} from "../sitemaps/redirectRule.js";
+import { deriveRedirectRule } from "../sitemaps/redirectRule.js";
 import { recomputePatternStatsSql } from "../sitemaps/redirectApply.js";
 import {
   FILE_REWRITE_PARALLEL_THRESHOLD,
@@ -133,17 +130,19 @@ export async function processApplyRedirectsJob(
 
   client.release();
 
-  if (rule) {
-    for (const url of inferredUrls) {
-      const dest = applyRedirectRule(url, rule);
+  // Whole-pattern widening (fixed v1.45.1): when the client opted into the
+  // unsampled URLs AND a single rule distilled from the confirmed samples, apply
+  // that rule to EVERY matching <loc> in the pattern's files via a streaming
+  // rewrite — NOT a replacement map built from the client's inferred_urls, which
+  // came from the capped pattern_urls pool and covered only the sample. The
+  // confirmed sampled pairs (`replacements`) still win per-URL. inferred_urls is
+  // now only a "widen requested" signal; its contents are not used to rewrite.
+  const widen = inferredUrls.length > 0 && rule !== null;
+  const effectiveRule = widen ? rule : null;
 
-      if (dest && dest !== url && !replacements.has(url)) {
-        replacements.set(url, dest);
-      }
-    }
-  }
-
-  if (replacements.size === 0) {
+  // Nothing to do only when there is neither a confirmed pair nor a rule to
+  // widen with (a rule can rewrite files even with zero confirmed pairs).
+  if (replacements.size === 0 && !effectiveRule) {
     logger.info(
       { session_id: sessionId, pattern_id: patternId },
       "apply-redirects job: nothing to rewrite"
@@ -276,20 +275,24 @@ export async function processApplyRedirectsJob(
 
   if (targets.length >= FILE_REWRITE_PARALLEL_THRESHOLD) {
     // Parallel: the pool caps concurrency at its thread count, so mapping every
-    // target is safe. Re-running a file is a no-op (its <loc> no longer matches
-    // the old URL), so a retry after a crash is harmless.
+    // target is safe. Re-running a file is a no-op (its <loc> no longer matches),
+    // so a retry after a crash is harmless.
     await Promise.all(
       targets.map((file) =>
         processFile(file, (input) =>
           runFileRewriteJob({
             ...input,
-            spec: { kind: "locMap", replacements: replacementPairs }
+            spec: {
+              kind: "redirectApply",
+              replacements: replacementPairs,
+              rule: effectiveRule
+            }
           }).then((result) => result.rewrittenCount)
         )
       )
     );
   } else {
-    const rewriter = buildLocMapRewriter(replacements);
+    const rewriter = buildRedirectApplyRewriter(replacements, effectiveRule);
 
     for (const file of targets) {
       await processFile(file, (input) =>
