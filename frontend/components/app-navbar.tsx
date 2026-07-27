@@ -113,12 +113,28 @@ export function AppNavbar() {
   // are this same app, so they stay relative hrefs (portable) in a new tab.
   const [seoDeskUrl, setSeoDeskUrl] = useState("");
 
+  // Deployed version, from APP_VERSION in .env — the same value that tags the
+  // running images — so what the navbar shows and what is actually deployed
+  // cannot drift apart. That drift is the whole reason this exists: the
+  // v1.48-vs-v1.46-aws-preview stale-image and wrong-compose-file mixups.
+  //
+  // v1.47 read this as a NEXT_PUBLIC_* inline. Kept the FEATURE but changed the
+  // MECHANISM to the runtime-config endpoint, because this branch established
+  // that NEXT_PUBLIC_* is frozen at `next build` — the same trap that made the
+  // BACKEND_URL rewrite ignore its env var. The value still originates from
+  // APP_VERSION and is still single-source; it just isn't baked into the bundle.
+  //
+  // Hidden rather than shown as a placeholder when unset, so a blank never reads
+  // as a real version.
+  const [appVersion, setAppVersion] = useState("");
+
   useEffect(() => {
     let cancelled = false;
 
     void getRuntimeConfig().then((runtimeConfig) => {
       if (!cancelled) {
         setSeoDeskUrl(runtimeConfig.seoDeskUrl);
+        setAppVersion(runtimeConfig.appVersion);
       }
     });
 
@@ -149,6 +165,14 @@ export function AppNavbar() {
             <span className="text-sm font-bold text-white sm:text-base">
               Sitemap Health Checker
             </span>
+            {appVersion ? (
+              <span
+                className="rounded-full bg-slate-800 px-2 py-0.5 font-mono text-[11px] font-medium leading-none text-slate-400 ring-1 ring-inset ring-slate-700"
+                title={`Deployed version ${appVersion}`}
+              >
+                {appVersion}
+              </span>
+            ) : null}
           </Link>
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-1.5">
