@@ -10,7 +10,7 @@ import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
 import { config, s3PrefixForDomain } from "../config.js";
 import { pool } from "../db/pool.js";
-import { displaySourceFilename, isHttpUrl } from "../sitemaps/filenames.js";
+import { isHttpUrl, productionFilename } from "../sitemaps/filenames.js";
 
 // Publish a session's corrected sitemaps to the live S3 bucket, then invalidate
 // exactly the CloudFront paths written (Phase 1).
@@ -22,9 +22,11 @@ import { displaySourceFilename, isHttpUrl } from "../sitemaps/filenames.js";
 // Filename resolution is the subtle part. Internally this app is copy-on-write:
 // an edited file is stored as "<session>-fixed-<hash>-<name>.xml" and the
 // original is kept for undo. Production must receive the file under its REAL
-// name, so every object key goes through displaySourceFilename() — publishing
-// the internal stored name would litter the bucket with files no index
-// references and leave the real ones stale.
+// name, so every object key goes through productionFilename() — which also
+// strips the source-role segment displaySourceFilename keeps for the UI.
+// Publishing the internal stored name (or the role-prefixed display name) would
+// litter the bucket with wrongly-named objects no index references, while
+// leaving the real ones stale.
 //
 // Deletions: this module NEVER calls DeleteObject. A file removed within a
 // session simply stops appearing in the regenerated index; the orphaned object
@@ -99,7 +101,7 @@ export async function buildPublishPlan(
       continue;
     }
 
-    const displayName = displaySourceFilename(sessionId, row.filename);
+    const displayName = productionFilename(sessionId, row.filename);
 
     if (row.is_deleted) {
       // Dropped from the regenerated index below; never DeleteObject'd.

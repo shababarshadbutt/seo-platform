@@ -2016,3 +2016,56 @@ export async function downloadDuplicatesCsv(
 
   await saveBlobWithPicker(blob, filename, { "text/csv": [".csv"] });
 }
+
+// ---- Phase 1: publish to S3 -----------------------------------------------
+
+export type PublishPreview = {
+  domain: string;
+  bucket: string;
+  prefix: string;
+  index_filename: string;
+  file_count: number;
+  total_bytes: number;
+  // First 50 production filenames, for a spot-check in the confirm dialog.
+  files: string[];
+  // Files deleted in-session: dropped from the regenerated index. NOT deleted
+  // from the bucket — publish issues no DeleteObject at all.
+  omitted_deleted: string[];
+  deletes_objects: boolean;
+  // Another publish of this same domain is already running.
+  locked: boolean;
+};
+
+export async function getPublishPreview(sessionId: string, domain: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/publish/preview?domain=${encodeURIComponent(domain)}`
+    ),
+    { method: "GET" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<PublishPreview>(response);
+}
+
+export type PublishStartResult = {
+  queued?: boolean;
+  job_id?: string;
+  domain?: string;
+};
+
+// Throws ApiError with status 409 when another publish holds this domain's
+// lock; the caller surfaces payload.message as plain text rather than a dump.
+export async function publishSession(sessionId: string, domain: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/publish`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ domain })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<PublishStartResult>(response);
+}

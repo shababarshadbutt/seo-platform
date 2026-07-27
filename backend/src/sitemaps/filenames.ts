@@ -117,3 +117,26 @@ export function buildTrailingSlashStoredFilename(
 
   return `${sessionId}-slashed-${hexToken}-${sanitizeUploadedFilename(displayName)}`;
 }
+
+// The filename a sitemap must carry in PRODUCTION, derived from its internal
+// stored name.
+//
+// displaySourceFilename() is the in-app label: it strips the session id and any
+// copy-on-write marker (fixed-/renamed-/transformed-/…) but deliberately keeps
+// the source-role segment, because "current-foo.xml" vs "legacy-foo.xml" is how
+// the UI tells the two roles apart. buildStoredUploadFilename() puts that role
+// there — it is OUR prefix, never part of what the client uploaded.
+//
+// Publishing overwrites a live bucket, so the object key must be the client's
+// real filename: uploading "current-aviation-mfg47.xml" would create a second,
+// wrongly-named object beside the real "aviation-mfg47.xml" and leave the live
+// one stale. Strip exactly one leading role segment to undo the convention.
+//
+// Caveat: a client file genuinely named "current-x.xml" would be published as
+// "x.xml". That is unavoidable without storing the original name separately,
+// and is far rarer than the alternative — which mis-names EVERY file.
+export function productionFilename(sessionId: string, storedFilename: string) {
+  const display = displaySourceFilename(sessionId, storedFilename);
+
+  return display.replace(/^(?:current|legacy)-/, "");
+}

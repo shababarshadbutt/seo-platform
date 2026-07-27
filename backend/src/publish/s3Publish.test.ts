@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import { s3PrefixForDomain } from "../config.js";
 import { assertSafeDomain } from "../sftp/sftpClient.js";
+import { productionFilename } from "../sitemaps/filenames.js";
 import { buildPublishIndexXml } from "./s3Publish.js";
 
 // Pure logic of the publish path — no AWS calls, so this runs anywhere.
@@ -68,4 +69,43 @@ test("a file omitted from the plan drops out of the regenerated index", () => {
   assert.ok(before.includes("deleted.xml"));
   assert.ok(!after.includes("deleted.xml"));
   assert.equal((after.match(/<sitemap>/g) ?? []).length, 2);
+});
+
+// The object key must be the CLIENT's filename. displaySourceFilename keeps the
+// source-role segment ("current-") that buildStoredUploadFilename adds — that
+// prefix is ours, not the client's, and publishing it would create a second
+// wrongly-named object beside the real one while leaving the live file stale.
+test("productionFilename strips our internal prefixes, including the role", () => {
+  const sid = "bbbbbbbb-cccc-4ddd-8eee-000000000001";
+
+  // Plain upload.
+  assert.equal(
+    productionFilename(sid, `${sid}-current-aviation-mfg47.xml`),
+    "aviation-mfg47.xml"
+  );
+
+  // Copy-on-write edit: fixed-<hex>- marker AND the role must both go.
+  assert.equal(
+    productionFilename(sid, `${sid}-fixed-9f2ab31c-current-aviation-mfg47.xml`),
+    "aviation-mfg47.xml"
+  );
+
+  // Other mutation markers behave the same.
+  assert.equal(
+    productionFilename(sid, `${sid}-transformed-abc123-current-a.xml.gz`),
+    "a.xml.gz"
+  );
+
+  // Legacy-role files resolve too.
+  assert.equal(
+    productionFilename(sid, `${sid}-legacy-old-sitemap.xml`),
+    "old-sitemap.xml"
+  );
+
+  // An edited copy and its original must resolve to the SAME production name —
+  // otherwise a fix would publish under a new key and orphan the live file.
+  assert.equal(
+    productionFilename(sid, `${sid}-fixed-deadbeef-current-x.xml`),
+    productionFilename(sid, `${sid}-current-x.xml`)
+  );
 });

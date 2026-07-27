@@ -51,7 +51,16 @@ services:
       # Plain (non-public) — read server-side at request time, exposed to the
       # client bundle via a small runtime-config endpoint, not build-time inlining.
       BACKEND_URL: http://backend:3001
-      SEO_DESK_URL: ${SEO_DESK_URL:-http://seo-desk:3000}
+      # Required, no default. This is a link the BROWSER navigates to, so it
+      # must be a browser-reachable address — the internal compose name
+      # (http://seo-desk:3000) resolves only inside Docker and would 404 for
+      # every user. Deliberately NOT proxied through this app: the link is a
+      # full-page navigation, not a fetch, so the same-origin/CORS argument
+      # that justified the /api/backend/* proxy does not apply, and SEO Desk
+      # has its own NextAuth session whose callback URLs and cookie scoping a
+      # path-prefix proxy would risk breaking for no benefit. SEO_DESK_PORT
+      # stays published on the host for exactly this reason.
+      SEO_DESK_URL: ${SEO_DESK_URL:?SEO_DESK_URL must be set to a browser-reachable address in .env}
       # Fine to bake at build time — this is genuinely static per image build,
       # unlike the two URLs above which can legitimately vary per deployment
       # target using the same image.

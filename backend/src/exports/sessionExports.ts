@@ -564,6 +564,19 @@ async function generatePdfExport(data: SessionExportData, filePath: string) {
           return;
         }
 
+        // Leave the reverse-proxied backend calls alone. Since Phase 1 the
+        // client fetches a RELATIVE /api/backend/* on the frontend origin,
+        // which Next proxies to the backend server-side. Rewriting the host
+        // here would send /api/backend/... straight at the backend, which has
+        // no such prefix (stripping it is exactly what the rewrite does) — a
+        // guaranteed 404 that would silently empty every exported PDF. The
+        // frontend is reachable from this container (page.goto already uses
+        // it), so letting these through is both correct and sufficient.
+        if (requestUrl.pathname.startsWith("/api/backend/")) {
+          await route.continue();
+          return;
+        }
+
         requestUrl.protocol = apiBaseUrl.protocol;
         requestUrl.host = apiBaseUrl.host;
         await route.continue({

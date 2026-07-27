@@ -23,7 +23,8 @@ import {
   TriangleAlert,
   Undo2,
   Wrench,
-  XCircle
+  XCircle,
+  UploadCloud
 } from "lucide-react";
 import {
   Bar,
@@ -58,6 +59,7 @@ import {
   getDownloadPreview,
   saveDownloadZip,
   supportsDirectoryPicker,
+  ApiError,
   friendlyApiErrorMessage,
   getBulkReplaceStatus,
   getMismatchedUrls,
@@ -86,7 +88,10 @@ import {
   type PatternSourceFile,
   type RedirectCandidate,
   type SampledUrl,
-  type SessionResponse
+  type SessionResponse,
+  getPublishPreview,
+  publishSession,
+  type PublishPreview
 } from "@/lib/api";
 import {
   countTemplateParams,
@@ -116,6 +121,7 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle
 } from "@/components/ui/dialog";
@@ -192,6 +198,24 @@ type FixAction = "fix" | "delete" | "skip";
 //     deleted anyway, so it's excluded from both actions until reviewed;
 //   • verified + not-found destination → Delete;
 //   • verified + normal → Fix.
+// Human byte size for the publish preview's "how much am I overwriting" line.
+function formatBytes(bytes: number) {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024;
+  let unit = 0;
+
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+
+  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
+}
+
 function defaultFixAction(candidate: RedirectCandidate): FixAction {
   if (!candidate.is_sampled) {
     return "skip";
@@ -867,6 +891,18 @@ export default function ResultsDashboardPage({
   );
   // "Fix Trailing Slashes" re-run confirmation (v1.31 Fix 4).
   const [slashRerunOpen, setSlashRerunOpen] = useState(false);
+  // Publish to S3 (Phase 1). Two-step by design: opening the dialog fetches a
+  // PREVIEW of what would change, and only an explicit second click writes to
+  // production — there is no bucket versioning, so a blind one-click publish
+  // has no undo. Mirrors the existing confirm-dialog pattern rather than
+  // introducing new chrome.
+  const [publishOpen, setPublishOpen] = useState(false);
+  const [publishPreview, setPublishPreview] = useState<PublishPreview | null>(
+    null
+  );
+  const [publishLoading, setPublishLoading] = useState(false);
+  const [publishError, setPublishError] = useState("");
+  const [isPublishing, setIsPublishing] = useState(false);
   const downloadAbortRef = useRef<AbortController | null>(null);
   const switchToCacheRef = useRef(false);
   const [deleteUrlTarget, setDeleteUrlTarget] = useState<SampledUrl | null>(
@@ -1855,6 +1891,73 @@ export default function ResultsDashboardPage({
     }
   }
 
+  // The domain to publish under: the session's own base URL host, so the user
+  // never types (or mistypes) a production target.
+  const publishDomain = (() => {
+    try {
+      return new URL(sessionData?.session.base_url ?? "").host;
+    } catch {
+      return "";
+    }
+  })();
+
+  async function openPublishDialog() {
+    setPublishOpen(true);
+    setPublishPreview(null);
+    setPublishError("");
+    setPublishLoading(true);
+
+    try {
+      setPublishPreview(await getPublishPreview(params.id, publishDomain));
+    } catch (nextError) {
+      setPublishError(
+        friendlyApiErrorMessage(
+          nextError,
+          "Unable to work out what would be published."
+        )
+      );
+    } finally {
+      setPublishLoading(false);
+    }
+  }
+
+  async function handlePublish() {
+    if (isPublishing || !publishDomain) {
+      return;
+    }
+
+    setIsPublishing(true);
+    setPublishError("");
+
+    try {
+      await publishSession(params.id, publishDomain);
+      setPublishOpen(false);
+      setFindReplaceToast({
+        tone: "success",
+        message: `Publishing ${formatNumber(
+          publishPreview?.file_count ?? 0
+        )} file${
+          (publishPreview?.file_count ?? 0) === 1 ? "" : "s"
+        } to ${publishDomain} — the CDN will be invalidated when it finishes.`
+      });
+    } catch (nextError) {
+      // 409 = another publish holds this domain's lock. Show the server's plain
+      // sentence, not a raw error dump — it already names the domain.
+      if (nextError instanceof ApiError && nextError.status === 409) {
+        setPublishError(
+          (nextError.payload as { message?: string })?.message ??
+            "Someone is already publishing this domain. Try again shortly."
+        );
+      } else {
+        setPublishError(
+          friendlyApiErrorMessage(nextError, "Unable to publish to S3.")
+        );
+      }
+    } finally {
+      setIsPublishing(false);
+    }
+  }
+
   // Current patterns eligible as a bulk-replace "From" (have a {param} slot).
   const bulkPatterns = useMemo<BulkReplacePattern[]>(
     () =>
@@ -2818,6 +2921,23 @@ export default function ResultsDashboardPage({
                   </DropdownMenuContent>
                 </DropdownMenu>
               ) : null}
+              {/* Publish to S3 — explicitly user-triggered (never automatic
+                  on completion): it overwrites live production and the
+                  bucket has no versioning. Opens a preview first. */}
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void openPublishDialog()}
+                disabled={!publishDomain}
+                title={
+                  publishDomain
+                    ? `Publish this session's sitemaps to ${publishDomain}`
+                    : "This session has no valid base URL to publish under"
+                }
+              >
+                <UploadCloud className="mr-2 h-4 w-4" />
+                Publish to S3
+              </Button>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button disabled={!session || isLoading} variant="outline">
@@ -4321,6 +4441,167 @@ export default function ResultsDashboardPage({
           </DialogContent>
         </Dialog>
 
+
+        {/* Publish to S3 — preview then commit. Same Dialog chrome as the
+            Undo / Fix confirmations rather than new UI. */}
+        <Dialog
+          open={publishOpen}
+          onOpenChange={(open) => {
+            if (!open && !isPublishing) {
+              setPublishOpen(false);
+            }
+          }}
+        >
+          <DialogContent className="max-h-[85vh] min-w-0 overflow-y-auto sm:max-w-xl">
+            <DialogHeader className="min-w-0">
+              <DialogTitle>Publish to S3</DialogTitle>
+              <DialogDescription>
+                Review what will change on production before publishing. This
+                overwrites the live sitemaps for this domain.
+              </DialogDescription>
+            </DialogHeader>
+
+            {publishLoading ? (
+              <div className="flex items-center gap-2 px-1 py-6 text-sm text-slate-500">
+                <Loader2 className="h-4 w-4 animate-spin text-indigo-500" />
+                Working out what would change…
+              </div>
+            ) : publishPreview ? (
+              <div className="min-w-0 space-y-4">
+                <div className="space-y-1 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm">
+                  <p className="break-all">
+                    <span className="text-slate-500">Destination:</span>{" "}
+                    <span className="font-mono text-xs">
+                      s3://{publishPreview.bucket}/{publishPreview.prefix}
+                    </span>
+                  </p>
+                  <p className="break-all">
+                    <span className="text-slate-500">Index file:</span>{" "}
+                    <span className="font-mono text-xs">
+                      {publishPreview.index_filename}
+                    </span>
+                  </p>
+                </div>
+
+                <p className="rounded-md bg-indigo-50 px-3 py-2 text-sm font-medium text-indigo-800">
+                  Overwriting {formatNumber(publishPreview.file_count)} sitemap
+                  {publishPreview.file_count === 1 ? "" : "s"} (
+                  {formatBytes(publishPreview.total_bytes)}) plus a regenerated{" "}
+                  {publishPreview.index_filename}
+                </p>
+
+                {publishPreview.files.length > 0 ? (
+                  <div className="rounded-md border border-slate-200">
+                    <p className="border-b border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600">
+                      Files to be written
+                      {publishPreview.file_count > publishPreview.files.length
+                        ? ` (first ${publishPreview.files.length} of ${formatNumber(
+                            publishPreview.file_count
+                          )})`
+                        : ""}
+                    </p>
+                    <ul className="max-h-[180px] overflow-y-auto">
+                      {publishPreview.files.map((filename) => (
+                        <li
+                          key={filename}
+                          className="truncate border-b border-slate-100 px-3 py-1.5 font-mono text-xs text-slate-700 last:border-b-0"
+                          title={filename}
+                        >
+                          {filename}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : (
+                  <p className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                    No files resolved for this session — nothing would be
+                    written. Check the session still has its sitemap files.
+                  </p>
+                )}
+
+                {publishPreview.omitted_deleted.length > 0 ? (
+                  <div className="space-y-1 rounded-md bg-amber-50 px-3 py-2">
+                    <p className="text-sm font-medium text-amber-900">
+                      {formatNumber(publishPreview.omitted_deleted.length)} file
+                      {publishPreview.omitted_deleted.length === 1 ? "" : "s"}{" "}
+                      dropped from the index
+                    </p>
+                    <p className="text-xs text-amber-800">
+                      Deleted in this session, so the regenerated index will no
+                      longer reference{" "}
+                      {publishPreview.omitted_deleted.length === 1
+                        ? "it"
+                        : "them"}
+                      . The existing object
+                      {publishPreview.omitted_deleted.length === 1 ? " is" : "s are"}{" "}
+                      left in the bucket — publishing never deletes, since there
+                      is no versioning to undo a wrong delete.
+                    </p>
+                    <ul className="max-h-[90px] overflow-y-auto pt-1">
+                      {publishPreview.omitted_deleted.map((filename) => (
+                        <li
+                          key={filename}
+                          className="truncate font-mono text-xs text-amber-900"
+                          title={filename}
+                        >
+                          {filename}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {publishPreview.locked ? (
+                  <p className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                    Someone is already publishing this domain. Wait for that to
+                    finish before starting another.
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+
+            {publishError ? (
+              <p
+                className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700"
+                role="alert"
+              >
+                {publishError}
+              </p>
+            ) : null}
+
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isPublishing}
+                onClick={() => setPublishOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                disabled={
+                  isPublishing ||
+                  publishLoading ||
+                  !publishPreview ||
+                  publishPreview.file_count === 0
+                }
+                onClick={() => void handlePublish()}
+              >
+                {isPublishing ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Publishing
+                  </>
+                ) : (
+                  `Publish ${formatNumber(publishPreview?.file_count ?? 0)} file${
+                    (publishPreview?.file_count ?? 0) === 1 ? "" : "s"
+                  }`
+                )}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
         <Dialog open={isUndoConfirmOpen} onOpenChange={setIsUndoConfirmOpen}>
           <DialogContent className="sm:max-w-md">

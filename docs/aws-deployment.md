@@ -1,0 +1,108 @@
+# AWS deployment — `feature/aws-s3-sftp-deploy`
+
+Branch cut from `ee7dd774` (v1.46 tip). Deploys with `docker-compose.aws.yml`,
+which is the **contract** for the env var names the code reads — change one side
+and you must change the other.
+
+---
+
+## REQUIRED PRE-LAUNCH GATE — throwaway-domain live test
+
+**Nothing real goes through the SFTP → publish path until this passes.**
+
+Everything in this feature was built and verified without AWS credentials or a
+Transfer Family endpoint: the SFTP client, S3 publish and CloudFront
+invalidation are unit-tested and typecheck against the real SDKs, but **no code
+here has ever completed a round trip against actual AWS**. The first thing to
+run once the VM has its IAM role and SFTP access is this end-to-end pass against
+a throwaway prefix — not a client domain.
+
+Use a disposable domain value such as `_test-domain`, so everything lands under
+`sites/_test-domain/sitemaps/` and touches no client's live sitemaps.
+
+1. **Config reachable.** `GET /api/sftp/domains` returns a list (not 503/502).
+   A 503 means an env var is unset; a 502 means the endpoint or credentials are
+   wrong.
+2. **Pull.** Create a session, `POST /api/sessions/:id/sources/sftp` with the
+   throwaway domain. Confirm the expected file count appears in the session and
+   parses — the pull is queued, so watch the worker log for
+   `sftp pull complete` and check `stored` vs `failed`.
+3. **Process.** Run a normal fix/clean over the session so at least one file is
+   edited (produces a `fixed-…` stored name) and at least one is deleted. This
+   is what exercises the production-filename resolution and the index-drop path.
+4. **Preview.** `GET /api/sessions/:id/publish/preview?domain=_test-domain`.
+   Check every filename is the **client-facing** name — no `current-`,
+   `fixed-…`, or session-id prefixes — and that the deleted file appears under
+   `omitted_deleted`, not in `files`.
+5. **Publish.** Click **Publish to S3**. Confirm `queued: true`, then
+   `s3 publish complete` in the worker log with a non-null `invalidation_id`.
+6. **Verify the objects.** `aws s3 ls s3://asap-cms-prod/sites/_test-domain/sitemaps/`
+   — the child files and the index are present under their real names, and the
+   deleted file's object is **still there** (publish never issues DeleteObject)
+   but is **absent from the index**.
+7. **Verify the CDN actually serves the new content.** Fetch the index through
+   CloudFront (not S3 directly) and confirm it reflects this publish. If it
+   serves stale content, the invalidation did not take — check the distribution
+   id and that the paths in the invalidation match the keys written.
+8. **Verify the lock under real conditions.** Start a publish for the throwaway
+   domain and, while it runs, start another for the same domain: the second must
+   return **409** with "someone is already publishing this domain". A publish of
+   a *different* domain at the same time must proceed normally.
+9. **Clean up.** Delete `sites/_test-domain/` from the bucket.
+
+Only after all nine pass should a real client domain be published.
+
+---
+
+## Required `.env` values
+
+No defaults — deployment fails loudly until each is set. That is deliberate: on
+a shared production box, silently starting with a stale or wrong value is worse
+than not starting.
+
+| Variable | Notes |
+| --- | --- |
+| `APP_VERSION` | Image tag **and** the version the UI reports. No fallback. |
+| `POSTGRES_PASSWORD` | No longer hardcoded. |
+| `ENCRYPTION_KEY` | GSC credential encryption at rest. |
+| `NEXTAUTH_SECRET`, `CRON_SECRET` | SEO Desk. |
+| `AWS_REGION` | S3 + CloudFront client region. |
+| `CLOUDFRONT_DISTRIBUTION_ID` | Invalidation target. |
+| `SFTP_HOST`, `SFTP_USERNAME` | AWS Transfer Family. |
+| `SEO_DESK_URL` | **Browser-reachable** address. The navbar link is a full-page navigation the user's browser follows, so an internal compose name (`http://seo-desk:3000`) will 404 for everyone. |
+
+Optional, with defaults: `SFTP_PORT` (22), `SFTP_PRIVATE_KEY_PATH`
+(`/run/secrets/sftp_private_key`), `SFTP_PASSWORD` (empty — fallback used only
+when the key file is absent), `SFTP_BASE_PATH` (`sftp-sitemaps-asapsmei`),
+`SFTP_MAX_CONCURRENT_CONNECTIONS` (4), `S3_BUCKET` (`asap-cms-prod`),
+`S3_SITEMAPS_PREFIX_TEMPLATE` (`sites/{domain}/sitemaps/`),
+`S3_PUBLISH_ALLOW_DELETE` (`false`), `PUBLISH_LOCK_TTL_SECONDS` (300),
+`NODE_TLS_REJECT_UNAUTHORIZED` (1), `FRONTEND_PORT` (3000), `SEO_DESK_PORT`
+(4000).
+
+**No AWS access keys anywhere.** S3 and CloudFront use the default provider
+chain, which resolves the EC2 instance role. If IAM-role auth is not wired up on
+first deploy that is a blocker to fix, not a reason to add keys.
+
+---
+
+## Design decisions worth knowing before changing anything
+
+- **Publish never deletes.** There is no `DeleteObject` call in the codebase. A
+  file removed in a session drops out of the regenerated index; its object stays
+  in the bucket, unreferenced. Versioning is off, so a wrong delete has no undo.
+  `S3_PUBLISH_ALLOW_DELETE=true` is **rejected at runtime** rather than silently
+  ignored, so the flag cannot imply a capability that does not exist.
+- **Publish is per-domain locked, and collisions are rejected, not queued.** Two
+  users publishing different domains run fully in parallel. Two publishing the
+  same domain: the second gets a 409. Queuing it would overwrite production
+  minutes later with nobody watching.
+- **One public port.** Only the frontend publishes a port. Browser calls go to a
+  relative `/api/backend/*` which Next reverse-proxies server-side to
+  `BACKEND_URL`. The backend deliberately publishes **no** port — exposing it
+  would put an unauthenticated API on the internet and defeat the design.
+  SEO Desk is the one exception: it is a separate app with its own NextAuth
+  session, reached by full-page navigation, so it keeps its own published port.
+- **Everything is compiled.** Backend runs `node dist/server.js`; the piscina
+  pools load `dist/workers/*.js` with no tsx. `tsx watch` on an always-on shared
+  box would re-exec the API on any stray file write.
