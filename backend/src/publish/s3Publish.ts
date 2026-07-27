@@ -22,11 +22,13 @@ import { isHttpUrl, productionFilename } from "../sitemaps/filenames.js";
 // Filename resolution is the subtle part. Internally this app is copy-on-write:
 // an edited file is stored as "<session>-fixed-<hash>-<name>.xml" and the
 // original is kept for undo. Production must receive the file under its REAL
-// name, so every object key goes through productionFilename() — which also
-// strips the source-role segment displaySourceFilename keeps for the UI.
-// Publishing the internal stored name (or the role-prefixed display name) would
-// litter the bucket with wrongly-named objects no index references, while
-// leaving the real ones stale.
+// name. Since migration 031 that name is RECORDED at ingestion
+// (sitemap_files.original_filename) rather than recovered from our prefixed
+// stored name, because the recovery heuristic cannot distinguish our own
+// "current-" role prefix from a client file genuinely called "current-x.xml" —
+// and publishing the wrong key overwrites the wrong object in a bucket with no
+// versioning. Pre-031 rows have no recorded name and fall back to
+// productionFilename(), which is exactly the old behaviour.
 //
 // Deletions: this module NEVER calls DeleteObject. A file removed within a
 // session simply stops appearing in the regenerated index; the orphaned object
@@ -79,11 +81,12 @@ export async function buildPublishPlan(
 ): Promise<PublishPlan> {
   const filesResult = await pool.query<{
     filename: string;
+    original_filename: string | null;
     is_deleted: boolean;
     is_index: boolean;
   }>(
     `
-      SELECT filename, is_deleted, is_index
+      SELECT filename, original_filename, is_deleted, is_index
       FROM sitemap_files
       WHERE session_id = $1 AND source_role = 'current'
       ORDER BY filename ASC
@@ -101,7 +104,12 @@ export async function buildPublishPlan(
       continue;
     }
 
-    const displayName = productionFilename(sessionId, row.filename);
+    // Recorded name wins outright (migration 031). Only rows ingested BEFORE
+    // that migration have NULL here, and they fall back to deriving it from the
+    // stored name exactly as before — so nothing changes retroactively, and no
+    // new row is ever subject to the heuristic.
+    const displayName =
+      row.original_filename ?? productionFilename(sessionId, row.filename);
 
     if (row.is_deleted) {
       // Dropped from the regenerated index below; never DeleteObject'd.
@@ -147,6 +155,20 @@ export async function buildPublishPlan(
 
 // Regenerate the index over exactly the files being published, so a file
 // deleted in-session drops out of it.
+// NOTE on the public path: a <loc> here must be the URL a search engine can
+// actually FETCH, which is not the S3 key. The key prefix
+// ("sites/<domain>/sitemaps/") is storage layout behind CloudFront; emitting it
+// verbatim produced
+//   https://<domain>/sites/<domain>/sitemaps/<file>
+// — the storage path leaked into the public URL. The public path is the last
+// segment of the prefix ("sitemaps"), matching the convention the Cleaner's own
+// buildIndexXml already uses (<domain>/<subfolder>/<file>), so both index
+// builders in this codebase now agree.
+//
+// This still ASSUMES CloudFront maps <domain>/sitemaps/* onto that prefix. That
+// mapping is a distribution setting this code cannot see, and step 7 of the
+// throwaway-domain gate (docs/aws-deployment.md) exists to confirm it before any
+// real client domain is published.
 export function buildPublishIndexXml(
   domain: string,
   prefix: string,
@@ -154,7 +176,8 @@ export function buildPublishIndexXml(
   today: string
 ): string {
   const base = `https://${domain}`;
-  const sub = prefix.replace(/^\/+|\/+$/g, "");
+  const segments = prefix.replace(/^\/+|\/+$/g, "").split("/").filter(Boolean);
+  const sub = segments.length > 0 ? segments[segments.length - 1] : "";
   const entries = filenames
     .map((filename) => {
       const loc = `${base}/${sub}/${filename}`
@@ -169,11 +192,15 @@ export function buildPublishIndexXml(
   return `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${entries}\n</sitemapindex>\n`;
 }
 
+// May return a promise; executePublish awaits it so progress writes stay in
+// ORDER. Unordered (fire-and-forget) writes let a late per-file update land
+// after the terminal "done" update and clobber it, which showed a stale
+// mid-upload message as the completion message.
 export type PublishProgress = (event: {
   current: number;
   total: number;
   filename: string;
-}) => void;
+}) => void | Promise<void>;
 
 // Execute a plan: upload every child file, then the regenerated index, then
 // invalidate exactly those paths.
@@ -217,7 +244,7 @@ export async function executePublish(
 
       writtenKeys.push(key);
       bytes += file.size;
-      options.onProgress?.({
+      await options.onProgress?.({
         current: index,
         total: plan.files.length + 1,
         filename: file.displayName
@@ -242,7 +269,7 @@ export async function executePublish(
     );
 
     writtenKeys.push(indexKey);
-    options.onProgress?.({
+    await options.onProgress?.({
       current: plan.files.length + 1,
       total: plan.files.length + 1,
       filename: plan.indexFilename

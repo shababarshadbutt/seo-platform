@@ -21,13 +21,16 @@ import {
   Search,
   Sparkles,
   UploadCloud,
-  X
+  X,
+  Server
 } from "lucide-react";
 
 import {
   apiErrorPayload,
   completeSitemapUpload,
   createSession,
+  getSftpDomains,
+  startSftpPull,
   fetchCleanerHandoffFile,
   friendlyApiErrorMessage,
   getCleanerHandoff,
@@ -64,7 +67,9 @@ const LARGE_UPLOAD_WARNING_THRESHOLD = 500;
 const SITEMAP_URL_FETCH_ERROR =
   "Could not fetch sitemap — check the URL and try again";
 
-type SourceMode = "file" | "url";
+// Third source alongside manual upload and fetch-from-URL: pull a domain's
+// whole sitemap set from the AWS Transfer Family SFTP location.
+type SourceMode = "file" | "url" | "sftp";
 type SitemapUrlField = {
   id: string;
   value: string;
@@ -225,6 +230,12 @@ export default function Home() {
   const [sampleSize, setSampleSize] = useState(10);
   const [concurrency, setConcurrency] = useState("10");
   const [sourceMode, setSourceMode] = useState<SourceMode>("file");
+  // SFTP source state. Domains are listed lazily the first time the tab is
+  // opened, so a deployment without SFTP configured costs nothing until asked.
+  const [sftpDomains, setSftpDomains] = useState<string[]>([]);
+  const [sftpDomain, setSftpDomain] = useState("");
+  const [sftpLoading, setSftpLoading] = useState(false);
+  const [sftpError, setSftpError] = useState("");
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [legacyFiles, setLegacyFiles] = useState<File[]>([]);
   const [folderXmlCount, setFolderXmlCount] = useState<number | null>(null);
@@ -290,7 +301,11 @@ export default function Home() {
       sitemapUrlFieldStates.every((fieldState) => fieldState.hasValidPreview)
   );
   const hasValidSource =
-    sourceMode === "file" ? selectedFiles.length > 0 : hasValidUrlPreview;
+    sourceMode === "file"
+      ? selectedFiles.length > 0
+      : sourceMode === "sftp"
+        ? sftpDomain.length > 0
+        : hasValidUrlPreview;
   const hasValidConcurrency =
     Number.isInteger(concurrencyNumber) &&
     concurrencyNumber >= 1 &&
@@ -853,6 +868,28 @@ export default function Home() {
     }
   }
 
+  async function loadSftpDomains() {
+    setSftpLoading(true);
+    setSftpError("");
+
+    try {
+      const result = await getSftpDomains();
+      setSftpDomains(result.domains);
+
+      if (result.domains.length === 1) {
+        setSftpDomain(result.domains[0]);
+      }
+    } catch (error) {
+      // A deployment without SFTP configured answers 503 with a plain reason —
+      // show it rather than an empty dropdown with no explanation.
+      setSftpError(
+        friendlyApiErrorMessage(error, "Could not list SFTP domains.")
+      );
+    } finally {
+      setSftpLoading(false);
+    }
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
@@ -872,6 +909,8 @@ export default function Home() {
         setFormError("Choose at least one XML file before starting analysis.");
       } else if (sourceMode === "url" && !hasValidUrlPreview) {
         setFormError("Preview every sitemap URL before starting analysis.");
+      } else if (sourceMode === "sftp" && !sftpDomain) {
+        setFormError("Choose a domain to pull from SFTP.");
       } else {
         setFormError("Complete the required fields before starting analysis.");
       }
@@ -1018,6 +1057,10 @@ export default function Home() {
             return;
           }
         }
+      } else if (sourceMode === "sftp" && sftpDomain) {
+        // Queued server-side: a domain can hold thousands of child sitemaps, so
+        // the pull runs as a job and the session page shows it arriving.
+        await startSftpPull(created.session_id, sftpDomain);
       } else if (confirmedSitemapUrls.length > 0) {
         await submitSitemapUrls(created.session_id, confirmedSitemapUrls);
       } else {
@@ -1212,7 +1255,7 @@ export default function Home() {
                     Sitemap source
                   </label>
                   <div
-                    className="grid grid-cols-2 gap-1 rounded-full border border-indigo-100 bg-indigo-50 p-1"
+                    className="grid grid-cols-3 gap-1 rounded-full border border-indigo-100 bg-indigo-50 p-1"
                     role="tablist"
                     aria-label="Sitemap source"
                   >
@@ -1252,7 +1295,90 @@ export default function Home() {
                       <LinkIcon className="h-4 w-4" aria-hidden="true" />
                       Enter URL
                     </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={sourceMode === "sftp"}
+                      onClick={() => {
+                        setSourceMode("sftp");
+                        setFormError("");
+
+                        if (sftpDomains.length === 0 && !sftpLoading) {
+                          void loadSftpDomains();
+                        }
+                      }}
+                      className={cn(
+                        "flex h-10 items-center justify-center gap-2 rounded-full text-sm font-semibold transition-colors",
+                        sourceMode === "sftp"
+                          ? "bg-indigo-500 text-white shadow-sm"
+                          : "text-slate-500 hover:text-indigo-600"
+                      )}
+                    >
+                      <Server className="h-4 w-4" aria-hidden="true" />
+                      From SFTP
+                    </button>
                   </div>
+
+                  {sourceMode === "sftp" ? (
+                    <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                      <div className="space-y-1">
+                        <label
+                          className="text-sm font-semibold text-slate-700"
+                          htmlFor="sftp-domain"
+                        >
+                          Client domain
+                        </label>
+                        <p className="text-xs text-slate-500">
+                          Pulls every sitemap file for this domain from the SFTP
+                          location, then processes them exactly like uploads.
+                        </p>
+                      </div>
+
+                      {sftpLoading ? (
+                        <p className="flex items-center gap-2 text-sm text-slate-500">
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          Listing domains…
+                        </p>
+                      ) : sftpError ? (
+                        <div className="space-y-2">
+                          <p className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                            {sftpError}
+                          </p>
+                          <button
+                            type="button"
+                            className="text-sm font-semibold text-indigo-600 hover:text-indigo-700"
+                            onClick={() => void loadSftpDomains()}
+                          >
+                            Try again
+                          </button>
+                        </div>
+                      ) : (
+                        <>
+                          <select
+                            id="sftp-domain"
+                            value={sftpDomain}
+                            onChange={(event) => {
+                              setSftpDomain(event.target.value);
+                              setFormError("");
+                            }}
+                            className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
+                          >
+                            <option value="">Select a domain…</option>
+                            {sftpDomains.map((domain) => (
+                              <option key={domain} value={domain}>
+                                {domain}
+                              </option>
+                            ))}
+                          </select>
+                          {sftpDomains.length === 0 ? (
+                            <p className="text-sm text-slate-500">
+                              No domains found in the SFTP location.
+                            </p>
+                          ) : null}
+                        </>
+                      )}
+                    </div>
+                  ) : null}
 
                   {sourceMode === "file" ? (
                     <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">

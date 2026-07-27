@@ -2069,3 +2069,78 @@ export async function publishSession(sessionId: string, domain: string) {
 
   return readJsonResponse<PublishStartResult>(response);
 }
+
+// ---- Phase 1: SFTP source ------------------------------------------------
+
+export type SftpDomainsResult = {
+  domains: string[];
+  pool?: { limit: number; available: number; queued: number };
+};
+
+export async function getSftpDomains() {
+  const response = await fetchWithTimeout(
+    backendUrl("/api/sftp/domains"),
+    { method: "GET" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<SftpDomainsResult>(response);
+}
+
+// Queue a pull of every sitemap file for `domain` into this session. The files
+// land through the same ingestion path a manual upload uses.
+export async function startSftpPull(sessionId: string, domain: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/sources/sftp`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ domain })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<{ queued?: boolean; job_id?: string; domain?: string }>(
+    response
+  );
+}
+
+export type PublishProgressEvent = {
+  type: "progress" | "done" | "error";
+  stage?: string;
+  current?: number;
+  total?: number;
+  message?: string;
+  result?: {
+    uploaded?: number;
+    bytes?: number;
+    index_key?: string;
+    omitted_deleted?: string[];
+    invalidation_id?: string | null;
+  };
+};
+
+// Follow a running publish. Same SSE shape the Cleaner already streams, so the
+// consumer logic is the familiar one. Returns the EventSource so the caller can
+// close it on unmount.
+export function followPublishProgress(
+  sessionId: string,
+  onEvent: (event: PublishProgressEvent) => void
+): EventSource {
+  const source = new EventSource(
+    backendUrl(`/api/sessions/${sessionId}/publish/progress`)
+  );
+
+  source.onmessage = (message) => {
+    try {
+      onEvent(JSON.parse(message.data) as PublishProgressEvent);
+    } catch {
+      // Ignore malformed frames rather than tearing the stream down.
+    }
+  };
+  source.onerror = () => {
+    source.close();
+  };
+
+  return source;
+}

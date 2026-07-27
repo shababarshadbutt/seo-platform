@@ -89,9 +89,11 @@ import {
   type RedirectCandidate,
   type SampledUrl,
   type SessionResponse,
+  followPublishProgress,
   getPublishPreview,
   publishSession,
-  type PublishPreview
+  type PublishPreview,
+  type PublishProgressEvent
 } from "@/lib/api";
 import {
   countTemplateParams,
@@ -903,6 +905,19 @@ export default function ResultsDashboardPage({
   const [publishLoading, setPublishLoading] = useState(false);
   const [publishError, setPublishError] = useState("");
   const [isPublishing, setIsPublishing] = useState(false);
+  // Live publish progress, streamed over SSE in the same shape the Cleaner
+  // already uses — a 1,600-file publish must not sit on a static spinner.
+  const [publishProgress, setPublishProgress] =
+    useState<PublishProgressEvent | null>(null);
+  const publishStreamRef = useRef<EventSource | null>(null);
+
+  useEffect(
+    () => () => {
+      publishStreamRef.current?.close();
+      publishStreamRef.current = null;
+    },
+    []
+  );
   const downloadAbortRef = useRef<AbortController | null>(null);
   const switchToCacheRef = useRef(false);
   const [deleteUrlTarget, setDeleteUrlTarget] = useState<SampledUrl | null>(
@@ -1905,6 +1920,9 @@ export default function ResultsDashboardPage({
     setPublishOpen(true);
     setPublishPreview(null);
     setPublishError("");
+    setPublishProgress(null);
+    publishStreamRef.current?.close();
+    publishStreamRef.current = null;
     setPublishLoading(true);
 
     try {
@@ -1931,15 +1949,37 @@ export default function ResultsDashboardPage({
 
     try {
       await publishSession(params.id, publishDomain);
-      setPublishOpen(false);
-      setFindReplaceToast({
-        tone: "success",
-        message: `Publishing ${formatNumber(
-          publishPreview?.file_count ?? 0
-        )} file${
-          (publishPreview?.file_count ?? 0) === 1 ? "" : "s"
-        } to ${publishDomain} — the CDN will be invalidated when it finishes.`
+      // Stay open and follow the job — closing here would drop the user back to
+      // a static toast for what can be a multi-minute upload.
+      setPublishProgress({
+        type: "progress",
+        stage: "start",
+        message: "Starting publish…"
       });
+      publishStreamRef.current?.close();
+      publishStreamRef.current = followPublishProgress(params.id, (event) => {
+        setPublishProgress(event);
+
+        if (event.type === "done" || event.type === "error") {
+          publishStreamRef.current?.close();
+          publishStreamRef.current = null;
+          setIsPublishing(false);
+
+          if (event.type === "done") {
+            void loadResults({ silent: true });
+            setFindReplaceToast({
+              tone: "success",
+              message: `${event.message ?? "Publish complete."}${
+                event.result?.invalidation_id
+                  ? " CDN invalidation requested."
+                  : ""
+              }`
+            });
+          }
+        }
+      });
+
+      return;
     } catch (nextError) {
       // 409 = another publish holds this domain's lock. Show the server's plain
       // sentence, not a raw error dump — it already names the domain.
@@ -1954,7 +1994,9 @@ export default function ResultsDashboardPage({
         );
       }
     } finally {
-      setIsPublishing(false);
+      if (!publishStreamRef.current) {
+        setIsPublishing(false);
+      }
     }
   }
 
@@ -4560,6 +4602,50 @@ export default function ResultsDashboardPage({
               </div>
             ) : null}
 
+            {publishProgress ? (
+              <div className="space-y-2 rounded-md border border-indigo-100 bg-indigo-50 px-3 py-2">
+                <p className="flex items-center gap-2 text-sm font-medium text-indigo-900">
+                  {publishProgress.type === "progress" ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : null}
+                  {publishProgress.message ?? "Publishing…"}
+                </p>
+                {typeof publishProgress.current === "number" &&
+                typeof publishProgress.total === "number" &&
+                publishProgress.total > 0 ? (
+                  <div
+                    className="h-1.5 w-full overflow-hidden rounded-full bg-indigo-100"
+                    role="progressbar"
+                    aria-valuemin={0}
+                    aria-valuemax={publishProgress.total}
+                    aria-valuenow={publishProgress.current}
+                  >
+                    <div
+                      className="h-full rounded-full bg-indigo-500 transition-all"
+                      style={{
+                        width: `${Math.min(
+                          100,
+                          Math.round(
+                            (publishProgress.current / publishProgress.total) * 100
+                          )
+                        )}%`
+                      }}
+                    />
+                  </div>
+                ) : null}
+                {publishProgress.type === "done" &&
+                publishProgress.result?.uploaded ? (
+                  <p className="text-xs text-indigo-800">
+                    {formatNumber(publishProgress.result.uploaded)} object
+                    {publishProgress.result.uploaded === 1 ? "" : "s"} written
+                    {publishProgress.result.invalidation_id
+                      ? " · CDN invalidation requested"
+                      : " · no CDN invalidation (distribution id not configured)"}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+
             {publishError ? (
               <p
                 className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700"
@@ -4576,13 +4662,14 @@ export default function ResultsDashboardPage({
                 disabled={isPublishing}
                 onClick={() => setPublishOpen(false)}
               >
-                Cancel
+                {publishProgress?.type === "done" ? "Close" : "Cancel"}
               </Button>
               <Button
                 type="button"
                 disabled={
                   isPublishing ||
                   publishLoading ||
+                  publishProgress?.type === "done" ||
                   !publishPreview ||
                   publishPreview.file_count === 0
                 }

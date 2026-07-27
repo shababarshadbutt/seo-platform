@@ -47,7 +47,14 @@ export async function processSftpPullJob(
     try {
       await downloadSftpFile(domain, remote.name, localPath);
       // Identical to the upload path from here on — row + parse job.
-      await createStoredSitemapFile(sessionId, storedFilename, "current");
+      // remote.name is the true filename on the SFTP server — recorded so
+      // publishing writes back under exactly that name (migration 031).
+      await createStoredSitemapFile(
+        sessionId,
+        storedFilename,
+        "current",
+        remote.name
+      );
       stored += 1;
     } catch (error) {
       failed += 1;

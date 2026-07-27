@@ -32,7 +32,13 @@ function isGzipName(value: string) {
   return value.toLowerCase().endsWith(".gz");
 }
 
-function downloadedFilename(url: string, isDecodedGzip: boolean) {
+// The TRUE source filename for a sitemap fetched from a URL: the basename of
+// its path. This is what the file is really called on the client's site, so it
+// is what publishing must write back — recorded via original_filename
+// (migration 031) rather than recovered from our internal stored name later.
+// Exported so the ingestion routes use exactly the same rule the download does,
+// with no second implementation to drift.
+export function sourceFilenameFromUrl(url: string, isDecodedGzip = false) {
   const parsedUrl = new URL(url);
   const baseName = path.posix.basename(parsedUrl.pathname) || "sitemap.xml";
   const decodedBaseName =
@@ -41,8 +47,13 @@ function downloadedFilename(url: string, isDecodedGzip: boolean) {
     ? decodedBaseName
     : `${decodedBaseName}.xml`;
 
-  return `fetched-${Date.now()}-${randomUUID()}-${sanitizeUploadedFilename(
-    withExtension
+  return sanitizeUploadedFilename(withExtension);
+}
+
+function downloadedFilename(url: string, isDecodedGzip: boolean) {
+  return `fetched-${Date.now()}-${randomUUID()}-${sourceFilenameFromUrl(
+    url,
+    isDecodedGzip
   )}`;
 }
 

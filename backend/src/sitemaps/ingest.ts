@@ -21,10 +21,16 @@ export type StoredSitemapFile = {
   parse_job_id?: string;
 };
 
+// `originalFilename` is the TRUE incoming name from the source — the uploaded
+// file's name, the basename of a fetched URL, or the remote SFTP filename. It is
+// recorded rather than derived so publishing never has to guess: see migration
+// 031 and productionFilename(). Callers that genuinely have no source name (only
+// pre-031 rows, in practice) may omit it and fall back to the heuristic.
 export async function createStoredSitemapFile(
   sessionId: string,
   storedFilename: string,
-  sourceRole: SitemapSourceRole
+  sourceRole: SitemapSourceRole,
+  originalFilename?: string
 ): Promise<StoredSitemapFile> {
   const filePath = path.join(config.uploadDir, storedFilename);
   const rootElement = await peekRootElement(filePath);
@@ -38,9 +44,10 @@ export async function createStoredSitemapFile(
           total_urls,
           is_valid,
           is_index,
-          source_role
+          source_role,
+          original_filename
         )
-        VALUES ($1, $2, 0, TRUE, $3, $4)
+        VALUES ($1, $2, 0, TRUE, $3, $4, $5)
         ON CONFLICT (session_id, filename) DO NOTHING
         RETURNING id
       )
@@ -52,7 +59,7 @@ export async function createStoredSitemapFile(
         AND filename = $2
       LIMIT 1
     `,
-    [sessionId, storedFilename, isIndex, sourceRole]
+    [sessionId, storedFilename, isIndex, sourceRole, originalFilename ?? null]
   );
   const sitemapFileId = fileResult.rows[0].id;
 

@@ -39,10 +39,15 @@ test("the regenerated index lists exactly the published files", () => {
   );
 
   assert.equal((xml.match(/<sitemap>/g) ?? []).length, 2);
+  // The <loc> must be the PUBLIC url, not the S3 key path: the storage prefix
+  // "sites/<domain>/sitemaps/" is behind CloudFront and must not leak into it.
   assert.ok(
-    xml.includes(
-      "https://airpartshop.com/sites/airpartshop.com/sitemaps/aviation-mfg47.xml"
-    )
+    xml.includes("https://airpartshop.com/sitemaps/aviation-mfg47.xml"),
+    "public loc must not contain the S3 key prefix"
+  );
+  assert.ok(
+    !xml.includes("/sites/airpartshop.com/"),
+    "storage layout must not appear in a public url"
   );
   assert.ok(xml.includes("<lastmod>2026-07-27</lastmod>"));
   assert.ok(xml.trimEnd().endsWith("</sitemapindex>"));

@@ -51,14 +51,18 @@ import {
 } from "../queue/bulkReplaceQueue.js";
 import { FILE_REWRITE_PARALLEL_THRESHOLD } from "../jobs/fileRewritePool.js";
 import { isSameDomain, normalizeHost } from "../sitemaps/domain.js";
-import { fetchSitemapPreview } from "../sitemaps/fetchPreview.js";
+import {
+  fetchSitemapPreview,
+  sourceFilenameFromUrl
+} from "../sitemaps/fetchPreview.js";
 import { lazyStreamSitemapWithoutForeignLocs } from "../sitemaps/foreignLocFilter.js";
 import {
   buildRenamedStoredFilename,
   buildStoredUploadFilename,
   buildTransformedStoredFilename,
   displaySourceFilename,
-  isHttpUrl
+  isHttpUrl,
+  sanitizeUploadedFilename
 } from "../sitemaps/filenames.js";
 import { peekRootElement } from "../sitemaps/peek.js";
 import {
@@ -80,8 +84,18 @@ import {
 import { buildPublishPlan } from "../publish/s3Publish.js";
 import {
   enqueueS3PublishJob,
-  enqueueSftpPullJob
+  enqueueSftpPullJob,
+  publishQueue,
+  S3_PUBLISH_JOB
 } from "../queue/publishQueue.js";
+
+// SSE tuning for publish progress, mirroring the Cleaner's values.
+const PUBLISH_SSE_KEEPALIVE_MS = 15 * 1000;
+const PUBLISH_SSE_POLL_MS = 1000;
+const PUBLISH_SSE_TIMEOUT_MS = 30 * 60 * 1000;
+// How long to wait for a just-enqueued job to become visible before reporting
+// that nothing is running.
+const PUBLISH_SSE_JOB_GRACE_MS = 10 * 1000;
 import {
   parseSitemapSource,
   streamSitemapUrlLocs,
@@ -1267,7 +1281,12 @@ async function storeUploadedSitemapFile(
   await pipeline(uploadedFile.file, createWriteStream(filePath));
 
   return {
-    original_filename: uploadedFile.filename,
+    // Sanitised the same way the stored name is, so the value recorded in
+    // sitemap_files.original_filename is exactly the name this file is known by
+    // — and can never carry a path segment into an S3 key at publish time.
+    // For every realistic sitemap name (including the "current-x.xml" case this
+    // column exists for) this is an identity transform.
+    original_filename: sanitizeUploadedFilename(uploadedFile.filename),
     stored_filename: storedFilename,
     file_path: filePath,
     source_role: sourceRole
@@ -1303,7 +1322,10 @@ async function processUploadedSitemapFile(
     await createStoredSitemapFile(
       sessionId,
       savedUpload.stored_filename,
-      savedUpload.source_role
+      savedUpload.source_role,
+      // Record the real uploaded name (migration 031) so publishing never has
+      // to recover it from our prefixed stored name.
+      savedUpload.original_filename
     )
   );
 }
@@ -1769,7 +1791,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       const storedSitemapFile = await createStoredSitemapFile(
         sessionId,
         storedFilename,
-        sourceRole
+        sourceRole,
+        sourceFilenameFromUrl(sitemapUrl)
       );
 
       await pool.query(
@@ -1869,7 +1892,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             await createStoredSitemapFile(
               sessionId,
               parsedSitemap.filename,
-              parsedSitemap.source_role
+              parsedSitemap.source_role,
+              sourceFilenameFromUrl(parsedSitemap.sitemap_url)
             )
           );
         }
@@ -5493,6 +5517,176 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // Released immediately — holding it across the queue wait would burn
         // the TTL on time the publish is not even running.
         await lock.release();
+      }
+    }
+  );
+  // Publish progress as Server-Sent Events. Deliberately the SAME mechanism the
+  // Cleaner already uses (routes/cleaner.ts): hijack the socket, emit
+  // `data: {type:"progress", stage, current, total, message}` frames, keep the
+  // connection alive with periodic comments so an idle proxy can't drop it, and
+  // finish with a single `done` (or `error`) frame. Users are already trained on
+  // that shape by the Cleaner, and a 1,600-file publish sitting on a static
+  // toast would be a regression against it.
+  //
+  // Unlike the Cleaner — whose work runs inline in the request — a publish runs
+  // in a BullMQ job, so this follows the job's progress rather than doing the
+  // work itself. That is why it polls job.progress instead of being handed a
+  // callback: the worker is a different process.
+  app.get<{ Params: SessionParams }>(
+    "/api/sessions/:id/publish/progress",
+    {
+      onRequest: (request, reply, done) => {
+        request.raw.setTimeout(PUBLISH_SSE_TIMEOUT_MS);
+        reply.raw.setTimeout(PUBLISH_SSE_TIMEOUT_MS);
+        done();
+      }
+    },
+    async (request, reply) => {
+      reply.hijack();
+      const stream = reply.raw;
+      stream.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+        "Access-Control-Allow-Origin":
+          (request.headers.origin as string | undefined) ?? "*"
+      });
+
+      const send = (payload: unknown) => {
+        if (!stream.writableEnded) {
+          stream.write(`data: ${JSON.stringify(payload)}\n\n`);
+        }
+      };
+
+      const keepalive = setInterval(() => {
+        if (!stream.writableEnded) {
+          stream.write(": keepalive\n\n");
+        }
+      }, PUBLISH_SSE_KEEPALIVE_MS);
+      keepalive.unref?.();
+
+      let closed = false;
+      const stop = () => {
+        closed = true;
+        clearInterval(keepalive);
+      };
+      request.raw.on("close", stop);
+
+      const jobId = `${S3_PUBLISH_JOB}-${request.params.id}`;
+      let lastMessage = "";
+      const startedAt = Date.now();
+
+      try {
+        for (;;) {
+          if (closed) {
+            return;
+          }
+
+          const job = await publishQueue.getJob(jobId);
+
+          if (!job) {
+            // The job may not be visible yet: the client can open this stream
+            // the instant its POST returns, and enqueue is not atomic with it.
+            // Give it a short grace window before concluding nothing is running,
+            // otherwise a perfectly normal publish shows "nothing running" and
+            // the user watches a dead stream. After the window it genuinely is
+            // absent (finished and trimmed, or never queued).
+            if (Date.now() - startedAt < PUBLISH_SSE_JOB_GRACE_MS) {
+              await new Promise((resolve) =>
+                setTimeout(resolve, PUBLISH_SSE_POLL_MS)
+              );
+              continue;
+            }
+
+            send({ type: "done", message: "No publish is running." });
+            break;
+          }
+
+          const state = await job.getState();
+          const progress = job.progress as
+            | {
+                stage?: string;
+                current?: number;
+                total?: number;
+                message?: string;
+                result?: unknown;
+              }
+            | number
+            | undefined;
+
+          if (progress && typeof progress === "object") {
+            // Only emit on change, so a slow publish doesn't spam identical
+            // frames at the poll rate.
+            if (progress.message && progress.message !== lastMessage) {
+              lastMessage = progress.message;
+              send({
+                type: "progress",
+                stage: progress.stage ?? "upload",
+                current: progress.current,
+                total: progress.total,
+                message: progress.message
+              });
+            }
+          }
+
+          if (state === "completed") {
+            // Read the job's RETURN VALUE, not its progress. BullMQ writes the
+            // return value atomically when it marks the job completed, whereas
+            // progress is a separate write that can still be in flight the
+            // first time a watcher sees "completed" — which surfaced the last
+            // per-file message as the completion summary.
+            const settled = (await publishQueue.getJob(jobId)) ?? job;
+            const returned = settled.returnvalue as
+              | {
+                  uploaded?: number;
+                  omitted_deleted?: string[];
+                  invalidation_id?: string | null;
+                }
+              | undefined;
+
+            send({
+              type: "done",
+              message: returned?.uploaded
+                ? `Published ${returned.uploaded} file(s)`
+                : lastMessage || "Publish complete.",
+              result: returned
+            });
+            break;
+          }
+
+          if (state === "failed") {
+            send({
+              type: "error",
+              message: job.failedReason || "Publish failed."
+            });
+            break;
+          }
+
+          if (Date.now() - startedAt > PUBLISH_SSE_TIMEOUT_MS) {
+            send({
+              type: "error",
+              message: "Stopped following this publish — it is taking unusually long."
+            });
+            break;
+          }
+
+          await new Promise((resolve) =>
+            setTimeout(resolve, PUBLISH_SSE_POLL_MS)
+          );
+        }
+      } catch (error) {
+        send({
+          type: "error",
+          message:
+            error instanceof Error ? error.message : "Could not follow publish"
+        });
+      } finally {
+        stop();
+
+        if (!stream.writableEnded) {
+          stream.end();
+        }
       }
     }
   );

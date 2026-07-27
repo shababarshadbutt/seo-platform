@@ -130,7 +130,7 @@ let maintenanceWorker: Worker<
 // domain safety comes from the per-domain Redis lock, not from serialising here.
 let publishWorker: Worker<
   PublishQueueData,
-  void,
+  unknown,
   PublishJobName
 > | null = null;
 // Download-ZIP pre-generation + daily cleanup on its own concurrency-1 queue, so
@@ -285,7 +285,7 @@ async function start() {
         "bulk replace worker job failed"
       );
     });
-    publishWorker = new Worker<PublishQueueData, void, PublishJobName>(
+    publishWorker = new Worker<PublishQueueData, unknown, PublishJobName>(
       PUBLISH_QUEUE_NAME,
       async (job) => {
         if (job.name === SFTP_PULL_JOB) {
@@ -294,8 +294,14 @@ async function start() {
         }
 
         if (job.name === S3_PUBLISH_JOB) {
-          await processS3PublishJob(job.data as S3PublishJobData, app.log);
-          return;
+          // Returned so BullMQ stores it as the job's returnvalue — see
+          // processS3PublishJob for why the SSE terminal frame reads that
+          // rather than progress.
+          return await processS3PublishJob(
+            job.data as S3PublishJobData,
+            app.log,
+            job
+          );
         }
 
         throw new Error(`Unsupported job: ${job.name}`);
