@@ -253,14 +253,50 @@ export class ApiError extends Error {
   }
 }
 
-function backendUrl(path: string) {
-  const baseUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
+// Every backend call goes to a RELATIVE path on the frontend's own origin,
+// which Next reverse-proxies to BACKEND_URL server-side (see next.config.mjs's
+// /api/backend/:path* rewrite).
+//
+// This replaces an absolute process.env.NEXT_PUBLIC_BACKEND_URL origin, which
+// could only ever work when the backend ran on the same machine as the browser.
+// On the shared VM every browser is remote: "localhost:3001" would hit the
+// user's own laptop and "http://backend:3001" isn't resolvable outside Docker.
+// Relative + proxy means one public port, no CORS, and no environment-specific
+// host baked into the client bundle at build time.
+const BACKEND_PROXY_PREFIX = "/api/backend";
 
-  if (!baseUrl) {
-    throw new Error("NEXT_PUBLIC_BACKEND_URL is not configured");
+function backendUrl(path: string) {
+  return `${BACKEND_PROXY_PREFIX}${path}`;
+}
+
+export type RuntimeConfig = {
+  seoDeskUrl: string;
+  appVersion: string;
+};
+
+// Per-deployment values the client needs but that must NOT be inlined at build
+// time. Fetched once from this app's own /api/config and cached for the page's
+// lifetime — the promise itself is cached so concurrent callers share one
+// request rather than racing.
+let runtimeConfigPromise: Promise<RuntimeConfig> | null = null;
+
+export function getRuntimeConfig(): Promise<RuntimeConfig> {
+  if (!runtimeConfigPromise) {
+    runtimeConfigPromise = fetch("/api/config", { cache: "no-store" })
+      .then((response) =>
+        response.ok
+          ? (response.json() as Promise<RuntimeConfig>)
+          : Promise.reject(new Error(`config ${response.status}`))
+      )
+      .catch(() => {
+        // Never let a config blip wedge the cache — the next caller retries.
+        runtimeConfigPromise = null;
+
+        return { seoDeskUrl: "", appVersion: "" };
+      });
   }
 
-  return `${baseUrl.replace(/\/$/, "")}${path}`;
+  return runtimeConfigPromise;
 }
 
 async function fetchWithTimeout(

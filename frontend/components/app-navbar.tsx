@@ -8,6 +8,7 @@ import { ExternalLink, Loader2, StopCircle } from "lucide-react";
 import {
   cancelSession,
   friendlyApiErrorMessage,
+  getRuntimeConfig,
   getSession,
   type SessionStatus
 } from "@/lib/api";
@@ -106,11 +107,25 @@ export function AppNavbar() {
 
   const showStop = Boolean(sessionId) && isActive;
 
-  // SEO Desk lives in a separate app on its own port; make it configurable so
-  // the link works across machines. Cleaner + Migration are this same app, so
-  // they use relative hrefs (portable) and just open in a new tab.
-  const seoDeskUrl =
-    process.env.NEXT_PUBLIC_SEO_DESK_URL ?? "http://localhost:4000";
+  // SEO Desk lives in a separate app on its own port. Its URL now comes from
+  // the runtime-config endpoint rather than a NEXT_PUBLIC_* build-time inline,
+  // so the same image can point at different environments. Cleaner + Migration
+  // are this same app, so they stay relative hrefs (portable) in a new tab.
+  const [seoDeskUrl, setSeoDeskUrl] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void getRuntimeConfig().then((runtimeConfig) => {
+      if (!cancelled) {
+        setSeoDeskUrl(runtimeConfig.seoDeskUrl);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const isCleanerActive = pathname === "/cleaner";
   const isMigrationActive =
     pathname === "/" || (pathname?.startsWith("/sessions") ?? false);
@@ -155,15 +170,17 @@ export function AppNavbar() {
                 🗺️ Migration
                 <ExternalLink className="h-3 w-3" aria-hidden="true" />
               </a>
-              <a
-                href={seoDeskUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className={toolLinkClass(false)}
-              >
-                📋 SEO Desk
-                <ExternalLink className="h-3 w-3" aria-hidden="true" />
-              </a>
+              {seoDeskUrl ? (
+                <a
+                  href={seoDeskUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className={toolLinkClass(false)}
+                >
+                  📋 SEO Desk
+                  <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                </a>
+              ) : null}
             </div>
             <span className="h-5 w-px bg-slate-700" aria-hidden="true" />
             <Link

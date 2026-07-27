@@ -1,6 +1,7 @@
-import { fileURLToPath } from "node:url";
 
 import { Piscina } from "piscina";
+
+import { workerExecArgv, workerFilePath } from "./workerRuntime.js";
 
 import type {
   FileRewriteInput,
@@ -29,14 +30,12 @@ let pool: Piscina | null = null;
 function getPool(): Piscina {
   if (!pool) {
     pool = new Piscina({
-      filename: fileURLToPath(
-        new URL("../workers/fileRewriteWorker.ts", import.meta.url)
-      ),
+      filename: workerFilePath("fileRewriteWorker"),
       minThreads: 1,
       maxThreads: MAX_WORKERS,
       // Let idle threads exit so they don't hold the process open at shutdown.
       idleTimeout: 30_000,
-      execArgv: ["--import", "tsx"]
+      execArgv: workerExecArgv
     });
   }
 

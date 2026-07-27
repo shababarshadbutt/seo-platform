@@ -1,6 +1,7 @@
-import { fileURLToPath } from "node:url";
 
 import { Piscina } from "piscina";
+
+import { workerExecArgv, workerFilePath } from "./workerRuntime.js";
 
 import type {
   ZipWorkerInput,
@@ -21,7 +22,7 @@ let pool: Piscina | null = null;
 function getPool(): Piscina {
   if (!pool) {
     pool = new Piscina({
-      filename: fileURLToPath(new URL("../workers/zipWorker.ts", import.meta.url)),
+      filename: workerFilePath("zipWorker"),
       // minThreads 2 keeps warm threads ready so the all + edited pre-gen jobs
       // for a session start immediately (v1.34); maxThreads 4 (v1.33) so large
       // sessions keep up and a cached ZIP is ready before the user downloads.
@@ -29,7 +30,7 @@ function getPool(): Piscina {
       maxThreads: 4,
       // Let idle threads exit so they don't hold the process open at shutdown.
       idleTimeout: 30_000,
-      execArgv: ["--import", "tsx"]
+      execArgv: workerExecArgv
     });
   }
 

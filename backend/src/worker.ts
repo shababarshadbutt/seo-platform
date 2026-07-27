@@ -24,6 +24,20 @@ import {
   type SitemapJobName
 } from "./queue/sitemapQueue.js";
 import {
+  PUBLISH_QUEUE_NAME,
+  PUBLISH_WORKER_CONCURRENCY,
+  SFTP_PULL_JOB,
+  S3_PUBLISH_JOB,
+  closePublishQueue,
+  type PublishQueueData,
+  type PublishJobName,
+  type SftpPullJobData,
+  type S3PublishJobData
+} from "./queue/publishQueue.js";
+import { processSftpPullJob } from "./jobs/sftpPullJob.js";
+import { processS3PublishJob } from "./jobs/s3PublishJob.js";
+import { closePublishLockClient } from "./publish/publishLock.js";
+import {
   APPLY_REDIRECTS_JOB,
   BULK_REPLACE_JOB,
   BULK_REPLACE_QUEUE_NAME,
@@ -110,6 +124,14 @@ let maintenanceWorker: Worker<
   MaintenanceQueueData,
   void,
   MaintenanceJobName
+> | null = null;
+// Phase 1 SFTP pull / S3 publish. Its OWN queue at concurrency > 1: publishes
+// for DIFFERENT domains must run in parallel for 10+ concurrent users. Same-
+// domain safety comes from the per-domain Redis lock, not from serialising here.
+let publishWorker: Worker<
+  PublishQueueData,
+  void,
+  PublishJobName
 > | null = null;
 // Download-ZIP pre-generation + daily cleanup on its own concurrency-1 queue, so
 // a heavy 1000-file archive write never starves the other workers.
@@ -263,6 +285,42 @@ async function start() {
         "bulk replace worker job failed"
       );
     });
+    publishWorker = new Worker<PublishQueueData, void, PublishJobName>(
+      PUBLISH_QUEUE_NAME,
+      async (job) => {
+        if (job.name === SFTP_PULL_JOB) {
+          await processSftpPullJob(job.data as SftpPullJobData, app.log);
+          return;
+        }
+
+        if (job.name === S3_PUBLISH_JOB) {
+          await processS3PublishJob(job.data as S3PublishJobData, app.log);
+          return;
+        }
+
+        throw new Error(`Unsupported job: ${job.name}`);
+      },
+      {
+        connection: redisConnectionOptions(),
+        concurrency: PUBLISH_WORKER_CONCURRENCY,
+        // A thousand-file SFTP pull or S3 publish runs far past BullMQ's default
+        // 30s job lock; without this it would be declared stalled and re-run
+        // mid-flight. Same reasoning (and value) as the bulk-replace worker.
+        lockDuration: 60 * 60 * 1000
+      }
+    );
+    publishWorker.on("failed", (job, error) => {
+      app.log.error(
+        {
+          job_id: job?.id,
+          job_name: job?.name,
+          session_id: (job?.data as { session_id?: string } | undefined)
+            ?.session_id,
+          error
+        },
+        "publish worker job failed"
+      );
+    });
     maintenanceWorker = new Worker<
       MaintenanceQueueData,
       void,
@@ -382,12 +440,15 @@ async function start() {
 async function close() {
   await parseWorker?.close();
   await bulkReplaceWorker?.close();
+  await publishWorker?.close();
   await maintenanceWorker?.close();
   await preGenerateZipWorker?.close();
   await destroyZipPool();
   await destroyFileRewritePool();
   await closeSitemapQueue();
   await closeBulkReplaceQueue();
+  await closePublishQueue();
+  await closePublishLockClient();
   await closeMaintenanceQueue();
   await closePreGenerateZipQueue();
   await app.close();

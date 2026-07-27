@@ -61,6 +61,13 @@ export interface CleanerResult {
   // Uploaded <sitemapindex> files are excluded from cleaning and replaced by a
   // freshly rebuilt index; surfaced separately so the count stays honest.
   index_files_detected: number;
+  // The filename the rebuilt index was written under. Carries through whatever
+  // the INPUT index was actually called (a client's live index may be
+  // "sitemap.xml" or "sitemap_index.xml"), falling back to sitemap-index.xml
+  // only when the set had no index to begin with. Publishing overwrites the
+  // live structure in place, so inventing a new index name here would strand
+  // the original object and leave search engines pointed at a stale file.
+  index_filename: string;
   // ---- URL-count-level stats (match the reference Streamlit report) ----
   // Sum, across every surviving/kept file, of its on-domain URL count BEFORE
   // cross-file dedup ("Total URLs (kept files)").
@@ -650,6 +657,8 @@ export async function cleanSitemaps(options: {
   // Output filenames claimed so far, so two uploads sharing a basename get
   // distinct output files instead of one silently overwriting the other.
   const usedOutputNames = new Set<string>();
+  // Name of the first uploaded <sitemapindex>, reused for the rebuilt index.
+  let detectedIndexName: string | null = null;
   let indexFilesDetected = 0;
   let filesProcessed = 0;
 
@@ -663,9 +672,16 @@ export async function cleanSitemaps(options: {
       continue;
     }
 
-    // Index files are rebuilt from scratch — set aside, not cleaned.
+    // Index files are rebuilt from scratch — set aside, not cleaned. The FIRST
+    // one's name is reused for the rebuilt index so the output replaces the
+    // original in place rather than introducing a differently-named file.
     if ((info.rootElement ?? "").toLowerCase() === "sitemapindex") {
       indexFilesDetected += 1;
+
+      if (!detectedIndexName) {
+        detectedIndexName = file.filename;
+      }
+
       continue;
     }
 
@@ -763,7 +779,14 @@ export async function cleanSitemaps(options: {
     message: "Building sitemap-index.xml…"
   });
 
-  const indexPath = path.join(outDir, INDEX_FILENAME);
+  // Reuse the uploaded index's own name; only fall back to the canonical
+  // sitemap-index.xml when the set genuinely had no index to preserve. Guard
+  // against it colliding with a cleaned child file of the same name.
+  const indexFilename =
+    detectedIndexName && !usedOutputNames.has(detectedIndexName)
+      ? detectedIndexName
+      : INDEX_FILENAME;
+  const indexPath = path.join(outDir, indexFilename);
   const indexXml = buildIndexXml(
     options.domain,
     options.subfolder,
@@ -799,7 +822,7 @@ export async function cleanSitemaps(options: {
     path: file.path
   }));
 
-  outputManifest.push({ filename: INDEX_FILENAME, path: indexPath });
+  outputManifest.push({ filename: indexFilename, path: indexPath });
   outputManifest.push({ filename: REPORT_FILENAME, path: reportPath });
 
   const totalUrlsKeptFiles = survivors.reduce(
@@ -836,6 +859,7 @@ export async function cleanSitemaps(options: {
       url_count: file.url_count
     })),
     index_files_detected: indexFilesDetected,
+    index_filename: indexFilename,
     total_urls_kept_files: totalUrlsKeptFiles,
     clean_urls_remaining: cleanUrlsRemaining,
     reduction_pct: reductionPct

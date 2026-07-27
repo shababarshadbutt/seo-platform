@@ -62,6 +62,27 @@ import {
 } from "../sitemaps/filenames.js";
 import { peekRootElement } from "../sitemaps/peek.js";
 import {
+  createStoredSitemapFile,
+  type StoredSitemapFile
+} from "../sitemaps/ingest.js";
+import { publishConfigError, sftpConfigError } from "../config.js";
+import {
+  assertSafeDomain,
+  listSftpDomains,
+  sftpPoolStats
+} from "../sftp/sftpClient.js";
+import {
+  acquirePublishLock,
+  isPublishLocked,
+  PublishLockedError,
+  type PublishLock
+} from "../publish/publishLock.js";
+import { buildPublishPlan } from "../publish/s3Publish.js";
+import {
+  enqueueS3PublishJob,
+  enqueueSftpPullJob
+} from "../queue/publishQueue.js";
+import {
   parseSitemapSource,
   streamSitemapUrlLocs,
   type ParsedSitemap
@@ -195,14 +216,6 @@ type SessionHistoryRow = {
   empty_sitemap_count: string;
 };
 
-type StoredSitemapFile = {
-  sitemap_file_id: string;
-  filename: string;
-  is_index: boolean;
-  root_element: string | null;
-  source_role: SitemapSourceRole;
-  parse_job_id?: string;
-};
 
 type SavedSitemapUpload = {
   original_filename: string;
@@ -1179,50 +1192,6 @@ function sitemapUrlDomainMismatchMessage(
   }
 
   return `Sitemap URL appears to belong to ${detectedHost}, not ${expectedHost}. Please use sitemaps for the same site.`;
-}
-
-async function createStoredSitemapFile(
-  sessionId: string,
-  storedFilename: string,
-  sourceRole: SitemapSourceRole
-): Promise<StoredSitemapFile> {
-  const filePath = path.join(config.uploadDir, storedFilename);
-  const rootElement = await peekRootElement(filePath);
-  const isIndex = rootElement === "sitemapindex";
-  const fileResult = await pool.query<{ id: string }>(
-    `
-      WITH inserted AS (
-        INSERT INTO sitemap_files (
-          session_id,
-          filename,
-          total_urls,
-          is_valid,
-          is_index,
-          source_role
-        )
-        VALUES ($1, $2, 0, TRUE, $3, $4)
-        ON CONFLICT (session_id, filename) DO NOTHING
-        RETURNING id
-      )
-      SELECT id FROM inserted
-      UNION ALL
-      SELECT id
-      FROM sitemap_files
-      WHERE session_id = $1
-        AND filename = $2
-      LIMIT 1
-    `,
-    [sessionId, storedFilename, isIndex, sourceRole]
-  );
-  const sitemapFileId = fileResult.rows[0].id;
-
-  return {
-    sitemap_file_id: sitemapFileId,
-    filename: storedFilename,
-    is_index: isIndex,
-    root_element: rootElement,
-    source_role: sourceRole
-  };
 }
 
 async function enqueueStoredSitemapFile(
@@ -5348,6 +5317,183 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       });
 
       return { job_row_id: jobRowId, status: "PENDING" };
+    }
+  );
+  // ---- Phase 1: SFTP input ------------------------------------------------
+
+  // The domains available to pull from AWS Transfer Family. Powers the source
+  // picker; a config-less deployment gets a clear 503 rather than a stack trace.
+  app.get("/api/sftp/domains", async (_request, reply) => {
+    const configError = sftpConfigError();
+
+    if (configError) {
+      return reply
+        .code(503)
+        .send({ error: "Service Unavailable", message: configError });
+    }
+
+    try {
+      return { domains: await listSftpDomains(), pool: sftpPoolStats() };
+    } catch (error) {
+      return reply.code(502).send({
+        error: "Bad Gateway",
+        message:
+          error instanceof Error
+            ? `Could not list SFTP domains: ${error.message}`
+            : "Could not list SFTP domains"
+      });
+    }
+  });
+
+  // Pull a domain's whole sitemap set into this session. A third session
+  // "source" alongside manual upload and fetch-from-URL: the files land via the
+  // SAME ingestion path (createStoredSitemapFile + parse job), so nothing
+  // downstream distinguishes them. Always queued — a 1,600-file domain would
+  // blow the request timeout, the same reason >200-file redirect fixes queue.
+  app.post<{ Params: SessionParams; Body: { domain?: unknown } }>(
+    "/api/sessions/:id/sources/sftp",
+    async (request, reply) => {
+      const configError = sftpConfigError();
+
+      if (configError) {
+        return reply
+          .code(503)
+          .send({ error: "Service Unavailable", message: configError });
+      }
+
+      const sessionResult = await pool.query(
+        "SELECT 1 FROM sessions WHERE id = $1",
+        [request.params.id]
+      );
+
+      if (sessionResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "session not found" });
+      }
+
+      const domain =
+        typeof request.body?.domain === "string" ? request.body.domain.trim() : "";
+
+      try {
+        assertSafeDomain(domain);
+      } catch {
+        return reply.code(400).send(badRequest("a valid domain is required"));
+      }
+
+      const job = await enqueueSftpPullJob({
+        session_id: request.params.id,
+        domain
+      });
+
+      return reply.send({ queued: true, job_id: job.id, domain });
+    }
+  );
+
+  // ---- Phase 1: S3 publish ------------------------------------------------
+
+  // What a publish WOULD write, without writing anything. Lets the user see the
+  // real production filenames (resolved through displaySourceFilename, not the
+  // internal fixed-/transformed- stored names) and which files dropped out.
+  app.get<{ Params: SessionParams; Querystring: { domain?: string } }>(
+    "/api/sessions/:id/publish/preview",
+    async (request, reply) => {
+      const configError = publishConfigError();
+
+      if (configError) {
+        return reply
+          .code(503)
+          .send({ error: "Service Unavailable", message: configError });
+      }
+
+      const domain = (request.query.domain ?? "").trim();
+
+      if (!domain) {
+        return reply.code(400).send(badRequest("domain is required"));
+      }
+
+      const plan = await buildPublishPlan(request.params.id, domain);
+
+      return {
+        domain,
+        bucket: config.s3.bucket,
+        prefix: plan.prefix,
+        index_filename: plan.indexFilename,
+        file_count: plan.files.length,
+        total_bytes: plan.files.reduce((sum, file) => sum + file.size, 0),
+        files: plan.files.slice(0, 50).map((file) => file.displayName),
+        omitted_deleted: plan.omittedDeleted,
+        // Deleted files are dropped from the regenerated index, never deleted
+        // from the bucket — surfaced so the UI can say so plainly.
+        deletes_objects: false,
+        locked: await isPublishLocked(domain)
+      };
+    }
+  );
+
+  // Publish to S3 + invalidate CloudFront. Explicitly user-triggered: this
+  // overwrites live production and the bucket has no versioning, so it is never
+  // automatic on session completion.
+  app.post<{ Params: SessionParams; Body: { domain?: unknown } }>(
+    "/api/sessions/:id/publish",
+    async (request, reply) => {
+      const configError = publishConfigError();
+
+      if (configError) {
+        return reply
+          .code(503)
+          .send({ error: "Service Unavailable", message: configError });
+      }
+
+      const sessionResult = await pool.query(
+        "SELECT 1 FROM sessions WHERE id = $1",
+        [request.params.id]
+      );
+
+      if (sessionResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "session not found" });
+      }
+
+      const domain =
+        typeof request.body?.domain === "string" ? request.body.domain.trim() : "";
+
+      if (!domain) {
+        return reply.code(400).send(badRequest("domain is required"));
+      }
+
+      // Reject a same-domain collision HERE, synchronously, so the user gets an
+      // immediate clear answer instead of a job that fails later. Publishes of
+      // DIFFERENT domains never touch this key and proceed fully in parallel.
+      // This lock only guards the enqueue decision; the job re-takes it for the
+      // duration of the actual write (see processS3PublishJob).
+      let lock: PublishLock;
+
+      try {
+        lock = await acquirePublishLock(domain);
+      } catch (error) {
+        if (error instanceof PublishLockedError) {
+          return reply
+            .code(409)
+            .send({ error: "Conflict", message: error.message });
+        }
+
+        throw error;
+      }
+
+      try {
+        const job = await enqueueS3PublishJob({
+          session_id: request.params.id,
+          domain
+        });
+
+        return reply.send({ queued: true, job_id: job.id, domain });
+      } finally {
+        // Released immediately — holding it across the queue wait would burn
+        // the TTL on time the publish is not even running.
+        await lock.release();
+      }
     }
   );
 };

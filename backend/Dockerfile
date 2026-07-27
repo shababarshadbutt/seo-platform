@@ -19,10 +19,18 @@ ENV NODE_OPTIONS="--max-old-space-size=4096"
 COPY package*.json ./
 RUN npm install
 
-COPY tsconfig.json ./
+COPY tsconfig.json tsconfig.build.json ./
 COPY migrations ./migrations
 COPY src ./src
 
+# Compile to dist at IMAGE BUILD time. This box is a shared, always-on
+# production deployment: `tsx watch` would re-exec the API whenever anything
+# touched a source path, which on a multi-user VM is a real interruption, and
+# transpiling on every worker-thread spawn is pure overhead. The piscina pools
+# detect the compiled build and load dist/workers/*.js without tsx
+# (see src/jobs/workerRuntime.ts).
+RUN npm run build
+
 EXPOSE 3001 3002
 
-CMD ["npm", "run", "dev"]
+CMD ["npm", "run", "start"]

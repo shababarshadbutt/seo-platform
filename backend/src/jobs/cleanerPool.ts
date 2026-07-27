@@ -1,6 +1,6 @@
-import { fileURLToPath } from "node:url";
-
 import { Piscina } from "piscina";
+
+import { workerExecArgv, workerFilePath } from "./workerRuntime.js";
 
 import type {
   CleanerClassifyInput,
@@ -39,13 +39,13 @@ export const CLEANER_MAX_WORKERS = 4;
 let classifyPool: Piscina | null = null;
 let parsePool: Piscina | null = null;
 
-function makePool(workerFile: string): Piscina {
+function makePool(workerBaseName: string): Piscina {
   return new Piscina({
-    filename: fileURLToPath(new URL(`../workers/${workerFile}`, import.meta.url)),
+    filename: workerFilePath(workerBaseName),
     minThreads: 1,
     maxThreads: CLEANER_MAX_WORKERS,
     idleTimeout: 30_000,
-    execArgv: ["--import", "tsx"]
+    execArgv: workerExecArgv
   });
 }
 
@@ -53,7 +53,7 @@ export function runCleanerClassify(
   input: CleanerClassifyInput
 ): Promise<CleanerClassifyResult> {
   if (!classifyPool) {
-    classifyPool = makePool("cleanerClassifyWorker.ts");
+    classifyPool = makePool("cleanerClassifyWorker");
   }
 
   return classifyPool.run(input);
@@ -63,7 +63,7 @@ export function runCleanerParse(
   input: CleanerParseInput
 ): Promise<CleanerParseResult> {
   if (!parsePool) {
-    parsePool = makePool("cleanerParseWorker.ts");
+    parsePool = makePool("cleanerParseWorker");
   }
 
   return parsePool.run(input);

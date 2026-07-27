@@ -12,6 +12,24 @@
 #   - APP_VERSION has NO fallback default (unlike the repo's :-v1.48 pattern) —
 #     on a shared production VM, silently deploying an unset/previous version by
 #     omission is worse than a deploy failing loudly until .env is set correctly.
+#   - BACKEND_URL / SEO_DESK_URL are now plain (non-NEXT_PUBLIC_) server-side env
+#     vars. Under `next start`, NEXT_PUBLIC_* is inlined at BUILD time, not read
+#     at runtime — baking a per-deployment URL into the distributed image is the
+#     same drift risk this project already got burned by with APP_VERSION.
+#     Frontend server code reads these normally at request time and hands them
+#     to the client via a small runtime-config endpoint (see decision #1 below).
+#   - Backend/worker now run a real compiled build (tsc -> dist), not `tsx`
+#     (watch or otherwise) — decision #2 below.
+#   - NODE_TLS_REJECT_UNAUTHORIZED now defaults to "1" (verify TLS) — the "0"
+#     default was a corporate-proxy workaround for laptops; defaulting it off on
+#     a production box means an unset .env silently ships with TLS verification
+#     disabled. Override to "0" only if AWS DevOps confirms egress genuinely
+#     needs it.
+#   - Postgres and Redis no longer publish ports to the host — only backend/
+#     worker/frontend containers need to reach them, over the internal compose
+#     network (service DNS names), on a shared VM they have no reason to be
+#     reachable from outside Docker at all.
+#   - POSTGRES_PASSWORD is now required via .env, not hardcoded "sitemap".
 #
 # Claude CLI: treat the env var NAMES below as the contract for Phase 1's
 # SFTP/S3/CloudFront code — read config using exactly these names so this file
@@ -23,14 +41,28 @@ services:
     image: shababarshadbutt/sitemap-frontend:${APP_VERSION}
     build:
       context: ./frontend
+      args:
+        # The ONLY build-time value left: static per image, unlike the URLs
+        # below which are read at runtime so one image works anywhere.
+        NEXT_PUBLIC_APP_VERSION: ${APP_VERSION}
     environment:
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: "1"
-      NEXT_PUBLIC_BACKEND_URL: http://localhost:${BACKEND_PORT:-3001}
+      # Plain (non-public) — read server-side at request time, exposed to the
+      # client bundle via a small runtime-config endpoint, not build-time inlining.
+      BACKEND_URL: http://backend:3001
+      SEO_DESK_URL: ${SEO_DESK_URL:-http://seo-desk:3000}
+      # Fine to bake at build time — this is genuinely static per image build,
+      # unlike the two URLs above which can legitimately vary per deployment
+      # target using the same image.
       NEXT_PUBLIC_APP_VERSION: ${APP_VERSION}
-      NEXT_PUBLIC_SEO_DESK_URL: ${NEXT_PUBLIC_SEO_DESK_URL:-http://localhost:4000}
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
+    # RESOLVED: browser-side code no longer talks to the backend directly. Every
+    # backend call goes to a RELATIVE /api/backend/* on this origin, which Next
+    # reverse-proxies server-side to BACKEND_URL (see frontend/next.config.mjs).
+    # That is why this is the only service publishing a port: one public entry
+    # point, no CORS, and no public backend hostname/IP baked into the image.
     depends_on:
       backend:
         condition: service_healthy
@@ -62,8 +94,8 @@ services:
       # egress in your VPC does route through some inspecting proxy/NAT
       # appliance — confirm with DevOps, then set NODE_TLS_REJECT_UNAUTHORIZED=1
       # in .env once confirmed safe to do so.
-      NODE_TLS_REJECT_UNAUTHORIZED: "${NODE_TLS_REJECT_UNAUTHORIZED:-0}"
-      DATABASE_URL: postgresql://sitemap:sitemap@postgres:5432/sitemap_health
+      NODE_TLS_REJECT_UNAUTHORIZED: "${NODE_TLS_REJECT_UNAUTHORIZED:-1}"
+      DATABASE_URL: postgresql://sitemap:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/sitemap_health
       REDIS_URL: redis://redis:6379
       UPLOAD_DIR: /uploads
       EXPORT_DIR: /exports
@@ -77,7 +109,10 @@ services:
       SFTP_PORT: ${SFTP_PORT:-22}
       SFTP_USERNAME: ${SFTP_USERNAME:?SFTP_USERNAME must be set in .env}
       # Prefer a private key over a password wherever Transfer Family supports it.
+      # Password is an optional fallback: if SFTP_PRIVATE_KEY_PATH's file isn't
+      # present, code falls back to SFTP_PASSWORD; require at least one set.
       SFTP_PRIVATE_KEY_PATH: ${SFTP_PRIVATE_KEY_PATH:-/run/secrets/sftp_private_key}
+      SFTP_PASSWORD: ${SFTP_PASSWORD:-}
       SFTP_BASE_PATH: ${SFTP_BASE_PATH:-sftp-sitemaps-asapsmei}
       SFTP_MAX_CONCURRENT_CONNECTIONS: ${SFTP_MAX_CONCURRENT_CONNECTIONS:-4}
 
@@ -95,8 +130,10 @@ services:
 
       # --- Phase 1: per-domain publish lock (Redis-backed, TTL'd) ---
       PUBLISH_LOCK_TTL_SECONDS: ${PUBLISH_LOCK_TTL_SECONDS:-300}
-    ports:
-      - "${BACKEND_PORT:-3001}:3001"
+    # No published port. The frontend reaches this over the internal compose
+    # network (http://backend:3001) and proxies browser traffic to it; exposing
+    # it publicly as well would defeat the single-entry-point design and put an
+    # unauthenticated API on the open internet.
     volumes:
       - uploads:/uploads
       - exports:/exports
@@ -126,12 +163,12 @@ services:
     image: shababarshadbutt/sitemap-backend:${APP_VERSION}
     build:
       context: ./backend
-    command: npm run worker
+    command: npm run start:worker
     environment:
       NODE_ENV: production
       WORKER_HEALTH_PORT: "3002"
-      NODE_TLS_REJECT_UNAUTHORIZED: "${NODE_TLS_REJECT_UNAUTHORIZED:-0}"
-      DATABASE_URL: postgresql://sitemap:sitemap@postgres:5432/sitemap_health
+      NODE_TLS_REJECT_UNAUTHORIZED: "${NODE_TLS_REJECT_UNAUTHORIZED:-1}"
+      DATABASE_URL: postgresql://sitemap:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/sitemap_health
       REDIS_URL: redis://redis:6379
       UPLOAD_DIR: /uploads
       EXPORT_DIR: /exports
@@ -142,6 +179,7 @@ services:
       SFTP_PORT: ${SFTP_PORT:-22}
       SFTP_USERNAME: ${SFTP_USERNAME:?SFTP_USERNAME must be set in .env}
       SFTP_PRIVATE_KEY_PATH: ${SFTP_PRIVATE_KEY_PATH:-/run/secrets/sftp_private_key}
+      SFTP_PASSWORD: ${SFTP_PASSWORD:-}
       SFTP_BASE_PATH: ${SFTP_BASE_PATH:-sftp-sitemaps-asapsmei}
       SFTP_MAX_CONCURRENT_CONNECTIONS: ${SFTP_MAX_CONCURRENT_CONNECTIONS:-4}
       S3_BUCKET: ${S3_BUCKET:-asap-cms-prod}
@@ -177,10 +215,11 @@ services:
     image: postgres:15-alpine
     environment:
       POSTGRES_USER: sitemap
-      POSTGRES_PASSWORD: sitemap
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
       POSTGRES_DB: sitemap_health
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+    # No published port — only backend/worker (same compose network) need to
+    # reach this. On a shared VM there's no reason for Postgres to be reachable
+    # from outside Docker at all.
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -192,8 +231,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "${REDIS_PORT:-6380}:6379"
+    # No published port — internal-only, same reasoning as Postgres above.
     volumes:
       - redis_data:/data
     healthcheck:

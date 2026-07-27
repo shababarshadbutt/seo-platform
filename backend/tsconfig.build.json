@@ -1,0 +1,8 @@
+{
+  // Production build only. Extends the base config (which typecheck still uses
+  // as-is, so *.test.ts stay type-checked) but keeps tests and their fixtures
+  // out of the shipped image — they are dead weight in a container and pull
+  // node:test into the production tree.
+  "extends": "./tsconfig.json",
+  "exclude": ["src/**/*.test.ts"]
+}
