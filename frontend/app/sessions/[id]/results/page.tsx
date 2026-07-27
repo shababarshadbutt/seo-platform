@@ -85,6 +85,7 @@ import {
   type Pattern,
   type PatternSourceFile,
   type RedirectCandidate,
+  type RedirectCandidatesResponse,
   type SampledUrl,
   type SessionResponse
 } from "@/lib/api";
@@ -198,6 +199,21 @@ function defaultFixAction(candidate: RedirectCandidate): FixAction {
   }
 
   return candidate.destination_not_found ? "delete" : "fix";
+}
+
+// Plain-language summary of the discovered rewrite rule, so the one-click
+// summary says what it will DO rather than making the reader infer it from a
+// list of URLs. Mirrors the two RedirectRule shapes in redirectRule.ts.
+function describeRedirectRule(
+  rule: NonNullable<RedirectCandidatesResponse["rule"]>
+): string {
+  if (rule.kind === "insert") {
+    return `Insert "${rule.insert}" after "${rule.prefix}"`;
+  }
+
+  return rule.replace === ""
+    ? `Remove "${rule.find}" from the URL`
+    : `Replace "${rule.find}" with "${rule.replace}"`;
 }
 
 const statusColors: Record<PatternStatus, string> = {
@@ -822,6 +838,18 @@ export default function ResultsDashboardPage({
   const [fixPatternTotal, setFixPatternTotal] = useState(0);
   const [fixLoading, setFixLoading] = useState(false);
   const [fixInferredWithoutRule, setFixInferredWithoutRule] = useState(false);
+  // The single rewrite rule distilled from the confirmed samples, or null when
+  // they were too varied. Non-null is what makes the one-click path possible:
+  // there is one transform to apply, so nothing needs per-row review. (v1.48)
+  const [fixRule, setFixRule] = useState<RedirectCandidatesResponse["rule"]>(
+    null
+  );
+  // How many files the widened rewrite spans — the "across M files" half of the
+  // scope line, mirroring the transform modal's own one-number summary.
+  const [fixFileCount, setFixFileCount] = useState(0);
+  // Opt-in escape hatch to the per-row list. The one-click summary is the
+  // default whenever a rule exists; this is never required to apply a fix.
+  const [fixReviewMode, setFixReviewMode] = useState(false);
   // Per-row action (v1.42.1): "fix" (adopt the redirect destination), "delete"
   // (remove the source URL — for not-found destinations), or "skip" (leave it
   // untouched — the inferred-row default). Keyed by candidate.key.
@@ -1920,6 +1948,9 @@ export default function ResultsDashboardPage({
     setFixActions({});
     setFixInferredWithoutRule(false);
     setFixPage(0);
+    setFixRule(null);
+    setFixFileCount(0);
+    setFixReviewMode(false);
 
     void getRedirectCandidates(params.id, fixPatternId)
       .then((data) => {
@@ -1929,6 +1960,8 @@ export default function ResultsDashboardPage({
 
         setFixCandidates(data.candidates);
         setFixPatternTotal(data.pattern_total_urls);
+        setFixRule(data.rule);
+        setFixFileCount(data.pattern_file_count ?? 0);
         // Default action per row (see defaultFixAction): verified-normal → Fix,
         // verified-not-found → Delete, inferred → Skip (excluded from both
         // actions until someone reviews it). (v1.42.1)
@@ -2104,6 +2137,111 @@ export default function ResultsDashboardPage({
     fixPageStart,
     fixPageStart + FIX_MODAL_PAGE_SIZE
   );
+
+  // ── One-click fix (v1.48) ────────────────────────────────────────────────
+  // HTTP-verified rows whose confirmed destination looks like a dead end. These
+  // are the ONLY rows the one-click action treats specially: adopting a
+  // not-found destination would mark a dead link "healthy", so they are held
+  // back from the adopt set and surfaced for a separate decision instead.
+  const fixDeadSampled = fixCandidates.filter(
+    (candidate) => candidate.is_sampled && candidate.destination_not_found
+  );
+  // HTTP-verified rows backing the rule — the evidence count worth stating.
+  const fixSampledCount = fixCandidates.filter(
+    (candidate) => candidate.is_sampled
+  ).length;
+  // The verified rows safe to adopt outright. Passed as url_ids so the dead ones
+  // keep their "redirect" status and stay visible as outstanding work.
+  const fixSafeSampledIds = fixCandidates
+    .filter(
+      (candidate) =>
+        candidate.is_sampled &&
+        candidate.sampled_url_id &&
+        !candidate.destination_not_found
+    )
+    .map((candidate) => candidate.sampled_url_id as string);
+  // Up to two verified before/after pairs, the same concrete reassurance the
+  // transform modal's preview gives — enough to sanity-check the rule without
+  // scrolling a thousand rows.
+  const fixRuleExamples = fixCandidates
+    .filter((candidate) => candidate.is_sampled && !candidate.destination_not_found)
+    .slice(0, 2);
+  // Every confirmed destination looks dead. The rule is distilled from those
+  // same pairs, so it maps the WHOLE pattern onto not-found pages — there is no
+  // safe one-click here, and offering one would quietly point the sitemap at a
+  // dead landing page. Force the review list, where Delete is the real answer.
+  const fixAllDestinationsDead =
+    fixSampledCount > 0 && fixDeadSampled.length === fixSampledCount;
+  // One click is offered whenever the samples distilled into a single rule:
+  // there is exactly one transform, so per-row review adds nothing.
+  const fixOneClickReady =
+    !fixLoading &&
+    fixRule !== null &&
+    !fixReviewMode &&
+    !fixAllDestinationsDead &&
+    fixCandidates.length > 0;
+
+  async function handleFixAllRedirects() {
+    if (!fixRow || isFixing || isDeletingRedirects) {
+      return;
+    }
+
+    setIsFixing(true);
+
+    try {
+      // widen:true is the whole request — no enumerated URL list. The server
+      // re-derives the rule from the confirmed samples and streams it across
+      // every <loc> in the pattern's files, so the capped preview pool never
+      // bounds the result.
+      const result = await applyPatternRedirects(
+        params.id,
+        fixRow.id,
+        fixSafeSampledIds,
+        undefined,
+        true
+      );
+
+      setFixRow(null);
+
+      if (result.queued) {
+        setFindReplaceToast({
+          tone: "success",
+          message: `Applying redirect fixes across ${formatNumber(
+            result.files_total ?? 0
+          )} files in the background — results will update shortly.`
+        });
+        window.setTimeout(() => void loadResults({ silent: true }), 6000);
+        return;
+      }
+
+      await loadResults({ silent: true });
+      const changed = result.rewritten_loc_count ?? 0;
+      setFindReplaceToast({
+        tone: "success",
+        message: `${formatNumber(changed)} URL${
+          changed === 1 ? "" : "s"
+        } updated to their redirect destinations${
+          fixDeadSampled.length > 0
+            ? ` · ${formatNumber(
+                fixDeadSampled.length
+              )} dead-link URL${
+                fixDeadSampled.length === 1 ? "" : "s"
+              } left flagged for review`
+            : ""
+        }`
+      });
+    } catch (nextError) {
+      setFindReplaceToast({
+        tone: "error",
+        message: friendlyApiErrorMessage(
+          nextError,
+          "Unable to apply redirect fixes."
+        )
+      });
+    } finally {
+      setIsFixing(false);
+    }
+  }
 
   const renameSelectedOccurrences = renameSourceFiles
     .filter((file) => selectedRenameFiles.has(file.source_file))
@@ -3749,11 +3887,141 @@ export default function ResultsDashboardPage({
                   {fixRow?.template}
                 </p>
               </div>
+              {fixOneClickReady && fixRule ? (
+                <>
+                  <div className="space-y-1 rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                    <p className="text-sm font-semibold text-slate-700">
+                      {describeRedirectRule(fixRule)}
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      Confirmed by {formatNumber(fixSampledCount)} HTTP-checked
+                      URL{fixSampledCount === 1 ? "" : "s"} that all redirect the
+                      same way. Every matching URL in this pattern gets the same
+                      rewrite.
+                    </p>
+                  </div>
+
+                  {fixRuleExamples.length > 0 ? (
+                    <ul className="space-y-2">
+                      {fixRuleExamples.map((sample) => (
+                        <li
+                          key={sample.key}
+                          className="min-w-0 rounded-md border border-slate-200 px-3 py-2 text-xs"
+                        >
+                          <p className="min-w-0 truncate" title={sample.url}>
+                            <span className="text-slate-400">Before: </span>
+                            <span className="font-mono">{sample.url}</span>
+                          </p>
+                          <p
+                            className="min-w-0 truncate"
+                            title={sample.final_url}
+                          >
+                            <span className="text-emerald-600">After: </span>
+                            <span className="font-mono text-emerald-700">
+                              {sample.final_url}
+                            </span>
+                          </p>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+
+                  <p className="rounded-md bg-indigo-50 px-3 py-2 text-sm font-medium text-indigo-800">
+                    Fixing {formatNumber(fixPatternTotal)} matching URL
+                    {fixPatternTotal === 1 ? "" : "s"}
+                    {fixFileCount > 0 ? (
+                      <>
+                        {" "}
+                        across {formatNumber(fixFileCount)} file
+                        {fixFileCount === 1 ? "" : "s"}
+                      </>
+                    ) : null}
+                  </p>
+
+                  {/* Soft-404 safety net: these are HTTP-verified rows whose
+                      confirmed destination looks like a not-found page. Adopting
+                      it would mark a dead link healthy, so they are held out of
+                      the adopt set and surfaced here for a separate decision —
+                      deliberately a note beside the main button, not a blocker
+                      on it. */}
+                  {fixDeadSampled.length > 0 ? (
+                    <div className="space-y-1 rounded-md bg-amber-50 px-3 py-2">
+                      <p className="text-sm font-medium text-amber-900">
+                        ⚠️ {formatNumber(fixDeadSampled.length)} of these look
+                        like dead links — review separately
+                      </p>
+                      <p className="text-xs text-amber-800">
+                        Their confirmed destination looks like a not-found page,
+                        so they are left flagged instead of being marked fixed.
+                        The pattern rewrite still updates their URL text, so
+                        they will point at a dead page — deleting them is
+                        usually the right follow-up. Open &ldquo;Review
+                        individually&rdquo; to do that.
+                      </p>
+                    </div>
+                  ) : null}
+
+                  <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => setFixRow(null)}
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={isFixing}
+                      onClick={() => setFixReviewMode(true)}
+                    >
+                      Review individually
+                    </Button>
+                    <Button
+                      type="button"
+                      className="bg-amber-600 hover:bg-amber-700"
+                      disabled={isFixing || isDeletingRedirects}
+                      onClick={() => void handleFixAllRedirects()}
+                    >
+                      {isFixing ? (
+                        <>
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          Applying
+                        </>
+                      ) : (
+                        `Fix all ${formatNumber(fixPatternTotal)} URLs`
+                      )}
+                    </Button>
+                  </div>
+                </>
+              ) : (
+                <>
               <p className="text-xs text-slate-500">
                 Sampled URLs were HTTP-checked and confirmed redirecting; the
                 rest match this pattern and get the same confirmed rewrite
                 applied by inference (not individually verified).
               </p>
+              {fixAllDestinationsDead ? (
+                <div className="space-y-1 rounded-md bg-amber-50 px-3 py-2">
+                  <p className="text-sm font-medium text-amber-900">
+                    ⚠️ No safe one-click fix for this pattern
+                  </p>
+                  <p className="text-xs text-amber-800">
+                    All {formatNumber(fixSampledCount)} confirmed destination
+                    {fixSampledCount === 1 ? "" : "s"} look like not-found
+                    pages, so redirecting to them would just point the sitemap
+                    at a dead page. Delete these URLs instead of adopting them.
+                  </p>
+                </div>
+              ) : fixRule !== null ? (
+                <button
+                  type="button"
+                  className="text-left text-xs font-semibold text-indigo-600 hover:text-indigo-700"
+                  onClick={() => setFixReviewMode(false)}
+                >
+                  ← Back to one-click fix
+                </button>
+              ) : null}
               {fixPatternTotal > fixCandidates.length ? (
                 <p className="rounded-md bg-indigo-50 px-3 py-2 text-xs text-indigo-800">
                   Showing {formatNumber(fixCandidates.length)} for review —
@@ -4007,6 +4275,8 @@ export default function ResultsDashboardPage({
                   )}
                 </Button>
               </div>
+                </>
+              )}
             </div>
           </DialogContent>
         </Dialog>

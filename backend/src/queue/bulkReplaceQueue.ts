@@ -38,8 +38,14 @@ export type ApplyRedirectsJobData = {
   pattern_id: string;
   // Sampled_urls ids whose confirmed destination to adopt. null → all redirects.
   url_ids: string[] | null;
-  // Unsampled source URLs to rewrite by the inferred rule.
+  // Unsampled source URLs to rewrite by the inferred rule. Legacy signal: kept
+  // so an older client's enumerated list still requests widening, but its
+  // CONTENTS are not used to rewrite (see applyRedirectsJob).
   inferred_urls: string[];
+  // Explicit "apply the confirmed rule to the WHOLE pattern" signal (v1.48).
+  // The one-click Fix modal sends this instead of enumerating URLs out of the
+  // capped pattern_urls preview; a non-empty inferred_urls still implies it.
+  widen?: boolean;
 };
 
 export type BulkReplaceQueueData =

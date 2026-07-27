@@ -845,6 +845,9 @@ export type RedirectCandidatesResponse = {
   // The pattern's REAL total occurrence count (the true rewrite scope on
   // accept). Distinct from the bounded review preview below.
   pattern_total_urls: number;
+  // How many files the widened rewrite spans, so the one-click modal can state
+  // its true scope ("N URLs across M files") the way the transform modal does.
+  pattern_file_count?: number;
   // How many rows the review preview holds (capped by the pattern_urls sample
   // pool) — for messaging that separates "shown for review" from "will rewrite".
   preview_count?: number;
@@ -895,9 +898,18 @@ export async function applyPatternRedirects(
   sessionId: string,
   patternId: string,
   urlIds?: string[],
-  inferredUrls?: string[]
+  inferredUrls?: string[],
+  // Ask the server to apply the confirmed rule to the WHOLE pattern instead of
+  // only the rows named above. Preferred over enumerating inferred_urls: the
+  // rewrite has been rule-driven since v1.46, so the list was only ever a
+  // "widen requested" flag — and one sourced from the capped preview pool.
+  widen?: boolean
 ) {
-  const body: { url_ids?: string[]; inferred_urls?: string[] } = {};
+  const body: {
+    url_ids?: string[];
+    inferred_urls?: string[];
+    widen?: boolean;
+  } = {};
 
   if (urlIds) {
     body.url_ids = urlIds;
@@ -905,6 +917,10 @@ export async function applyPatternRedirects(
 
   if (inferredUrls && inferredUrls.length > 0) {
     body.inferred_urls = inferredUrls;
+  }
+
+  if (widen) {
+    body.widen = true;
   }
 
   const response = await fetchWithTimeout(

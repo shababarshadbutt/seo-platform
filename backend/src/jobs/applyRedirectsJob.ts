@@ -50,6 +50,11 @@ export async function processApplyRedirectsJob(
   const { session_id: sessionId, pattern_id: patternId } = data;
   const urlIds = data.url_ids;
   const inferredUrls = data.inferred_urls ?? [];
+  // Widening is requested either explicitly (v1.48 one-click Fix) or implicitly
+  // by an older client enumerating inferred_urls. Either way the rewrite is
+  // rule-driven across the pattern's full file list, so the list's contents are
+  // never read — only its non-emptiness, as a legacy signal.
+  const widenRequested = data.widen === true || inferredUrls.length > 0;
 
   const patternResult = await pool.query<{ source_role: string }>(
     "SELECT source_role FROM patterns WHERE id = $1",
@@ -137,7 +142,7 @@ export async function processApplyRedirectsJob(
   // came from the capped pattern_urls pool and covered only the sample. The
   // confirmed sampled pairs (`replacements`) still win per-URL. inferred_urls is
   // now only a "widen requested" signal; its contents are not used to rewrite.
-  const widen = inferredUrls.length > 0 && rule !== null;
+  const widen = widenRequested && rule !== null;
   const effectiveRule = widen ? rule : null;
 
   // Nothing to do only when there is neither a confirmed pair nor a rule to

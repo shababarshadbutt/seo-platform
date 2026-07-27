@@ -3594,9 +3594,19 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // confirmed rule to all pattern_total_urls matching URLs (v1.45.1).
       const patternTotalUrls = Number(patternResult.rows[0].total_urls) || 0;
 
+      // How many files the widened rewrite spans — the same COUNT(DISTINCT
+      // source_file) apply-redirects uses to size the job, surfaced here so the
+      // one-click modal can state its true scope ("N URLs across M files")
+      // without a second round-trip. (v1.48)
+      const fileCountResult = await pool.query<{ n: string }>(
+        "SELECT COUNT(DISTINCT source_file)::bigint AS n FROM pattern_file_occurrences WHERE pattern_id = $1",
+        [request.params.patternId]
+      );
+
       return {
         rule: rule ?? null,
         pattern_total_urls: patternTotalUrls,
+        pattern_file_count: Number(fileCountResult.rows[0]?.n ?? 0),
         // How many rows the review preview holds (bounded by the pattern_urls
         // sample pool) — distinct from pattern_total_urls, the real rewrite scope.
         preview_count: candidates.length,
@@ -3609,7 +3619,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
   app.post<{
     Params: PatternParams;
-    Body: { url_ids?: unknown[]; inferred_urls?: unknown[] };
+    Body: { url_ids?: unknown[]; inferred_urls?: unknown[]; widen?: unknown };
   }>(
     "/api/sessions/:id/patterns/:patternId/apply-redirects",
     async (request, reply) => {
@@ -3644,6 +3654,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           )
         : [];
 
+      // "Apply the confirmed rule to the WHOLE pattern". Since v1.46 the widened
+      // rewrite is rule-driven and never reads inferred_urls' CONTENTS, so the
+      // one-click Fix modal (v1.48) just sends widen:true rather than shipping a
+      // list enumerated from the capped pattern_urls preview. A non-empty
+      // inferred_urls still implies it, keeping older clients working unchanged.
+      const widenRequested =
+        request.body?.widen === true || inferredUrls.length > 0;
+
       // Route a WIDENED apply that would rewrite more than the parallel
       // threshold's worth of files to a background job (v1.42). The sampled-only
       // path (no inferred URLs) only ever touches a handful of files, so it
@@ -3652,7 +3670,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // event loop / trip the request timeout — the failure mode that hit the
       // ZIP path (v1.27) and Cleaner (v1.38). The job re-derives everything
       // server-side and rewrites via the piscina pool.
-      if (inferredUrls.length > 0) {
+      if (widenRequested) {
         const fileSpanResult = await pool.query<{ n: string }>(
           "SELECT COUNT(DISTINCT source_file)::bigint AS n FROM pattern_file_occurrences WHERE pattern_id = $1",
           [request.params.patternId]
@@ -3664,7 +3682,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             session_id: request.params.id,
             pattern_id: request.params.patternId,
             url_ids: urlIds,
-            inferred_urls: inferredUrls
+            inferred_urls: inferredUrls,
+            widen: true
           });
 
           return reply.send({
@@ -3678,7 +3697,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // to 'success' (which would erase the evidence).
       let inferredRule: RedirectRule | null = null;
 
-      if (inferredUrls.length > 0) {
+      if (widenRequested) {
         const ruleSamples = await pool.query<{ url: string; final_url: string }>(
           `
             SELECT url, final_url
@@ -3773,7 +3792,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // per-URL transform, so it reaches all real occurrences independent of
         // the pool/preview size. The confirmed sampled pairs (`replacements`)
         // still win per-URL inside buildRedirectApplyRewriter.
-        const widen = inferredUrls.length > 0 && inferredRule !== null;
+        const widen = widenRequested && inferredRule !== null;
 
         if (widen) {
           // Scan the pattern's real, complete file list (pattern_file_occurrences
