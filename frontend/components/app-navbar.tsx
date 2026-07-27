@@ -111,6 +111,12 @@ export function AppNavbar() {
   // they use relative hrefs (portable) and just open in a new tab.
   const seoDeskUrl =
     process.env.NEXT_PUBLIC_SEO_DESK_URL ?? "http://localhost:4000";
+
+  // Deployed version, injected from APP_VERSION in .env (the same value that
+  // tags the running images — see docker-compose.yml), so what the navbar shows
+  // and what is actually deployed cannot drift apart. Hidden rather than shown
+  // as a placeholder when unset, so a blank never reads as a real version.
+  const appVersion = process.env.NEXT_PUBLIC_APP_VERSION;
   const isCleanerActive = pathname === "/cleaner";
   const isMigrationActive =
     pathname === "/" || (pathname?.startsWith("/sessions") ?? false);
@@ -134,6 +140,14 @@ export function AppNavbar() {
             <span className="text-sm font-bold text-white sm:text-base">
               Sitemap Health Checker
             </span>
+            {appVersion ? (
+              <span
+                className="rounded-full bg-slate-800 px-2 py-0.5 font-mono text-[11px] font-medium leading-none text-slate-400 ring-1 ring-inset ring-slate-700"
+                title={`Deployed version ${appVersion}`}
+              >
+                {appVersion}
+              </span>
+            ) : null}
           </Link>
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-1.5">
