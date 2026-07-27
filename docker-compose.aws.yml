@@ -1,0 +1,239 @@
+# AWS deployment compose file — branch feature/aws-s3-sftp-deploy (from v1.46).
+#
+# Changes vs. the repo's existing docker-compose.yml:
+#   - frontend/backend/worker run in production mode (next build + next start /
+#     compiled backend start, not `next dev` / `npm run dev`) — v1.46 was a dev-mode
+#     deployment; this is a shared, always-on production one.
+#   - New SFTP_*, S3_*, CLOUDFRONT_* env vars for the Phase 1 pull-from-SFTP /
+#     publish-to-S3 / invalidate-CloudFront feature. NO AWS access keys appear
+#     anywhere here — the EC2 instance's IAM role supplies S3 + CloudFront
+#     permissions. If IAM-role auth isn't wired up yet when this first deploys,
+#     that's a blocker to fix, not a reason to add hardcoded keys.
+#   - APP_VERSION has NO fallback default (unlike the repo's :-v1.48 pattern) —
+#     on a shared production VM, silently deploying an unset/previous version by
+#     omission is worse than a deploy failing loudly until .env is set correctly.
+#
+# Claude CLI: treat the env var NAMES below as the contract for Phase 1's
+# SFTP/S3/CloudFront code — read config using exactly these names so this file
+# and the implementation stay in sync. Adjust values/comments as needed once
+# real code lands, but don't rename the keys without updating this file too.
+
+services:
+  frontend:
+    image: shababarshadbutt/sitemap-frontend:${APP_VERSION}
+    build:
+      context: ./frontend
+    environment:
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: "1"
+      NEXT_PUBLIC_BACKEND_URL: http://localhost:${BACKEND_PORT:-3001}
+      NEXT_PUBLIC_APP_VERSION: ${APP_VERSION}
+      NEXT_PUBLIC_SEO_DESK_URL: ${NEXT_PUBLIC_SEO_DESK_URL:-http://localhost:4000}
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 45s
+    restart: unless-stopped
+
+  backend:
+    image: shababarshadbutt/sitemap-backend:${APP_VERSION}
+    build:
+      context: ./backend
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      NODE_OPTIONS: "--max-old-space-size=4096"
+      # Corporate SSL-inspection proxy workaround (v1.39) — this VM is on AWS,
+      # not behind that laptop-side proxy, so this almost certainly should be
+      # "1" here. Left overridable rather than hardcoded off in case AWS
+      # egress in your VPC does route through some inspecting proxy/NAT
+      # appliance — confirm with DevOps, then set NODE_TLS_REJECT_UNAUTHORIZED=1
+      # in .env once confirmed safe to do so.
+      NODE_TLS_REJECT_UNAUTHORIZED: "${NODE_TLS_REJECT_UNAUTHORIZED:-0}"
+      DATABASE_URL: postgresql://sitemap:sitemap@postgres:5432/sitemap_health
+      REDIS_URL: redis://redis:6379
+      UPLOAD_DIR: /uploads
+      EXPORT_DIR: /exports
+      FRONTEND_URL: http://frontend:3000
+      PDF_BACKEND_URL: http://localhost:3001
+      CHROMIUM_PATH: /usr/bin/chromium-browser
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY must be set in .env}
+
+      # --- Phase 1: SFTP input (AWS Transfer Family) ---
+      SFTP_HOST: ${SFTP_HOST:?SFTP_HOST must be set in .env}
+      SFTP_PORT: ${SFTP_PORT:-22}
+      SFTP_USERNAME: ${SFTP_USERNAME:?SFTP_USERNAME must be set in .env}
+      # Prefer a private key over a password wherever Transfer Family supports it.
+      SFTP_PRIVATE_KEY_PATH: ${SFTP_PRIVATE_KEY_PATH:-/run/secrets/sftp_private_key}
+      SFTP_BASE_PATH: ${SFTP_BASE_PATH:-sftp-sitemaps-asapsmei}
+      SFTP_MAX_CONCURRENT_CONNECTIONS: ${SFTP_MAX_CONCURRENT_CONNECTIONS:-4}
+
+      # --- Phase 1: S3 output (no access keys — IAM instance role only) ---
+      S3_BUCKET: ${S3_BUCKET:-asap-cms-prod}
+      S3_SITEMAPS_PREFIX_TEMPLATE: ${S3_SITEMAPS_PREFIX_TEMPLATE:-sites/{domain}/sitemaps/}
+      AWS_REGION: ${AWS_REGION:?AWS_REGION must be set in .env}
+      # Publish never issues DeleteObject calls (explicit decision — removed
+      # sitemap files become absent from the regenerated index, not deleted
+      # from the bucket, since versioning is off and there's no undo).
+      S3_PUBLISH_ALLOW_DELETE: "false"
+
+      # --- Phase 1: CloudFront invalidation ---
+      CLOUDFRONT_DISTRIBUTION_ID: ${CLOUDFRONT_DISTRIBUTION_ID:?CLOUDFRONT_DISTRIBUTION_ID must be set in .env}
+
+      # --- Phase 1: per-domain publish lock (Redis-backed, TTL'd) ---
+      PUBLISH_LOCK_TTL_SECONDS: ${PUBLISH_LOCK_TTL_SECONDS:-300}
+    ports:
+      - "${BACKEND_PORT:-3001}:3001"
+    volumes:
+      - uploads:/uploads
+      - exports:/exports
+      # Mount the SFTP private key read-only if using key-based auth; omit if
+      # Transfer Family is configured for a different auth method.
+      - ${SFTP_PRIVATE_KEY_HOST_PATH:-./secrets/sftp_private_key}:/run/secrets/sftp_private_key:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  worker:
+    image: shababarshadbutt/sitemap-backend:${APP_VERSION}
+    build:
+      context: ./backend
+    command: npm run worker
+    environment:
+      NODE_ENV: production
+      WORKER_HEALTH_PORT: "3002"
+      NODE_TLS_REJECT_UNAUTHORIZED: "${NODE_TLS_REJECT_UNAUTHORIZED:-0}"
+      DATABASE_URL: postgresql://sitemap:sitemap@postgres:5432/sitemap_health
+      REDIS_URL: redis://redis:6379
+      UPLOAD_DIR: /uploads
+      EXPORT_DIR: /exports
+
+      # Same Phase 1 config as backend — the queued SFTP-pull / S3-publish jobs
+      # (mirroring the existing >200-file redirect-fix job pattern) run here.
+      SFTP_HOST: ${SFTP_HOST:?SFTP_HOST must be set in .env}
+      SFTP_PORT: ${SFTP_PORT:-22}
+      SFTP_USERNAME: ${SFTP_USERNAME:?SFTP_USERNAME must be set in .env}
+      SFTP_PRIVATE_KEY_PATH: ${SFTP_PRIVATE_KEY_PATH:-/run/secrets/sftp_private_key}
+      SFTP_BASE_PATH: ${SFTP_BASE_PATH:-sftp-sitemaps-asapsmei}
+      SFTP_MAX_CONCURRENT_CONNECTIONS: ${SFTP_MAX_CONCURRENT_CONNECTIONS:-4}
+      S3_BUCKET: ${S3_BUCKET:-asap-cms-prod}
+      S3_SITEMAPS_PREFIX_TEMPLATE: ${S3_SITEMAPS_PREFIX_TEMPLATE:-sites/{domain}/sitemaps/}
+      AWS_REGION: ${AWS_REGION:?AWS_REGION must be set in .env}
+      S3_PUBLISH_ALLOW_DELETE: "false"
+      CLOUDFRONT_DISTRIBUTION_ID: ${CLOUDFRONT_DISTRIBUTION_ID:?CLOUDFRONT_DISTRIBUTION_ID must be set in .env}
+      PUBLISH_LOCK_TTL_SECONDS: ${PUBLISH_LOCK_TTL_SECONDS:-300}
+    volumes:
+      - uploads:/uploads
+      - exports:/exports
+      - ${SFTP_PRIVATE_KEY_HOST_PATH:-./secrets/sftp_private_key}:/run/secrets/sftp_private_key:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3002/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: sitemap
+      POSTGRES_PASSWORD: sitemap
+      POSTGRES_DB: sitemap_health
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sitemap -d sitemap_health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  seo-desk:
+    build:
+      context: ./apps/seo-desk
+    environment:
+      NODE_ENV: production
+      MONGODB_URI: mongodb://mongo:27017/seo_desk
+      NEXTAUTH_URL: http://localhost:${SEO_DESK_PORT:-4000}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?NEXTAUTH_SECRET must be set in .env}
+      PYTHON_EXECUTABLE: python3
+      CRON_SECRET: ${CRON_SECRET:?CRON_SECRET must be set in .env}
+    ports:
+      - "${SEO_DESK_PORT:-4000}:3000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  uploads:
+  exports:
+  postgres_data:
+  redis_data:
+  mongo_data:

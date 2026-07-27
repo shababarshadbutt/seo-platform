@@ -1,6 +1,7 @@
 import { createReadStream, createWriteStream } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { createInterface } from "node:readline";
+import { createGzip } from "node:zlib";
 import path from "node:path";
 
 import { streamUrlsetLocs } from "./parser.js";
@@ -66,9 +67,14 @@ export interface CleanerResult {
   total_urls_kept_files: number;
   // Sum of output_files[].url_count — the deduped URLs actually written
   // ("Clean URLs remaining"). In the common case (no file emptied by dedup)
-  // total_urls_kept_files - clean_urls_remaining === duplicates_removed.
+  // total_urls_kept_files - clean_urls_remaining === duplicates_removed. That
+  // identity does NOT hold when a file is emptied entirely by dedup: it leaves
+  // the survivors set, so its URLs drop out of total_urls_kept_files while its
+  // duplicates remain counted in duplicates_removed. reduction_pct is measured
+  // against all candidates precisely so it stays correct in that case.
   clean_urls_remaining: number;
-  // duplicates_removed / total_urls_kept_files * 100 ("Reduction %").
+  // duplicates_removed as a share of every on-domain URL that entered dedup
+  // (all candidate files, including any later emptied) * 100 ("Reduction %").
   reduction_pct: number;
 }
 
@@ -189,6 +195,75 @@ function finishStream(stream: import("node:fs").WriteStream): Promise<void> {
     stream.on("error", reject);
     stream.end(() => resolve());
   });
+}
+
+// Give a candidate a collision-free OUTPUT filename. Two uploaded files can
+// legitimately share a basename — the route flattens ZIP paths through
+// baseName(), so `a/sitemap.xml` and `b/sitemap.xml` both arrive as
+// "sitemap.xml" — and before this, both wrote to the same outDir path: the
+// second silently overwrote the first, losing its URLs while the summary still
+// counted both files and all their URLs. Suffix the duplicate instead
+// (sitemap.xml, sitemap-2.xml), keeping any .xml / .xml.gz extension intact so
+// the rebuilt index and the ZIP both reference a file that actually exists.
+export function uniqueOutputName(desired: string, used: Set<string>): string {
+  if (!used.has(desired)) {
+    used.add(desired);
+
+    return desired;
+  }
+
+  // Split off the full extension so the suffix lands on the stem:
+  // "a.xml.gz" -> stem "a", ext ".xml.gz".
+  const lower = desired.toLowerCase();
+  const ext = lower.endsWith(".xml.gz")
+    ? desired.slice(-7)
+    : path.extname(desired);
+  const stem = ext ? desired.slice(0, desired.length - ext.length) : desired;
+
+  for (let n = 2; ; n += 1) {
+    const candidate = `${stem}-${n}${ext}`;
+
+    if (!used.has(candidate)) {
+      used.add(candidate);
+
+      return candidate;
+    }
+  }
+}
+
+// Open the sink a cleaned file is written through. When the output name ends
+// in .gz the bytes must actually BE gzip — the cleaner accepts .xml.gz input
+// (streamUrlsetLocs gunzips it) but used to write the cleaned result as plain
+// XML under the same .gz name, producing a file that any consumer trying to
+// decompress it — Google, or this tool's own re-ingest on handoff — fails on.
+// `done` resolves only once the underlying FILE is closed, not merely when the
+// gzip transform has ended, so callers never unlink or ZIP a partial file.
+function openCleanedSink(outPath: string): {
+  sink: NodeJS.WritableStream;
+  done: () => Promise<void>;
+} {
+  const fileStream = createWriteStream(outPath);
+
+  if (!isGzipName(outPath)) {
+    return { sink: fileStream, done: () => finishStream(fileStream) };
+  }
+
+  const gzip = createGzip();
+  const closed = new Promise<void>((resolve, reject) => {
+    fileStream.on("error", reject);
+    gzip.on("error", reject);
+    fileStream.on("close", () => resolve());
+  });
+  gzip.pipe(fileStream);
+
+  return {
+    sink: gzip,
+    done: () => {
+      gzip.end();
+
+      return closed;
+    }
+  };
 }
 
 // ---- Worker-safe primitives (imported by the piscina workers) -----------
@@ -314,25 +389,38 @@ type SurvivorFile = {
   onDomainCount: number;
 };
 
+// A file that survived Pass 1 and will be cleaned. `outputName` is its
+// collision-free output filename (usually identical to file.filename).
+export type CleanerCandidate = {
+  file: CleanerInputFile;
+  outputName: string;
+  onDomainCount: number;
+};
+
 // Write one candidate's cleaned output: header, one <url> per kept loc, footer.
 // The on-domain (loc, key) pairs are supplied by `produce` via `emit`, which
 // runs each through the shared dedup decision. A file with nothing kept is
 // removed and reported empty. Identical for the sequential and parallel paths.
+// `outputName` is the collision-free name this file is written under (see
+// uniqueOutputName); it may differ from file.filename when two uploads shared a
+// basename. Dedup attribution uses it too, so the duplicates report points at a
+// file that actually exists in the output.
 async function writeCandidateFile(
   file: CleanerInputFile,
+  outputName: string,
   outDir: string,
   today: string,
   state: DedupState,
   produce: (emit: (loc: string, key: string) => void) => void | Promise<unknown>
 ): Promise<{ kept: boolean; url_count: number; path: string }> {
-  const outPath = path.join(outDir, file.filename);
-  const out = createWriteStream(outPath);
-  out.write(URLSET_HEADER);
+  const outPath = path.join(outDir, outputName);
+  const { sink, done } = openCleanedSink(outPath);
+  sink.write(URLSET_HEADER);
   let keptCount = 0;
 
   const emit = (loc: string, key: string) => {
-    if (considerLoc(state, loc, key, file.filename)) {
-      out.write(urlEntry(loc, today));
+    if (considerLoc(state, loc, key, outputName)) {
+      sink.write(urlEntry(loc, today));
       keptCount += 1;
     }
   };
@@ -340,14 +428,14 @@ async function writeCandidateFile(
   await produce(emit);
 
   if (keptCount === 0) {
-    await finishStream(out);
+    await done();
     await unlink(outPath).catch(() => undefined);
 
     return { kept: false, url_count: 0, path: outPath };
   }
 
-  out.write(URLSET_FOOTER);
-  await finishStream(out);
+  sink.write(URLSET_FOOTER);
+  await done();
 
   return { kept: true, url_count: keptCount, path: outPath };
 }
@@ -421,7 +509,7 @@ async function runBoundedByIndex<T>(
 // completion order. `loadProvisional` is injectable so the test can drive it
 // with out-of-order-completing mocks.
 export async function writeCandidatesParallel(options: {
-  candidates: { file: CleanerInputFile; onDomainCount: number }[];
+  candidates: CleanerCandidate[];
   concurrency: number;
   today: string;
   outDir: string;
@@ -429,7 +517,7 @@ export async function writeCandidatesParallel(options: {
   survivors: SurvivorFile[];
   dropped: { filename: string; reason: DropReason }[];
   loadProvisional: (
-    candidate: { file: CleanerInputFile; onDomainCount: number },
+    candidate: CleanerCandidate,
     index: number
   ) => Promise<string>;
   onProgress?: CleanerProgress;
@@ -460,7 +548,7 @@ export async function writeCandidatesParallel(options: {
   }
 
   for (let i = 0; i < candidates.length; i += 1) {
-    const { file, onDomainCount } = candidates[i];
+    const { file, outputName, onDomainCount } = candidates[i];
     const provisionalPath = await (inFlight.get(i) as Promise<string>);
     inFlight.delete(i);
     dispatch(i + window);
@@ -472,8 +560,13 @@ export async function writeCandidatesParallel(options: {
       message: `Cleaning ${file.filename} (${i + 1} of ${candidates.length})`
     });
 
-    const result = await writeCandidateFile(file, outDir, today, state, (emit) =>
-      readProvisionalPairs(provisionalPath, emit)
+    const result = await writeCandidateFile(
+      file,
+      outputName,
+      outDir,
+      today,
+      state,
+      (emit) => readProvisionalPairs(provisionalPath, emit)
     );
 
     if (cleanupProvisional) {
@@ -482,7 +575,7 @@ export async function writeCandidatesParallel(options: {
 
     if (result.kept) {
       survivors.push({
-        filename: file.filename,
+        filename: outputName,
         url_count: result.url_count,
         path: result.path,
         onDomainCount
@@ -553,7 +646,10 @@ export async function cleanSitemaps(options: {
   const dropped: { filename: string; reason: DropReason }[] = [];
   // Each candidate carries its on-domain URL count from Pass 1 so the
   // "Total URLs (kept files)" stat can be summed without re-counting.
-  const candidates: { file: CleanerInputFile; onDomainCount: number }[] = [];
+  const candidates: CleanerCandidate[] = [];
+  // Output filenames claimed so far, so two uploads sharing a basename get
+  // distinct output files instead of one silently overwriting the other.
+  const usedOutputNames = new Set<string>();
   let indexFilesDetected = 0;
   let filesProcessed = 0;
 
@@ -581,7 +677,11 @@ export async function cleanSitemaps(options: {
       continue;
     }
 
-    candidates.push({ file, onDomainCount: info.matching });
+    candidates.push({
+      file,
+      outputName: uniqueOutputName(file.filename, usedOutputNames),
+      onDomainCount: info.matching
+    });
   }
 
   // ---- Pass 2: dedup + write cleaned files (streaming, first wins) -------
@@ -610,7 +710,7 @@ export async function cleanSitemaps(options: {
     });
   } else {
     for (let i = 0; i < candidates.length; i += 1) {
-      const { file, onDomainCount } = candidates[i];
+      const { file, outputName, onDomainCount } = candidates[i];
 
       onProgress?.({
         stage: "output",
@@ -621,6 +721,7 @@ export async function cleanSitemaps(options: {
 
       const result = await writeCandidateFile(
         file,
+        outputName,
         outDir,
         today,
         state,
@@ -643,7 +744,7 @@ export async function cleanSitemaps(options: {
 
       if (result.kept) {
         survivors.push({
-          filename: file.filename,
+          filename: outputName,
           url_count: result.url_count,
           path: result.path,
           onDomainCount
@@ -709,9 +810,18 @@ export async function cleanSitemaps(options: {
     (sum, file) => sum + file.url_count,
     0
   );
+  // Reduction is measured against every on-domain URL that ENTERED dedup, not
+  // just those in surviving files. A file wiped out entirely by dedup leaves
+  // its duplicates in the numerator but takes its URLs out of a survivors-only
+  // denominator — which reported e.g. 2 duplicates over 2 surviving URLs =
+  // "100% reduction" for an input that was really 4 URLs and 50% duplicated.
+  const totalUrlsCandidateFiles = candidates.reduce(
+    (sum, candidate) => sum + candidate.onDomainCount,
+    0
+  );
   const reductionPct =
-    totalUrlsKeptFiles > 0
-      ? (duplicatesRemoved / totalUrlsKeptFiles) * 100
+    totalUrlsCandidateFiles > 0
+      ? (duplicatesRemoved / totalUrlsCandidateFiles) * 100
       : 0;
 
   const result: CleanerResult = {
