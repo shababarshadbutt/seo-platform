@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { s3PrefixForDomain } from "../config.js";
+import {
+  config,
+  publicSitemapUrl,
+  publishConfigError,
+  s3PrefixForDomain
+} from "../config.js";
 import { assertSafeDomain } from "../sftp/sftpClient.js";
 import { productionFilename } from "../sitemaps/filenames.js";
 import { buildPublishIndexXml } from "./s3Publish.js";
@@ -30,10 +35,44 @@ test("s3PrefixForDomain fills the template and always ends in a slash", () => {
   );
 });
 
+test("publicSitemapUrl fills the default template and is independent of the S3 key", () => {
+  assert.equal(
+    publicSitemapUrl("airpartshop.com", "aviation-mfg47.xml"),
+    "https://airpartshop.com/sitemaps/aviation-mfg47.xml"
+  );
+});
+
+// A {file}-less template yields a syntactically valid index whose every entry
+// points at the same url — silent breakage, so the config gate rejects it.
+// Mutates the live config and restores it; node:test runs a file's tests in
+// order, so no other test observes the change.
+test("publishConfigError rejects a template that would collapse every loc", () => {
+  const saved = {
+    region: config.s3.region,
+    bucket: config.s3.bucket,
+    template: config.publicSitemapUrlTemplate
+  };
+
+  try {
+    // Get past the earlier gates so the template check is what we're reading.
+    config.s3.region = "us-east-1";
+    config.s3.bucket = "asap-cms-prod";
+
+    config.publicSitemapUrlTemplate = "https://{domain}/sitemaps/";
+    assert.match(publishConfigError() ?? "", /PUBLIC_SITEMAP_URL_TEMPLATE/);
+
+    config.publicSitemapUrlTemplate = "https://{domain}/sitemaps/{file}";
+    assert.equal(publishConfigError(), null);
+  } finally {
+    config.s3.region = saved.region;
+    config.s3.bucket = saved.bucket;
+    config.publicSitemapUrlTemplate = saved.template;
+  }
+});
+
 test("the regenerated index lists exactly the published files", () => {
   const xml = buildPublishIndexXml(
     "airpartshop.com",
-    "sites/airpartshop.com/sitemaps/",
     ["aviation-mfg47.xml", "civil-aviation-rfq-with-aircraft-model-52.xml"],
     "2026-07-27"
   );
@@ -53,6 +92,45 @@ test("the regenerated index lists exactly the published files", () => {
   assert.ok(xml.trimEnd().endsWith("</sitemapindex>"));
 });
 
+// The whole point of PUBLIC_SITEMAP_URL_TEMPLATE: if the real CloudFront mapping
+// turns out to differ from the bucket layout, correcting it is one .env line.
+// The S3 prefix is untouched by any of these — the builder never receives it.
+test("the public loc follows the template, not the bucket layout", () => {
+  const files = ["aviation-mfg47.xml"];
+
+  // Served at the domain root, objects still under sites/<domain>/sitemaps/.
+  assert.ok(
+    buildPublishIndexXml(
+      "airpartshop.com",
+      files,
+      "2026-07-27",
+      "https://{domain}/{file}"
+    ).includes("<loc>https://airpartshop.com/aviation-mfg47.xml</loc>")
+  );
+
+  // Served from a different subpath than the key's.
+  assert.ok(
+    buildPublishIndexXml(
+      "airpartshop.com",
+      files,
+      "2026-07-27",
+      "https://{domain}/sitemap-files/{file}"
+    ).includes("<loc>https://airpartshop.com/sitemap-files/aviation-mfg47.xml</loc>")
+  );
+
+  // Served off a fixed CDN host that isn't the client domain at all.
+  assert.ok(
+    buildPublishIndexXml(
+      "airpartshop.com",
+      files,
+      "2026-07-27",
+      "https://cdn.example.net/sites/{domain}/sitemaps/{file}"
+    ).includes(
+      "<loc>https://cdn.example.net/sites/airpartshop.com/sitemaps/aviation-mfg47.xml</loc>"
+    )
+  );
+});
+
 // A file deleted in-session must vanish from the index — that is the ONLY
 // mechanism by which a removal reaches production. Publish never issues
 // DeleteObject (no bucket versioning => a wrong delete is unrecoverable), so
@@ -60,16 +138,10 @@ test("the regenerated index lists exactly the published files", () => {
 test("a file omitted from the plan drops out of the regenerated index", () => {
   const before = buildPublishIndexXml(
     "airpartshop.com",
-    "sites/airpartshop.com/sitemaps/",
     ["a.xml", "deleted.xml", "b.xml"],
     "2026-07-27"
   );
-  const after = buildPublishIndexXml(
-    "airpartshop.com",
-    "sites/airpartshop.com/sitemaps/",
-    ["a.xml", "b.xml"],
-    "2026-07-27"
-  );
+  const after = buildPublishIndexXml("airpartshop.com", ["a.xml", "b.xml"], "2026-07-27");
 
   assert.ok(before.includes("deleted.xml"));
   assert.ok(!after.includes("deleted.xml"));

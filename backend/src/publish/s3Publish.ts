@@ -8,7 +8,7 @@ import {
 } from "@aws-sdk/client-cloudfront";
 import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
-import { config, s3PrefixForDomain } from "../config.js";
+import { config, publicSitemapUrl, s3PrefixForDomain } from "../config.js";
 import { pool } from "../db/pool.js";
 import { isHttpUrl, productionFilename } from "../sitemaps/filenames.js";
 
@@ -155,32 +155,31 @@ export async function buildPublishPlan(
 
 // Regenerate the index over exactly the files being published, so a file
 // deleted in-session drops out of it.
-// NOTE on the public path: a <loc> here must be the URL a search engine can
-// actually FETCH, which is not the S3 key. The key prefix
-// ("sites/<domain>/sitemaps/") is storage layout behind CloudFront; emitting it
-// verbatim produced
-//   https://<domain>/sites/<domain>/sitemaps/<file>
-// — the storage path leaked into the public URL. The public path is the last
-// segment of the prefix ("sitemaps"), matching the convention the Cleaner's own
-// buildIndexXml already uses (<domain>/<subfolder>/<file>), so both index
-// builders in this codebase now agree.
 //
-// This still ASSUMES CloudFront maps <domain>/sitemaps/* onto that prefix. That
-// mapping is a distribution setting this code cannot see, and step 7 of the
-// throwaway-domain gate (docs/aws-deployment.md) exists to confirm it before any
-// real client domain is published.
+// NOTE on the public path: a <loc> here must be the URL a search engine can
+// actually FETCH, which is NOT the S3 key. This function therefore takes NO
+// prefix and never sees one — the public url comes wholly from
+// PUBLIC_SITEMAP_URL_TEMPLATE (config.publicSitemapUrlTemplate). Earlier
+// versions derived it from the key path, which first leaked storage layout into
+// the public url (https://<domain>/sites/<domain>/sitemaps/<file>) and then, once
+// patched to use the prefix's last segment, still silently coupled the two.
+// Where objects are laid out in the bucket and what path CloudFront serves them
+// at are set by different systems; they are configured independently here so a
+// mismatch is one .env line, not a code change.
+//
+// The default template still ASSUMES CloudFront maps <domain>/sitemaps/* onto
+// the bucket prefix. That mapping is a distribution setting this code cannot
+// see; step 7 of the throwaway-domain gate (docs/aws-deployment.md) confirms it
+// before any real client domain is published.
 export function buildPublishIndexXml(
   domain: string,
-  prefix: string,
   filenames: string[],
-  today: string
+  today: string,
+  urlTemplate?: string
 ): string {
-  const base = `https://${domain}`;
-  const segments = prefix.replace(/^\/+|\/+$/g, "").split("/").filter(Boolean);
-  const sub = segments.length > 0 ? segments[segments.length - 1] : "";
   const entries = filenames
     .map((filename) => {
-      const loc = `${base}/${sub}/${filename}`
+      const loc = publicSitemapUrl(domain, filename, urlTemplate)
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
@@ -251,9 +250,10 @@ export async function executePublish(
       });
     }
 
+    // plan.prefix is deliberately NOT passed: the index's public urls come from
+    // the template, the keys below come from the prefix.
     const indexXml = buildPublishIndexXml(
       plan.domain,
-      plan.prefix,
       plan.files.map((file) => file.displayName),
       options.today
     );

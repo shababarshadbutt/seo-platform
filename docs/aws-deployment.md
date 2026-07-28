@@ -44,6 +44,14 @@ Use a disposable domain value such as `_test-domain`, so everything lands under
    CloudFront (not S3 directly) and confirm it reflects this publish. If it
    serves stale content, the invalidation did not take — check the distribution
    id and that the paths in the invalidation match the keys written.
+   Then **fetch one `<loc>` from that index** and confirm it returns the child
+   sitemap. That is the check for the storage-vs-served mapping: the `<loc>`
+   comes from `PUBLIC_SITEMAP_URL_TEMPLATE`, the object key from
+   `S3_SITEMAPS_PREFIX_TEMPLATE`, and nothing in the code links the two. A 404
+   here means the template is wrong, which is a **one-line `.env` fix** — set
+   `PUBLIC_SITEMAP_URL_TEMPLATE` to the path CloudFront really serves (e.g.
+   `https://{domain}/{file}` if it's served at the root) and republish. Do not
+   "fix" it by changing the prefix: that would move the objects instead.
 8. **Verify the lock under real conditions.** Start a publish for the throwaway
    domain and, while it runs, start another for the same domain: the second must
    return **409** with "someone is already publishing this domain". A publish of
@@ -76,6 +84,7 @@ Optional, with defaults: `SFTP_PORT` (22), `SFTP_PRIVATE_KEY_PATH`
 when the key file is absent), `SFTP_BASE_PATH` (`sftp-sitemaps-asapsmei`),
 `SFTP_MAX_CONCURRENT_CONNECTIONS` (4), `S3_BUCKET` (`asap-cms-prod`),
 `S3_SITEMAPS_PREFIX_TEMPLATE` (`sites/{domain}/sitemaps/`),
+`PUBLIC_SITEMAP_URL_TEMPLATE` (`https://{domain}/sitemaps/{file}`),
 `S3_PUBLISH_ALLOW_DELETE` (`false`), `PUBLISH_LOCK_TTL_SECONDS` (300),
 `NODE_TLS_REJECT_UNAUTHORIZED` (1), `FRONTEND_PORT` (3000), `SEO_DESK_PORT`
 (4000).
@@ -93,6 +102,14 @@ first deploy that is a blocker to fix, not a reason to add keys.
   in the bucket, unreferenced. Versioning is off, so a wrong delete has no undo.
   `S3_PUBLISH_ALLOW_DELETE=true` is **rejected at runtime** rather than silently
   ignored, so the flag cannot imply a capability that does not exist.
+- **Storage layout and public url are separate configs, on purpose.**
+  `S3_SITEMAPS_PREFIX_TEMPLATE` decides the object key;
+  `PUBLIC_SITEMAP_URL_TEMPLATE` decides the `<loc>` written into the sitemap
+  index. `buildPublishIndexXml` is not given the prefix at all, so the key path
+  cannot leak back into a public url as it did originally. Only the CloudFront
+  distribution knows the true mapping between them, and this code cannot read
+  it — so the mapping is configuration, verified by gate step 7, not an
+  assumption compiled in. Changing one to match the other is almost always wrong.
 - **Publish is per-domain locked, and collisions are rejected, not queued.** Two
   users publishing different domains run fully in parallel. Two publishing the
   same domain: the second gets a 409. Queuing it would overwrite production

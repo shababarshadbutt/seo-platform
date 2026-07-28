@@ -107,6 +107,18 @@ export const config = {
     allowDelete: (process.env.S3_PUBLISH_ALLOW_DELETE ?? "false") === "true"
   },
 
+  // The PUBLIC url a search engine fetches a sitemap at. Deliberately a separate
+  // config from s3.prefixTemplate above: that one is where objects LIVE in the
+  // bucket, this one is where CloudFront SERVES them. The two happen to share
+  // the "sitemaps" segment under the mapping we could test against MinIO, but
+  // they are set by different systems (our uploader vs. the distribution's
+  // origin path / behaviours) and nothing guarantees they stay in step. Keeping
+  // them independent means a different real mapping is an .env change here, not
+  // a code change. Placeholders: {domain}, {file}.
+  publicSitemapUrlTemplate:
+    process.env.PUBLIC_SITEMAP_URL_TEMPLATE ??
+    "https://{domain}/sitemaps/{file}",
+
   cloudfrontDistributionId: process.env.CLOUDFRONT_DISTRIBUTION_ID ?? "",
 
   // Per-domain publish lock TTL. A crashed publish's lock expires rather than
@@ -143,12 +155,34 @@ export function publishConfigError(): string | null {
     return "S3 publishing is not configured on this deployment (S3_BUCKET is unset)";
   }
 
+  // A template without {file} would resolve every child sitemap to the SAME
+  // <loc>, producing a syntactically valid index that points at one file. That
+  // is silent, so reject it here rather than publishing a broken index.
+  if (!config.publicSitemapUrlTemplate.includes("{file}")) {
+    return "PUBLIC_SITEMAP_URL_TEMPLATE must contain {file} (every sitemap would otherwise get the same <loc>)";
+  }
+
   return null;
 }
 
-// Resolve the S3 key prefix for one domain from the template.
+// Resolve the S3 key prefix for one domain from the template — where the object
+// is STORED. Not related to publicSitemapUrl below; see the note on
+// config.publicSitemapUrlTemplate for why these two are separate.
 export function s3PrefixForDomain(domain: string): string {
   const prefix = config.s3.prefixTemplate.replace("{domain}", domain);
 
   return prefix.endsWith("/") ? prefix : `${prefix}/`;
+}
+
+// Resolve the public url one sitemap is SERVED at. Derived only from the
+// template — never from the S3 key or its prefix, so a CloudFront mapping that
+// doesn't match our bucket layout is a config change, not a code change. The
+// template is a parameter so tests can exercise alternative mappings without
+// reloading the module.
+export function publicSitemapUrl(
+  domain: string,
+  filename: string,
+  template: string = config.publicSitemapUrlTemplate
+): string {
+  return template.replaceAll("{domain}", domain).replaceAll("{file}", filename);
 }

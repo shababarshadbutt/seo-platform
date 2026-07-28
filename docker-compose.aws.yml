@@ -127,7 +127,13 @@ services:
 
       # --- Phase 1: S3 output (no access keys — IAM instance role only) ---
       S3_BUCKET: ${S3_BUCKET:-asap-cms-prod}
+      # Where objects LIVE in the bucket. Independent of the public url below.
       S3_SITEMAPS_PREFIX_TEMPLATE: ${S3_SITEMAPS_PREFIX_TEMPLATE:-sites/{domain}/sitemaps/}
+      # Where CloudFront SERVES them — what goes in the sitemap index's <loc>.
+      # Set by the distribution, not by our uploader, so it is a SEPARATE knob:
+      # if the real mapping differs from the bucket layout, change this line only.
+      # Placeholders: {domain}, {file}. Must contain {file}.
+      PUBLIC_SITEMAP_URL_TEMPLATE: ${PUBLIC_SITEMAP_URL_TEMPLATE:-https://{domain}/sitemaps/{file}}
       AWS_REGION: ${AWS_REGION:?AWS_REGION must be set in .env}
       # Publish never issues DeleteObject calls (explicit decision — removed
       # sitemap files become absent from the regenerated index, not deleted
@@ -192,7 +198,11 @@ services:
       SFTP_BASE_PATH: ${SFTP_BASE_PATH:-sftp-sitemaps-asapsmei}
       SFTP_MAX_CONCURRENT_CONNECTIONS: ${SFTP_MAX_CONCURRENT_CONNECTIONS:-4}
       S3_BUCKET: ${S3_BUCKET:-asap-cms-prod}
+      # Storage layout vs. served path — two separate knobs; see the backend
+      # service above. The worker is what actually writes the index, so this one
+      # is the copy that decides the <loc> values in production.
       S3_SITEMAPS_PREFIX_TEMPLATE: ${S3_SITEMAPS_PREFIX_TEMPLATE:-sites/{domain}/sitemaps/}
+      PUBLIC_SITEMAP_URL_TEMPLATE: ${PUBLIC_SITEMAP_URL_TEMPLATE:-https://{domain}/sitemaps/{file}}
       AWS_REGION: ${AWS_REGION:?AWS_REGION must be set in .env}
       S3_PUBLISH_ALLOW_DELETE: "false"
       CLOUDFRONT_DISTRIBUTION_ID: ${CLOUDFRONT_DISTRIBUTION_ID:?CLOUDFRONT_DISTRIBUTION_ID must be set in .env}
