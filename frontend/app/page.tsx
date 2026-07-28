@@ -1408,11 +1408,33 @@ export default function Home() {
                               No domains found in the SFTP location.
                             </p>
                           ) : null}
+                          {/* This tab's action is the form's Start Analysis
+                              button (same as Upload File — only Enter URL has
+                              its own two-step Fetch & Preview). Saying so
+                              removes the ambiguity that made the stray
+                              Fetch & Preview button look like this tab's
+                              action. */}
+                          {sftpDomain ? (
+                            <p className="text-sm text-slate-500">
+                              Click <span className="font-semibold">Start Analysis</span>{" "}
+                              below to pull this domain&apos;s sitemaps and begin.
+                            </p>
+                          ) : null}
                         </>
                       )}
                     </div>
                   ) : null}
 
+                  {/* One panel per tab. This MUST test each mode explicitly: it
+                      used to be a two-way `file ? … : …`, so the else branch —
+                      the Enter-URL panel — also rendered on the SFTP tab. That
+                      put "Sitemap URL 1" and "Fetch & Preview" under the SFTP
+                      domain picker, and since the URL input's onFocus and the
+                      preview handler both setSourceMode("url"), touching them
+                      silently switched the active tab back to Enter URL and left
+                      Start Analysis disabled (hasValidSource then wanted a URL
+                      preview that did not exist). Any new mode must get its own
+                      branch here rather than falling through to another's. */}
                   {sourceMode === "file" ? (
                     <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
                       <div
@@ -1665,7 +1687,7 @@ export default function Home() {
                         <p className="text-sm text-red-500">{fileError}</p>
                       ) : null}
                     </div>
-                  ) : (
+                  ) : sourceMode === "url" ? (
                     <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
                       <div className="space-y-3">
                         {sitemapUrlFieldStates.map((fieldState, index) => (
@@ -1885,7 +1907,7 @@ export default function Home() {
                       ) : null}
 
                     </div>
-                  )}
+                  ) : null}
                 </div>
 
                 {uploadProgress ? (
