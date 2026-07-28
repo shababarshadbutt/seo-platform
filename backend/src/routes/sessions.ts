@@ -5542,6 +5542,19 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       }
     },
     async (request, reply) => {
+      // Gate BEFORE hijacking — once the socket is hijacked a normal JSON reply
+      // is no longer possible. Unreachable in practice when the flag is off (no
+      // publish can have been queued), but this endpoint is the one that never
+      // called a *ConfigError gate, so it gets one rather than being the odd
+      // one out.
+      const configError = publishConfigError();
+
+      if (configError) {
+        return reply
+          .code(503)
+          .send({ error: "Service Unavailable", message: configError });
+      }
+
       reply.hijack();
       const stream = reply.raw;
       stream.writeHead(200, {

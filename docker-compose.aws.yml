@@ -65,6 +65,17 @@ services:
       # unlike the two URLs above which can legitimately vary per deployment
       # target using the same image.
       NEXT_PUBLIC_APP_VERSION: ${APP_VERSION}
+      # --- Phase 1 feature flag (default OFF) ---
+      # Hides the SFTP source tab and the Publish-to-S3 button ENTIRELY (absent
+      # from the DOM, not greyed out). Those two paths have never completed a
+      # round trip against real AWS: the CloudFront public-path mapping is
+      # unconfirmed and no live SFTP/S3 credentials have been exercised.
+      # Everything else on this branch is verified, which is why only these two
+      # are gated. Set to "true" only after the CloudFront mapping is confirmed
+      # AND the throwaway-domain live test in docs/aws-deployment.md passes.
+      # Must be on the frontend (hides the UI) AND the backend/worker (refuses
+      # the endpoints) — one .env line feeds all three.
+      AWS_PUBLISH_ENABLED: ${AWS_PUBLISH_ENABLED:-false}
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
     # RESOLVED: browser-side code no longer talks to the backend directly. Every
@@ -124,6 +135,13 @@ services:
       SFTP_PASSWORD: ${SFTP_PASSWORD:-}
       SFTP_BASE_PATH: ${SFTP_BASE_PATH:-sftp-sitemaps-asapsmei}
       SFTP_MAX_CONCURRENT_CONNECTIONS: ${SFTP_MAX_CONCURRENT_CONNECTIONS:-4}
+
+      # --- Phase 1 feature flag (default OFF) ---
+      # With this false the SFTP and publish ENDPOINTS refuse with a 503 naming
+      # the flag, so hiding the frontend controls is not the only thing gating an
+      # unverified path — a hand-crafted request is refused too. See the frontend
+      # service above for why these two features specifically are gated.
+      AWS_PUBLISH_ENABLED: ${AWS_PUBLISH_ENABLED:-false}
 
       # --- Phase 1: S3 output (no access keys — IAM instance role only) ---
       S3_BUCKET: ${S3_BUCKET:-asap-cms-prod}
@@ -197,6 +215,10 @@ services:
       SFTP_PASSWORD: ${SFTP_PASSWORD:-}
       SFTP_BASE_PATH: ${SFTP_BASE_PATH:-sftp-sitemaps-asapsmei}
       SFTP_MAX_CONCURRENT_CONNECTIONS: ${SFTP_MAX_CONCURRENT_CONNECTIONS:-4}
+      # Same flag as the backend: the worker runs the SFTP pull and the publish
+      # jobs themselves, so it must agree or a job enqueued by an older process
+      # would still execute.
+      AWS_PUBLISH_ENABLED: ${AWS_PUBLISH_ENABLED:-false}
       S3_BUCKET: ${S3_BUCKET:-asap-cms-prod}
       # Storage layout vs. served path — two separate knobs; see the backend
       # service above. The worker is what actually writes the index, so this one

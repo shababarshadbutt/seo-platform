@@ -31,6 +31,21 @@ function readNumber(name: string, options: NumberEnvOptions): number {
   return value;
 }
 
+// Boolean env vars, read strictly: ONLY the exact string "true" enables. A flag
+// that guards an unverified path must not be switched on by "1", "yes" or "TRUE"
+// — if the value isn't unambiguous the safe reading is off. Exported so the rule
+// is testable rather than being an inline comparison repeated per flag.
+export function readBooleanFlag(
+  raw: string | undefined,
+  fallback = false
+): boolean {
+  if (raw === undefined || raw === "") {
+    return fallback;
+  }
+
+  return raw === "true";
+}
+
 export const config = {
   nodeEnv: process.env.NODE_ENV ?? "development",
   port: readNumber("PORT", { fallback: 3001, min: 1, max: 65535 }),
@@ -65,6 +80,16 @@ export const config = {
   // work without extra setup — set a real value in production.
   encryptionKey:
     process.env.ENCRYPTION_KEY ?? "dev-insecure-encryption-key-change-me",
+
+  // ---- Phase 1: master feature flag -------------------------------------
+  // Gates the two capabilities that have NEVER completed a round trip against
+  // real AWS: the SFTP pull source and publishing to S3/CloudFront. Everything
+  // else on this branch is verified, so only these two hide behind the flag.
+  // Default OFF: DevOps deploys this branch as-is, and an unverified path that
+  // writes to live production must not be discoverable by accident. Flip to
+  // true only after the CloudFront mapping is confirmed and the
+  // throwaway-domain live test in docs/aws-deployment.md passes.
+  awsPublishEnabled: readBooleanFlag(process.env.AWS_PUBLISH_ENABLED),
 
   // ---- Phase 1: SFTP input (AWS Transfer Family) ------------------------
   // Names are the contract in docker-compose.aws.yml — do not rename one side
@@ -130,10 +155,26 @@ export const config = {
   })
 };
 
+// Why the AWS-gated features can't run, or null when the flag allows them.
+// Deliberately checked FIRST by both gates below, so hiding the UI is not the
+// only thing standing between a curious user and an unverified code path: with
+// the flag off the endpoints refuse regardless of what a client sends.
+function awsFeatureDisabledError(): string | null {
+  return config.awsPublishEnabled
+    ? null
+    : "This feature is disabled on this deployment (AWS_PUBLISH_ENABLED is not true): the SFTP pull and S3 publish paths are unverified against real AWS infrastructure";
+}
+
 // Why the SFTP feature can't run, or null when it is usable. Checked by the
 // routes so a missing deployment env var is a clear 503 rather than a stack
 // trace from deep inside the ssh2 client.
 export function sftpConfigError(): string | null {
+  const disabled = awsFeatureDisabledError();
+
+  if (disabled) {
+    return disabled;
+  }
+
   if (!config.sftp.host) {
     return "SFTP is not configured on this deployment (SFTP_HOST is unset)";
   }
@@ -147,6 +188,12 @@ export function sftpConfigError(): string | null {
 
 // Why publishing can't run, or null when it is usable.
 export function publishConfigError(): string | null {
+  const disabled = awsFeatureDisabledError();
+
+  if (disabled) {
+    return disabled;
+  }
+
   if (!config.s3.region) {
     return "S3 publishing is not configured on this deployment (AWS_REGION is unset)";
   }

@@ -6,6 +6,34 @@ and you must change the other.
 
 ---
 
+## The features are OFF by default — `AWS_PUBLISH_ENABLED`
+
+This branch deploys with the SFTP pull and S3 publish paths **switched off**,
+because they are the only two things here that have never completed a round trip
+against real AWS. Everything else on the branch is verified.
+
+`AWS_PUBLISH_ENABLED` (default `false`) is read by the frontend, the backend and
+the worker from one `.env` line:
+
+| Value | Effect |
+| --- | --- |
+| `false` (default) | The **From SFTP** tab on New Analysis and the **Publish to S3** button on the results page are **absent from the page** — not greyed out, so there is nothing to discover and ask about. The `/api/sftp/*` and `/api/sessions/:id/publish*` endpoints refuse with **503** naming the flag, and the SFTP-pull and publish **jobs** refuse too, so a queued job that outlives a config change cannot run. |
+| `true` | Both appear and behave exactly as built. |
+
+Hiding the UI is not the whole gate: the endpoints and the background jobs each
+re-check independently, so a hand-crafted request or a stale queued job is
+refused as well.
+
+**Turn it on only after** the CloudFront public-path mapping is confirmed and the
+throwaway-domain live test below passes. Note that the live test itself needs the
+flag on — set `AWS_PUBLISH_ENABLED=true` for that run.
+
+Also note this branch is deployed **as-is, not merged with `main`**: it does not
+include v1.47 (version display) or v1.48 (one-click Fix-all redesign). Known and
+accepted.
+
+---
+
 ## REQUIRED PRE-LAUNCH GATE — throwaway-domain live test
 
 **Nothing real goes through the SFTP → publish path until this passes.**
@@ -20,9 +48,13 @@ a throwaway prefix — not a client domain.
 Use a disposable domain value such as `_test-domain`, so everything lands under
 `sites/_test-domain/sitemaps/` and touches no client's live sitemaps.
 
+0. **Flag on.** Set `AWS_PUBLISH_ENABLED=true` in `.env` and recreate the
+   frontend, backend and worker. Until this is done the controls are absent and
+   every endpoint below answers 503 — that is the gate working, not a fault.
 1. **Config reachable.** `GET /api/sftp/domains` returns a list (not 503/502).
-   A 503 means an env var is unset; a 502 means the endpoint or credentials are
-   wrong.
+   A 503 naming `AWS_PUBLISH_ENABLED` means step 0 was missed; a 503 naming
+   another variable means that env var is unset; a 502 means the endpoint or
+   credentials are wrong.
 2. **Pull.** Create a session, `POST /api/sessions/:id/sources/sftp` with the
    throwaway domain. Confirm the expected file count appears in the session and
    parses — the pull is queued, so watch the worker log for
@@ -79,7 +111,8 @@ than not starting.
 | `SFTP_HOST`, `SFTP_USERNAME` | AWS Transfer Family. |
 | `SEO_DESK_URL` | **Browser-reachable** address. The navbar link is a full-page navigation the user's browser follows, so an internal compose name (`http://seo-desk:3000`) will 404 for everyone. |
 
-Optional, with defaults: `SFTP_PORT` (22), `SFTP_PRIVATE_KEY_PATH`
+Optional, with defaults: `AWS_PUBLISH_ENABLED` (`false` — see the section above),
+`SFTP_PORT` (22), `SFTP_PRIVATE_KEY_PATH`
 (`/run/secrets/sftp_private_key`), `SFTP_PASSWORD` (empty — fallback used only
 when the key file is absent), `SFTP_BASE_PATH` (`sftp-sitemaps-asapsmei`),
 `SFTP_MAX_CONCURRENT_CONNECTIONS` (4), `S3_BUCKET` (`asap-cms-prod`),

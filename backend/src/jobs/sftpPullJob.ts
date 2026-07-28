@@ -26,6 +26,15 @@ export async function processSftpPullJob(
 ) {
   const { session_id: sessionId, domain } = data;
 
+  // Re-check the flag HERE, not just at the route that enqueued this. A job can
+  // outlive the process that queued it (retries, a restart with a changed .env),
+  // so the worker refuses rather than trusting that the enqueue was gated.
+  if (!config.awsPublishEnabled) {
+    throw new Error(
+      "SFTP pull is disabled on this deployment (AWS_PUBLISH_ENABLED is not true)"
+    );
+  }
+
   const remoteFiles = await listSftpSitemapFiles(domain);
 
   logger.info(

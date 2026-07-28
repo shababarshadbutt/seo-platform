@@ -21,6 +21,12 @@ export function GET() {
     seoDeskUrl: process.env.SEO_DESK_URL ?? "",
     // Static per image build, so NEXT_PUBLIC_ is genuinely correct here; served
     // alongside the rest so the client has one place to read config from.
-    appVersion: process.env.NEXT_PUBLIC_APP_VERSION ?? ""
+    appVersion: process.env.NEXT_PUBLIC_APP_VERSION ?? "",
+    // Master flag for the two AWS paths never exercised against real
+    // infrastructure (SFTP pull, S3 publish). Read here rather than as a
+    // NEXT_PUBLIC_* inline so DevOps can flip it in .env without rebuilding the
+    // image — the same reason seoDeskUrl moved here. Anything other than the
+    // exact string "true" leaves the features hidden.
+    awsPublishEnabled: (process.env.AWS_PUBLISH_ENABLED ?? "false") === "true"
   });
 }

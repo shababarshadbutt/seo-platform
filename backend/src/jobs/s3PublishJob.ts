@@ -1,6 +1,7 @@
 import type { Job } from "bullmq";
 import type { FastifyBaseLogger } from "fastify";
 
+import { config } from "../config.js";
 import { withPublishLock } from "../publish/publishLock.js";
 import { buildPublishPlan, executePublish } from "../publish/s3Publish.js";
 import type { S3PublishJobData } from "../queue/publishQueue.js";
@@ -30,6 +31,17 @@ export async function processS3PublishJob(
   job?: Job
 ): Promise<S3PublishJobResult> {
   const { session_id: sessionId, domain } = data;
+
+  // Re-check the flag HERE, not just at the route that enqueued this. A job can
+  // outlive the process that queued it (retries, a restart with a changed .env),
+  // and this one WRITES TO LIVE PRODUCTION, so it refuses rather than trusting
+  // that the enqueue was gated. Checked before the lock so a refusal doesn't
+  // occupy the domain.
+  if (!config.awsPublishEnabled) {
+    throw new Error(
+      "S3 publish is disabled on this deployment (AWS_PUBLISH_ENABLED is not true)"
+    );
+  }
 
   return withPublishLock(domain, async () => {
     const plan = await buildPublishPlan(sessionId, domain);

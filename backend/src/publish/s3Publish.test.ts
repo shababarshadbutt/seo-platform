@@ -5,7 +5,9 @@ import {
   config,
   publicSitemapUrl,
   publishConfigError,
-  s3PrefixForDomain
+  readBooleanFlag,
+  s3PrefixForDomain,
+  sftpConfigError
 } from "../config.js";
 import { assertSafeDomain } from "../sftp/sftpClient.js";
 import { productionFilename } from "../sitemaps/filenames.js";
@@ -48,13 +50,16 @@ test("publicSitemapUrl fills the default template and is independent of the S3 k
 // order, so no other test observes the change.
 test("publishConfigError rejects a template that would collapse every loc", () => {
   const saved = {
+    enabled: config.awsPublishEnabled,
     region: config.s3.region,
     bucket: config.s3.bucket,
     template: config.publicSitemapUrlTemplate
   };
 
   try {
-    // Get past the earlier gates so the template check is what we're reading.
+    // Get past the earlier gates so the template check is what we're reading —
+    // including the AWS_PUBLISH_ENABLED flag, which is checked first.
+    config.awsPublishEnabled = true;
     config.s3.region = "us-east-1";
     config.s3.bucket = "asap-cms-prod";
 
@@ -64,10 +69,64 @@ test("publishConfigError rejects a template that would collapse every loc", () =
     config.publicSitemapUrlTemplate = "https://{domain}/sitemaps/{file}";
     assert.equal(publishConfigError(), null);
   } finally {
+    config.awsPublishEnabled = saved.enabled;
     config.s3.region = saved.region;
     config.s3.bucket = saved.bucket;
     config.publicSitemapUrlTemplate = saved.template;
   }
+});
+
+// AWS_PUBLISH_ENABLED gates BOTH features, and is checked before every other
+// reason so a fully-configured deployment still refuses while the flag is off.
+// This is what makes the hidden UI more than cosmetic.
+test("AWS_PUBLISH_ENABLED=false refuses SFTP and publish even when fully configured", () => {
+  const saved = {
+    enabled: config.awsPublishEnabled,
+    region: config.s3.region,
+    bucket: config.s3.bucket,
+    host: config.sftp.host,
+    username: config.sftp.username
+  };
+
+  try {
+    // Everything else valid: the flag alone must be the blocker.
+    config.s3.region = "us-east-1";
+    config.s3.bucket = "asap-cms-prod";
+    config.sftp.host = "transfer.example.com";
+    config.sftp.username = "svc";
+
+    config.awsPublishEnabled = false;
+    assert.match(publishConfigError() ?? "", /AWS_PUBLISH_ENABLED/);
+    assert.match(sftpConfigError() ?? "", /AWS_PUBLISH_ENABLED/);
+
+    // And with the flag on, the same config is usable — so the flag is the only
+    // thing that changed, not some unrelated misconfiguration.
+    config.awsPublishEnabled = true;
+    assert.equal(publishConfigError(), null);
+    assert.equal(sftpConfigError(), null);
+  } finally {
+    config.awsPublishEnabled = saved.enabled;
+    config.s3.region = saved.region;
+    config.s3.bucket = saved.bucket;
+    config.sftp.host = saved.host;
+    config.sftp.username = saved.username;
+  }
+});
+
+// Default OFF is the deployment contract: DevOps takes this branch as-is and the
+// unverified paths must not be live until the CloudFront + live-test gate passes.
+test("AWS_PUBLISH_ENABLED defaults to off, and only the exact string 'true' enables it", () => {
+  // Unset and empty both mean off — an env var present but blank (a common
+  // compose/.env artefact) must not read as enabled.
+  assert.equal(readBooleanFlag(undefined), false);
+  assert.equal(readBooleanFlag(""), false);
+
+  // Near-misses stay off rather than being generously interpreted.
+  for (const raw of ["1", "TRUE", "True", "yes", "on", "false", " true"]) {
+    assert.equal(readBooleanFlag(raw), false, `${JSON.stringify(raw)} must not enable`);
+  }
+
+  assert.equal(readBooleanFlag("true"), true);
 });
 
 test("the regenerated index lists exactly the published files", () => {

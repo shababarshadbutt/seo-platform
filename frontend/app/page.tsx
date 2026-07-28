@@ -34,6 +34,7 @@ import {
   fetchCleanerHandoffFile,
   friendlyApiErrorMessage,
   getCleanerHandoff,
+  getRuntimeConfig,
   getSystemDiskUsage,
   previewSitemapUrl,
   submitSitemapUrls,
@@ -230,6 +231,26 @@ export default function Home() {
   const [sampleSize, setSampleSize] = useState(10);
   const [concurrency, setConcurrency] = useState("10");
   const [sourceMode, setSourceMode] = useState<SourceMode>("file");
+  // AWS_PUBLISH_ENABLED, via the runtime-config endpoint. Starts FALSE so the
+  // SFTP tab is absent on the very first paint rather than appearing and then
+  // vanishing once config resolves — and so a failed config fetch leaves it
+  // hidden. Flipping it to true is what makes the tab exist at all.
+  const [awsPublishEnabled, setAwsPublishEnabled] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void getRuntimeConfig().then((runtimeConfig) => {
+      if (!cancelled) {
+        setAwsPublishEnabled(runtimeConfig.awsPublishEnabled);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // SFTP source state. Domains are listed lazily the first time the tab is
   // opened, so a deployment without SFTP configured costs nothing until asked.
   const [sftpDomains, setSftpDomains] = useState<string[]>([]);
@@ -1255,7 +1276,13 @@ export default function Home() {
                     Sitemap source
                   </label>
                   <div
-                    className="grid grid-cols-3 gap-1 rounded-full border border-indigo-100 bg-indigo-50 p-1"
+                    className={cn(
+                      "grid gap-1 rounded-full border border-indigo-100 bg-indigo-50 p-1",
+                      // Collapses to two columns when the SFTP tab is gated off,
+                      // so the strip stays full-width instead of leaving a third
+                      // empty cell where the hidden tab used to sit.
+                      awsPublishEnabled ? "grid-cols-3" : "grid-cols-2"
+                    )}
                     role="tablist"
                     aria-label="Sitemap source"
                   >
@@ -1295,31 +1322,37 @@ export default function Home() {
                       <LinkIcon className="h-4 w-4" aria-hidden="true" />
                       Enter URL
                     </button>
-                    <button
-                      type="button"
-                      role="tab"
-                      aria-selected={sourceMode === "sftp"}
-                      onClick={() => {
-                        setSourceMode("sftp");
-                        setFormError("");
+                    {/* From SFTP — gated on AWS_PUBLISH_ENABLED. Rendered
+                        conditionally rather than disabled: the pull path has
+                        never run against real AWS, so it should not be
+                        discoverable at all until the live test passes. */}
+                    {awsPublishEnabled ? (
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={sourceMode === "sftp"}
+                        onClick={() => {
+                          setSourceMode("sftp");
+                          setFormError("");
 
-                        if (sftpDomains.length === 0 && !sftpLoading) {
-                          void loadSftpDomains();
-                        }
-                      }}
-                      className={cn(
-                        "flex h-10 items-center justify-center gap-2 rounded-full text-sm font-semibold transition-colors",
-                        sourceMode === "sftp"
-                          ? "bg-indigo-500 text-white shadow-sm"
-                          : "text-slate-500 hover:text-indigo-600"
-                      )}
-                    >
-                      <Server className="h-4 w-4" aria-hidden="true" />
-                      From SFTP
-                    </button>
+                          if (sftpDomains.length === 0 && !sftpLoading) {
+                            void loadSftpDomains();
+                          }
+                        }}
+                        className={cn(
+                          "flex h-10 items-center justify-center gap-2 rounded-full text-sm font-semibold transition-colors",
+                          sourceMode === "sftp"
+                            ? "bg-indigo-500 text-white shadow-sm"
+                            : "text-slate-500 hover:text-indigo-600"
+                        )}
+                      >
+                        <Server className="h-4 w-4" aria-hidden="true" />
+                        From SFTP
+                      </button>
+                    ) : null}
                   </div>
 
-                  {sourceMode === "sftp" ? (
+                  {awsPublishEnabled && sourceMode === "sftp" ? (
                     <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
                       <div className="space-y-1">
                         <label

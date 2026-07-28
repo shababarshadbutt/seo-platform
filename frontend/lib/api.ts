@@ -272,6 +272,9 @@ function backendUrl(path: string) {
 export type RuntimeConfig = {
   seoDeskUrl: string;
   appVersion: string;
+  // Gates the SFTP source tab and the Publish-to-S3 button. Both are absent
+  // from the DOM when false, not merely disabled.
+  awsPublishEnabled: boolean;
 };
 
 // Per-deployment values the client needs but that must NOT be inlined at build
@@ -292,7 +295,9 @@ export function getRuntimeConfig(): Promise<RuntimeConfig> {
         // Never let a config blip wedge the cache — the next caller retries.
         runtimeConfigPromise = null;
 
-        return { seoDeskUrl: "", appVersion: "" };
+        // Fails CLOSED on awsPublishEnabled: a config fetch that errors must
+        // not be the thing that reveals an unverified publish path.
+        return { seoDeskUrl: "", appVersion: "", awsPublishEnabled: false };
       });
   }
 

@@ -91,6 +91,7 @@ import {
   type SessionResponse,
   followPublishProgress,
   getPublishPreview,
+  getRuntimeConfig,
   publishSession,
   type PublishPreview,
   type PublishProgressEvent
@@ -898,6 +899,26 @@ export default function ResultsDashboardPage({
   // production — there is no bucket versioning, so a blind one-click publish
   // has no undo. Mirrors the existing confirm-dialog pattern rather than
   // introducing new chrome.
+  // AWS_PUBLISH_ENABLED, via the runtime-config endpoint. Starts FALSE so the
+  // button never flashes into view before config resolves, and stays hidden if
+  // that fetch fails — publishing overwrites live production, so the safe
+  // default when we don't know is "absent".
+  const [awsPublishEnabled, setAwsPublishEnabled] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void getRuntimeConfig().then((runtimeConfig) => {
+      if (!cancelled) {
+        setAwsPublishEnabled(runtimeConfig.awsPublishEnabled);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const [publishOpen, setPublishOpen] = useState(false);
   const [publishPreview, setPublishPreview] = useState<PublishPreview | null>(
     null
@@ -2965,21 +2986,30 @@ export default function ResultsDashboardPage({
               ) : null}
               {/* Publish to S3 — explicitly user-triggered (never automatic
                   on completion): it overwrites live production and the
-                  bucket has no versioning. Opens a preview first. */}
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => void openPublishDialog()}
-                disabled={!publishDomain}
-                title={
-                  publishDomain
-                    ? `Publish this session's sitemaps to ${publishDomain}`
-                    : "This session has no valid base URL to publish under"
-                }
-              >
-                <UploadCloud className="mr-2 h-4 w-4" />
-                Publish to S3
-              </Button>
+                  bucket has no versioning. Opens a preview first.
+
+                  Gated on AWS_PUBLISH_ENABLED and rendered conditionally, NOT
+                  disabled: this path has never completed a round trip against
+                  real AWS, and a greyed-out button still advertises a feature
+                  someone will ask to have switched on. Absent until the
+                  CloudFront mapping is confirmed and the throwaway-domain live
+                  test passes. */}
+              {awsPublishEnabled ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => void openPublishDialog()}
+                  disabled={!publishDomain}
+                  title={
+                    publishDomain
+                      ? `Publish this session's sitemaps to ${publishDomain}`
+                      : "This session has no valid base URL to publish under"
+                  }
+                >
+                  <UploadCloud className="mr-2 h-4 w-4" />
+                  Publish to S3
+                </Button>
+              ) : null}
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button disabled={!session || isLoading} variant="outline">
