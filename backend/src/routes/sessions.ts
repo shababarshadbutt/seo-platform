@@ -86,7 +86,8 @@ import {
   enqueueS3PublishJob,
   enqueueSftpPullJob,
   publishQueue,
-  S3_PUBLISH_JOB
+  S3_PUBLISH_JOB,
+  SFTP_PULL_JOB
 } from "../queue/publishQueue.js";
 
 // SSE tuning for publish progress, mirroring the Cleaner's values.
@@ -5693,6 +5694,176 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           type: "error",
           message:
             error instanceof Error ? error.message : "Could not follow publish"
+        });
+      } finally {
+        stop();
+
+        if (!stream.writableEnded) {
+          stream.end();
+        }
+      }
+    }
+  );
+
+  // ---- Phase 1: SFTP pull progress (SSE) ----------------------------------
+  //
+  // Deliberately the SAME mechanism as the publish stream above — hijacked
+  // socket, `data: {type,stage,current,total,message}` frames, keepalive
+  // comments, terminal done/error frame read from the job's RETURN VALUE — because
+  // that shape is already proven in production. The pull's file total is known
+  // before its download loop starts, so every frame carries current AND total
+  // rather than a bare count with nothing to compare against.
+  app.get<{ Params: SessionParams }>(
+    "/api/sessions/:id/sources/sftp/progress",
+    {
+      onRequest: (request, reply, done) => {
+        request.raw.setTimeout(PUBLISH_SSE_TIMEOUT_MS);
+        reply.raw.setTimeout(PUBLISH_SSE_TIMEOUT_MS);
+        done();
+      }
+    },
+    async (request, reply) => {
+      // Gate before hijacking, same as the publish stream.
+      const configError = sftpConfigError();
+
+      if (configError) {
+        return reply
+          .code(503)
+          .send({ error: "Service Unavailable", message: configError });
+      }
+
+      reply.hijack();
+      const stream = reply.raw;
+      stream.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+        "Access-Control-Allow-Origin":
+          (request.headers.origin as string | undefined) ?? "*"
+      });
+
+      const send = (payload: unknown) => {
+        if (!stream.writableEnded) {
+          stream.write(`data: ${JSON.stringify(payload)}\n\n`);
+        }
+      };
+
+      const keepalive = setInterval(() => {
+        if (!stream.writableEnded) {
+          stream.write(": keepalive\n\n");
+        }
+      }, PUBLISH_SSE_KEEPALIVE_MS);
+      keepalive.unref?.();
+
+      let closed = false;
+      const stop = () => {
+        closed = true;
+        clearInterval(keepalive);
+      };
+      request.raw.on("close", stop);
+
+      const jobId = `${SFTP_PULL_JOB}-${request.params.id}`;
+      let lastMessage = "";
+      const startedAt = Date.now();
+
+      try {
+        for (;;) {
+          if (closed) {
+            return;
+          }
+
+          const job = await publishQueue.getJob(jobId);
+
+          if (!job) {
+            // Same grace window as publish: the client opens this stream right
+            // after its POST returns, and enqueue is not atomic with that.
+            if (Date.now() - startedAt < PUBLISH_SSE_JOB_GRACE_MS) {
+              await new Promise((resolve) =>
+                setTimeout(resolve, PUBLISH_SSE_POLL_MS)
+              );
+              continue;
+            }
+
+            send({ type: "done", message: "No SFTP pull is running." });
+            break;
+          }
+
+          const state = await job.getState();
+          const progress = job.progress as
+            | {
+                stage?: string;
+                current?: number;
+                total?: number;
+                message?: string;
+              }
+            | number
+            | undefined;
+
+          if (progress && typeof progress === "object") {
+            if (progress.message && progress.message !== lastMessage) {
+              lastMessage = progress.message;
+              send({
+                type: "progress",
+                stage: progress.stage ?? "pull",
+                current: progress.current,
+                total: progress.total,
+                message: progress.message
+              });
+            }
+          }
+
+          if (state === "completed") {
+            const settled = (await publishQueue.getJob(jobId)) ?? job;
+            const returned = settled.returnvalue as
+              | {
+                  stored?: number;
+                  failed?: number;
+                  total?: number;
+                  domain?: string;
+                }
+              | undefined;
+
+            send({
+              type: "done",
+              message: returned?.total
+                ? `Pulled ${returned.stored ?? 0} of ${returned.total} file(s)${
+                    returned.failed ? `, ${returned.failed} failed` : ""
+                  }`
+                : lastMessage || "SFTP pull complete.",
+              result: returned
+            });
+            break;
+          }
+
+          if (state === "failed") {
+            send({
+              type: "error",
+              message: job.failedReason || "SFTP pull failed."
+            });
+            break;
+          }
+
+          if (Date.now() - startedAt > PUBLISH_SSE_TIMEOUT_MS) {
+            send({
+              type: "error",
+              message:
+                "Stopped following this SFTP pull — it is taking unusually long."
+            });
+            break;
+          }
+
+          await new Promise((resolve) =>
+            setTimeout(resolve, PUBLISH_SSE_POLL_MS)
+          );
+        }
+      } catch (error) {
+        send({
+          type: "error",
+          message:
+            error instanceof Error
+              ? error.message
+              : "Could not follow SFTP pull"
         });
       } finally {
         stop();

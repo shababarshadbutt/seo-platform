@@ -2149,3 +2149,42 @@ export function followPublishProgress(
 
   return source;
 }
+
+export type SftpPullProgressEvent = {
+  type: "progress" | "done" | "error";
+  stage?: string;
+  current?: number;
+  total?: number;
+  message?: string;
+  result?: {
+    stored?: number;
+    failed?: number;
+    total?: number;
+    domain?: string;
+  };
+};
+
+// Follow a running SFTP pull. Same frame shape and same consumer contract as
+// followPublishProgress above — only the endpoint differs — so the UI can show
+// "N of TOTAL" instead of a bare count that means nothing on its own.
+export function followSftpPullProgress(
+  sessionId: string,
+  onEvent: (event: SftpPullProgressEvent) => void
+): EventSource {
+  const source = new EventSource(
+    backendUrl(`/api/sessions/${sessionId}/sources/sftp/progress`)
+  );
+
+  source.onmessage = (message) => {
+    try {
+      onEvent(JSON.parse(message.data) as SftpPullProgressEvent);
+    } catch {
+      // Ignore malformed frames rather than tearing the stream down.
+    }
+  };
+  source.onerror = () => {
+    source.close();
+  };
+
+  return source;
+}

@@ -6,6 +6,7 @@ import { request } from "undici";
 import { pool } from "../db/pool.js";
 import { tlsAwareDispatcher } from "../http/tlsDispatcher.js";
 import { SOFT_404_TEXT_SIGNALS } from "../sitemaps/softNotFound.js";
+import { isMethodRejectedStatus } from "./sampleHttpStatus.js";
 import { isSessionCancelled, markSessionComplete } from "./sessionCompletion.js";
 
 // Short, stable codes describing WHY a sample got no HTTP status, persisted on
@@ -52,6 +53,9 @@ export function classifyRequestError(error: unknown): SampleErrorReason {
 const HTTP_TIMEOUT_MS = 5000;
 const SOFT_404_BODY_SAMPLE_BYTES = 64 * 1024;
 const SOFT_404_SHORT_BODY_BYTES = 1000;
+// Only a status line is wanted from the method-rejection re-probe, so read just
+// enough of the body to let the connection close cleanly and drop the rest.
+const METHOD_FALLBACK_BODY_SAMPLE_BYTES = 8 * 1024;
 // SOFT_404_TEXT_SIGNALS lives in sitemaps/softNotFound.js so the Fix Redirect
 // URLs modal's destination check reuses the exact same vocabulary.
 
@@ -213,6 +217,60 @@ async function readBodyPrefix(
   };
 }
 
+// Same probe as headOnce but with GET, used only when HEAD was method-rejected.
+// Returns the identical shape so the caller's classification is unchanged — the
+// point is to get a TRUSTWORTHY status for the same URL, not to branch anywhere
+// new.
+async function getStatusOnce(
+  url: string,
+  userAgent: string
+): Promise<HeadResult> {
+  const started = performance.now();
+
+  try {
+    const response = await request(url, {
+      method: "GET",
+      maxRedirections: 0,
+      dispatcher: tlsAwareDispatcher,
+      headers: {
+        "user-agent": userAgent,
+        accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "identity"
+      },
+      headersTimeout: HTTP_TIMEOUT_MS,
+      bodyTimeout: HTTP_TIMEOUT_MS,
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
+    });
+
+    // No Range header here, unlike the soft-404 probe: a ranged request can
+    // legitimately answer 206, which would then have to be un-picked from a real
+    // 200 before classifying. readBodyPrefix destroys the stream once it has its
+    // prefix, so a large page still isn't downloaded in full.
+    await readBodyPrefix(
+      response.body,
+      METHOD_FALLBACK_BODY_SAMPLE_BYTES
+    ).catch(() => undefined);
+
+    return {
+      statusCode: response.statusCode,
+      responseMs: Math.round(performance.now() - started),
+      location: firstHeaderValue(response.headers.location),
+      timedOut: false,
+      errorReason: null
+    };
+  } catch (error) {
+    return {
+      statusCode: null,
+      responseMs: Math.round(performance.now() - started),
+      location: null,
+      timedOut: true,
+      errorReason: classifyRequestError(error)
+    };
+  }
+}
+
 async function checkSoft404Signals(
   url: string,
   userAgent: string
@@ -306,7 +364,28 @@ async function checkSampleUrl(
 
   logger.info(logContext, "sample url HEAD request started");
 
-  const firstResult = await headOnce(url, userAgent);
+  let firstResult = await headOnce(url, userAgent);
+  let methodFallbackFrom: number | null = null;
+
+  // HEAD refused for being HEAD: re-probe with GET and classify on THAT, so the
+  // page is judged on whether it actually serves, not on which verb we happened
+  // to send. If GET is refused too, the failure is genuine and stands.
+  if (isMethodRejectedStatus(firstResult.statusCode)) {
+    methodFallbackFrom = firstResult.statusCode;
+    logger.info(
+      { ...logContext, head_status: firstResult.statusCode },
+      "sample url HEAD method-rejected, re-probing with GET"
+    );
+
+    const getResult = await getStatusOnce(url, userAgent);
+
+    firstResult = {
+      ...getResult,
+      // Keep the total honest: both probes were paid for.
+      responseMs: firstResult.responseMs + getResult.responseMs
+    };
+  }
+
   let result: SampleCheckResult;
 
   if (firstResult.statusCode && firstResult.statusCode >= 200 && firstResult.statusCode <= 299) {
@@ -389,7 +468,11 @@ async function checkSampleUrl(
       final_url: result.finalUrl,
       redirect_count: result.redirectCount,
       response_ms: result.responseMs,
-      timed_out: result.timedOut
+      timed_out: result.timedOut,
+      // Non-null when HEAD was method-rejected and the verdict came from the GET
+      // re-probe instead — makes the fallback auditable in the logs rather than
+      // silently changing what a status means.
+      method_fallback_from: methodFallbackFrom
     },
     "sample url HEAD request completed"
   );

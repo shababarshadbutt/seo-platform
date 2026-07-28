@@ -1,6 +1,7 @@
 import { unlink } from "node:fs/promises";
 import path from "node:path";
 
+import type { Job } from "bullmq";
 import type { FastifyBaseLogger } from "fastify";
 
 import { config } from "../config.js";
@@ -22,7 +23,11 @@ import { createStoredSitemapFile } from "../sitemaps/ingest.js";
 // like uploads, so one user's pull can never appear in another user's session.
 export async function processSftpPullJob(
   data: SftpPullJobData,
-  logger: FastifyBaseLogger
+  logger: FastifyBaseLogger,
+  // Progress is written to the BullMQ job so the SSE route can follow it without
+  // the API process needing a channel back into this worker — the same mechanism
+  // processS3PublishJob already uses, deliberately not a new one.
+  job?: Job
 ) {
   const { session_id: sessionId, domain } = data;
 
@@ -35,17 +40,31 @@ export async function processSftpPullJob(
     );
   }
 
+  // The full file set is known BEFORE the download loop — it has to be, to know
+  // what to pull — so the total is available from the first frame onward. That is
+  // the whole point: a bare incrementing count tells the user nothing about how
+  // much is left.
   const remoteFiles = await listSftpSitemapFiles(domain);
+  const total = remoteFiles.length;
 
   logger.info(
-    { session_id: sessionId, domain, files: remoteFiles.length },
+    { session_id: sessionId, domain, files: total },
     "sftp pull started"
   );
 
+  await job?.updateProgress({
+    stage: "start",
+    current: 0,
+    total,
+    message: `Pulling ${total} file(s) from ${domain}`
+  });
+
   let stored = 0;
   let failed = 0;
+  let index = 0;
 
   for (const remote of remoteFiles) {
+    index += 1;
     const storedFilename = buildStoredUploadFilename(
       sessionId,
       remote.name,
@@ -65,6 +84,15 @@ export async function processSftpPullJob(
         remote.name
       );
       stored += 1;
+      // Awaited, not fire-and-forget: unordered progress writes let a late frame
+      // land after the terminal one and clobber it — a defect already found and
+      // fixed on the publish path, so it is not repeated here.
+      await job?.updateProgress({
+        stage: "pull",
+        current: index,
+        total,
+        message: `Pulled ${remote.name} (${index} of ${total})`
+      });
     } catch (error) {
       failed += 1;
       // Don't leave a truncated download behind to be parsed as a real sitemap.
@@ -73,6 +101,14 @@ export async function processSftpPullJob(
         { session_id: sessionId, domain, file: remote.name, error },
         "sftp pull: file failed"
       );
+      // A failed file still advances the counter, otherwise the bar stalls and
+      // the totals stop adding up.
+      await job?.updateProgress({
+        stage: "pull",
+        current: index,
+        total,
+        message: `Failed ${remote.name} (${index} of ${total})`
+      });
     }
   }
 
@@ -86,4 +122,20 @@ export async function processSftpPullJob(
     { session_id: sessionId, domain, stored, failed },
     "sftp pull complete"
   );
+
+  await job?.updateProgress({
+    stage: "done",
+    current: total,
+    total,
+    message:
+      failed > 0
+        ? `Pulled ${stored} of ${total} file(s), ${failed} failed`
+        : `Pulled ${stored} file(s) from ${domain}`,
+    result: { stored, failed, total, domain }
+  });
+
+  // Returned as the job's RETURN VALUE too: BullMQ persists that atomically with
+  // completion, whereas a progress write can still be in flight when a watcher
+  // first sees "completed" (the third defect found on the publish path).
+  return { stored, failed, total, domain };
 }

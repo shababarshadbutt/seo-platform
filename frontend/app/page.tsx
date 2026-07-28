@@ -33,12 +33,14 @@ import {
   startSftpPull,
   fetchCleanerHandoffFile,
   friendlyApiErrorMessage,
+  followSftpPullProgress,
   getCleanerHandoff,
   getRuntimeConfig,
   getSystemDiskUsage,
   previewSitemapUrl,
   submitSitemapUrls,
   type CleanerHandoffFile,
+  type SftpPullProgressEvent,
   type SitemapUrlPreview,
   type UploadProgress,
   type UploadRejectedFile,
@@ -257,6 +259,11 @@ export default function Home() {
   const [sftpDomain, setSftpDomain] = useState("");
   const [sftpLoading, setSftpLoading] = useState(false);
   const [sftpError, setSftpError] = useState("");
+  // Live pull progress, streamed over SSE in the same shape the publish dialog
+  // consumes. Carries current AND total so the user can see how much is left —
+  // a bare incrementing count told them nothing.
+  const [sftpPullProgress, setSftpPullProgress] =
+    useState<SftpPullProgressEvent | null>(null);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [legacyFiles, setLegacyFiles] = useState<File[]>([]);
   const [folderXmlCount, setFolderXmlCount] = useState<number | null>(null);
@@ -1082,6 +1089,30 @@ export default function Home() {
         // Queued server-side: a domain can hold thousands of child sitemaps, so
         // the pull runs as a job and the session page shows it arriving.
         await startSftpPull(created.session_id, sftpDomain);
+
+        // Stay on this page while the pull runs and show current/total, the same
+        // way a multi-file upload does, rather than navigating instantly to a
+        // session whose files are still arriving with no indication of how many
+        // are coming. Resolves on the terminal frame OR on stream error, so a
+        // dropped SSE can't leave the form stuck mid-submit.
+        await new Promise<void>((resolve) => {
+          const source = followSftpPullProgress(
+            created.session_id,
+            (event) => {
+              setSftpPullProgress(event);
+
+              if (event.type === "done" || event.type === "error") {
+                source.close();
+                resolve();
+              }
+            }
+          );
+
+          source.addEventListener("error", () => {
+            source.close();
+            resolve();
+          });
+        });
       } else if (confirmedSitemapUrls.length > 0) {
         await submitSitemapUrls(created.session_id, confirmedSitemapUrls);
       } else {
@@ -1909,6 +1940,45 @@ export default function Home() {
                     </div>
                   ) : null}
                 </div>
+
+                {/* SFTP pull progress — same current/total contract as the
+                    publish dialog, shown here because the pull starts from this
+                    form. */}
+                {sftpPullProgress ? (
+                  <div
+                    className="space-y-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-sm text-slate-700"
+                    role="status"
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <span>
+                        {sftpPullProgress.message ?? "Pulling from SFTP…"}
+                      </span>
+                      {typeof sftpPullProgress.current === "number" &&
+                      typeof sftpPullProgress.total === "number" &&
+                      sftpPullProgress.total > 0 ? (
+                        <span className="font-medium text-slate-900">
+                          {sftpPullProgress.current} of {sftpPullProgress.total}
+                        </span>
+                      ) : null}
+                    </div>
+                    {typeof sftpPullProgress.current === "number" &&
+                    typeof sftpPullProgress.total === "number" &&
+                    sftpPullProgress.total > 0 ? (
+                      <Progress
+                        value={Math.min(
+                          100,
+                          Math.round(
+                            (sftpPullProgress.current /
+                              sftpPullProgress.total) *
+                              100
+                          )
+                        )}
+                        className="bg-sky-100"
+                        indicatorClassName="bg-sky-500"
+                      />
+                    ) : null}
+                  </div>
+                ) : null}
 
                 {uploadProgress ? (
                   <div

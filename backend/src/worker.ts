@@ -289,8 +289,14 @@ async function start() {
       PUBLISH_QUEUE_NAME,
       async (job) => {
         if (job.name === SFTP_PULL_JOB) {
-          await processSftpPullJob(job.data as SftpPullJobData, app.log);
-          return;
+          // `job` is passed so the pull can report current/total progress, and
+          // the result is returned so BullMQ stores it as the job's returnvalue —
+          // both for the same reasons as the publish job below.
+          return await processSftpPullJob(
+            job.data as SftpPullJobData,
+            app.log,
+            job
+          );
         }
 
         if (job.name === S3_PUBLISH_JOB) {
