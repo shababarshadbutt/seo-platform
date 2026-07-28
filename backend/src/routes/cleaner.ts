@@ -65,6 +65,13 @@ function storeRun(token: string, run: CachedRun) {
   timer.unref?.();
 }
 
+// Look up a completed run by its handoff token. Exported so the Migration side
+// can ingest the cleaned files DIRECTLY off disk instead of shipping them to the
+// browser and back — see /api/sessions/:id/sources/cleaner.
+export function getCleanerRun(token: string) {
+  return runCache.get(token);
+}
+
 function isXmlName(name: string) {
   return /\.xml(\.gz)?$/i.test(name);
 }
@@ -73,6 +80,10 @@ function isXmlName(name: string) {
 // also bundles a duplicates-report.csv into the ZIP — that must not be handed
 // off as a "sitemap". Both handoff endpoints index into this same filtered list
 // so the metadata indices match the file-bytes route. (v1.37 Fix 2)
+export function cleanerHandoffFiles(files: CleanerOutputFile[]) {
+  return handoffFiles(files);
+}
+
 function handoffFiles(files: CleanerOutputFile[]) {
   return files.filter((file) => /\.xml$/i.test(file.filename));
 }

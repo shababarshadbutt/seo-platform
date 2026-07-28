@@ -25,7 +25,14 @@ await app.register(cors, {
 await app.register(multipart, {
   limits: {
     files: 5000,
-    fileSize: 1024 * 1024 * 1024
+    fileSize: 1024 * 1024 * 1024,
+    // busboy counts every field AND every file as a "part" and defaults to 1000,
+    // so raising `files` alone was not enough: a single request carrying more than
+    // 1000 files failed with a bare 400 "reach parts limit" regardless. Measured
+    // directly — 600 files in one request passed, 1200 did not. Kept in step with
+    // `files` (plus headroom for the handful of text fields) so the two limits
+    // cannot disagree again.
+    parts: 5100
   }
 });
 // Central error mapping so file-system failures surface as actionable HTTP

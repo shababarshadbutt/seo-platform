@@ -31,11 +31,11 @@ import {
   createSession,
   getSftpDomains,
   startSftpPull,
-  fetchCleanerHandoffFile,
   friendlyApiErrorMessage,
   followSftpPullProgress,
   getCleanerHandoff,
   getRuntimeConfig,
+  ingestCleanerRun,
   getSystemDiskUsage,
   previewSitemapUrl,
   submitSitemapUrls,
@@ -292,6 +292,7 @@ export default function Home() {
   // ?source=cleaner&token=…&domain=…, the cleaned files + domain are loaded and
   // pre-filled so the user can start analysis without re-uploading.
   const [cleanerHandoff, setCleanerHandoff] = useState<{
+    token?: string;
     domain: string;
     fileCount: number;
   } | null>(null);
@@ -330,7 +331,7 @@ export default function Home() {
   );
   const hasValidSource =
     sourceMode === "file"
-      ? selectedFiles.length > 0
+      ? selectedFiles.length > 0 || Boolean(cleanerHandoff?.token)
       : sourceMode === "sftp"
         ? sftpDomain.length > 0
         : hasValidUrlPreview;
@@ -421,35 +422,12 @@ export default function Home() {
       try {
         const handoff = await getCleanerHandoff(handoffToken);
 
-        // Fetch the cleaned files (bounded concurrency) and rebuild them as File
-        // objects so they flow through the normal upload path on submit.
-        const orderedFiles = new Array<File>(handoff.files.length);
-        let cursor = 0;
-        const worker = async () => {
-          for (;;) {
-            const index = cursor;
-            cursor += 1;
-
-            if (index >= handoff.files.length) {
-              return;
-            }
-
-            const meta: CleanerHandoffFile = handoff.files[index];
-            orderedFiles[index] = await fetchCleanerHandoffFile(
-              handoffToken,
-              meta
-            );
-          }
-        };
-
-        await Promise.all(
-          Array.from(
-            { length: Math.min(6, handoff.files.length) },
-            () => worker()
-          )
-        );
-
-        const loadedFiles = orderedFiles.filter(Boolean);
+        // Metadata only. The files are NOT downloaded here any more: the cleaned
+        // output already sits on the server, so on submit the backend ingests it
+        // directly (ingestCleanerRun). Previously every file was fetched into
+        // browser memory and re-uploaded as multipart, which doubled the transfer,
+        // held the whole set in the tab, and put the handoff behind every
+        // request-size limit between the browser and the app.
         let hostLabel = handoff.domain;
 
         try {
@@ -460,13 +438,13 @@ export default function Home() {
 
         setBaseUrl(handoff.domain);
         setSourceMode("file");
-        setSelectedFiles(loadedFiles);
         setSessionName((current) =>
           current.trim().length > 0 ? current : `Cleaned sitemaps — ${hostLabel}`
         );
         setCleanerHandoff({
           domain: handoff.domain,
-          fileCount: loadedFiles.length
+          fileCount: handoff.files.length,
+          token: handoffToken
         });
       } catch (nextError) {
         const status =
@@ -980,6 +958,21 @@ export default function Home() {
         sampleSize,
         concurrency: concurrencyNumber
       });
+
+      // Cleaner handoff: the cleaned files are already on the server, so ask the
+      // backend to ingest them rather than uploading anything from here.
+      if (cleanerHandoff?.token && selectedFiles.length === 0) {
+        const ingested = await ingestCleanerRun(
+          created.session_id,
+          cleanerHandoff.token
+        );
+
+        setQueuedSessionId(created.session_id);
+        setQueuedFileCount(ingested.ingested);
+        router.push(`/sessions/${created.session_id}`);
+
+        return;
+      }
 
       if (sourceMode === "file" && selectedFiles.length > 0) {
         setUploadProgress({

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync, statSync } from "node:fs";
 import {
   access,
+  copyFile,
   mkdir,
   readdir,
   readFile,
@@ -82,6 +83,7 @@ import {
   type PublishLock
 } from "../publish/publishLock.js";
 import { buildPublishPlan } from "../publish/s3Publish.js";
+import { cleanerHandoffFiles, getCleanerRun } from "./cleaner.js";
 import {
   enqueueS3PublishJob,
   enqueueSftpPullJob,
@@ -5344,6 +5346,116 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       return { job_row_id: jobRowId, status: "PENDING" };
     }
   );
+
+  // ---- Cleaner -> Migration handoff, server-side -------------------------
+  //
+  // The cleaned files are ALREADY on this server, in the cleaner run's working
+  // directory. The original handoff shipped all of them to the browser
+  // (one GET each) and had the browser re-upload them as multipart batches, which
+  // means every byte crosses the wire twice, the whole set is held in browser
+  // memory as File objects, and the upload is exposed to every request-size limit
+  // between the browser and the app. At 2,000+ files that is the bottleneck — and
+  // any proxy body-size limit in front of the app turns it into a 413 that the UI
+  // reported as "Too many files selected".
+  //
+  // This ingests them directly: copy each cleaned XML into the session's upload
+  // dir and hand it to createStoredSitemapFile — the SAME ingestion path uploads
+  // and SFTP pulls use, so nothing downstream can tell the difference. No browser
+  // round trip, no multipart, no size limits.
+  app.post<{ Params: SessionParams; Body: { token?: unknown } }>(
+    "/api/sessions/:id/sources/cleaner",
+    async (request, reply) => {
+      const sessionResult = await pool.query(
+        "SELECT 1 FROM sessions WHERE id = $1",
+        [request.params.id]
+      );
+
+      if (sessionResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "session not found" });
+      }
+
+      const token =
+        typeof request.body?.token === "string" ? request.body.token.trim() : "";
+
+      if (!token) {
+        return reply.code(400).send(badRequest("a cleaner token is required"));
+      }
+
+      const run = getCleanerRun(token);
+
+      if (!run) {
+        // Runs expire after an hour, taking their working directory with them.
+        return reply.code(404).send({
+          error: "Not Found",
+          message:
+            "That cleaner result has expired — run the clean again to hand it off."
+        });
+      }
+
+      // XML sitemaps only: the run also contains a duplicates-report.csv, which
+      // must never be ingested as a sitemap.
+      const cleaned = cleanerHandoffFiles(run.files);
+      let stored = 0;
+      let failed = 0;
+
+      for (const file of cleaned) {
+        const storedFilename = buildStoredUploadFilename(
+          request.params.id,
+          file.filename,
+          "current"
+        );
+        const destination = path.join(config.uploadDir, storedFilename);
+
+        try {
+          // Copy rather than move: the run keeps serving its ZIP download until
+          // its TTL expires, so its files must stay put.
+          await copyFile(file.path, destination);
+          await createStoredSitemapFile(
+            request.params.id,
+            storedFilename,
+            "current",
+            file.filename
+          );
+          stored += 1;
+        } catch (error) {
+          failed += 1;
+          await unlink(destination).catch(() => undefined);
+          request.log.error(
+            { session_id: request.params.id, file: file.filename, error },
+            "cleaner handoff: file failed"
+          );
+        }
+      }
+
+      if (stored === 0) {
+        return reply.code(500).send({
+          error: "Internal Server Error",
+          message: "Could not ingest any cleaned files."
+        });
+      }
+
+      // Same completion signal the upload flow sends.
+      await pool.query(
+        "UPDATE sessions SET upload_complete = TRUE WHERE id = $1",
+        [request.params.id]
+      );
+
+      request.log.info(
+        { session_id: request.params.id, stored, failed, total: cleaned.length },
+        "cleaner handoff ingested"
+      );
+
+      return reply.send({
+        ingested: stored,
+        failed,
+        total: cleaned.length,
+        domain: run.domain
+      });
+    }
+  );
+
   // ---- Phase 1: SFTP input ------------------------------------------------
 
   // The domains available to pull from AWS Transfer Family. Powers the source

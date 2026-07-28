@@ -374,8 +374,14 @@ export function friendlyApiErrorMessage(
       return "Server storage is full — free up disk space and try again";
     }
 
+    // 413 is about BYTES, not file count, and nothing in this app emits it: the
+    // upload route allows a 10GB body and 5,000 files. When it appears it comes
+    // from something in front of the app — a reverse proxy or load balancer with a
+    // request-size cap (nginx's client_max_body_size defaults to 1MB). Saying
+    // "select fewer files" sent a real investigation down the wrong path, looking
+    // for a client-side count limit that does not exist.
     if (error.status === 413) {
-      return "Too many files selected — try selecting fewer files at once";
+      return "Upload rejected as too large by a proxy in front of the app (HTTP 413) — this is a server/proxy request-size limit, not a file-count limit";
     }
 
     if (error.status >= 500) {
@@ -507,7 +513,19 @@ export async function uploadSitemap(
     };
 
     xhr.onerror = () => {
-      reject(new TypeError("Failed to upload sitemap files"));
+      // A connection-level failure: the request never produced a response. That is
+      // NOT necessarily the backend being down — a proxy closing the connection
+      // mid-upload looks identical from here. Deliberately not a TypeError any
+      // more, because friendlyApiErrorMessage renders every TypeError as
+      // "Cannot connect to backend — make sure Docker is running", which sent a
+      // real investigation looking for a crash that never happened.
+      reject(
+        new ApiError(
+          "The upload connection dropped before the server responded — if a proxy sits in front of the app, check its request-size and timeout limits",
+          0,
+          { code: "upload_connection_dropped" }
+        )
+      );
     };
 
     xhr.ontimeout = () => {
@@ -1897,6 +1915,29 @@ async function consumeCleanerRun(
   }
 
   return done;
+}
+
+// Ingest a finished cleaner run into a session SERVER-SIDE. The cleaned files are
+// already on the server, so this replaces "download every file to the browser and
+// re-upload it as multipart": no second trip over the wire, nothing held in
+// browser memory, and no exposure to request-size limits between browser and app.
+export async function ingestCleanerRun(sessionId: string, token: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/sources/cleaner`),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token })
+    },
+    UPLOAD_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<{
+    ingested: number;
+    failed: number;
+    total: number;
+    domain: string;
+  }>(response);
 }
 
 export type CleanerHandoffFile = {
