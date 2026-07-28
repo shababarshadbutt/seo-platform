@@ -1,29 +1,21 @@
 /** @type {import('next').NextConfig} */
 
-// Reverse-proxy every backend call through the frontend's OWN origin.
+// The browser -> backend reverse proxy deliberately does NOT live here.
 //
-// Why: lib/api.ts runs in each user's browser. On the old per-laptop setup an
-// absolute http://localhost:3001 worked because the backend really was on that
-// laptop. On the shared VM every browser is remote, so "localhost" points at
-// the user's own machine and the internal service name (http://backend:3001) is
-// unreachable from outside Docker — either way it breaks for every user.
+// It used to: a rewrite from /api/backend/:path* to `${process.env.BACKEND_URL}`.
+// That is a trap. `next build` calls rewrites() and writes the RESOLVED
+// destination into .next/routes-manifest.json; `next start` serves from that
+// manifest and never calls rewrites() again. So the destination is fixed at
+// BUILD time, not read at server start — and since the image is built without
+// BACKEND_URL (on purpose: one artifact, any environment), the build baked in a
+// "http://localhost:3001" fallback. Two containers on a Docker network then got
+// ECONNREFUSED 127.0.0.1:3001 on every call, with the correct
+// BACKEND_URL=http://backend:3001 sitting unused in the container's env.
 //
-// Routing browser calls to a relative /api/backend/* on the frontend origin and
-// letting Next proxy them server-side to BACKEND_URL means: exactly ONE public
-// port (the frontend's), no CORS to configure, and no public hostname or IP
-// baked into the image. BACKEND_URL is read here at server start, not inlined
-// into the client bundle, so one image works in any environment.
-const backendUrl = process.env.BACKEND_URL ?? "http://localhost:3001";
-
-const nextConfig = {
-  async rewrites() {
-    return [
-      {
-        source: "/api/backend/:path*",
-        destination: `${backendUrl.replace(/\/$/, "")}/:path*`
-      }
-    ];
-  }
-};
+// It is now app/api/backend/[...path]/route.ts, which runs per request and reads
+// process.env.BACKEND_URL from the live environment. Do not "simplify" it back
+// into a rewrite: any env-dependent rewrite destination has this same bug, and
+// on a single machine the localhost fallback masks it.
+const nextConfig = {};
 
 export default nextConfig;
