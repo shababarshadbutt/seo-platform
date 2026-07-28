@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, DragEvent, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   ArrowRight,
@@ -19,7 +19,10 @@ import {
   downloadCleanerZip,
   downloadDuplicatesCsv,
   friendlyApiErrorMessage,
+  getRuntimeConfig,
+  getSftpDomains,
   processCleaner,
+  processCleanerFromSftp,
   type CleanerDropReason,
   type CleanerProgressEvent,
   type CleanerSummary
@@ -61,6 +64,45 @@ const DROP_REASON_LABEL: Record<CleanerDropReason, string> = {
 };
 
 export default function CleanerPage() {
+  // Source of the sitemaps to clean. "upload" is the original behaviour; "sftp"
+  // pulls the domain's folder server-side, reusing Migration's SFTP backend.
+  const [sourceMode, setSourceMode] = useState<"upload" | "sftp">("upload");
+  const [sftpDomains, setSftpDomains] = useState<string[]>([]);
+  const [sftpDomain, setSftpDomain] = useState("");
+  const [sftpLoading, setSftpLoading] = useState(false);
+  const [sftpError, setSftpError] = useState("");
+  // Gated exactly like Migration's SFTP tab: absent unless AWS_PUBLISH_ENABLED.
+  const [awsPublishEnabled, setAwsPublishEnabled] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void getRuntimeConfig().then((runtimeConfig) => {
+      if (!cancelled) {
+        setAwsPublishEnabled(runtimeConfig.awsPublishEnabled);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function loadSftpDomains() {
+    setSftpLoading(true);
+    setSftpError("");
+
+    try {
+      setSftpDomains((await getSftpDomains()).domains);
+    } catch (loadError) {
+      setSftpError(
+        friendlyApiErrorMessage(loadError, "Could not list SFTP domains.")
+      );
+    } finally {
+      setSftpLoading(false);
+    }
+  }
+
   const [domain, setDomain] = useState("");
   const [subfolder, setSubfolder] = useState("sitemaps");
   const [files, setFiles] = useState<File[]>([]);
@@ -83,7 +125,10 @@ export default function CleanerPage() {
     ? `${cleanBase}${cleanSub ? `/${cleanSub}` : ""}/{filename}.xml`
     : "https://www.domain.com/sitemaps/{filename}.xml";
 
-  const canClean = domainValid && files.length > 0 && phase !== "processing";
+  const canClean =
+    domainValid &&
+    phase !== "processing" &&
+    (sourceMode === "upload" ? files.length > 0 : sftpDomain.length > 0);
 
   function addFiles(incoming: FileList | File[]) {
     const accepted = Array.from(incoming).filter((file) =>
@@ -148,6 +193,44 @@ export default function CleanerPage() {
 
     resetResults();
     setPhase("processing");
+
+    // SFTP source: no upload at all — the backend pulls the folder and runs the
+    // same clean, emitting the same SSE frames (including the done frame with a
+    // download_token, which is what the existing Migration handoff consumes).
+    if (sourceMode === "sftp") {
+      try {
+        const done = await processCleanerFromSftp(
+          {
+            domain: sftpDomain,
+            siteUrl: domain.trim(),
+            subfolder: cleanSub || "sitemaps"
+          },
+          (event: CleanerProgressEvent) => {
+            if (event.type === "progress") {
+              setProgressMessage(event.message);
+              setProgress(
+                typeof event.current === "number" &&
+                  typeof event.total === "number"
+                  ? { current: event.current, total: event.total }
+                  : null
+              );
+            }
+          }
+        );
+
+        setSummary(done.summary);
+        setDownloadToken(done.download_token);
+        setZipFilename(done.zip_filename);
+        setPhase("done");
+      } catch (sftpRunError) {
+        setError(
+          friendlyApiErrorMessage(sftpRunError, "Cleaning from SFTP failed.")
+        );
+        setPhase("error");
+      }
+
+      return;
+    }
 
     const formData = new FormData();
     formData.append("domain", domain.trim());
@@ -324,6 +407,110 @@ export default function CleanerPage() {
             </CardDescription>
           </CardHeader>
           <CardContent>
+            {/* Source picker. Only appears when AWS_PUBLISH_ENABLED is on, the
+                same gate Migration's From SFTP tab uses — with the flag off the
+                Cleaner looks and behaves exactly as before. */}
+            {awsPublishEnabled ? (
+              <div
+                className="mb-4 grid grid-cols-2 gap-1 rounded-full border border-indigo-100 bg-indigo-50 p-1"
+                role="tablist"
+                aria-label="Sitemap source"
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={sourceMode === "upload"}
+                  onClick={() => setSourceMode("upload")}
+                  className={cn(
+                    "flex h-9 items-center justify-center gap-2 rounded-full text-sm font-semibold transition-colors",
+                    sourceMode === "upload"
+                      ? "bg-indigo-500 text-white shadow-sm"
+                      : "text-slate-500 hover:text-indigo-600"
+                  )}
+                >
+                  Upload Files
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={sourceMode === "sftp"}
+                  onClick={() => {
+                    setSourceMode("sftp");
+
+                    if (sftpDomains.length === 0 && !sftpLoading) {
+                      void loadSftpDomains();
+                    }
+                  }}
+                  className={cn(
+                    "flex h-9 items-center justify-center gap-2 rounded-full text-sm font-semibold transition-colors",
+                    sourceMode === "sftp"
+                      ? "bg-indigo-500 text-white shadow-sm"
+                      : "text-slate-500 hover:text-indigo-600"
+                  )}
+                >
+                  From SFTP
+                </button>
+              </div>
+            ) : null}
+
+            {awsPublishEnabled && sourceMode === "sftp" ? (
+              <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                <div className="space-y-1">
+                  <label
+                    className="text-sm font-semibold text-slate-700"
+                    htmlFor="cleaner-sftp-domain"
+                  >
+                    Client domain
+                  </label>
+                  <p className="text-xs text-slate-500">
+                    Pulls every sitemap file for this domain from the SFTP
+                    location and cleans them — nothing is uploaded from here.
+                  </p>
+                </div>
+
+                {sftpLoading ? (
+                  <p className="text-sm text-slate-500">Listing domains…</p>
+                ) : sftpError ? (
+                  <div className="space-y-2">
+                    <p className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                      {sftpError}
+                    </p>
+                    <button
+                      type="button"
+                      className="text-sm font-semibold text-indigo-600 hover:text-indigo-700"
+                      onClick={() => void loadSftpDomains()}
+                    >
+                      Try again
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    <select
+                      id="cleaner-sftp-domain"
+                      value={sftpDomain}
+                      onChange={(event) => setSftpDomain(event.target.value)}
+                      className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
+                    >
+                      <option value="">Select a domain…</option>
+                      {sftpDomains.map((option) => (
+                        <option key={option} value={option}>
+                          {option}
+                        </option>
+                      ))}
+                    </select>
+                    {sftpDomains.length === 0 ? (
+                      <p className="text-sm text-slate-500">
+                        No domains found in the SFTP location.
+                      </p>
+                    ) : null}
+                    <p className="text-sm text-slate-500">
+                      The Domain field above is still what the cleaned{" "}
+                      <code>&lt;loc&gt;</code> values are written against.
+                    </p>
+                  </>
+                )}
+              </div>
+            ) : (
             <div
               role="button"
               tabIndex={0}
@@ -381,8 +568,9 @@ export default function CleanerPage() {
                 </>
               )}
             </div>
+            )}
 
-            {files.length > 0 ? (
+            {sourceMode === "upload" && files.length > 0 ? (
               <ul className="mt-3 max-h-40 space-y-1 overflow-y-auto">
                 {files.map((file, index) => (
                   <li

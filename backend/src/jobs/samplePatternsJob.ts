@@ -7,6 +7,7 @@ import { pool } from "../db/pool.js";
 import { tlsAwareDispatcher } from "../http/tlsDispatcher.js";
 import { SOFT_404_TEXT_SIGNALS } from "../sitemaps/softNotFound.js";
 import { isMethodRejectedStatus } from "./sampleHttpStatus.js";
+import { resolveSampleTarget } from "./sampleTarget.js";
 import { isSessionCancelled, markSessionComplete } from "./sessionCompletion.js";
 
 // Short, stable codes describing WHY a sample got no HTTP status, persisted on
@@ -77,6 +78,9 @@ type PatternRow = {
 type PatternUrlRow = {
   id: string;
   path: string;
+  // The <loc> exactly as it appeared in the sitemap, host included. Needed
+  // because base_url and the sitemap can disagree about the "www." label.
+  source_url: string | null;
 };
 
 type HttpStatusCategory = "success" | "redirect" | "failure" | "soft_404";
@@ -125,13 +129,6 @@ type SampleLogContext = {
   template: string;
   sampleIndex: number;
 };
-
-function targetUrlForPath(baseUrl: string, path: string) {
-  const normalizedBaseUrl = baseUrl.replace(/\/$/, "");
-  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-
-  return `${normalizedBaseUrl}${normalizedPath}`;
-}
 
 function firstHeaderValue(value: string | string[] | undefined) {
   if (Array.isArray(value)) {
@@ -349,11 +346,12 @@ function resolveRedirectUrl(location: string | null, sourceUrl: string) {
 async function checkSampleUrl(
   baseUrl: string,
   samplePath: string,
+  sampleSourceUrl: string | null,
   userAgent: string,
   logger: FastifyBaseLogger,
   context: SampleLogContext
 ): Promise<SampleCheckResult> {
-  const url = targetUrlForPath(baseUrl, samplePath);
+  const url = resolveSampleTarget(baseUrl, samplePath, sampleSourceUrl);
   const logContext = {
     session_id: context.sessionId,
     pattern_id: context.patternId,
@@ -557,7 +555,7 @@ async function loadSamplePool(patternId: string, sampleLimit: number) {
 
   const result = await pool.query<PatternUrlRow>(
     `
-      SELECT id, path
+      SELECT id, path, source_url
       FROM pattern_urls
       WHERE pattern_id = $1
       ORDER BY random()
@@ -733,12 +731,19 @@ export async function processSamplePatternsJob(
         samplePool,
         session.concurrency,
         (sample, index) =>
-          checkSampleUrl(session.base_url, sample.path, session.user_agent, logger, {
-            sessionId: data.session_id,
-            patternId: pattern.id,
-            template: pattern.template,
-            sampleIndex: index
-          })
+          checkSampleUrl(
+            session.base_url,
+            sample.path,
+            sample.source_url,
+            session.user_agent,
+            logger,
+            {
+              sessionId: data.session_id,
+              patternId: pattern.id,
+              template: pattern.template,
+              sampleIndex: index
+            }
+          )
       );
       const score = await persistPatternSamples(
         pattern.id,

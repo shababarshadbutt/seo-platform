@@ -19,9 +19,14 @@ export function GET() {
     // BROWSER navigates to — so it must be reachable from the user's machine,
     // not an internal compose service name.
     seoDeskUrl: process.env.SEO_DESK_URL ?? "",
-    // Static per image build, so NEXT_PUBLIC_ is genuinely correct here; served
-    // alongside the rest so the client has one place to read config from.
-    appVersion: process.env.NEXT_PUBLIC_APP_VERSION ?? "",
+    // Deployed version for the navbar pill. APP_VERSION (runtime env) is
+    // preferred over the NEXT_PUBLIC_ build arg: the build arg is frozen into
+    // the image, so re-running an image after editing APP_VERSION in .env would
+    // show a stale version — the exact drift the pill exists to expose. The
+    // build-time value stays as a fallback for images run without the runtime
+    // var, so a version still shows rather than nothing.
+    appVersion:
+      process.env.APP_VERSION ?? process.env.NEXT_PUBLIC_APP_VERSION ?? "",
     // Master flag for the two AWS paths never exercised against real
     // infrastructure (SFTP pull, S3 publish). Read here rather than as a
     // NEXT_PUBLIC_* inline so DevOps can flip it in .env without rebuilding the

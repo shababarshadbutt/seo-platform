@@ -793,6 +793,9 @@ export default function ResultsDashboardPage({
   const [drawerLoading, setDrawerLoading] = useState(false);
   const [drawerError, setDrawerError] = useState("");
   const [copiedSampleId, setCopiedSampleId] = useState<string | null>(null);
+  // Copy can genuinely fail (no clipboard API over HTTP and execCommand refused).
+  // Tracked separately so the button says so instead of claiming success.
+  const [copyFailedId, setCopyFailedId] = useState<string | null>(null);
   const [isPrintMode, setIsPrintMode] = useState(false);
   const [exportError, setExportError] = useState("");
   const [exportingFormat, setExportingFormat] = useState<ExportFormat | null>(
@@ -1520,24 +1523,84 @@ export default function ResultsDashboardPage({
     getSortedRowModel: getSortedRowModel()
   });
 
-  async function copyText(text: string, feedbackId: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      const textArea = document.createElement("textarea");
+  // Synchronous clipboard write via the legacy command. Works over plain HTTP,
+  // unlike navigator.clipboard — but ONLY while the browser still considers the
+  // current task a user gesture, which is why the caller must not await anything
+  // before reaching here.
+  function copyWithExecCommand(text: string): boolean {
+    const textArea = document.createElement("textarea");
 
-      textArea.value = text;
-      textArea.style.position = "fixed";
-      textArea.style.opacity = "0";
-      document.body.appendChild(textArea);
-      textArea.focus();
+    textArea.value = text;
+    // Must be rendered and selectable: some browsers refuse to copy from an
+    // element that isn't laid out. Kept 1px and transparent instead of
+    // opacity/display tricks, and readOnly so no mobile keyboard appears.
+    textArea.readOnly = true;
+    textArea.style.position = "fixed";
+    textArea.style.top = "0";
+    textArea.style.left = "0";
+    textArea.style.width = "1px";
+    textArea.style.height = "1px";
+    textArea.style.padding = "0";
+    textArea.style.border = "none";
+    textArea.style.background = "transparent";
+    document.body.appendChild(textArea);
+
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    let copied = false;
+
+    try {
+      textArea.focus({ preventScroll: true });
       textArea.select();
-      document.execCommand("copy");
+      // Explicit range as well as select(): required by iOS Safari.
+      textArea.setSelectionRange(0, text.length);
+      copied = document.execCommand("copy");
+    } catch {
+      copied = false;
+    } finally {
       textArea.remove();
+      previouslyFocused?.focus?.();
     }
 
-    setCopiedSampleId(feedbackId);
-    window.setTimeout(() => setCopiedSampleId(null), 1200);
+    return copied;
+  }
+
+  async function copyText(text: string, feedbackId: string) {
+    let copied = false;
+
+    // navigator.clipboard exists only in a SECURE context. This app is served
+    // over plain HTTP on the VM, so on that deployment it is undefined and the
+    // async path is unusable. Check up front rather than calling it and handling
+    // the throw: the old code awaited first, and after an await the browser no
+    // longer treats the task as a user gesture, so the execCommand fallback was
+    // silently refused — the button appeared to do nothing.
+    const canUseAsyncClipboard =
+      typeof navigator !== "undefined" &&
+      typeof navigator.clipboard?.writeText === "function" &&
+      window.isSecureContext;
+
+    if (canUseAsyncClipboard) {
+      try {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      } catch {
+        copied = false;
+      }
+    }
+
+    if (!copied) {
+      copied = copyWithExecCommand(text);
+    }
+
+    // Report what actually happened. Previously "Copied" was shown regardless,
+    // so a failed copy looked like a successful one.
+    if (copied) {
+      setCopiedSampleId(feedbackId);
+      setCopyFailedId(null);
+      window.setTimeout(() => setCopiedSampleId(null), 1200);
+    } else {
+      setCopyFailedId(feedbackId);
+      window.setTimeout(() => setCopyFailedId(null), 2500);
+    }
   }
 
   async function copyUrl(sample: SampledUrl) {
@@ -3817,7 +3880,9 @@ export default function ResultsDashboardPage({
                                     <Clipboard className="mr-1 h-3 w-3" />
                                     {copiedSampleId === `final-${sample.id}`
                                       ? "Copied"
-                                      : "Copy"}
+                                      : copyFailedId === `final-${sample.id}`
+                                        ? "Press Ctrl+C"
+                                        : "Copy"}
                                   </Button>
                                   <Button
                                     type="button"
@@ -3868,7 +3933,11 @@ export default function ResultsDashboardPage({
                               onClick={() => void copyUrl(sample)}
                             >
                               <Clipboard className="mr-2 h-3.5 w-3.5" />
-                              {copiedSampleId === sample.id ? "Copied" : "Copy"}
+                              {copiedSampleId === sample.id
+                                ? "Copied"
+                                : copyFailedId === sample.id
+                                  ? "Press Ctrl+C"
+                                  : "Copy"}
                             </Button>
                             {isDeletable && !isDeleted ? (
                               <Button

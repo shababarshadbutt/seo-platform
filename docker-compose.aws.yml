@@ -65,6 +65,12 @@ services:
       # unlike the two URLs above which can legitimately vary per deployment
       # target using the same image.
       NEXT_PUBLIC_APP_VERSION: ${APP_VERSION}
+      # Same value again, but as a RUNTIME env var. /api/config prefers this over
+      # the build-time copy above, so editing APP_VERSION in .env and recreating
+      # the container updates the navbar pill without a rebuild — otherwise the
+      # pill could report the version baked at build time while the image tag says
+      # something else, which is the drift the pill exists to catch.
+      APP_VERSION: ${APP_VERSION}
       # --- Phase 1 feature flag (default OFF) ---
       # Hides the SFTP source tab and the Publish-to-S3 button ENTIRELY (absent
       # from the DOM, not greyed out). Those two paths have never completed a

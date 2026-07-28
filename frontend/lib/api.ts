@@ -1748,12 +1748,43 @@ export async function processCleaner(
   onEvent: (event: CleanerProgressEvent) => void,
   signal?: AbortSignal
 ): Promise<CleanerDone> {
-  const response = await fetch(backendUrl("/api/cleaner/process"), {
-    method: "POST",
-    body: formData,
-    signal
-  });
+  return consumeCleanerRun(
+    await fetch(backendUrl("/api/cleaner/process"), {
+      method: "POST",
+      body: formData,
+      signal
+    }),
+    onEvent
+  );
+}
 
+// Same clean, pulled from SFTP instead of uploaded. Streams the identical SSE
+// shape (including a `done` frame with a download_token), so the whole consumer
+// below — and the Cleaner→Migration handoff that follows it — is reused as-is.
+export async function processCleanerFromSftp(
+  input: { domain: string; siteUrl?: string; subfolder?: string },
+  onEvent: (event: CleanerProgressEvent) => void,
+  signal?: AbortSignal
+): Promise<CleanerDone> {
+  return consumeCleanerRun(
+    await fetch(backendUrl("/api/cleaner/process-sftp"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        domain: input.domain,
+        site_url: input.siteUrl,
+        subfolder: input.subfolder
+      }),
+      signal
+    }),
+    onEvent
+  );
+}
+
+async function consumeCleanerRun(
+  response: Response,
+  onEvent: (event: CleanerProgressEvent) => void
+): Promise<CleanerDone> {
   if (!response.ok || !response.body) {
     const text = await response.text().catch(() => "");
     let message = `Cleaning failed with status ${response.status}`;

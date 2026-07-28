@@ -9,7 +9,12 @@ import AdmZip from "adm-zip";
 import type { FastifyInstance } from "fastify";
 import { ZipArchive } from "archiver";
 
-import { config } from "../config.js";
+import { config, sftpConfigError } from "../config.js";
+import {
+  assertSafeDomain,
+  downloadSftpFile,
+  listSftpSitemapFiles
+} from "../sftp/sftpClient.js";
 import {
   cleanSitemaps,
   type CleanerInputFile,
@@ -99,6 +104,78 @@ function archiveToFile(
 
     void archive.finalize();
   });
+}
+
+// Everything after the input files are on disk: clean, package, cache the run,
+// emit the terminal frame. Shared by the upload route and the SFTP route so the
+// two sources cannot drift — in particular so the SFTP source produces the exact
+// same `done` frame with a download_token, which is what makes the existing
+// Cleaner→Migration handoff (v1.37) work for it with no changes at all.
+//
+// Returns whether the run was cached (handed off); the caller removes the working
+// directory when it wasn't.
+async function cleanPackageAndFinish(options: {
+  inputFiles: CleanerInputFile[];
+  domain: string;
+  subfolder: string;
+  runDir: string;
+  inDir: string;
+  outDir: string;
+  send: (payload: unknown) => void;
+  log: FastifyInstance["log"];
+}): Promise<boolean> {
+  const { inputFiles, domain, subfolder, runDir, inDir, outDir, send, log } =
+    options;
+
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const { result, files } = await cleanSitemaps({
+      files: inputFiles,
+      domain,
+      subfolder: subfolder || "sitemaps",
+      today,
+      outDir,
+      onProgress: (event) => send({ type: "progress", ...event })
+    });
+
+    // Inputs are no longer needed — free the disk they occupy.
+    await rm(inDir, { recursive: true, force: true });
+
+    send({ type: "progress", stage: "zip", message: "Packaging ZIP…" });
+
+    const zipFilename = `cleaned-sitemaps-${today}.zip`;
+    const zipPath = path.join(runDir, zipFilename);
+    await archiveToFile(files, zipPath);
+
+    const token = randomUUID();
+
+    // Cache the on-disk paths so both the binary download and the Migration
+    // handoff can use this one token; the working dir is removed on TTL.
+    storeRun(token, {
+      dir: runDir,
+      zipPath,
+      filename: zipFilename,
+      domain,
+      files
+    });
+
+    send({
+      type: "done",
+      summary: result,
+      download_token: token,
+      zip_filename: zipFilename
+    });
+
+    return true;
+  } catch (error) {
+    log.error({ error }, "cleaner process failed");
+    send({
+      type: "error",
+      message: error instanceof Error ? error.message : "Cleaning failed"
+    });
+
+    return false;
+  }
 }
 
 export async function cleanerRoutes(app: FastifyInstance) {
@@ -382,49 +459,15 @@ export async function cleanerRoutes(app: FastifyInstance) {
       let handedOff = false;
 
       try {
-        const today = new Date().toISOString().slice(0, 10);
-        const { result, files } = await cleanSitemaps({
-          files: inputFiles,
+        handedOff = await cleanPackageAndFinish({
+          inputFiles,
           domain,
-          subfolder: subfolder || "sitemaps",
-          today,
+          subfolder,
+          runDir,
+          inDir,
           outDir,
-          onProgress: (event) => send({ type: "progress", ...event })
-        });
-
-        // Inputs are no longer needed — free the disk they occupy.
-        await rm(inDir, { recursive: true, force: true });
-
-        send({ type: "progress", stage: "zip", message: "Packaging ZIP…" });
-
-        const zipFilename = `cleaned-sitemaps-${today}.zip`;
-        const zipPath = path.join(runDir, zipFilename);
-        await archiveToFile(files, zipPath);
-
-        const token = randomUUID();
-
-        // Cache the on-disk paths so both the binary download and the Migration
-        // handoff can use this one token; the working dir is removed on TTL.
-        storeRun(token, {
-          dir: runDir,
-          zipPath,
-          filename: zipFilename,
-          domain,
-          files
-        });
-        handedOff = true;
-
-        send({
-          type: "done",
-          summary: result,
-          download_token: token,
-          zip_filename: zipFilename
-        });
-      } catch (error) {
-        request.log.error({ error }, "cleaner process failed");
-        send({
-          type: "error",
-          message: error instanceof Error ? error.message : "Cleaning failed"
+          send,
+          log: request.log
         });
       } finally {
         stopKeepalive();
@@ -535,6 +578,204 @@ export async function cleanerRoutes(app: FastifyInstance) {
       );
 
       return reply.send(createReadStream(file.path));
+    }
+  );
+
+  // Same clean, different SOURCE: pull a domain's sitemap folder over SFTP
+  // instead of receiving an upload. No new SFTP logic and no new cleaning logic —
+  // this reuses listSftpSitemapFiles/downloadSftpFile (exactly what Migration's
+  // pull job uses) and then hands off to cleanPackageAndFinish, the same tail the
+  // upload route runs. Because that tail emits the identical `done` frame with a
+  // download_token, the existing Cleaner→Migration handoff (v1.37) works for this
+  // source with no changes to it whatsoever.
+  //
+  // Gated by sftpConfigError(), so AWS_PUBLISH_ENABLED=false refuses it here too.
+  app.post<{ Body: { domain?: unknown; site_url?: unknown; subfolder?: unknown } }>(
+    "/api/cleaner/process-sftp",
+    {
+      onRequest: (request, reply, done) => {
+        request.raw.setTimeout(CLEANER_TIMEOUT_MS);
+        reply.raw.setTimeout(CLEANER_TIMEOUT_MS);
+        done();
+      }
+    },
+    async (request, reply) => {
+      const configError = sftpConfigError();
+
+      if (configError) {
+        return reply
+          .code(503)
+          .send({ error: "Service Unavailable", message: configError });
+      }
+
+      const sftpDomain =
+        typeof request.body?.domain === "string" ? request.body.domain.trim() : "";
+
+      try {
+        assertSafeDomain(sftpDomain);
+      } catch {
+        return reply
+          .code(400)
+          .send({ error: "Bad Request", message: "a valid domain is required" });
+      }
+
+      // The cleaner needs a site URL to build <loc> values. Default to the SFTP
+      // folder name as a host; the client may override (e.g. to add www.).
+      const siteUrl =
+        typeof request.body?.site_url === "string" && request.body.site_url.trim()
+          ? request.body.site_url.trim()
+          : `https://${sftpDomain}`;
+      const subfolder =
+        typeof request.body?.subfolder === "string" && request.body.subfolder.trim()
+          ? request.body.subfolder.trim()
+          : "sitemaps";
+
+      try {
+        new URL(siteUrl);
+      } catch {
+        return reply.code(400).send({
+          error: "Bad Request",
+          message: "site_url must be a valid URL (e.g. https://www.example.com)"
+        });
+      }
+
+      const runId = randomUUID();
+      const runDir = path.join(CLEANER_WORK_ROOT, runId);
+      const inDir = path.join(runDir, "in");
+      const outDir = path.join(runDir, "out");
+
+      await mkdir(inDir, { recursive: true });
+      await mkdir(outDir, { recursive: true });
+
+      let keepalive: NodeJS.Timeout | null = null;
+      const stopKeepalive = () => {
+        if (keepalive) {
+          clearInterval(keepalive);
+          keepalive = null;
+        }
+      };
+
+      reply.hijack();
+      const stream = reply.raw;
+      stream.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+        "Access-Control-Allow-Origin":
+          (request.headers.origin as string | undefined) ?? "*"
+      });
+
+      const send = (payload: unknown) => {
+        if (!stream.writableEnded) {
+          stream.write(`data: ${JSON.stringify(payload)}\n\n`);
+        }
+      };
+
+      keepalive = setInterval(() => {
+        if (!stream.writableEnded) {
+          stream.write(": keepalive\n\n");
+        }
+      }, SSE_KEEPALIVE_MS);
+      keepalive.unref?.();
+      request.raw.on("close", stopKeepalive);
+
+      let handedOff = false;
+
+      try {
+        // Total is known before the download loop, so every frame carries
+        // current/total — same contract as the Migration pull progress.
+        const remoteFiles = await listSftpSitemapFiles(sftpDomain);
+        const total = remoteFiles.length;
+
+        send({
+          type: "progress",
+          stage: "pull",
+          current: 0,
+          total,
+          message: `Pulling ${total} file(s) from ${sftpDomain}`
+        });
+
+        if (total === 0) {
+          send({
+            type: "error",
+            message: `No sitemap files found for ${sftpDomain} on the SFTP server.`
+          });
+
+          return;
+        }
+
+        const inputFiles: CleanerInputFile[] = [];
+        let index = 0;
+
+        for (const remote of remoteFiles) {
+          index += 1;
+          const localPath = path.join(inDir, path.basename(remote.name));
+
+          try {
+            await downloadSftpFile(sftpDomain, remote.name, localPath);
+            inputFiles.push({ filename: remote.name, path: localPath });
+            send({
+              type: "progress",
+              stage: "pull",
+              current: index,
+              total,
+              message: `Pulled ${remote.name} (${index} of ${total})`
+            });
+          } catch (error) {
+            // Don't leave a truncated download to be parsed as a real sitemap.
+            await rm(localPath, { force: true }).catch(() => undefined);
+            request.log.error(
+              { domain: sftpDomain, file: remote.name, error },
+              "cleaner sftp pull: file failed"
+            );
+            send({
+              type: "progress",
+              stage: "pull",
+              current: index,
+              total,
+              message: `Failed ${remote.name} (${index} of ${total})`
+            });
+          }
+        }
+
+        if (inputFiles.length === 0) {
+          send({
+            type: "error",
+            message: `Could not download any sitemap files for ${sftpDomain}.`
+          });
+
+          return;
+        }
+
+        handedOff = await cleanPackageAndFinish({
+          inputFiles,
+          domain: siteUrl,
+          subfolder,
+          runDir,
+          inDir,
+          outDir,
+          send,
+          log: request.log
+        });
+      } catch (error) {
+        request.log.error({ error }, "cleaner sftp process failed");
+        send({
+          type: "error",
+          message:
+            error instanceof Error ? error.message : "SFTP clean failed"
+        });
+      } finally {
+        stopKeepalive();
+
+        if (!stream.writableEnded) {
+          stream.end();
+        }
+
+        if (!handedOff) {
+          void rm(runDir, { recursive: true, force: true });
+        }
+      }
     }
   );
 }
