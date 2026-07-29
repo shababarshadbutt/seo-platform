@@ -2108,11 +2108,30 @@ export type PublishPreview = {
   // Files deleted in-session: dropped from the regenerated index. NOT deleted
   // from the bucket — publish issues no DeleteObject at all.
   omitted_deleted: string[];
+  // Files this session lists whose content is no longer on disk (session uploads
+  // are deleted an hour after completion). Publishing is REFUSED while this is
+  // non-empty: those objects would be left stale in the bucket AND dropped from
+  // the regenerated index.
+  missing_local: string[];
+  // Where the prefix host came from. "sftp" = the folder the files were pulled
+  // from (authoritative); "base_url" = the session base URL's host, normalized.
+  // The server resolves this itself — the `domain` argument below is ignored.
+  domain_source: "sftp" | "base_url";
+  // The host used for the public <loc> urls. Legitimately differs from `domain`
+  // for a www site: one storage prefix, but the real serving host in the index.
+  public_host: string;
+  // Set only when an SFTP session's base_url host disagrees with its SFTP
+  // folder. The folder wins; this is what was overridden.
+  base_url_host_ignored: string | null;
   deletes_objects: boolean;
   // Another publish of this same domain is already running.
   locked: boolean;
 };
 
+// `domain` is sent for backward compatibility and IGNORED by the server: the
+// publish prefix is resolved from the session row (SFTP source domain, else the
+// normalized base_url host) so a client value can never select which production
+// folder gets overwritten. Read the resolved target off the response.
 export async function getPublishPreview(sessionId: string, domain: string) {
   const response = await fetchWithTimeout(
     backendUrl(

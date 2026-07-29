@@ -11,7 +11,12 @@ import {
 } from "../config.js";
 import { assertSafeDomain } from "../sftp/sftpClient.js";
 import { productionFilename } from "../sitemaps/filenames.js";
-import { buildPublishIndexXml } from "./s3Publish.js";
+import {
+  buildPublishIndexXml,
+  executePublish,
+  PublishFileError,
+  type PublishPlan
+} from "./s3Publish.js";
 
 // Pure logic of the publish path — no AWS calls, so this runs anywhere.
 
@@ -205,6 +210,79 @@ test("a file omitted from the plan drops out of the regenerated index", () => {
   assert.ok(before.includes("deleted.xml"));
   assert.ok(!after.includes("deleted.xml"));
   assert.equal((after.match(/<sitemap>/g) ?? []).length, 2);
+});
+
+// ---- Silent-success guards -------------------------------------------------
+//
+// These cover the two ways a publish could previously report success while
+// leaving production wrong. Both refuse BEFORE constructing an S3 client, so
+// they need no credentials and no network.
+
+function planWith(overrides: Partial<PublishPlan>): PublishPlan {
+  return {
+    domain: "airpartshop.com",
+    publicHost: "airpartshop.com",
+    prefix: "sites/airpartshop.com/sitemaps/",
+    files: [
+      { displayName: "a.xml", localPath: "/tmp/a.xml", size: 10 }
+    ],
+    indexFilename: "sitemap-index.xml",
+    omittedDeleted: [],
+    missingLocal: [],
+    ...overrides
+  };
+}
+
+// A live file whose bytes are gone used to be dropped from the plan silently —
+// so it was ALSO dropped from the regenerated index (de-indexing live URLs)
+// while the publish reported success with a count nobody could check. Session
+// uploads are deleted an hour after completion, so this is the normal state of
+// any session published the next day.
+test("executePublish refuses when a live file's content is missing from disk", async () => {
+  await assert.rejects(
+    () =>
+      executePublish(
+        planWith({ missingLocal: ["manufacturers.xml", "products-2.xml"] }),
+        { today: "2026-07-29" }
+      ),
+    (error: Error) => {
+      assert.match(error.message, /Refusing to publish/);
+      // The user has to know WHICH files and WHY, not just that it failed.
+      assert.match(error.message, /manufacturers\.xml/);
+      assert.match(error.message, /deleted an hour after/);
+
+      return true;
+    }
+  );
+});
+
+// With every child file skipped, the only PUT was a regenerated index with zero
+// <sitemap> entries, landing on top of the live one — reported as
+// "Published 1 file(s)" because the index counts toward `uploaded`.
+test("executePublish refuses to write an empty index when no files resolved", async () => {
+  await assert.rejects(
+    () => executePublish(planWith({ files: [] }), { today: "2026-07-29" }),
+    /EMPTY sitemap index/
+  );
+});
+
+// A mid-publish failure leaves the first N objects overwritten in a bucket with
+// no versioning AND the index not updated. The bare SDK error says none of that,
+// so the wrapper carries the partial state into the message the user sees.
+test("PublishFileError reports how far the publish got", () => {
+  const error = new PublishFileError({
+    key: "sites/airpartshop.com/sitemaps/products-500.xml",
+    uploadedBefore: 499,
+    plannedTotal: 1600,
+    cause: new Error("AccessDenied")
+  });
+
+  assert.match(error.message, /products-500\.xml/);
+  assert.match(error.message, /file 500 of 1600/);
+  assert.match(error.message, /AccessDenied/);
+  // The partial-overwrite warning is the operationally important half.
+  assert.match(error.message, /499 object\(s\) were already overwritten/);
+  assert.match(error.message, /index was NOT updated/);
 });
 
 // The object key must be the CLIENT's filename. displaySourceFilename keeps the

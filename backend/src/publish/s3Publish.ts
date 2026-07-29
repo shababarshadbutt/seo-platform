@@ -11,6 +11,7 @@ import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { config, publicSitemapUrl, s3PrefixForDomain } from "../config.js";
 import { pool } from "../db/pool.js";
 import { isHttpUrl, productionFilename } from "../sitemaps/filenames.js";
+import type { PublishTarget } from "./publishTarget.js";
 
 // Publish a session's corrected sitemaps to the live S3 bucket, then invalidate
 // exactly the CloudFront paths written (Phase 1).
@@ -46,13 +47,32 @@ export type PublishFile = {
 };
 
 export type PublishPlan = {
+  // The canonical host that produced `prefix`. Comes from resolvePublishTarget,
+  // never from a caller-supplied string — see publish/publishTarget.ts.
   domain: string;
+  // The host the public <loc> urls use. Deliberately separate from `domain`:
+  // stripping "www." is right for choosing ONE storage prefix and wrong for
+  // telling a search engine where to fetch the file.
+  publicHost: string;
   prefix: string;
   files: PublishFile[];
   indexFilename: string;
   // Files present in the session but skipped because they were deleted in-app.
   // Recorded so the caller can report them; NOT turned into DeleteObject calls.
   omittedDeleted: string[];
+  // Live files the session still lists but whose BYTES ARE GONE from disk.
+  //
+  // This used to be a bare `continue` with a comment saying skipping beats
+  // uploading a zero-byte object. Skipping does beat that, but silently
+  // dropping the file was worse than either: the regenerated index is built
+  // from plan.files, so a dropped file is also dropped from the index —
+  // de-indexing live URLs — while the publish reports success and a file count
+  // the user has no way to compare against. Uploads are deleted an hour after
+  // a session completes (CLEANUP_UPLOADS_DELAY_MS), so this is the ordinary
+  // state of any session published the next day, not an exotic failure.
+  //
+  // Recorded here, surfaced by the preview, and refused by executePublish.
+  missingLocal: string[];
 };
 
 export type PublishResult = {
@@ -65,6 +85,11 @@ export type PublishResult = {
   omitted_deleted: string[];
   invalidation_id: string | null;
   invalidated_paths: number;
+  // Every key actually PUT, in order. Logged (a bounded sample) by the job so
+  // the deployment's logs answer "which prefix did this publish write to?"
+  // without needing bucket access — the question a www/non-www prefix mismatch
+  // turns on.
+  written_keys: string[];
 };
 
 function contentTypeFor(filename: string) {
@@ -75,9 +100,14 @@ function contentTypeFor(filename: string) {
 
 // Build the publish plan for a session: every live (non-deleted) sitemap file,
 // resolved to its production filename and current on-disk bytes.
+//
+// Takes a resolved PublishTarget, NOT a domain string. That is deliberate: this
+// used to accept whatever host the caller had, which is how a publish request
+// carrying an unnormalized base_url host could write to a second, wrong prefix.
+// The type now makes the resolver the only way in.
 export async function buildPublishPlan(
   sessionId: string,
-  domain: string
+  target: PublishTarget
 ): Promise<PublishPlan> {
   const filesResult = await pool.query<{
     filename: string;
@@ -96,6 +126,7 @@ export async function buildPublishPlan(
 
   const files: PublishFile[] = [];
   const omittedDeleted: string[] = [];
+  const missingLocal: string[] = [];
   const seen = new Set<string>();
   let indexFilename: string | null = null;
 
@@ -136,8 +167,11 @@ export async function buildPublishPlan(
     try {
       size = (await stat(localPath)).size;
     } catch {
-      // The session's uploads were cleaned up — nothing to publish for this
-      // file. Skipping beats uploading a zero-byte object over a live one.
+      // The session's uploads were cleaned up (or the volume changed under us).
+      // Still NOT uploaded — a zero-byte object over a live one is worse. But
+      // recorded rather than dropped, because a file missing here is silently
+      // missing from the regenerated index too. executePublish refuses.
+      missingLocal.push(displayName);
       continue;
     }
 
@@ -145,11 +179,13 @@ export async function buildPublishPlan(
   }
 
   return {
-    domain,
-    prefix: s3PrefixForDomain(domain),
+    domain: target.prefixDomain,
+    publicHost: target.publicHost,
+    prefix: s3PrefixForDomain(target.prefixDomain),
     files,
     indexFilename: indexFilename ?? "sitemap-index.xml",
-    omittedDeleted
+    omittedDeleted,
+    missingLocal
   };
 }
 
@@ -201,6 +237,41 @@ export type PublishProgress = (event: {
   filename: string;
 }) => void | Promise<void>;
 
+// A publish that died PART WAY THROUGH. Carries how far it got, because that is
+// the operationally important fact and it is otherwise unrecoverable: the first
+// N objects were already overwritten in a bucket with no versioning, and the
+// regenerated index was NOT written, so production is now a mixture of new
+// child sitemaps and an old index. The bare SDK error says none of that.
+export class PublishFileError extends Error {
+  readonly key: string;
+  readonly uploadedBefore: number;
+  readonly plannedTotal: number;
+
+  constructor(options: {
+    key: string;
+    uploadedBefore: number;
+    plannedTotal: number;
+    cause: unknown;
+  }) {
+    const reason =
+      options.cause instanceof Error
+        ? options.cause.message
+        : String(options.cause);
+
+    super(
+      `S3 upload failed on ${options.key} (file ${
+        options.uploadedBefore + 1
+      } of ${options.plannedTotal}): ${reason}. ` +
+        `${options.uploadedBefore} object(s) were already overwritten and the sitemap index was NOT updated — production is in a mixed state. Re-run the publish once the cause is fixed.`
+    );
+    this.name = "PublishFileError";
+    this.key = options.key;
+    this.uploadedBefore = options.uploadedBefore;
+    this.plannedTotal = options.plannedTotal;
+    this.cause = options.cause;
+  }
+}
+
 // Execute a plan: upload every child file, then the regenerated index, then
 // invalidate exactly those paths.
 export async function executePublish(
@@ -218,6 +289,29 @@ export async function executePublish(
     );
   }
 
+  // Refuse rather than publish an index that omits files whose bytes we no
+  // longer have. Uploading nothing for them and dropping them from the index
+  // de-indexes live URLs, and the old code did exactly that while reporting
+  // success. A session whose uploads were cleaned up must be re-ingested (or
+  // re-pulled over SFTP) before it can be published again.
+  if (plan.missingLocal.length > 0) {
+    const sample = plan.missingLocal.slice(0, 5).join(", ");
+
+    throw new Error(
+      `Refusing to publish: ${plan.missingLocal.length} file(s) in this session no longer have their content on disk (${sample}${
+        plan.missingLocal.length > 5 ? ", …" : ""
+      }). Publishing would leave those sitemaps stale in the bucket AND drop them from the regenerated index. Session uploads are deleted an hour after a session completes — re-upload or re-pull this domain's files, then publish.`
+    );
+  }
+
+  if (plan.files.length === 0) {
+    // Would otherwise upload a sitemap index containing zero <sitemap> entries
+    // over a live one, and report "Published 1 file(s)" as a success.
+    throw new Error(
+      "Refusing to publish: this session has no sitemap files to upload, so the only thing written would be an EMPTY sitemap index replacing the live one."
+    );
+  }
+
   const s3 = new S3Client({ region: config.s3.region });
   const writtenKeys: string[] = [];
   let bytes = 0;
@@ -231,15 +325,29 @@ export async function executePublish(
 
       // Stream from disk — a large child sitemap is never read into the heap.
       // ContentLength is required because a stream body has no known length.
-      await s3.send(
-        new PutObjectCommand({
-          Bucket: config.s3.bucket,
-          Key: key,
-          Body: createReadStream(file.localPath),
-          ContentLength: file.size,
-          ContentType: contentTypeFor(file.displayName)
-        })
-      );
+      //
+      // Deliberately NOT a try/continue: one failed PUT aborts the whole
+      // publish. A per-file "log and carry on" would leave the index claiming
+      // files that were never written, which is the failure this whole path
+      // must not have. The catch only ATTACHES CONTEXT and rethrows.
+      try {
+        await s3.send(
+          new PutObjectCommand({
+            Bucket: config.s3.bucket,
+            Key: key,
+            Body: createReadStream(file.localPath),
+            ContentLength: file.size,
+            ContentType: contentTypeFor(file.displayName)
+          })
+        );
+      } catch (error) {
+        throw new PublishFileError({
+          key,
+          uploadedBefore: writtenKeys.length,
+          plannedTotal: plan.files.length,
+          cause: error
+        });
+      }
 
       writtenKeys.push(key);
       bytes += file.size;
@@ -252,21 +360,34 @@ export async function executePublish(
 
     // plan.prefix is deliberately NOT passed: the index's public urls come from
     // the template, the keys below come from the prefix.
+    //
+    // publicHost, not plan.domain: plan.domain is normalized so that one site
+    // maps to one storage prefix, but a site that genuinely serves at
+    // www.example.com must not have the www stripped out of its <loc> values.
     const indexXml = buildPublishIndexXml(
-      plan.domain,
+      plan.publicHost,
       plan.files.map((file) => file.displayName),
       options.today
     );
     const indexKey = `${plan.prefix}${plan.indexFilename}`;
 
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: config.s3.bucket,
-        Key: indexKey,
-        Body: indexXml,
-        ContentType: "application/xml; charset=utf-8"
-      })
-    );
+    try {
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: config.s3.bucket,
+          Key: indexKey,
+          Body: indexXml,
+          ContentType: "application/xml; charset=utf-8"
+        })
+      );
+    } catch (error) {
+      throw new PublishFileError({
+        key: indexKey,
+        uploadedBefore: writtenKeys.length,
+        plannedTotal: plan.files.length + 1,
+        cause: error
+      });
+    }
 
     writtenKeys.push(indexKey);
     await options.onProgress?.({
@@ -286,7 +407,8 @@ export async function executePublish(
       index_key: indexKey,
       omitted_deleted: plan.omittedDeleted,
       invalidation_id: invalidation,
-      invalidated_paths: writtenKeys.length
+      invalidated_paths: writtenKeys.length,
+      written_keys: writtenKeys
     };
   } finally {
     // Release the SDK's sockets as soon as this publish is done rather than

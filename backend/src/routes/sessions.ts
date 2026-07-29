@@ -83,6 +83,11 @@ import {
   type PublishLock
 } from "../publish/publishLock.js";
 import { buildPublishPlan } from "../publish/s3Publish.js";
+import {
+  PublishTargetError,
+  resolvePublishTarget,
+  type PublishTarget
+} from "../publish/publishTarget.js";
 import { cleanerHandoffFiles, getCleanerRun } from "./cleaner.js";
 import {
   enqueueS3PublishJob,
@@ -5498,8 +5503,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           .send({ error: "Service Unavailable", message: configError });
       }
 
-      const sessionResult = await pool.query(
-        "SELECT 1 FROM sessions WHERE id = $1",
+      const sessionResult = await pool.query<{ sftp_domain: string | null }>(
+        "SELECT sftp_domain FROM sessions WHERE id = $1::uuid",
         [request.params.id]
       );
 
@@ -5517,6 +5522,27 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       } catch {
         return reply.code(400).send(badRequest("a valid domain is required"));
       }
+
+      // A session's files must all come from ONE domain, because that domain now
+      // decides the single S3 prefix everything in the session publishes to. A
+      // second pull from a different folder would produce a session of mixed
+      // provenance whose publish target is whichever pull ran last.
+      const existingDomain = sessionResult.rows[0].sftp_domain;
+
+      if (existingDomain && existingDomain !== domain) {
+        return reply.code(409).send({
+          error: "Conflict",
+          message: `This session already holds sitemaps pulled from "${existingDomain}". Start a new session to work on "${domain}" — one session publishes to one domain's prefix.`
+        });
+      }
+
+      // Recorded at enqueue, before the pull runs: this is the moment the user
+      // chose the domain, and from here on it — not base_url — is what decides
+      // the publish prefix (see publish/publishTarget.ts).
+      await pool.query(
+        "UPDATE sessions SET sftp_domain = $2 WHERE id = $1::uuid",
+        [request.params.id, domain]
+      );
 
       const job = await enqueueSftpPullJob({
         session_id: request.params.id,
@@ -5543,16 +5569,35 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           .send({ error: "Service Unavailable", message: configError });
       }
 
-      const domain = (request.query.domain ?? "").trim();
+      // The `domain` query param is ACCEPTED AND IGNORED. It used to decide the
+      // S3 prefix, which is how a client sending an unnormalized base_url host
+      // wrote a whole domain's sitemaps to a second, wrong prefix. The target is
+      // now resolved server-side from the session row and the client has no say
+      // in it. Kept in the signature so an older frontend build still gets a
+      // correct answer rather than a 400.
+      let target: PublishTarget;
 
-      if (!domain) {
-        return reply.code(400).send(badRequest("domain is required"));
+      try {
+        target = await resolvePublishTarget(request.params.id);
+      } catch (error) {
+        if (error instanceof PublishTargetError) {
+          return reply.code(400).send(badRequest(error.message));
+        }
+
+        throw error;
       }
 
-      const plan = await buildPublishPlan(request.params.id, domain);
+      const plan = await buildPublishPlan(request.params.id, target);
 
       return {
-        domain,
+        domain: target.prefixDomain,
+        // Where the prefix host came from, so the dialog states it as a fact
+        // instead of the user inferring it from a hostname.
+        domain_source: target.source,
+        public_host: target.publicHost,
+        // Non-null only when the SFTP folder and base_url's host disagree; the
+        // SFTP folder wins and this is what was overridden.
+        base_url_host_ignored: target.baseUrlHostIgnored,
         bucket: config.s3.bucket,
         prefix: plan.prefix,
         index_filename: plan.indexFilename,
@@ -5560,10 +5605,17 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         total_bytes: plan.files.reduce((sum, file) => sum + file.size, 0),
         files: plan.files.slice(0, 50).map((file) => file.displayName),
         omitted_deleted: plan.omittedDeleted,
+        // Files the session lists whose bytes are gone from disk. Publishing is
+        // REFUSED while this is non-empty (it would stale those objects and drop
+        // them from the index), so the dialog shows it before the button is used.
+        missing_local: plan.missingLocal,
         // Deleted files are dropped from the regenerated index, never deleted
         // from the bucket — surfaced so the UI can say so plainly.
         deletes_objects: false,
-        locked: await isPublishLocked(domain)
+        // Locked on the resolved prefix domain, so a www and a non-www session
+        // for the same site now collide on the lock instead of racing each other
+        // into two different prefixes.
+        locked: await isPublishLocked(target.prefixDomain)
       };
     }
   );
@@ -5593,18 +5645,31 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           .send({ error: "Not Found", message: "session not found" });
       }
 
-      const domain =
-        typeof request.body?.domain === "string" ? request.body.domain.trim() : "";
+      // body.domain is ACCEPTED AND IGNORED — see the preview route. The prefix
+      // is resolved from the session row, so a stale page (or a hand-made
+      // request) can no longer pick which production folder gets overwritten.
+      let target: PublishTarget;
 
-      if (!domain) {
-        return reply.code(400).send(badRequest("domain is required"));
+      try {
+        target = await resolvePublishTarget(request.params.id);
+      } catch (error) {
+        if (error instanceof PublishTargetError) {
+          return reply.code(400).send(badRequest(error.message));
+        }
+
+        throw error;
       }
+
+      const domain = target.prefixDomain;
 
       // Reject a same-domain collision HERE, synchronously, so the user gets an
       // immediate clear answer instead of a job that fails later. Publishes of
       // DIFFERENT domains never touch this key and proceed fully in parallel.
       // This lock only guards the enqueue decision; the job re-takes it for the
       // duration of the actual write (see processS3PublishJob).
+      //
+      // Keyed on the RESOLVED prefix domain: a www and a non-www session for one
+      // site used to take two different locks and could publish concurrently.
       let lock: PublishLock;
 
       try {
@@ -5620,6 +5685,9 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       }
 
       try {
+        // The job carries the resolved domain for logging, but re-resolves it
+        // from the database itself rather than trusting this value — a queued job
+        // can outlive the request that made it.
         const job = await enqueueS3PublishJob({
           session_id: request.params.id,
           domain
@@ -5725,7 +5793,16 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
               continue;
             }
 
-            send({ type: "done", message: "No publish is running." });
+            // An ERROR frame, not a `done` one. This stream is only ever opened
+            // straight after a publish POST, so reaching here means the job that
+            // POST claimed to enqueue is not in the queue — nothing published.
+            // It used to send type:"done", which the UI renders as a green
+            // success toast: a publish that never ran reported as one that did.
+            send({
+              type: "error",
+              message:
+                "Nothing was published: no publish job for this session is in the queue. It was never enqueued, or the queue was cleared. Check the worker logs and re-run the publish."
+            });
             break;
           }
 
@@ -5771,11 +5848,24 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
                 }
               | undefined;
 
+            // No upload count means the job was marked completed without
+            // recording what it wrote. Report that plainly instead of falling
+            // back to "Publish complete." — an unconfirmed publish is not a
+            // confirmed one, and the last mid-upload progress message is even
+            // worse as a completion summary.
+            if (!returned?.uploaded) {
+              send({
+                type: "error",
+                message:
+                  "The publish job finished but reported no uploaded files. Do not assume production was updated — check the worker logs for 's3 publish complete' and the publish_runs table before re-running.",
+                result: returned
+              });
+              break;
+            }
+
             send({
               type: "done",
-              message: returned?.uploaded
-                ? `Published ${returned.uploaded} file(s)`
-                : lastMessage || "Publish complete.",
+              message: `Published ${returned.uploaded} file(s)`,
               result: returned
             });
             break;

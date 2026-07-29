@@ -2059,6 +2059,16 @@ export default function ResultsDashboardPage({
                   : ""
               }`
             });
+          } else {
+            // A failed publish used to produce NO toast at all, and its message
+            // landed in the same indigo panel a successful one uses — so a
+            // publish that wrote nothing (or wrote half the files) read as
+            // benign. The panel is now red for error frames; this adds the toast
+            // so it is noticed even if the dialog is not being watched.
+            setFindReplaceToast({
+              tone: "error",
+              message: event.message ?? "Publish failed."
+            });
           }
         }
       });
@@ -4622,7 +4632,80 @@ export default function ResultsDashboardPage({
                       {publishPreview.index_filename}
                     </span>
                   </p>
+                  {/* The prefix is resolved server-side and cannot be influenced
+                      from here: an SFTP-pulled session uses the folder it was
+                      pulled from, anything else uses base_url's host with the
+                      same www/case normalization the domain-mismatch check uses.
+                      Stated rather than warned about, because the two can no
+                      longer diverge into separate production folders. */}
+                  <p className="pt-1 text-xs text-slate-500">
+                    {publishPreview.domain_source === "sftp"
+                      ? "Prefix taken from the SFTP folder these sitemaps were pulled from."
+                      : "Prefix taken from this session's base URL host (normalized — www and non-www resolve to the same prefix)."}
+                  </p>
+                  {publishPreview.public_host !== publishPreview.domain ? (
+                    <p className="break-all text-xs text-slate-500">
+                      <span className="text-slate-500">
+                        Public sitemap urls use:
+                      </span>{" "}
+                      <span className="font-mono">
+                        {publishPreview.public_host}
+                      </span>
+                    </p>
+                  ) : null}
+                  {publishPreview.base_url_host_ignored ? (
+                    <p className="break-all text-xs text-amber-700">
+                      This session&apos;s base URL host (
+                      <span className="font-mono">
+                        {publishPreview.base_url_host_ignored}
+                      </span>
+                      ) differs from its SFTP source domain. The SFTP domain
+                      decides where files are written.
+                    </p>
+                  ) : null}
                 </div>
+
+                {/* Refused, not warned: publishing without these files leaves
+                    them stale in the bucket AND drops them from the regenerated
+                    index, de-indexing live URLs. This is the ordinary state of
+                    any session published more than an hour after it completed. */}
+                {publishPreview.missing_local.length > 0 ? (
+                  <div
+                    className="space-y-1 rounded-md border border-red-200 bg-red-50 px-3 py-2"
+                    role="alert"
+                  >
+                    <p className="text-sm font-semibold text-red-800">
+                      Cannot publish:{" "}
+                      {formatNumber(publishPreview.missing_local.length)} file
+                      {publishPreview.missing_local.length === 1 ? "" : "s"} no
+                      longer{" "}
+                      {publishPreview.missing_local.length === 1 ? "has" : "have"}{" "}
+                      content on disk
+                    </p>
+                    <p className="text-xs text-red-700">
+                      Session uploads are deleted an hour after a session
+                      completes. Publishing now would leave{" "}
+                      {publishPreview.missing_local.length === 1
+                        ? "this file"
+                        : "these files"}{" "}
+                      stale in the bucket and drop{" "}
+                      {publishPreview.missing_local.length === 1 ? "it" : "them"}{" "}
+                      from the new index. Re-upload or re-pull this domain, then
+                      publish.
+                    </p>
+                    <ul className="max-h-[120px] overflow-y-auto pt-1">
+                      {publishPreview.missing_local.map((filename) => (
+                        <li
+                          key={filename}
+                          className="truncate font-mono text-xs text-red-800"
+                          title={filename}
+                        >
+                          {filename}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
 
                 <p className="rounded-md bg-indigo-50 px-3 py-2 text-sm font-medium text-indigo-800">
                   Overwriting {formatNumber(publishPreview.file_count)} sitemap
@@ -4701,9 +4784,25 @@ export default function ResultsDashboardPage({
               </div>
             ) : null}
 
+            {/* Tone follows the frame type. An error frame used to render in the
+                same indigo panel as progress and success, so "nothing was
+                published" looked identical to "published 1,600 files". */}
             {publishProgress ? (
-              <div className="space-y-2 rounded-md border border-indigo-100 bg-indigo-50 px-3 py-2">
-                <p className="flex items-center gap-2 text-sm font-medium text-indigo-900">
+              <div
+                className={`space-y-2 rounded-md border px-3 py-2 ${
+                  publishProgress.type === "error"
+                    ? "border-red-200 bg-red-50"
+                    : "border-indigo-100 bg-indigo-50"
+                }`}
+                role={publishProgress.type === "error" ? "alert" : undefined}
+              >
+                <p
+                  className={`flex items-center gap-2 text-sm font-medium ${
+                    publishProgress.type === "error"
+                      ? "text-red-800"
+                      : "text-indigo-900"
+                  }`}
+                >
                   {publishProgress.type === "progress" ? (
                     <Loader2 className="h-4 w-4 animate-spin" />
                   ) : null}
@@ -4770,7 +4869,10 @@ export default function ResultsDashboardPage({
                   publishLoading ||
                   publishProgress?.type === "done" ||
                   !publishPreview ||
-                  publishPreview.file_count === 0
+                  publishPreview.file_count === 0 ||
+                  // The backend refuses this case too; disabling here means the
+                  // user gets the reason instead of a rejected job.
+                  publishPreview.missing_local.length > 0
                 }
                 onClick={() => void handlePublish()}
               >
