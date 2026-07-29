@@ -12,7 +12,7 @@ import { ZipArchive } from "archiver";
 import { config, sftpConfigError } from "../config.js";
 import {
   assertSafeDomain,
-  downloadSftpFile,
+  downloadSftpFiles,
   listSftpSitemapFiles
 } from "../sftp/sftpClient.js";
 import {
@@ -20,6 +20,7 @@ import {
   type CleanerInputFile,
   type CleanerOutputFile
 } from "../sitemaps/cleaner.js";
+import { StageTimer } from "../sitemaps/stageTimer.js";
 
 // The Sitemap Cleaner is stateless — nothing is written to the DB. Uploads and
 // generated files ARE spilled to disk (a per-run working directory under the
@@ -134,9 +135,14 @@ async function cleanPackageAndFinish(options: {
   outDir: string;
   send: (payload: unknown) => void;
   log: FastifyInstance["log"];
+  // Carried in from the caller so the pull/upload stage that ran BEFORE this
+  // function is included in the breakdown. A run that spends 24 of 25 minutes
+  // pulling would otherwise look instant here.
+  timer?: StageTimer;
 }): Promise<boolean> {
   const { inputFiles, domain, subfolder, runDir, inDir, outDir, send, log } =
     options;
+  const timer = options.timer ?? new StageTimer();
 
   try {
     const today = new Date().toISOString().slice(0, 10);
@@ -146,12 +152,16 @@ async function cleanPackageAndFinish(options: {
       subfolder: subfolder || "sitemaps",
       today,
       outDir,
-      onProgress: (event) => send({ type: "progress", ...event })
+      onProgress: (event) => {
+        timer.mark(event.stage);
+        send({ type: "progress", ...event });
+      }
     });
 
     // Inputs are no longer needed — free the disk they occupy.
     await rm(inDir, { recursive: true, force: true });
 
+    timer.mark("zip");
     send({ type: "progress", stage: "zip", message: "Packaging ZIP…" });
 
     const zipFilename = `cleaned-sitemaps-${today}.zip`;
@@ -169,6 +179,27 @@ async function cleanPackageAndFinish(options: {
       domain,
       files
     });
+
+    timer.mark("done");
+    const timing = timer.finish();
+    const dominant = StageTimer.dominant(timing.stage_ms);
+
+    // The line that makes "which stage was slow?" readable instead of a
+    // reproduction exercise. Leads with the dominant stage on purpose.
+    log.info(
+      {
+        domain,
+        files: inputFiles.length,
+        total_urls_kept_files: result.total_urls_kept_files,
+        clean_urls_remaining: result.clean_urls_remaining,
+        total_ms: timing.total_ms,
+        dominant_stage: dominant?.stage,
+        dominant_stage_ms: dominant?.ms,
+        stage_ms: timing.stage_ms,
+        ms_per_file: Number((timing.total_ms / inputFiles.length).toFixed(1))
+      },
+      "cleaner run timing"
+    );
 
     send({
       type: "done",
@@ -696,6 +727,11 @@ export async function cleanerRoutes(app: FastifyInstance) {
       try {
         // Total is known before the download loop, so every frame carries
         // current/total — same contract as the Migration pull progress.
+        // Started BEFORE the listing so the pull stage covers the SSH round
+        // trips too, not just the transfers.
+        const timer = new StageTimer();
+
+        timer.mark("pull");
         const remoteFiles = await listSftpSitemapFiles(sftpDomain);
         const total = remoteFiles.length;
 
@@ -716,38 +752,50 @@ export async function cleanerRoutes(app: FastifyInstance) {
           return;
         }
 
+        // Downloaded with bounded parallelism (SFTP_MAX_CONCURRENT_CONNECTIONS)
+        // rather than one at a time. Each download is its own SSH connect +
+        // fastGet + end, so a sequential loop paid a full round trip per file and
+        // left most of the connection pool idle — measured as the overwhelming
+        // majority of a 2,264-file run.
         const inputFiles: CleanerInputFile[] = [];
-        let index = 0;
-
-        for (const remote of remoteFiles) {
-          index += 1;
-          const localPath = path.join(inDir, path.basename(remote.name));
-
-          try {
-            await downloadSftpFile(sftpDomain, remote.name, localPath);
-            inputFiles.push({ filename: remote.name, path: localPath });
-            send({
-              type: "progress",
-              stage: "pull",
-              current: index,
-              total,
-              message: `Pulled ${remote.name} (${index} of ${total})`
-            });
-          } catch (error) {
-            // Don't leave a truncated download to be parsed as a real sitemap.
-            await rm(localPath, { force: true }).catch(() => undefined);
-            request.log.error(
-              { domain: sftpDomain, file: remote.name, error },
-              "cleaner sftp pull: file failed"
-            );
-            send({
-              type: "progress",
-              stage: "pull",
-              current: index,
-              total,
-              message: `Failed ${remote.name} (${index} of ${total})`
-            });
+        const outcomes = await downloadSftpFiles(
+          sftpDomain,
+          remoteFiles.map((remote) => ({
+            name: remote.name,
+            localPath: path.join(inDir, path.basename(remote.name))
+          })),
+          {
+            onSettled: (outcome, completed) => {
+              timer.mark("pull");
+              send({
+                type: "progress",
+                stage: "pull",
+                current: completed,
+                total,
+                message: outcome.ok
+                  ? `Pulled ${outcome.name} (${completed} of ${total})`
+                  : `Failed ${outcome.name} (${completed} of ${total})`
+              });
+            }
           }
+        );
+
+        for (const outcome of outcomes) {
+          if (outcome.ok) {
+            // Order follows the remote listing, not completion order: the
+            // outcomes array is index-aligned with the input, so the cleaner
+            // still sees files in a stable order regardless of which download
+            // finished first.
+            inputFiles.push({ filename: outcome.name, path: outcome.localPath });
+            continue;
+          }
+
+          // Don't leave a truncated download to be parsed as a real sitemap.
+          await rm(outcome.localPath, { force: true }).catch(() => undefined);
+          request.log.error(
+            { domain: sftpDomain, file: outcome.name, error: outcome.error },
+            "cleaner sftp pull: file failed"
+          );
         }
 
         if (inputFiles.length === 0) {
@@ -767,7 +815,8 @@ export async function cleanerRoutes(app: FastifyInstance) {
           inDir,
           outDir,
           send,
-          log: request.log
+          log: request.log,
+          timer
         });
       } catch (error) {
         request.log.error({ error }, "cleaner sftp process failed");

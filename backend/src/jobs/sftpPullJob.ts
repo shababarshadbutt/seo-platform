@@ -7,7 +7,7 @@ import type { FastifyBaseLogger } from "fastify";
 import { config } from "../config.js";
 import { pool } from "../db/pool.js";
 import {
-  downloadSftpFile,
+  downloadSftpFiles,
   listSftpSitemapFiles
 } from "../sftp/sftpClient.js";
 import { buildStoredUploadFilename } from "../sitemaps/filenames.js";
@@ -61,55 +61,72 @@ export async function processSftpPullJob(
 
   let stored = 0;
   let failed = 0;
-  let index = 0;
 
-  for (const remote of remoteFiles) {
-    index += 1;
+  // Downloaded with bounded parallelism (SFTP_MAX_CONCURRENT_CONNECTIONS) rather
+  // than one file at a time. Every download is its own SSH connect + fastGet +
+  // end, so the sequential loop this replaces paid a full round trip per file and
+  // left most of the connection pool idle. At 1,000+ files the pull dominated the
+  // whole run.
+  //
+  // The DB row + parse job stay sequential, in listing order, after the transfers
+  // settle: createStoredSitemapFile enqueues parse work and writes rows, and
+  // interleaving those with the downloads would trade a well-understood
+  // bottleneck for concurrent writes that nothing here needs.
+  const targets = remoteFiles.map((remote) => {
     const storedFilename = buildStoredUploadFilename(
       sessionId,
       remote.name,
       "current"
     );
-    const localPath = path.join(config.uploadDir, storedFilename);
 
-    try {
-      await downloadSftpFile(domain, remote.name, localPath);
-      // Identical to the upload path from here on — row + parse job.
-      // remote.name is the true filename on the SFTP server — recorded so
-      // publishing writes back under exactly that name (migration 031).
-      await createStoredSitemapFile(
-        sessionId,
-        storedFilename,
-        "current",
-        remote.name
-      );
-      stored += 1;
+    return {
+      name: remote.name,
+      storedFilename,
+      localPath: path.join(config.uploadDir, storedFilename)
+    };
+  });
+
+  const outcomes = await downloadSftpFiles(domain, targets, {
+    onSettled: async (outcome, completed) => {
       // Awaited, not fire-and-forget: unordered progress writes let a late frame
       // land after the terminal one and clobber it — a defect already found and
       // fixed on the publish path, so it is not repeated here.
       await job?.updateProgress({
         stage: "pull",
-        current: index,
+        current: completed,
         total,
-        message: `Pulled ${remote.name} (${index} of ${total})`
-      });
-    } catch (error) {
-      failed += 1;
-      // Don't leave a truncated download behind to be parsed as a real sitemap.
-      await unlink(localPath).catch(() => undefined);
-      logger.error(
-        { session_id: sessionId, domain, file: remote.name, error },
-        "sftp pull: file failed"
-      );
-      // A failed file still advances the counter, otherwise the bar stalls and
-      // the totals stop adding up.
-      await job?.updateProgress({
-        stage: "pull",
-        current: index,
-        total,
-        message: `Failed ${remote.name} (${index} of ${total})`
+        message: outcome.ok
+          ? `Pulled ${outcome.name} (${completed} of ${total})`
+          : `Failed ${outcome.name} (${completed} of ${total})`
       });
     }
+  });
+
+  for (const [index, outcome] of outcomes.entries()) {
+    if (!outcome.ok) {
+      failed += 1;
+      // Don't leave a truncated download behind to be parsed as a real sitemap.
+      await unlink(outcome.localPath).catch(() => undefined);
+      logger.error(
+        { session_id: sessionId, domain, file: outcome.name, error: outcome.error },
+        "sftp pull: file failed"
+      );
+      continue;
+    }
+
+    // Identical to the upload path from here on — row + parse job.
+    // outcome.name is the true filename on the SFTP server — recorded so
+    // publishing writes back under exactly that name (migration 031).
+    await createStoredSitemapFile(
+      sessionId,
+      // Carried through from the target rather than recovered from the path with
+      // basename(): downloadSftpFiles returns outcomes index-aligned with its
+      // input, so the stored name is knowable exactly.
+      targets[index].storedFilename,
+      "current",
+      outcome.name
+    );
+    stored += 1;
   }
 
   // Mirrors what the upload flow does once every file has landed.

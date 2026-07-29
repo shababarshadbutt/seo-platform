@@ -191,3 +191,96 @@ export async function downloadSftpFile(
     await client.fastGet(remotePath, localPath);
   });
 }
+
+export type SftpDownloadOutcome = {
+  name: string;
+  localPath: string;
+  ok: boolean;
+  error?: unknown;
+};
+
+// Download many files with BOUNDED PARALLELISM.
+//
+// Both callers (the Cleaner's SFTP source and the Migration SFTP pull) used to
+// await one downloadSftpFile at a time. Because every download is its own SSH
+// connect + fastGet + end, a sequential loop pays a full round trip per file and
+// leaves the connection pool almost entirely idle — measured at 2,264 files, the
+// pull was the overwhelming majority of a ~19 minute run while 3 of 4 pool slots
+// sat unused.
+//
+// Concurrency is capped at SFTP_MAX_CONCURRENT_CONNECTIONS, the same limit the
+// pool semaphore enforces, and deliberately NOT higher: this is a shared VM and
+// a shared Transfer Family endpoint.
+//
+// It is also capped at exactly that number rather than launching every download
+// at once and letting the semaphore queue them. The semaphore is global and FIFO,
+// so a run that queues 2,000 waiters would push every other user's request behind
+// all of them. Keeping only `limit` in flight per run means a second user's pull
+// interleaves after at most `limit` completions instead of waiting out the whole
+// batch.
+//
+// A failed file does not abort the batch — it is reported in its outcome and the
+// caller decides, exactly as the sequential loops did.
+export async function downloadSftpFiles(
+  domain: string,
+  files: { name: string; localPath: string }[],
+  options: {
+    // Awaited, not fire-and-forget: unordered progress writes let a late frame
+    // land after the terminal one and clobber it. Same discipline as the publish
+    // path, where that defect was already found once.
+    onSettled?: (
+      outcome: SftpDownloadOutcome,
+      completed: number,
+      total: number
+    ) => void | Promise<void>;
+  } = {}
+): Promise<SftpDownloadOutcome[]> {
+  assertSafeDomain(domain);
+
+  const total = files.length;
+  const outcomes: SftpDownloadOutcome[] = new Array(total);
+  let nextIndex = 0;
+  let completed = 0;
+
+  const concurrency = Math.max(
+    1,
+    Math.min(config.sftp.maxConcurrentConnections, total)
+  );
+
+  async function worker() {
+    for (;;) {
+      const index = nextIndex;
+
+      if (index >= total) {
+        return;
+      }
+
+      nextIndex += 1;
+      const file = files[index];
+
+      try {
+        await downloadSftpFile(domain, file.name, file.localPath);
+        outcomes[index] = { name: file.name, localPath: file.localPath, ok: true };
+      } catch (error) {
+        outcomes[index] = {
+          name: file.name,
+          localPath: file.localPath,
+          ok: false,
+          error
+        };
+      }
+
+      // Completion COUNT, not the file's index: with parallel workers the
+      // indexes finish out of order, and a progress bar driven by them would
+      // jump around and go backwards.
+      completed += 1;
+      await options.onSettled?.(outcomes[index], completed, total);
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: concurrency }, () => worker())
+  );
+
+  return outcomes;
+}
