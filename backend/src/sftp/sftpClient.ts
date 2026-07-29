@@ -101,23 +101,91 @@ async function authOptions(): Promise<{ privateKey?: Buffer; password?: string }
 // Run `work` against a connected SFTP client, holding one pool slot for exactly
 // the duration of the operation. The slot and the connection are both released
 // in a finally, including on throw.
+// How long a disconnect is allowed to take before we stop waiting for it. Much
+// shorter than an operation timeout: there is nothing left to accomplish, and the
+// only reason to wait at all is politeness to the remote.
+const SFTP_DISCONNECT_TIMEOUT_MS = 5000;
+
+// Reject if `promise` has not settled in `ms`. Used to bound every SFTP operation.
+//
+// Note this does NOT cancel the underlying work — ssh2 offers no cancellation —
+// it stops us WAITING on it. That distinction is the whole value here: the pool
+// slot is freed even when the socket underneath is wedged, so one bad connection
+// degrades one transfer instead of the entire endpoint for every user.
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} timed out after ${ms}ms`)),
+          ms
+        );
+        timer.unref?.();
+      })
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 async function withSftp<T>(work: (client: SftpClient) => Promise<T>): Promise<T> {
   const release = await semaphore.acquire();
   const client = new SftpClient();
 
   try {
-    await client.connect({
-      host: config.sftp.host,
-      port: config.sftp.port,
-      username: config.sftp.username,
-      ...(await authOptions())
+    // Both the connect AND the operation are bounded. Either can hang on a
+    // half-open socket, and an unbounded await here held a pool slot forever —
+    // measured: two wedged transfers left the pool at 0 of 2 available for
+    // minutes, blocking every other user of the shared endpoint.
+    await withTimeout(
+      client.connect({
+        host: config.sftp.host,
+        port: config.sftp.port,
+        username: config.sftp.username,
+        ...(await authOptions())
+      }),
+      config.sftp.operationTimeoutMs,
+      "SFTP connect"
+    );
+
+    return await withTimeout(
+      work(client),
+      config.sftp.operationTimeoutMs,
+      "SFTP operation"
+    );
+  } finally {
+    // end() can throw OR HANG if the socket already died. It used to be awaited
+    // unbounded, directly in front of release() — so a hanging disconnect leaked
+    // the slot just as surely as a hanging transfer. Bounded, and its failure
+    // cannot skip the release below.
+    await withTimeout(
+      client.end(),
+      SFTP_DISCONNECT_TIMEOUT_MS,
+      "SFTP disconnect"
+    ).catch(() => {
+      // A disconnect we gave up on may leave the socket open. Tear it down
+      // explicitly rather than leaking a file descriptor for the process's life;
+      // guarded because it reaches past the wrapper to the underlying ssh2
+      // client, which is not part of its public contract.
+      try {
+        (
+          client as unknown as { client?: { destroy?: () => void } }
+        ).client?.destroy?.();
+      } catch {
+        // Nothing further to try; the slot release below is what matters.
+      }
     });
 
-    return await work(client);
-  } finally {
-    // end() can throw if the socket already died; that must not mask the real
-    // error or skip the semaphore release.
-    await client.end().catch(() => undefined);
+    // ALWAYS. Every path above is bounded and swallowed precisely so this runs.
     release();
   }
 }
@@ -233,6 +301,15 @@ export async function downloadSftpFiles(
       completed: number,
       total: number
     ) => void | Promise<void>;
+    // Stops the batch between files. Checked BEFORE starting each transfer, so an
+    // aborted batch releases its connection-pool slot as soon as the in-flight
+    // transfer finishes rather than at the end of the whole run — which is the
+    // point: a slot held by an abandoned run starves every other user.
+    //
+    // Not aborted mid-transfer on purpose: ssh2's fastGet has no cancellation, and
+    // tearing the socket down would leave a truncated file on disk that looks like
+    // a real sitemap. One file's worth of delay is a fair price for that.
+    signal?: AbortSignal;
   } = {}
 ): Promise<SftpDownloadOutcome[]> {
   assertSafeDomain(domain);
@@ -252,6 +329,12 @@ export async function downloadSftpFiles(
       const index = nextIndex;
 
       if (index >= total) {
+        return;
+      }
+
+      // Checked here, not just once up front: an abort that lands mid-batch must
+      // stop the REMAINING files, and every worker has to see it.
+      if (options.signal?.aborted) {
         return;
       }
 
@@ -281,6 +364,21 @@ export async function downloadSftpFiles(
   await Promise.all(
     Array.from({ length: concurrency }, () => worker())
   );
+
+  // An abort leaves holes: files the workers never reached. Fill them in as
+  // explicit failures rather than returning a sparse array — every caller
+  // index-aligns against its input, and a hole would surface as a crash on
+  // `outcome.ok` instead of a file that simply did not get downloaded.
+  for (let index = 0; index < total; index += 1) {
+    if (!outcomes[index]) {
+      outcomes[index] = {
+        name: files[index].name,
+        localPath: files[index].localPath,
+        ok: false,
+        error: new Error("SFTP download batch was aborted before this file")
+      };
+    }
+  }
 
   return outcomes;
 }

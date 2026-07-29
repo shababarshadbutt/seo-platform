@@ -13,6 +13,7 @@ import { runMigrations } from "./db/migrate.js";
 import { fsErrorResponse } from "./errors/fsErrors.js";
 import { sessionRoutes } from "./routes/sessions.js";
 import { cleanerRoutes } from "./routes/cleaner.js";
+import { startAbandonedRunWatchdog } from "./sitemaps/cleanerRuns.js";
 
 const app = Fastify({
   logger: true
@@ -91,6 +92,16 @@ app.get("/", async () => ({
 async function start() {
   try {
     await runMigrations(app.log);
+    // Reaps Cleaner runs nobody is watching any more, releasing the SFTP
+    // connection slots they hold. A client disconnect no longer stops a run — see
+    // sitemaps/cleanerRuns.ts — so this is what keeps "runs on without a viewer"
+    // from meaning "forever" on a shared endpoint.
+    startAbandonedRunWatchdog((runIds) => {
+      app.log.warn(
+        { run_ids: runIds, count: runIds.length },
+        "stopped cleaner run(s) left unwatched past the abandon grace period; SFTP slots released"
+      );
+    });
     await app.listen({
       port: config.port,
       host: "0.0.0.0"

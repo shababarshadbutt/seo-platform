@@ -114,6 +114,34 @@ export const config = {
     60 *
     1000,
 
+  // How long a Cleaner run with NOBODY WATCHING keeps going before it is treated
+  // as abandoned, aborted, and its SFTP connection slots released.
+  //
+  // A client disconnect no longer kills the run — that is the point of the
+  // reconnect support — but "runs forever unwatched" is not an acceptable
+  // alternative on a shared VM: each in-flight transfer holds one of
+  // SFTP_MAX_CONCURRENT_CONNECTIONS, and a forgotten run measurably halved
+  // throughput for everyone else (found while benchmarking the 2,264-file pull).
+  //
+  // 5 minutes is the default: comfortably longer than a tab reload, a network
+  // blip, or a laptop lid closing for a moment — the SSE stream heartbeats every
+  // poll, so a live viewer refreshes this constantly — but short enough that a
+  // closed tab frees its slots inside one coffee break rather than holding them
+  // for the run's full duration.
+  //
+  // Applies to the CLEANER only, deliberately. An abandoned Cleaner run produces
+  // nothing: its output lives in a process-local cache behind a token the user
+  // has to claim. A Migration SFTP pull is the opposite — the files land in a
+  // durable session the user will come back to — so it is left to finish.
+  cleanerAbandonGraceMs:
+    readNumber("CLEANER_ABANDON_GRACE_MINUTES", {
+      fallback: 5,
+      min: 1,
+      max: 120
+    }) *
+    60 *
+    1000,
+
   // ---- Phase 1: master feature flag -------------------------------------
   // Gates the two capabilities that have NEVER completed a round trip against
   // real AWS: the SFTP pull source and publishing to S3/CloudFront. Everything
@@ -146,7 +174,24 @@ export const config = {
       fallback: 4,
       min: 1,
       max: 32
-    })
+    }),
+    // Hard ceiling on a single SFTP connect / transfer / disconnect.
+    //
+    // There was NO timeout here, and it is a slot leak with teeth: every
+    // operation holds one of maxConcurrentConnections for its duration, and
+    // ssh2's connect and fastGet can both hang indefinitely on a half-open
+    // socket. Observed directly — after a run was stopped, two ESTABLISHED
+    // sockets to the SFTP endpoint stayed open and the pool sat at 0 of 2
+    // available for minutes, so no other user could pull anything at all.
+    //
+    // 120s is generous for one file (a 50 MB sitemap over a slow link) while
+    // still bounded. Clamped to 10..3600.
+    operationTimeoutMs:
+      readNumber("SFTP_OPERATION_TIMEOUT_SECONDS", {
+        fallback: 120,
+        min: 10,
+        max: 3600
+      }) * 1000
   },
 
   // ---- Phase 1: S3 publish (IAM instance role — never access keys) ------

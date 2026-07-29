@@ -50,3 +50,27 @@ variable. Restart the backend between runs and let each finish: an abandoned run
 keeps downloading server-side after its client disconnects and will silently
 share the connection pool with the next one, splitting the throughput and
 corrupting both numbers.
+
+## Disconnect / reconnect / abandonment
+
+`cleaner-reconnect.mjs` and `cleaner-abandon.mjs` verify the two halves of the
+detached-run behaviour (`sitemaps/cleanerRuns.ts`). Both drive the real endpoints
+against a real SFTP source — this behaviour cannot be typechecked, and both scripts
+caught genuine bugs that compiled fine.
+
+```sh
+# reconnect: kill the client mid-transfer, confirm the run continues and a
+# reconnect sees live progress and the download token
+node backend/bench/cleaner-reconnect.mjs
+
+# abandonment: kill the client and DO NOT reconnect; confirm the run is stopped
+# after the grace period and the SFTP slot is actually released.
+# Needs a corpus big enough that the pull outlives the grace window — 500 files
+# at ~2.5 files/s is ~200s against a 60s grace. Run the backend with
+# CLEANER_ABANDON_GRACE_MINUTES=1 (the configurable floor) so this takes a minute
+# rather than five.
+node backend/bench/cleaner-abandon.mjs <sftp-domain-folder>
+```
+
+Watch `pool.available` from `GET /api/sftp/domains` — that is the number the whole
+change is about. A stopped run must return it to `limit`.

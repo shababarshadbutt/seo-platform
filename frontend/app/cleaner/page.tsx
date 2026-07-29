@@ -108,6 +108,10 @@ export default function CleanerPage() {
   const [files, setFiles] = useState<File[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
+  // True while a dropped SFTP-clean stream is being reattached. Distinct from
+  // `phase`: the run is still processing, only our view of it lapsed, so this
+  // must not read as an error state.
+  const [reconnecting, setReconnecting] = useState(false);
   const [progressMessage, setProgressMessage] = useState("");
   const [progress, setProgress] = useState<{ current: number; total: number } | null>(
     null
@@ -184,6 +188,7 @@ export default function CleanerPage() {
     setError("");
     setProgress(null);
     setProgressMessage("");
+    setReconnecting(false);
   }
 
   async function handleClean() {
@@ -208,11 +213,20 @@ export default function CleanerPage() {
           (event: CleanerProgressEvent) => {
             if (event.type === "progress") {
               setProgressMessage(event.message);
+              setReconnecting(false);
               setProgress(
                 typeof event.current === "number" &&
                   typeof event.total === "number"
                   ? { current: event.current, total: event.total }
                   : null
+              );
+            } else if (event.type === "reconnecting") {
+              // A dropped stream is NOT a failure: the run is independent of the
+              // connection and is still going. Say so, keep the last known
+              // progress on screen, and stay in the processing phase.
+              setReconnecting(true);
+              setProgressMessage(
+                `Connection lost — reconnecting to the run (attempt ${event.attempt} of ${event.max_attempts})…`
               );
             }
           }
@@ -221,8 +235,10 @@ export default function CleanerPage() {
         setSummary(done.summary);
         setDownloadToken(done.download_token);
         setZipFilename(done.zip_filename);
+        setReconnecting(false);
         setPhase("done");
       } catch (sftpRunError) {
+        setReconnecting(false);
         setError(
           friendlyApiErrorMessage(sftpRunError, "Cleaning from SFTP failed.")
         );
@@ -621,10 +637,26 @@ export default function CleanerPage() {
         {phase === "processing" ? (
           <Card className="mb-4">
             <CardContent className="space-y-2 py-4">
-              <p className="flex items-center gap-2 text-sm font-medium text-slate-700">
+              <p
+                className={`flex items-center gap-2 text-sm font-medium ${
+                  reconnecting ? "text-amber-700" : "text-slate-700"
+                }`}
+                data-testid={
+                  reconnecting ? "cleaner-reconnecting" : "cleaner-progress"
+                }
+              >
                 <Loader2 className="h-4 w-4 animate-spin" />
                 {progressMessage || "Processing…"}
               </p>
+              {/* Amber, not red, and the spinner keeps turning: the run is still
+                  going on the server, only our view of it lapsed. */}
+              {reconnecting ? (
+                <p className="text-xs text-amber-700">
+                  The cleaning run is still going on the server. Your progress
+                  view dropped out and is being reattached — you do not need to
+                  start again.
+                </p>
+              ) : null}
               {progressPercent !== null ? (
                 <Progress value={progressPercent} />
               ) : null}

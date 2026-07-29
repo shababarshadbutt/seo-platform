@@ -1822,7 +1822,15 @@ export type CleanerProgressEvent =
       download_token: string;
       zip_filename: string;
     }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  // First frame of any run stream: the id needed to reconnect to it. Emitted
+  // before any work frame so a connection lost one second in is still
+  // recoverable.
+  | { type: "started"; run_id: string; domain: string }
+  // Synthesised CLIENT-side, never sent by the server: the stream dropped and we
+  // are going back for the same run. The UI shows this instead of a failure,
+  // because the run is still going — that distinction is the whole point.
+  | { type: "reconnecting"; attempt: number; max_attempts: number };
 
 export type CleanerDone = {
   summary: CleanerSummary;
@@ -1851,24 +1859,130 @@ export async function processCleaner(
 // Same clean, pulled from SFTP instead of uploaded. Streams the identical SSE
 // shape (including a `done` frame with a download_token), so the whole consumer
 // below — and the Cleaner→Migration handoff that follows it — is reused as-is.
+// How many times a dropped SFTP-clean stream is reattached before giving up, and
+// how long between attempts. The server keeps the run alive for
+// CLEANER_ABANDON_GRACE_MINUTES (5 by default) with nobody watching, so the retry
+// budget below — 10 attempts, 3s apart, ~30s — sits comfortably inside it: a
+// transient blip reconnects long before the run could be reaped, and a client
+// that has genuinely gone away stops retrying long before then too.
+const CLEANER_RECONNECT_ATTEMPTS = 10;
+const CLEANER_RECONNECT_DELAY_MS = 3000;
+
+// Run the SFTP clean, surviving a dropped connection.
+//
+// The server-side run is independent of any single request, so losing the stream
+// is not losing the work. On a drop this reattaches to the SAME run by id and
+// keeps reporting progress; the caller sees `reconnecting` frames rather than an
+// error. It only fails when the run is genuinely unreachable — a 404 (stopped or
+// collected) or the retry budget running out.
 export async function processCleanerFromSftp(
   input: { domain: string; siteUrl?: string; subfolder?: string },
   onEvent: (event: CleanerProgressEvent) => void,
   signal?: AbortSignal
 ): Promise<CleanerDone> {
-  return consumeCleanerRun(
-    await fetch(backendUrl("/api/cleaner/process-sftp"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        domain: input.domain,
-        site_url: input.siteUrl,
-        subfolder: input.subfolder
+  let runId: string | null = null;
+
+  // Captured on the way past so a reconnect knows where to go, while still
+  // forwarding every frame to the caller untouched.
+  const observe = (event: CleanerProgressEvent) => {
+    if (event.type === "started") {
+      runId = event.run_id;
+    }
+
+    onEvent(event);
+  };
+
+  try {
+    return await consumeCleanerRun(
+      await fetch(backendUrl("/api/cleaner/process-sftp"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          domain: input.domain,
+          site_url: input.siteUrl,
+          subfolder: input.subfolder
+        }),
+        signal
       }),
-      signal
-    }),
-    onEvent
+      observe
+    );
+  } catch (error) {
+    // Without a run id there is nothing to reconnect TO — the request never got
+    // far enough to start one, so this is a real failure (bad domain, 503, …).
+    if (!runId || !isReconnectableStreamError(error)) {
+      throw error;
+    }
+  }
+
+  for (let attempt = 1; attempt <= CLEANER_RECONNECT_ATTEMPTS; attempt += 1) {
+    if (signal?.aborted) {
+      throw new ApiError("Cleaning was cancelled", 0, null);
+    }
+
+    observe({
+      type: "reconnecting",
+      attempt,
+      max_attempts: CLEANER_RECONNECT_ATTEMPTS
+    });
+
+    await new Promise((resolve) =>
+      setTimeout(resolve, CLEANER_RECONNECT_DELAY_MS)
+    );
+
+    let response: Response;
+
+    try {
+      response = await fetch(
+        backendUrl(`/api/cleaner/runs/${encodeURIComponent(runId)}/progress`),
+        { signal }
+      );
+    } catch {
+      // Backend unreachable for the moment; that is what the retries are for.
+      continue;
+    }
+
+    // 404 means the run is genuinely gone — stopped after being left unwatched,
+    // or already collected. Retrying cannot help, so surface it.
+    if (response.status === 404) {
+      const payload = (await response.json().catch(() => null)) as
+        | { message?: string }
+        | null;
+
+      throw new ApiError(
+        payload?.message ??
+          "That cleaning run is no longer available.",
+        404,
+        payload
+      );
+    }
+
+    try {
+      return await consumeCleanerRun(response, observe);
+    } catch (error) {
+      if (!isReconnectableStreamError(error)) {
+        throw error;
+      }
+      // Dropped again — keep trying while the budget lasts.
+    }
+  }
+
+  throw new ApiError(
+    "Lost the connection to this cleaning run and could not get back to it. It may still be running — reload to check.",
+    0,
+    { code: "reconnect_exhausted" }
   );
+}
+
+// A dropped stream, as opposed to a real refusal. Only the former is worth
+// reconnecting for; a 400/503 will fail identically every time.
+function isReconnectableStreamError(error: unknown): boolean {
+  if (error instanceof ApiError) {
+    const payload = error.payload as { code?: string } | null;
+
+    return payload?.code === "stream_closed" || error.status === 0;
+  }
+
+  return error instanceof TypeError;
 }
 
 async function consumeCleanerRun(

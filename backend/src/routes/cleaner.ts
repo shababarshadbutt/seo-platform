@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import type { ServerResponse } from "node:http";
 
 import AdmZip from "adm-zip";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { ZipArchive } from "archiver";
 
 import { config, sftpConfigError } from "../config.js";
@@ -21,6 +21,16 @@ import {
   type CleanerOutputFile
 } from "../sitemaps/cleaner.js";
 import { StageTimer } from "../sitemaps/stageTimer.js";
+import {
+  createRun,
+  finishRun,
+  getRun,
+  publishFrame,
+  subscribeRun,
+  touchRun,
+  type LiveRun,
+  type RunFrame
+} from "../sitemaps/cleanerRuns.js";
 
 // The Sitemap Cleaner is stateless — nothing is written to the DB. Uploads and
 // generated files ARE spilled to disk (a per-run working directory under the
@@ -133,12 +143,19 @@ async function cleanPackageAndFinish(options: {
   runDir: string;
   inDir: string;
   outDir: string;
-  send: (payload: unknown) => void;
+  // RunFrame-shaped rather than `unknown`: both callers emit progress frames and
+  // the detached path fans them out to run subscribers, which need the `type`.
+  send: (frame: RunFrame) => void;
   log: FastifyInstance["log"];
   // Carried in from the caller so the pull/upload stage that ran BEFORE this
   // function is included in the breakdown. A run that spends 24 of 25 minutes
   // pulling would otherwise look instant here.
   timer?: StageTimer;
+  // Present for a detached (SFTP) run. Its terminal frame must be RETAINED by the
+  // run so a client reconnecting after completion still gets the download token,
+  // which a plain send() to a possibly-dead socket would lose. Absent for the
+  // upload route, which still owns its request for the whole clean.
+  runId?: string;
 }): Promise<boolean> {
   const { inputFiles, domain, subfolder, runDir, inDir, outDir, send, log } =
     options;
@@ -201,20 +218,32 @@ async function cleanPackageAndFinish(options: {
       "cleaner run timing"
     );
 
-    send({
+    const doneFrame = {
       type: "done",
       summary: result,
       download_token: token,
       zip_filename: zipFilename
-    });
+    };
+
+    if (options.runId) {
+      finishRun(options.runId, "done", doneFrame);
+    } else {
+      send(doneFrame);
+    }
 
     return true;
   } catch (error) {
     log.error({ error }, "cleaner process failed");
-    send({
+    const errorFrame = {
       type: "error",
       message: error instanceof Error ? error.message : "Cleaning failed"
-    });
+    };
+
+    if (options.runId) {
+      finishRun(options.runId, "error", errorFrame);
+    } else {
+      send(errorFrame);
+    }
 
     return false;
   }
@@ -697,145 +726,334 @@ export async function cleanerRoutes(app: FastifyInstance) {
         }
       };
 
-      reply.hijack();
-      const stream = reply.raw;
-      stream.writeHead(200, {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive",
-        "X-Accel-Buffering": "no",
-        "Access-Control-Allow-Origin":
-          (request.headers.origin as string | undefined) ?? "*"
-      });
+      // The run is created FIRST and the work below is detached from this
+      // request, which merely subscribes to it. That inversion is the fix: the
+      // clean used to run inside the hijacked request, so a client going away
+      // left the download loop running with nobody able to reach it — holding an
+      // SFTP connection slot for the rest of the run, and reading to the user as
+      // the misleading "Processing stream closed before finishing".
+      const run = createRun(runId, sftpDomain);
 
-      const send = (payload: unknown) => {
-        if (!stream.writableEnded) {
-          stream.write(`data: ${JSON.stringify(payload)}\n\n`);
-        }
-      };
+      attachRunStream({ request, reply, run });
 
-      keepalive = setInterval(() => {
-        if (!stream.writableEnded) {
-          stream.write(": keepalive\n\n");
-        }
-      }, SSE_KEEPALIVE_MS);
-      keepalive.unref?.();
-      request.raw.on("close", stopKeepalive);
+      // Frames go to the RUN, not to a socket. Every subscriber gets them, and
+      // the last one is retained so a reconnect sees current state immediately.
+      const send = (frame: RunFrame) => publishFrame(run.runId, frame);
 
       let handedOff = false;
 
-      try {
-        // Total is known before the download loop, so every frame carries
-        // current/total — same contract as the Migration pull progress.
-        // Started BEFORE the listing so the pull stage covers the SSH round
-        // trips too, not just the transfers.
-        const timer = new StageTimer();
+      // Deliberately NOT awaited: the request has already been answered with a
+      // stream. Errors become terminal frames below, so there is nothing for an
+      // unhandled rejection to carry.
+      void (async () => {
+        try {
+          // Total is known before the download loop, so every frame carries
+          // current/total — same contract as the Migration pull progress.
+          // Started BEFORE the listing so the pull stage covers the SSH round
+          // trips too, not just the transfers.
+          const timer = new StageTimer();
 
-        timer.mark("pull");
-        const remoteFiles = await listSftpSitemapFiles(sftpDomain);
-        const total = remoteFiles.length;
+          timer.mark("pull");
+          const remoteFiles = await listSftpSitemapFiles(sftpDomain);
+          const total = remoteFiles.length;
 
-        send({
-          type: "progress",
-          stage: "pull",
-          current: 0,
-          total,
-          message: `Pulling ${total} file(s) from ${sftpDomain}`
-        });
-
-        if (total === 0) {
           send({
-            type: "error",
-            message: `No sitemap files found for ${sftpDomain} on the SFTP server.`
+            type: "progress",
+            stage: "pull",
+            current: 0,
+            total,
+            message: `Pulling ${total} file(s) from ${sftpDomain}`
           });
 
-          return;
-        }
+          if (total === 0) {
+            send({
+              type: "error",
+              message: `No sitemap files found for ${sftpDomain} on the SFTP server.`
+            });
 
-        // Downloaded with bounded parallelism (SFTP_MAX_CONCURRENT_CONNECTIONS)
-        // rather than one at a time. Each download is its own SSH connect +
-        // fastGet + end, so a sequential loop paid a full round trip per file and
-        // left most of the connection pool idle — measured as the overwhelming
-        // majority of a 2,264-file run.
-        const inputFiles: CleanerInputFile[] = [];
-        const outcomes = await downloadSftpFiles(
-          sftpDomain,
-          remoteFiles.map((remote) => ({
-            name: remote.name,
-            localPath: path.join(inDir, path.basename(remote.name))
-          })),
-          {
-            onSettled: (outcome, completed) => {
-              timer.mark("pull");
-              send({
-                type: "progress",
-                stage: "pull",
-                current: completed,
-                total,
-                message: outcome.ok
-                  ? `Pulled ${outcome.name} (${completed} of ${total})`
-                  : `Failed ${outcome.name} (${completed} of ${total})`
-              });
+            return;
+          }
+
+          // Downloaded with bounded parallelism (SFTP_MAX_CONCURRENT_CONNECTIONS)
+          // rather than one at a time. Each download is its own SSH connect +
+          // fastGet + end, so a sequential loop paid a full round trip per file and
+          // left most of the connection pool idle — measured as the overwhelming
+          // majority of a 2,264-file run.
+          const inputFiles: CleanerInputFile[] = [];
+          const outcomes = await downloadSftpFiles(
+            sftpDomain,
+            remoteFiles.map((remote) => ({
+              name: remote.name,
+              localPath: path.join(inDir, path.basename(remote.name))
+            })),
+            {
+              // Abandonment stops the batch between files, so the connection
+              // slot is released instead of being held for the rest of a run
+              // nobody is waiting for. Without this the watchdog marks the run
+              // abandoned while the downloads carry on regardless — which is
+              // exactly what a live test caught.
+              signal: run.controller.signal,
+              onSettled: (outcome, completed) => {
+                timer.mark("pull");
+                send({
+                  type: "progress",
+                  stage: "pull",
+                  current: completed,
+                  total,
+                  message: outcome.ok
+                    ? `Pulled ${outcome.name} (${completed} of ${total})`
+                    : `Failed ${outcome.name} (${completed} of ${total})`
+                });
+              }
             }
-          }
-        );
-
-        for (const outcome of outcomes) {
-          if (outcome.ok) {
-            // Order follows the remote listing, not completion order: the
-            // outcomes array is index-aligned with the input, so the cleaner
-            // still sees files in a stable order regardless of which download
-            // finished first.
-            inputFiles.push({ filename: outcome.name, path: outcome.localPath });
-            continue;
-          }
-
-          // Don't leave a truncated download to be parsed as a real sitemap.
-          await rm(outcome.localPath, { force: true }).catch(() => undefined);
-          request.log.error(
-            { domain: sftpDomain, file: outcome.name, error: outcome.error },
-            "cleaner sftp pull: file failed"
           );
-        }
 
-        if (inputFiles.length === 0) {
+          for (const outcome of outcomes) {
+            if (outcome.ok) {
+              // Order follows the remote listing, not completion order: the
+              // outcomes array is index-aligned with the input, so the cleaner
+              // still sees files in a stable order regardless of which download
+              // finished first.
+              inputFiles.push({ filename: outcome.name, path: outcome.localPath });
+              continue;
+            }
+
+            // Don't leave a truncated download to be parsed as a real sitemap.
+            await rm(outcome.localPath, { force: true }).catch(() => undefined);
+            request.log.error(
+              { domain: sftpDomain, file: outcome.name, error: outcome.error },
+              "cleaner sftp pull: file failed"
+            );
+          }
+
+          if (run.controller.signal.aborted) {
+            // Reaped mid-pull. Don't spend CPU cleaning a partial set nobody is
+            // waiting for; the working directory is removed in the finally.
+            request.log.warn(
+              { run_id: run.runId, domain: sftpDomain, pulled: inputFiles.length },
+              "cleaner sftp run abandoned: aborted mid-pull, connection slots released"
+            );
+            finishRun(run.runId, "abandoned", {
+              type: "error",
+              message:
+                "This cleaning run was stopped because nothing was watching it. Start it again when you are ready."
+            });
+
+            return;
+          }
+
+          if (inputFiles.length === 0) {
+            send({
+              type: "error",
+              message: `Could not download any sitemap files for ${sftpDomain}.`
+            });
+
+            return;
+          }
+
+          handedOff = await cleanPackageAndFinish({
+            inputFiles,
+            domain: siteUrl,
+            subfolder,
+            runDir,
+            inDir,
+            outDir,
+            send,
+            log: request.log,
+            timer,
+            runId: run.runId
+          });
+        } catch (error) {
+          request.log.error(
+            { error, run_id: run.runId },
+            "cleaner sftp process failed"
+          );
           send({
             type: "error",
-            message: `Could not download any sitemap files for ${sftpDomain}.`
+            message: error instanceof Error ? error.message : "SFTP clean failed"
           });
-
-          return;
+          finishRun(run.runId, "error", {
+            type: "error",
+            message: error instanceof Error ? error.message : "SFTP clean failed"
+          });
+        } finally {
+          // The working directory goes only when the run did NOT hand its files
+          // off to the download cache. Note what is absent: nothing here touches
+          // the client's socket, because the run does not own one.
+          if (!handedOff) {
+            void rm(runDir, { recursive: true, force: true });
+          }
         }
-
-        handedOff = await cleanPackageAndFinish({
-          inputFiles,
-          domain: siteUrl,
-          subfolder,
-          runDir,
-          inDir,
-          outDir,
-          send,
-          log: request.log,
-          timer
-        });
-      } catch (error) {
-        request.log.error({ error }, "cleaner sftp process failed");
-        send({
-          type: "error",
-          message:
-            error instanceof Error ? error.message : "SFTP clean failed"
-        });
-      } finally {
-        stopKeepalive();
-
-        if (!stream.writableEnded) {
-          stream.end();
-        }
-
-        if (!handedOff) {
-          void rm(runDir, { recursive: true, force: true });
-        }
-      }
+      })();
     }
   );
+
+  // Reconnect to an in-progress (or just-finished) run.
+  //
+  // This is what makes a dropped connection a blip rather than a failure. The
+  // client keeps the run_id from the `started` frame and comes back here; the
+  // stream replays the last known progress immediately (a reconnect during a slow
+  // stage would otherwise sit blank for minutes), then streams live. A run that
+  // finished while the client was away still gets its terminal frame.
+  app.get<{ Params: { runId: string } }>(
+    "/api/cleaner/runs/:runId/progress",
+    {
+      onRequest: (request, reply, done) => {
+        request.raw.setTimeout(CLEANER_TIMEOUT_MS);
+        reply.raw.setTimeout(CLEANER_TIMEOUT_MS);
+        done();
+      }
+    },
+    async (request, reply) => {
+      const run = getRun(request.params.runId);
+
+      // Gate BEFORE hijacking — once hijacked a JSON reply is impossible. A 404
+      // is the honest answer and the client's signal to stop retrying: the run is
+      // genuinely gone (abandoned and stopped, or its retention lapsed).
+      if (!run) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message:
+            "That cleaning run is no longer available. It may have been stopped after being left unwatched, or already collected."
+        });
+      }
+
+      attachRunStream({ request, reply, run });
+    }
+  );
+
+  // Cheap non-streaming status, so a client can ask whether a run is still alive
+  // without opening a stream.
+  app.get<{ Params: { runId: string } }>(
+    "/api/cleaner/runs/:runId",
+    async (request, reply) => {
+      const run = getRun(request.params.runId);
+
+      if (!run) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "no such cleaning run" });
+      }
+
+      return {
+        run_id: run.runId,
+        domain: run.domain,
+        status: run.status,
+        started_at: new Date(run.startedAt).toISOString(),
+        watchers: run.subscribers.size,
+        last: run.lastFrame,
+        abandon_grace_seconds: Math.round(config.cleanerAbandonGraceMs / 1000)
+      };
+    }
+  );
+}
+
+// Stream one run to one client. Shared by the start endpoint and the reconnect
+// endpoint so the two cannot drift in what they emit.
+function attachRunStream(options: {
+  request: FastifyRequest;
+  reply: FastifyReply;
+  run: LiveRun;
+}) {
+  const { request, reply, run } = options;
+
+  reply.hijack();
+  const stream = reply.raw;
+  stream.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+    "Access-Control-Allow-Origin":
+      (request.headers.origin as string | undefined) ?? "*"
+  });
+
+  const send = (payload: unknown) => {
+    if (!stream.writableEnded) {
+      stream.write(`data: ${JSON.stringify(payload)}\n\n`);
+    }
+  };
+
+  let cleanedUp = false;
+  let keepalive: NodeJS.Timeout | null = null;
+
+  const cleanup = () => {
+    if (cleanedUp) {
+      return;
+    }
+
+    cleanedUp = true;
+
+    if (keepalive) {
+      clearInterval(keepalive);
+      keepalive = null;
+    }
+
+    subscription?.unsubscribe();
+  };
+
+  // The run id goes out FIRST, before any work frame, so a client that loses the
+  // connection a second later already knows what to reconnect to.
+  send({ type: "started", run_id: run.runId, domain: run.domain });
+
+  const subscription = subscribeRun(run.runId, (frame) => {
+    send(frame);
+
+    if (frame.type === "done" || frame.type === "error") {
+      cleanup();
+
+      if (!stream.writableEnded) {
+        stream.end();
+      }
+    }
+  });
+
+  if (!subscription) {
+    send({ type: "error", message: "no such cleaning run" });
+    stream.end();
+
+    return;
+  }
+
+  keepalive = setInterval(() => {
+    // `destroyed` as well as `writableEnded`: an aborted client leaves a socket
+    // that is destroyed but NOT ended, and writing to it fails asynchronously —
+    // so checking writableEnded alone would go on heartbeating a dead connection
+    // forever and the run would never look abandoned.
+    if (stream.destroyed || stream.writableEnded) {
+      cleanup();
+
+      return;
+    }
+
+    stream.write(": keepalive\n\n");
+    // Doubles as the heartbeat: a still-writable stream means somebody is still
+    // watching, which is exactly what the abandonment check asks.
+    touchRun(run.runId);
+  }, SSE_KEEPALIVE_MS);
+  keepalive.unref?.();
+
+  // A client going away unsubscribes and does NOTHING ELSE. The run continues;
+  // the watchdog decides later whether it has been unwatched long enough to stop.
+  //
+  // Bound on BOTH objects and on error: with a hijacked reply an aborted fetch was
+  // observed to fire `close` on neither reliably — verified, the subscriber
+  // lingered and the run reported watchers=1 after the client had gone. The
+  // keepalive check above is the backstop that stops correctness depending on any
+  // one of these firing.
+  request.raw.on("close", cleanup);
+  request.raw.on("aborted", cleanup);
+  request.raw.on("error", cleanup);
+  stream.on("close", cleanup);
+  stream.on("error", cleanup);
+
+  for (const frame of subscription.replay) {
+    send(frame);
+  }
+
+  // Already finished before this client arrived: the replay covered it, so close.
+  if (run.terminalFrame) {
+    cleanup();
+    stream.end();
+  }
 }
