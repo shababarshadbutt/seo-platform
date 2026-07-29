@@ -4,8 +4,14 @@ type NumberEnvOptions = {
   max?: number;
 };
 
+// Identify as a crawler, NOT as a browser. Impersonating Chrome is what broke
+// sampling behind AWS WAF: a browser UA arriving without browser TLS/header
+// fingerprints trips the Bot Control "signal: non-browser" rule, and the ALB
+// answers every request — HEAD and GET alike — with 405 + x-amzn-waf-action:
+// captcha. Verified 2026-07-29 against aerooemparts.com, industrialworld360.com
+// and acquireelectrical.com: Chrome UA -> 405 captcha, this UA -> 200/301.
 export const DEFAULT_HTTP_USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (compatible; SitemapHealthChecker/1.0)";
 
 function readNumber(name: string, options: NumberEnvOptions): number {
   const raw = process.env[name];
