@@ -391,7 +391,7 @@ export default function SessionProcessingPage({
     try {
       await cancelSession(params.id);
       setIsStopOpen(false);
-      router.push("/");
+      router.push("/migration");
     } catch (stopException) {
       setStopError(
         friendlyApiErrorMessage(stopException, "Unable to stop the analysis.")
@@ -804,7 +804,7 @@ export default function SessionProcessingPage({
                           type="button"
                           size="sm"
                           variant="outline"
-                          onClick={() => router.push("/")}
+                          onClick={() => router.push("/migration")}
                         >
                           <RotateCcw className="mr-2 h-4 w-4" />
                           Start over

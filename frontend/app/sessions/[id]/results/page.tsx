@@ -89,8 +89,11 @@ import {
   type RedirectCandidate,
   type SampledUrl,
   type SessionResponse,
+  cleanupSessionUploads,
   followPublishProgress,
   getPublishPreview,
+  getSessionStorage,
+  type SessionStorage,
   getRuntimeConfig,
   publishSession,
   type PublishPreview,
@@ -1990,6 +1993,65 @@ export default function ResultsDashboardPage({
     }
   }
 
+  // Post-publish disk reclamation. Offered after a successful publish, never
+  // performed without an explicit click — see the dialog at the bottom of this
+  // file for why the default is "keep".
+  const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [cleanupStorage, setCleanupStorage] = useState<SessionStorage | null>(
+    null
+  );
+  const [cleanupRunning, setCleanupRunning] = useState(false);
+  const [cleanupError, setCleanupError] = useState("");
+
+  async function openCleanupPrompt() {
+    setCleanupError("");
+    setCleanupStorage(null);
+
+    try {
+      const storage = await getSessionStorage(params.id);
+
+      // Nothing on disk (already reclaimed, or the safety net beat us to it) —
+      // don't show a dialog offering to free zero bytes.
+      if (storage.disk_bytes <= 0) {
+        return;
+      }
+
+      setCleanupStorage(storage);
+      setCleanupOpen(true);
+    } catch {
+      // A failed size lookup must not intrude on a successful publish; the
+      // History storage view remains available for reclaiming later.
+    }
+  }
+
+  async function handleConfirmCleanup() {
+    if (cleanupRunning) {
+      return;
+    }
+
+    setCleanupRunning(true);
+    setCleanupError("");
+
+    try {
+      const result = await cleanupSessionUploads(params.id);
+
+      setCleanupOpen(false);
+      setFindReplaceToast({
+        tone: "success",
+        message: `Freed ${formatBytes(result.freed_bytes)} from ${formatNumber(
+          result.freed_file_count
+        )} file${result.freed_file_count === 1 ? "" : "s"}. Reports and history kept.`
+      });
+      void loadResults({ silent: true });
+    } catch (nextError) {
+      setCleanupError(
+        friendlyApiErrorMessage(nextError, "Could not free this session's files.")
+      );
+    } finally {
+      setCleanupRunning(false);
+    }
+  }
+
   // The domain to publish under: the session's own base URL host, so the user
   // never types (or mistypes) a production target.
   const publishDomain = (() => {
@@ -2059,6 +2121,11 @@ export default function ResultsDashboardPage({
                   : ""
               }`
             });
+            // Offer to reclaim this session's disk space — only now that the
+            // files are safely on production, and only as an OFFER. Fully
+            // automatic deletion is what produced the silent partial publish this
+            // session already fixed, so the user has to choose it.
+            void openCleanupPrompt();
           } else {
             // A failed publish used to produce NO toast at all, and its message
             // landed in the same indigo panel a successful one uses — so a
@@ -2814,7 +2881,7 @@ export default function ResultsDashboardPage({
                   <Link href="/sessions">Go back</Link>
                 </Button>
                 <Button asChild variant="outline">
-                  <Link href="/">New Analysis</Link>
+                  <Link href="/migration">New Analysis</Link>
                 </Button>
               </div>
             </CardContent>
@@ -2845,7 +2912,7 @@ export default function ResultsDashboardPage({
                 <Link href="/sessions">Back to History</Link>
               </Button>
               <Button asChild>
-                <Link href="/">New Analysis</Link>
+                <Link href="/migration">New Analysis</Link>
               </Button>
               {hasSitemapFiles ? (
                 <Button asChild variant="outline">
@@ -3222,7 +3289,7 @@ export default function ResultsDashboardPage({
                 </CardHeader>
                 <CardContent className="flex justify-center">
                   <Button asChild>
-                    <Link href="/">Start New Analysis</Link>
+                    <Link href="/migration">Start New Analysis</Link>
                   </Button>
                 </CardContent>
               </Card>
@@ -4885,6 +4952,108 @@ export default function ResultsDashboardPage({
                   `Publish ${formatNumber(publishPreview?.file_count ?? 0)} file${
                     (publishPreview?.file_count ?? 0) === 1 ? "" : "s"
                   }`
+                )}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        {/* Post-publish disk reclamation. An OFFER, never an action: the confirm
+            button is the secondary one, "Keep files" is what Escape and the
+            backdrop resolve to, and the dialog only appears once the files are
+            safely on production. Automatic deletion an hour after analysis is
+            exactly what silently emptied a publish earlier in this session. */}
+        <Dialog
+          open={cleanupOpen}
+          onOpenChange={(open) => {
+            if (!open && !cleanupRunning) {
+              setCleanupOpen(false);
+            }
+          }}
+        >
+          <DialogContent className="sm:max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Free up disk space for this session?</DialogTitle>
+              <DialogDescription>
+                The publish finished, so this session&apos;s local sitemap files
+                are no longer needed to serve production.
+              </DialogDescription>
+            </DialogHeader>
+
+            {cleanupStorage ? (
+              <div className="space-y-3">
+                <p
+                  className="rounded-md bg-indigo-50 px-3 py-2 text-sm font-medium text-indigo-900"
+                  data-testid="cleanup-size"
+                >
+                  Frees {formatBytes(cleanupStorage.disk_bytes)} across{" "}
+                  {formatNumber(cleanupStorage.disk_file_count)} file
+                  {cleanupStorage.disk_file_count === 1 ? "" : "s"}
+                </p>
+
+                <div className="space-y-1 rounded-md border border-amber-200 bg-amber-50 px-3 py-2">
+                  <p className="text-sm font-semibold text-amber-900">
+                    This cannot be undone
+                  </p>
+                  <ul className="list-disc space-y-1 pl-5 text-xs text-amber-800">
+                    <li>
+                      <span className="font-semibold">Undo stops working</span>{" "}
+                      for this session — the original files are what an undo
+                      restores.
+                    </li>
+                    <li>
+                      Publishing this session again, or downloading its sitemaps,
+                      will need a{" "}
+                      <span className="font-semibold">fresh SFTP pull</span> of
+                      this domain.
+                    </li>
+                  </ul>
+                </div>
+
+                <p className="text-xs text-slate-500">
+                  Kept either way: this session&apos;s reports, patterns, fix
+                  history and file list. Only the sitemap file contents are
+                  deleted.
+                </p>
+              </div>
+            ) : null}
+
+            {cleanupError ? (
+              <p
+                className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700"
+                role="alert"
+              >
+                {cleanupError}
+              </p>
+            ) : null}
+
+            <DialogFooter>
+              {/* Default action: keep. Listed first and styled as the primary so
+                  a reflexive Enter/click does the safe thing. */}
+              <Button
+                type="button"
+                disabled={cleanupRunning}
+                onClick={() => setCleanupOpen(false)}
+                data-testid="cleanup-keep"
+              >
+                Keep files
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                disabled={cleanupRunning}
+                onClick={() => void handleConfirmCleanup()}
+                data-testid="cleanup-confirm"
+              >
+                {cleanupRunning ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Freeing
+                  </>
+                ) : (
+                  `Delete files, free ${formatBytes(
+                    cleanupStorage?.disk_bytes ?? 0
+                  )}`
                 )}
               </Button>
             </DialogFooter>

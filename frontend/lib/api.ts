@@ -645,6 +645,78 @@ export async function getSystemDiskUsage() {
   return readJsonResponse<SystemDiskUsage>(response);
 }
 
+// ---- Upload storage reclamation -------------------------------------------
+//
+// Sessions for large client sites reach ~10 GB on a 500 GB volume shared by 10+
+// users. Reclamation is explicit and human-confirmed: the post-publish prompt and
+// the History storage view both call cleanupSessionUploads below. Only the file
+// blobs go — the session row, its patterns and its reports stay.
+
+export type SessionStorage = {
+  session_id: string;
+  disk_bytes: number;
+  disk_file_count: number;
+  uploads_cleaned_at: string | null;
+};
+
+export async function getSessionStorage(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/storage`),
+    { cache: "no-store" }
+  );
+
+  return readJsonResponse<SessionStorage>(response);
+}
+
+export type StorageSession = {
+  id: string;
+  name: string;
+  base_url: string;
+  sftp_domain: string | null;
+  status: string;
+  created_at: string;
+  completed_at: string | null;
+  uploads_cleaned_at: string | null;
+  sitemap_file_count: number;
+  disk_bytes: number;
+  disk_file_count: number;
+};
+
+export type StorageOverview = {
+  upload_dir: string;
+  total_disk_bytes: number;
+  safety_net_hours: number;
+  sessions: StorageSession[];
+};
+
+export async function getStorageOverview() {
+  const response = await fetchWithTimeout(
+    backendUrl("/api/storage/sessions"),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<StorageOverview>(response);
+}
+
+export type CleanupUploadsResult = {
+  session_id: string;
+  freed_bytes: number;
+  freed_file_count: number;
+};
+
+// Deletes only the upload blobs. Keeps the session row, patterns and history —
+// distinct from deleteSession below, which removes the record itself.
+export async function cleanupSessionUploads(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/uploads/cleanup`),
+    { method: "POST" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CleanupUploadsResult>(response);
+}
+
 export async function deleteSession(sessionId: string) {
   const response = await fetchWithTimeout(backendUrl(`/api/sessions/${sessionId}`), {
     method: "DELETE"

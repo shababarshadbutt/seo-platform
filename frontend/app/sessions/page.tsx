@@ -39,6 +39,7 @@ import {
   DialogHeader,
   DialogTitle
 } from "@/components/ui/dialog";
+import { StoragePanel } from "@/components/storage-panel";
 import { cn } from "@/lib/utils";
 
 function formatDate(value: string) {
@@ -204,7 +205,7 @@ export default function SessionsHistoryPage() {
             </p>
           </div>
           <Button asChild>
-            <Link href="/">
+            <Link href="/migration">
               <Plus className="mr-2 h-4 w-4" />
               New Analysis
             </Link>
@@ -245,6 +246,11 @@ export default function SessionsHistoryPage() {
         </div>
 
         <div className="space-y-6">
+          {/* Disk reclamation for sessions whose post-publish prompt was
+              missed. Placed above the history list because filling the
+              volume blocks everyone, so it should be seen without scrolling. */}
+          <StoragePanel />
+
           {error ? (
             <div
               className="mb-4 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
@@ -271,7 +277,7 @@ export default function SessionsHistoryPage() {
               </CardHeader>
               <CardContent>
                 <Button asChild>
-                  <Link href="/">Start analysis</Link>
+                  <Link href="/migration">Start analysis</Link>
                 </Button>
               </CardContent>
             </Card>

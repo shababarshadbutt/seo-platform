@@ -1,5 +1,6 @@
 import { Queue, type JobsOptions } from "bullmq";
 
+import { config } from "../config.js";
 import { redisConnectionOptions } from "./redisConnection.js";
 
 export const SITEMAP_QUEUE_NAME = "sitemap";
@@ -10,7 +11,10 @@ export const CLEANUP_UPLOADS_JOB = "cleanup-uploads" as const;
 export const WATCHDOG_STUCK_SESSIONS_JOB = "watchdog-stuck-sessions" as const;
 export const PARSE_SITEMAP_BATCH_SIZE = 50;
 export const PARSE_SITEMAP_BATCH_DELAY_MS = 100;
-export const CLEANUP_UPLOADS_DELAY_MS = 60 * 60 * 1000;
+// Safety-net delay for abandoned sessions, from UPLOAD_CLEANUP_DELAY_HOURS
+// (default 48). Was a hardcoded 1 hour AND the primary cleanup path — see the
+// comment on config.uploadCleanupDelayMs and jobs/cleanupUploadsJob.ts.
+export const CLEANUP_UPLOADS_DELAY_MS = config.uploadCleanupDelayMs;
 export const WATCHDOG_STUCK_SESSIONS_INTERVAL_MS = 2 * 60 * 1000;
 
 export type ParseSitemapJobData = {

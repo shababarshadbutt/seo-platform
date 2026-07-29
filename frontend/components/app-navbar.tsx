@@ -95,7 +95,7 @@ export function AppNavbar() {
       await cancelSession(sessionId);
       setIsDialogOpen(false);
       setIsActive(false);
-      router.push("/");
+      router.push("/migration");
     } catch (error) {
       setCancelError(
         friendlyApiErrorMessage(error, "Unable to stop the analysis.")
@@ -142,9 +142,13 @@ export function AppNavbar() {
       cancelled = true;
     };
   }, []);
-  const isCleanerActive = pathname === "/cleaner";
+  // "/" now redirects to the Cleaner (see app/page.tsx), so it is the Cleaner's
+  // route as far as the highlight is concerned — and Migration owns /migration
+  // plus every /sessions route beneath it.
+  const isCleanerActive = pathname === "/cleaner" || pathname === "/";
   const isMigrationActive =
-    pathname === "/" || (pathname?.startsWith("/sessions") ?? false);
+    (pathname?.startsWith("/migration") ?? false) ||
+    (pathname?.startsWith("/sessions") ?? false);
 
   const toolLinkClass = (active: boolean) =>
     `inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-xs font-medium transition-colors ${
@@ -186,7 +190,7 @@ export function AppNavbar() {
                 <ExternalLink className="h-3 w-3" aria-hidden="true" />
               </a>
               <a
-                href="/"
+                href="/migration"
                 target="_blank"
                 rel="noopener noreferrer"
                 className={toolLinkClass(isMigrationActive)}
@@ -227,7 +231,7 @@ export function AppNavbar() {
               </button>
             ) : null}
             <Link
-              href="/"
+              href="/migration"
               className="inline-flex h-9 items-center justify-center rounded-lg bg-indigo-500 px-4 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-indigo-600"
             >
               New Analysis

@@ -87,6 +87,33 @@ export const config = {
   encryptionKey:
     process.env.ENCRYPTION_KEY ?? "dev-insecure-encryption-key-change-me",
 
+  // How long after a session completes its upload blobs are deleted as a SAFETY
+  // NET for abandoned sessions.
+  //
+  // This was a hardcoded 1 hour, and it was the primary reclamation path. Two
+  // problems: the clock starts when ANALYSIS finishes, not when the user is done
+  // — review, fixes and publishing all happen after it — and an hour is not
+  // enough to work through a multi-gigabyte client site. It also fired regardless
+  // of whether anything had been published.
+  //
+  // It is now a backstop, at 48 hours, behind the deliberate human-confirmed
+  // cleanup (the post-publish prompt and the History storage view). Env-tunable
+  // because the right value depends on the volume's headroom and how many
+  // concurrent users a deployment has, and neither is knowable here.
+  //
+  // Floor of 1 hour rather than 0: a zero would delete blobs the instant analysis
+  // finished, which no deployment can want. Ceiling of 30 days keeps a typo from
+  // effectively disabling the backstop on a 500 GB volume.
+  uploadCleanupDelayMs:
+    readNumber("UPLOAD_CLEANUP_DELAY_HOURS", {
+      fallback: 48,
+      min: 1,
+      max: 720
+    }) *
+    60 *
+    60 *
+    1000,
+
   // ---- Phase 1: master feature flag -------------------------------------
   // Gates the two capabilities that have NEVER completed a round trip against
   // real AWS: the SFTP pull source and publishing to S3/CloudFront. Everything

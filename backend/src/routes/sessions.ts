@@ -66,6 +66,11 @@ import {
   sanitizeUploadedFilename
 } from "../sitemaps/filenames.js";
 import { peekRootElement } from "../sitemaps/peek.js";
+import { deleteSessionUploads } from "../sitemaps/uploadCleanup.js";
+import {
+  allSessionUploadUsage,
+  sessionUploadUsage
+} from "../sitemaps/uploadStorage.js";
 import {
   createStoredSitemapFile,
   type StoredSitemapFile
@@ -1482,6 +1487,150 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       upload_storage_mb: Number((uploadStorageBytes / 1024 / 1024).toFixed(2))
     };
   });
+
+  // Per-session disk usage for the History storage view. Sessions for large client
+  // sites reach ~10 GB and the volume is 500 GB shared by 10+ users, so someone
+  // needs to be able to come back later and reclaim the ones whose post-publish
+  // prompt was dismissed or never seen.
+  //
+  // ONE directory scan for every session (allSessionUploadUsage), not a scan per
+  // row: the uploads directory holds thousands of files and a per-row scan would
+  // be quadratic. Sessions with no blobs left are still listed, with zero bytes
+  // and cleaned_at set, so "already reclaimed" is visibly different from "not
+  // listed".
+  app.get("/api/storage/sessions", async () => {
+    const usage = await allSessionUploadUsage();
+    const result = await pool.query<{
+      id: string;
+      name: string;
+      base_url: string;
+      sftp_domain: string | null;
+      status: string;
+      created_at: string;
+      completed_at: string | null;
+      uploads_cleaned_at: string | null;
+      file_count: string;
+    }>(
+      `
+        SELECT
+          s.id,
+          s.name,
+          s.base_url,
+          s.sftp_domain,
+          s.status::text AS status,
+          s.created_at,
+          s.completed_at,
+          s.uploads_cleaned_at,
+          COALESCE(f.file_count, 0)::text AS file_count
+        FROM sessions s
+        LEFT JOIN (
+          SELECT session_id, COUNT(*) AS file_count
+          FROM sitemap_files
+          WHERE is_deleted = FALSE
+          GROUP BY session_id
+        ) f ON f.session_id = s.id
+        ORDER BY s.created_at DESC
+      `
+    );
+
+    const sessions = result.rows.map((row) => {
+      const onDisk = usage.get(row.id.toLowerCase()) ?? {
+        bytes: 0,
+        file_count: 0
+      };
+
+      return {
+        id: row.id,
+        name: row.name,
+        base_url: row.base_url,
+        sftp_domain: row.sftp_domain,
+        status: row.status,
+        created_at: row.created_at,
+        completed_at: row.completed_at,
+        uploads_cleaned_at: row.uploads_cleaned_at,
+        sitemap_file_count: Number(row.file_count),
+        // What is actually on disk right now, not what was ingested.
+        disk_bytes: onDisk.bytes,
+        disk_file_count: onDisk.file_count
+      };
+    });
+
+    return {
+      upload_dir: config.uploadDir,
+      total_disk_bytes: sessions.reduce(
+        (sum, session) => sum + session.disk_bytes,
+        0
+      ),
+      // Surfaced so the storage view can state the real backstop rather than the
+      // old hardcoded "1 hour" that no longer applies.
+      safety_net_hours: Math.round(config.uploadCleanupDelayMs / 3600000),
+      sessions
+    };
+  });
+
+  // What one session currently occupies. Read by the post-publish prompt so it
+  // states the real figure it is about to free.
+  app.get<{ Params: SessionParams }>(
+    "/api/sessions/:id/storage",
+    async (request, reply) => {
+      const sessionResult = await pool.query<{
+        uploads_cleaned_at: string | null;
+      }>(
+        "SELECT uploads_cleaned_at FROM sessions WHERE id = $1::uuid",
+        [request.params.id]
+      );
+
+      if (sessionResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "session not found" });
+      }
+
+      const usage = await sessionUploadUsage(request.params.id);
+
+      return {
+        session_id: request.params.id,
+        disk_bytes: usage.bytes,
+        disk_file_count: usage.file_count,
+        uploads_cleaned_at: sessionResult.rows[0].uploads_cleaned_at
+      };
+    }
+  );
+
+  // Explicit, user-confirmed reclamation of one session's upload blobs.
+  //
+  // Deliberately a separate endpoint from DELETE /api/sessions/:id, which removes
+  // the session ROW. This one keeps the row, its sitemap_files, its patterns and
+  // its reports, and removes only the bytes — so the session stays browsable and
+  // its history intact. Shares deleteSessionUploads() with the safety-net job so
+  // the two cannot disagree about scope.
+  app.post<{ Params: SessionParams }>(
+    "/api/sessions/:id/uploads/cleanup",
+    async (request, reply) => {
+      const sessionResult = await pool.query(
+        "SELECT 1 FROM sessions WHERE id = $1::uuid",
+        [request.params.id]
+      );
+
+      if (sessionResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "session not found" });
+      }
+
+      const freed = await deleteSessionUploads(
+        request.params.id,
+        request.log,
+        "user"
+      );
+
+      return {
+        session_id: request.params.id,
+        freed_bytes: freed.bytes,
+        freed_file_count: freed.file_count
+      };
+    }
+  );
 
   app.get("/api/sessions", async () => {
     const result = await pool.query<SessionHistoryRow>(

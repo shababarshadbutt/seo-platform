@@ -278,7 +278,7 @@ export default function CleanerPage() {
   }
 
   const migrationHandoffUrl = downloadToken
-    ? `/?domain=${encodeURIComponent(domain.trim())}&source=cleaner&token=${encodeURIComponent(
+    ? `/migration?domain=${encodeURIComponent(domain.trim())}&source=cleaner&token=${encodeURIComponent(
         downloadToken
       )}`
     : "";
