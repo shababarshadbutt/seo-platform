@@ -1,4 +1,19 @@
+import { randomUUID } from "node:crypto";
+
 import { config } from "../config.js";
+
+// Identifies THIS process, minted once at module load.
+//
+// Runs live in the Map below, so a restart loses every one of them — accepted,
+// documented, and unchanged. What was NOT acceptable is what a reconnect was
+// told afterwards: the run is simply missing, and the 404 blamed the only two
+// causes that existed in code, "stopped after being left unwatched, or already
+// collected". Both are false after a restart, and both point the user at their
+// own browser for a server-side event. A client that reconnects quoting the
+// epoch it was started under lets the server say which of the two actually
+// happened, instead of guessing wrong in the direction that wastes the most of
+// the user's time.
+export const SERVER_EPOCH = randomUUID();
 
 // Live Cleaner runs, decoupled from the HTTP request that started them.
 //

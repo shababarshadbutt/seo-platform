@@ -1826,7 +1826,15 @@ export type CleanerProgressEvent =
   // First frame of any run stream: the id needed to reconnect to it. Emitted
   // before any work frame so a connection lost one second in is still
   // recoverable.
-  | { type: "started"; run_id: string; domain: string }
+  // server_epoch identifies the API process that owns this run. Quoted back on
+  // reconnect so a 404 can distinguish "the API restarted under me" from "my run
+  // was reaped or collected" — see the reconnect branch below.
+  | {
+      type: "started";
+      run_id: string;
+      domain: string;
+      server_epoch?: string;
+    }
   // Synthesised CLIENT-side, never sent by the server: the stream dropped and we
   // are going back for the same run. The UI shows this instead of a failure,
   // because the run is still going — that distinction is the whole point.
@@ -1881,12 +1889,14 @@ export async function processCleanerFromSftp(
   signal?: AbortSignal
 ): Promise<CleanerDone> {
   let runId: string | null = null;
+  let serverEpoch: string | null = null;
 
   // Captured on the way past so a reconnect knows where to go, while still
   // forwarding every frame to the caller untouched.
   const observe = (event: CleanerProgressEvent) => {
     if (event.type === "started") {
       runId = event.run_id;
+      serverEpoch = event.server_epoch ?? null;
     }
 
     onEvent(event);
@@ -1932,8 +1942,18 @@ export async function processCleanerFromSftp(
     let response: Response;
 
     try {
+      // The epoch goes with the request so that if the run is missing, the server
+      // can tell us WHY: its own restart, or a genuine reap/collection. Without it
+      // a 404 can only guess, and it guessed wrong in the direction that blames
+      // the user's connection for a server-side crash.
+      const query = serverEpoch
+        ? `?epoch=${encodeURIComponent(serverEpoch)}`
+        : "";
+
       response = await fetch(
-        backendUrl(`/api/cleaner/runs/${encodeURIComponent(runId)}/progress`),
+        backendUrl(
+          `/api/cleaner/runs/${encodeURIComponent(runId)}/progress${query}`
+        ),
         { signal }
       );
     } catch {

@@ -10,6 +10,7 @@ import {
   publishFrame,
   reapAbandonedRuns,
   resetRunsForTest,
+  SERVER_EPOCH,
   subscribeRun,
   touchRun,
   type RunFrame
@@ -155,4 +156,41 @@ test("one dead subscriber cannot silence the others", () => {
 test("subscribing to an unknown run reports absence rather than inventing one", () => {
   assert.equal(subscribeRun("nope", () => {}), null);
   assert.equal(getRun("nope"), undefined);
+});
+
+// The invariant the "no longer available" diagnosis rests on.
+//
+// A field report showed a user being told their run was "stopped after being left
+// unwatched, or already collected" while they sat watching it. Reaping cannot
+// produce that message: it aborts the run and flips its status, but LEAVES IT IN
+// the registry, so a reconnect still resolves and receives the terminal frame
+// explaining what happened. Only a run absent from the registry 404s — which
+// after a reap means the retention window lapsed, and otherwise means the process
+// itself is new. If a future change makes reaping delete instead, that misleading
+// message becomes reachable again and this test is what should stop it.
+test("reaping an abandoned run does NOT remove it — a reconnect still resolves", () => {
+  const run = createRun("run-9", "example.com");
+  run.lastWatchedAt = Date.now() - config.cleanerAbandonGraceMs - 1;
+
+  assert.deepEqual(reapAbandonedRuns(), ["run-9"]);
+  assert.equal(run.status, "abandoned");
+  assert.equal(run.controller.signal.aborted, true);
+
+  // Still reachable: the client learns WHY rather than that the run vanished.
+  assert.notEqual(getRun("run-9"), undefined);
+  assert.ok(subscribeRun("run-9", () => {}));
+});
+
+test("the server epoch is stable within a process and non-empty", () => {
+  // Reconnect correctness depends on this being constant for the life of the
+  // process: it is what tells a returning client whether the API underneath it is
+  // the same one that started the run. A per-call value would report a restart on
+  // every reconnect; an empty one would report none, ever.
+  assert.equal(typeof SERVER_EPOCH, "string");
+  assert.ok(SERVER_EPOCH.length > 0);
+  assert.equal(SERVER_EPOCH, SERVER_EPOCH);
+  // Surviving resetRunsForTest matters — the epoch describes the PROCESS, not the
+  // registry's contents.
+  resetRunsForTest();
+  assert.ok(SERVER_EPOCH.length > 0);
 });

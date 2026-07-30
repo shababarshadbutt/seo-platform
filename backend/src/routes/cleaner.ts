@@ -6,7 +6,12 @@ import { randomUUID } from "node:crypto";
 import type { ServerResponse } from "node:http";
 
 import AdmZip from "adm-zip";
-import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type {
+  FastifyBaseLogger,
+  FastifyInstance,
+  FastifyReply,
+  FastifyRequest
+} from "fastify";
 import { ZipArchive } from "archiver";
 
 import { config, sftpConfigError } from "../config.js";
@@ -26,6 +31,7 @@ import {
   finishRun,
   getRun,
   publishFrame,
+  SERVER_EPOCH,
   subscribeRun,
   touchRun,
   type LiveRun,
@@ -67,11 +73,38 @@ type CachedRun = {
 };
 const runCache = new Map<string, CachedRun>();
 
+// Throw away a working directory without waiting for it, and WITHOUT betting the
+// process on it succeeding.
+//
+// Every one of these sites used to be a bare `void rm(...)`. An unawaited
+// rejection is an unhandledRejection, which Node 15+ escalates to an
+// uncaughtException and — with no handler installed — EXITS THE PROCESS. That
+// turns a failed temp-directory delete into an API restart, and because live
+// Cleaner runs are held in a process-local Map (see sitemaps/cleanerRuns.ts) the
+// restart wipes every one of them. The next reconnect then gets a 404 and the
+// user is told their run "is no longer available … may have been stopped after
+// being left unwatched, or already collected" about a run that was healthy a
+// second earlier and had a viewer attached the whole time.
+//
+// `force: true` swallows ENOENT but NOT the EBUSY/EPERM/ENOTEMPTY that removing
+// a tree still being written to can raise, which is why this is reachable at all
+// — and most reachable on exactly the big, slow runs where losing progress hurts
+// most. The pull loop's per-file `rm` already guarded itself this way; these did
+// not.
+function discardDir(dir: string, log?: FastifyBaseLogger) {
+  void rm(dir, { recursive: true, force: true }).catch((error) => {
+    log?.warn(
+      { error, dir },
+      "cleaner: could not remove working directory (ignored)"
+    );
+  });
+}
+
 function storeRun(token: string, run: CachedRun) {
   runCache.set(token, run);
   const timer = setTimeout(() => {
     runCache.delete(token);
-    void rm(run.dir, { recursive: true, force: true });
+    discardDir(run.dir);
   }, RUN_TTL_MS);
   timer.unref?.();
 }
@@ -278,8 +311,7 @@ export async function cleanerRoutes(app: FastifyInstance) {
       await mkdir(inDir, { recursive: true });
       await mkdir(outDir, { recursive: true });
 
-      const cleanupRunDir = () =>
-        void rm(runDir, { recursive: true, force: true });
+      const cleanupRunDir = () => discardDir(runDir, request.log);
 
       const inputFiles: CleanerInputFile[] = [];
       let domain = "";
@@ -881,7 +913,7 @@ export async function cleanerRoutes(app: FastifyInstance) {
           // off to the download cache. Note what is absent: nothing here touches
           // the client's socket, because the run does not own one.
           if (!handedOff) {
-            void rm(runDir, { recursive: true, force: true });
+            discardDir(runDir, request.log);
           }
         }
       })();
@@ -909,12 +941,38 @@ export async function cleanerRoutes(app: FastifyInstance) {
 
       // Gate BEFORE hijacking — once hijacked a JSON reply is impossible. A 404
       // is the honest answer and the client's signal to stop retrying: the run is
-      // genuinely gone (abandoned and stopped, or its retention lapsed).
+      // genuinely gone.
+      //
+      // WHICH KIND of gone is the part worth getting right. An epoch that does
+      // not match ours means this process is not the one that started the run, so
+      // the run did not go anywhere — the API did, taking its whole in-memory
+      // registry with it. Saying "left unwatched or already collected" there
+      // blames the user's browser for a server restart and sends them hunting the
+      // wrong thing; it is also the message a real report came in about.
       if (!run) {
+        const clientEpoch =
+          typeof (request.query as { epoch?: unknown })?.epoch === "string"
+            ? ((request.query as { epoch?: string }).epoch as string)
+            : null;
+        const restarted = clientEpoch !== null && clientEpoch !== SERVER_EPOCH;
+
+        if (restarted) {
+          request.log.warn(
+            {
+              run_id: request.params.runId,
+              client_epoch: clientEpoch,
+              server_epoch: SERVER_EPOCH
+            },
+            "cleaner reconnect after an API restart: the run's process is gone"
+          );
+        }
+
         return reply.code(404).send({
           error: "Not Found",
-          message:
-            "That cleaning run is no longer available. It may have been stopped after being left unwatched, or already collected."
+          code: restarted ? "server_restarted" : "run_gone",
+          message: restarted
+            ? "The server restarted while this run was in progress, so the run could not be resumed. Nothing was wrong with your connection. Start the clean again — and if this keeps happening, the API is being restarted mid-run (check its logs for a crash or an out-of-memory kill)."
+            : "That cleaning run is no longer available. It may have been stopped after being left unwatched, or already collected."
         });
       }
 
@@ -935,14 +993,30 @@ export async function cleanerRoutes(app: FastifyInstance) {
           .send({ error: "Not Found", message: "no such cleaning run" });
       }
 
+      // Enough to watch the abandon timer rather than infer it. Diagnosing the
+      // reap required knowing how stale the heartbeat was and how much of the
+      // grace period was left, and both had to be reconstructed from log
+      // timestamps; `watchers` alone cannot show it, because abandonment is
+      // decided by the heartbeat and NOT by the subscriber count.
+      const now = Date.now();
+      const staleMs = now - run.lastWatchedAt;
+
       return {
         run_id: run.runId,
         domain: run.domain,
         status: run.status,
         started_at: new Date(run.startedAt).toISOString(),
+        elapsed_seconds: Math.round((now - run.startedAt) / 1000),
         watchers: run.subscribers.size,
         last: run.lastFrame,
-        abandon_grace_seconds: Math.round(config.cleanerAbandonGraceMs / 1000)
+        server_epoch: SERVER_EPOCH,
+        abandon_grace_seconds: Math.round(config.cleanerAbandonGraceMs / 1000),
+        heartbeat_stale_seconds: Math.round(staleMs / 1000),
+        // Negative means the next watchdog sweep will reap it.
+        abandon_in_seconds:
+          run.status === "running"
+            ? Math.round((config.cleanerAbandonGraceMs - staleMs) / 1000)
+            : null
       };
     }
   );
@@ -994,7 +1068,14 @@ function attachRunStream(options: {
 
   // The run id goes out FIRST, before any work frame, so a client that loses the
   // connection a second later already knows what to reconnect to.
-  send({ type: "started", run_id: run.runId, domain: run.domain });
+  // The epoch rides along with the run id so a reconnect can be told whether the
+  // process it is coming back to is the one that started its run.
+  send({
+    type: "started",
+    run_id: run.runId,
+    domain: run.domain,
+    server_epoch: SERVER_EPOCH
+  });
 
   const subscription = subscribeRun(run.runId, (frame) => {
     send(frame);

@@ -13,7 +13,11 @@ import { runMigrations } from "./db/migrate.js";
 import { fsErrorResponse } from "./errors/fsErrors.js";
 import { sessionRoutes } from "./routes/sessions.js";
 import { cleanerRoutes } from "./routes/cleaner.js";
-import { startAbandonedRunWatchdog } from "./sitemaps/cleanerRuns.js";
+import {
+  activeRunCount,
+  SERVER_EPOCH,
+  startAbandonedRunWatchdog
+} from "./sitemaps/cleanerRuns.js";
 
 const app = Fastify({
   logger: true
@@ -118,6 +122,48 @@ async function close() {
   await destroyCleanerPools();
   await closePool();
 }
+
+// An API restart is the one thing that destroys live Cleaner runs outright: they
+// are held in a process-local Map, so a crash takes every in-progress clean with
+// it and the user's next reconnect is a bare 404. That made a crash and an
+// abandonment reap look identical from the outside, and with no handler here a
+// crash left nothing in the logs tying it to the runs it killed — the process was
+// simply gone and back, restarted by Docker's `restart: unless-stopped`.
+//
+// These handlers do not swallow anything. An unhandled rejection or uncaught
+// exception still exits non-zero; what changes is that it says so first, names
+// how many runs it is destroying, and flushes before going. Anyone reading logs
+// after a "no longer available" report can now see whether the API died under
+// the run — which is not something the message on the screen could ever tell
+// them.
+function logFatal(kind: string, error: unknown) {
+  try {
+    app.log.fatal(
+      {
+        err: error,
+        kind,
+        active_cleaner_runs: activeRunCount(),
+        server_epoch: SERVER_EPOCH
+      },
+      `${kind}: the API is exiting — every in-progress Cleaner run is lost with it`
+    );
+  } catch {
+    // Logging must never be the reason a fatal path fails to reach the exit.
+    console.error(`[fatal] ${kind}`, error);
+  }
+}
+
+process.on("unhandledRejection", (reason) => {
+  logFatal("unhandledRejection", reason);
+  // Matches Node's own default (`--unhandled-rejections=throw`) rather than
+  // quietly continuing in an unknown state.
+  process.exit(1);
+});
+
+process.on("uncaughtException", (error) => {
+  logFatal("uncaughtException", error);
+  process.exit(1);
+});
 
 process.on("SIGINT", () => {
   void close().finally(() => process.exit(0));
