@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   createReadStream,
   createWriteStream,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -17,7 +18,10 @@ import { createGzip, gunzipSync } from "node:zlib";
 import {
   cleanSitemaps,
   createDedupState,
+  dedupBucketCount,
+  dedupBucketOf,
   normalizeForDedup,
+  REPORT_FILENAME,
   uniqueOutputName,
   writeCandidatesParallel,
   type CleanerInputFile,
@@ -307,6 +311,327 @@ test("reduction_pct counts every URL that entered dedup, not just survivors", as
     assert.equal(result.duplicates_removed, 2);
     // 2 duplicates out of the 4 on-domain URLs that entered dedup = 50%.
     assert.equal(result.reduction_pct, 50);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- Sharded cross-file dedup (the 2^24 Map ceiling fix) ------------------
+//
+// A V8 Map throws `RangeError: Map maximum size exceeded` at 16,777,216 entries.
+// A real client (915 sitemaps / 33.4M URLs) is double that, so the single-Map
+// dedup could never hold it: Map.set threw, nothing caught it, and the API
+// exited 1 — killing every concurrent run and reporting itself to the user as
+// "the server restarted while this run was in progress".
+//
+// The fix shards the dedup by key into buckets processed one at a time. These
+// tests force real sharding on small inputs via CLEANER_DEDUP_URLS_PER_BUCKET so
+// the sharded and single-Map paths can be compared over the SAME corpus.
+
+async function cleanWithBucketSize(
+  files: CleanerInputFile[],
+  outDir: string,
+  perBucket: string | undefined
+) {
+  const previous = process.env.CLEANER_DEDUP_URLS_PER_BUCKET;
+
+  if (perBucket === undefined) {
+    delete process.env.CLEANER_DEDUP_URLS_PER_BUCKET;
+  } else {
+    process.env.CLEANER_DEDUP_URLS_PER_BUCKET = perBucket;
+  }
+
+  try {
+    return await cleanSitemaps({
+      files,
+      domain: DOMAIN,
+      subfolder: "sitemaps",
+      today: TODAY,
+      outDir
+    });
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CLEANER_DEDUP_URLS_PER_BUCKET;
+    } else {
+      process.env.CLEANER_DEDUP_URLS_PER_BUCKET = previous;
+    }
+  }
+}
+
+test("dedupBucketCount stays on the single-Map path until sharding is needed", () => {
+  // The whole safety argument for this change: anything that fits today keeps
+  // running through the exact code path it ran through before.
+  assert.equal(dedupBucketCount(0), 1);
+  assert.equal(dedupBucketCount(1), 1);
+  assert.equal(dedupBucketCount(4_000_000), 1);
+
+  // Past the per-bucket target it shards, always to a power of two, and always
+  // enough that expected/buckets lands back under the target.
+  for (const expected of [4_000_001, 33_404_316, 100_000_000]) {
+    const buckets = dedupBucketCount(expected);
+    assert.ok(buckets > 1, `${expected} must shard`);
+    assert.equal(buckets & (buckets - 1), 0, `${buckets} must be a power of 2`);
+    assert.ok(
+      expected / buckets <= 4_000_000,
+      `${expected} over ${buckets} buckets must fit the per-bucket target`
+    );
+    // And must stay clear of the ceiling that caused the outage.
+    assert.ok(expected / buckets < 16_777_216);
+  }
+});
+
+test("dedupBucketOf is pure in the key, so equal keys always co-locate", () => {
+  // The property the whole correctness argument rests on: if equal keys could
+  // land in different buckets, a duplicate would be missed and a URL silently
+  // kept twice.
+  for (const buckets of [2, 8, 64]) {
+    for (const key of [
+      `${DOMAIN}/a`,
+      `${DOMAIN}/some/deep/path`,
+      "",
+      "not-a-url"
+    ]) {
+      assert.equal(
+        dedupBucketOf(key, buckets),
+        dedupBucketOf(key, buckets),
+        "same key must always map to the same bucket"
+      );
+      const bucket = dedupBucketOf(key, buckets);
+      assert.ok(
+        Number.isInteger(bucket) && bucket >= 0 && bucket < buckets,
+        `bucket ${bucket} out of range for ${buckets}`
+      );
+    }
+  }
+
+  // buckets === 1 is the unsharded path — everything lands in bucket 0.
+  assert.equal(dedupBucketOf(`${DOMAIN}/anything`, 1), 0);
+});
+
+test("sharded dedup is byte-identical to the single-Map path", async () => {
+  // Same corpus cleaned twice: once unsharded, once forced into many buckets.
+  // Every reported number, the duplicates report, and the actual output bytes
+  // must agree — sharding is a memory strategy, not a behaviour change.
+  const locsFor = (tag: string) =>
+    Array.from({ length: 40 }, (_, i) => `${DOMAIN}/${tag}/page-${i}`);
+  // Deliberate cross-file overlap so dedup has real work spread across buckets.
+  const shared = Array.from({ length: 25 }, (_, i) => `${DOMAIN}/shared/s-${i}`);
+
+  const build = (tag: string) => {
+    const { dir, inDir, outDir } = scratch(`shard-${tag}`);
+    const files: CleanerInputFile[] = [];
+
+    for (const [index, name] of ["a", "b", "c", "d", "e"].entries()) {
+      const p = path.join(inDir, `${index}__${name}.xml`);
+      // Every file re-lists `shared`, so most of it duplicates file a.
+      writeFileSync(p, urlsetXml([...locsFor(name), ...shared]));
+      files.push({ filename: `${name}.xml`, path: p });
+    }
+
+    return { dir, outDir, files };
+  };
+
+  const plain = build("plain");
+  const shard = build("shard");
+
+  try {
+    const unsharded = await cleanWithBucketSize(
+      plain.files,
+      plain.outDir,
+      undefined
+    );
+    // 1 URL per bucket forces the maximum number of buckets for this corpus.
+    const sharded = await cleanWithBucketSize(shard.files, shard.outDir, "1");
+
+    // Sanity: the fixture must actually produce duplicates, or this proves nothing.
+    assert.ok(unsharded.result.duplicates_removed > 0);
+    assert.equal(
+      sharded.result.duplicates_removed,
+      unsharded.result.duplicates_removed
+    );
+    assert.equal(sharded.result.files_kept, unsharded.result.files_kept);
+    assert.equal(
+      sharded.result.clean_urls_remaining,
+      unsharded.result.clean_urls_remaining
+    );
+    assert.equal(
+      sharded.result.total_urls_kept_files,
+      unsharded.result.total_urls_kept_files
+    );
+    assert.equal(sharded.result.reduction_pct, unsharded.result.reduction_pct);
+    assert.deepEqual(
+      sharded.result.dropped_files,
+      unsharded.result.dropped_files
+    );
+    assert.deepEqual(
+      sharded.result.output_files,
+      unsharded.result.output_files
+    );
+    // Report rows: same content AND same order as the unsharded run.
+    assert.deepEqual(
+      sharded.result.duplicate_urls,
+      unsharded.result.duplicate_urls
+    );
+
+    // The cleaned files themselves must be byte-for-byte identical.
+    for (const { filename } of unsharded.result.output_files) {
+      assert.equal(
+        readFileSync(path.join(shard.outDir, filename), "utf8"),
+        readFileSync(path.join(plain.outDir, filename), "utf8"),
+        `${filename} must be byte-identical between sharded and unsharded runs`
+      );
+    }
+
+    // So must the rebuilt index and the full CSV on disk.
+    for (const filename of [unsharded.result.index_filename, REPORT_FILENAME]) {
+      assert.equal(
+        readFileSync(path.join(shard.outDir, filename), "utf8"),
+        readFileSync(path.join(plain.outDir, filename), "utf8"),
+        `${filename} must be byte-identical between sharded and unsharded runs`
+      );
+    }
+
+    // The scratch dir must not survive into the output handed to the user.
+    assert.ok(
+      !existsSync(path.join(shard.outDir, ".cleaner-scratch")),
+      "the sharded scratch dir must be cleaned up, not shipped in the ZIP"
+    );
+  } finally {
+    rmSync(plain.dir, { recursive: true, force: true });
+    rmSync(shard.dir, { recursive: true, force: true });
+  }
+});
+
+test("sharded dedup handles a file emptied entirely by duplicates", async () => {
+  // Verdict bitsets are sized from each provisional's own line count. If a
+  // file's every loc is a duplicate its bitset is all zeros, and the file must
+  // drop as "empty" — the same outcome the single-Map path produces.
+  const { dir, inDir, outDir } = scratch("shard-empty");
+
+  try {
+    const x = path.join(inDir, "0__x.xml");
+    const y = path.join(inDir, "1__y.xml");
+    writeFileSync(x, urlsetXml([`${DOMAIN}/q1`, `${DOMAIN}/q2`]));
+    writeFileSync(y, urlsetXml([`${DOMAIN}/q1`, `${DOMAIN}/q2`]));
+
+    const { result } = await cleanWithBucketSize(
+      [
+        { filename: "x.xml", path: x },
+        { filename: "y.xml", path: y }
+      ],
+      outDir,
+      "1"
+    );
+
+    assert.equal(result.files_kept, 1);
+    assert.deepEqual(result.dropped_files, [
+      { filename: "y.xml", reason: "empty" }
+    ]);
+    assert.equal(result.duplicates_removed, 2);
+    assert.equal(result.reduction_pct, 50);
+    assert.ok(!existsSync(path.join(outDir, "y.xml")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sharding also covers the sequential (sub-threshold) path", async () => {
+  // The crash was NOT limited to big file COUNTS. A handful of files can hold
+  // far more than 2^24 URLs between them, and that input stays under
+  // CLEANER_PARALLEL_THRESHOLD (200) — so it ran the sequential engine and died
+  // exactly the same way. Only 3 files here, so no worker pool is involved, and
+  // the sharded two-phase machinery must still be what runs.
+  const { dir, inDir, outDir } = scratch("shard-seq");
+
+  try {
+    const files: CleanerInputFile[] = [];
+
+    for (const [index, name] of ["p", "q", "r"].entries()) {
+      const p = path.join(inDir, `${index}__${name}.xml`);
+      writeFileSync(
+        p,
+        urlsetXml([
+          ...Array.from({ length: 12 }, (_, i) => `${DOMAIN}/${name}/u-${i}`),
+          // Shared across all three files, so files q and r contribute dups.
+          `${DOMAIN}/common/one`,
+          `${DOMAIN}/common/two`
+        ])
+      );
+      files.push({ filename: `${name}.xml`, path: p });
+    }
+
+    assert.ok(files.length < 200, "must stay under the parallel threshold");
+
+    const sharded = await cleanWithBucketSize(files, outDir, "1");
+
+    // 2 shared URLs duplicated in 2 later files = 4 removals, 2 groups.
+    assert.equal(sharded.result.duplicates_removed, 4);
+    assert.equal(sharded.result.duplicate_urls_total, 2);
+    assert.equal(sharded.result.files_kept, 3);
+    assert.equal(sharded.result.clean_urls_remaining, 12 * 3 + 2);
+
+    // And it agrees with the unsharded run over the same corpus.
+    const plainOut = path.join(dir, "out-plain");
+    mkdirSync(plainOut, { recursive: true });
+    const plain = await cleanWithBucketSize(files, plainOut, undefined);
+
+    assert.equal(
+      sharded.result.duplicates_removed,
+      plain.result.duplicates_removed
+    );
+    assert.deepEqual(
+      sharded.result.duplicate_urls,
+      plain.result.duplicate_urls
+    );
+
+    for (const { filename } of plain.result.output_files) {
+      assert.equal(
+        readFileSync(path.join(outDir, filename), "utf8"),
+        readFileSync(path.join(plainOut, filename), "utf8"),
+        `${filename} must match the unsharded sequential run`
+      );
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("duplicate_urls is capped while the CSV on disk stays complete", async () => {
+  // The summary rides an SSE frame to the browser, so it cannot carry tens of
+  // millions of rows. The cap keeps it deliverable — and the full report must
+  // still be on disk, because that is what the download now serves.
+  const { dir, inDir, outDir } = scratch("shard-cap");
+
+  try {
+    const locs = Array.from({ length: 60 }, (_, i) => `${DOMAIN}/c/page-${i}`);
+    const a = path.join(inDir, "0__a.xml");
+    const b = path.join(inDir, "1__b.xml");
+    writeFileSync(a, urlsetXml(locs));
+    writeFileSync(b, urlsetXml(locs)); // every loc duplicates a → 60 groups
+
+    const { result, files } = await cleanWithBucketSize(
+      [
+        { filename: "a.xml", path: a },
+        { filename: "b.xml", path: b }
+      ],
+      outDir,
+      "1"
+    );
+
+    assert.equal(result.duplicates_removed, 60);
+    assert.equal(result.duplicate_urls_total, 60);
+    // Well under the 10,000 cap, so nothing is truncated here.
+    assert.equal(result.duplicate_urls_truncated, false);
+    assert.equal(result.duplicate_urls.length, 60);
+
+    // The complete report is on disk AND in the manifest, so the download route
+    // can serve it by token.
+    const report = files.find((f) => f.filename === REPORT_FILENAME);
+    assert.ok(report, "the duplicates report must be in the output manifest");
+    const csv = readFileSync(report.path, "utf8");
+    const rows = csv.trimEnd().split("\r\n");
+    assert.equal(rows[0], "url,kept_in_file,duplicate_in_files");
+    assert.equal(rows.length - 1, 60, "every duplicate group must be in the CSV");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

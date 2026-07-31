@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream } from "node:fs";
-import { unlink } from "node:fs/promises";
+import { mkdir, rm, unlink } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { createGzip } from "node:zlib";
 import path from "node:path";
@@ -56,7 +56,13 @@ export interface CleanerResult {
   files_dropped: number;
   dropped_files: { filename: string; reason: DropReason }[];
   duplicates_removed: number;
+  // Bounded to DUPLICATE_URLS_LIMIT rows. When the run found more distinct
+  // duplicate groups than that, `duplicate_urls_truncated` is true and
+  // `duplicate_urls_total` is the real group count — the full report is on disk
+  // as REPORT_FILENAME, downloadable via /api/cleaner/report/:token.
   duplicate_urls: { url: string; kept_in: string; also_in: string[] }[];
+  duplicate_urls_truncated: boolean;
+  duplicate_urls_total: number;
   output_files: { filename: string; url_count: number }[];
   // Uploaded <sitemapindex> files are excluded from cleaning and replaced by a
   // freshly rebuilt index; surfaced separately so the count stays honest.
@@ -107,6 +113,13 @@ export type CleanerProgress = (event: {
 
 export const INDEX_FILENAME = "sitemap-index.xml";
 export const REPORT_FILENAME = "duplicates-report.csv";
+
+// How many duplicate rows travel in the JSON summary (and therefore the SSE
+// `done` frame). The COMPLETE report is always written to REPORT_FILENAME on
+// disk and served by /api/cleaner/report/:token — this cap exists because a
+// 33M-row array cannot be JSON-serialized or delivered to a browser, and trying
+// to would reintroduce the very OOM this change removes.
+export const DUPLICATE_URLS_LIMIT = 10_000;
 
 const URLSET_HEADER =
   '<?xml version="1.0" encoding="UTF-8"?>\n' +
@@ -354,6 +367,87 @@ export function createDedupState(): DedupState {
   return { keptBy: new Map(), dupReport: new Map(), duplicatesRemoved: 0 };
 }
 
+// ---- Sharding: why this exists ------------------------------------------
+//
+// A V8 Map has a HARD ceiling of 2^24 = 16,777,216 entries. It is not a heap
+// limit and no --max-old-space-size raises it: at entry 16,777,217 Map.set
+// throws `RangeError: Map maximum size exceeded`. With nothing catching it that
+// became an uncaughtException, server.ts exited 1, Docker restarted the API, and
+// every concurrent Cleaner run died with it — reported to the user as the
+// misleading "the server restarted while this run was in progress".
+//
+// A real client (915 sitemaps, 33.4M URLs) is double the ceiling, so keptBy
+// could never hold it. The fix shards the dedup by KEY into `buckets` spill
+// files and processes ONE bucket at a time, so no single Map approaches the
+// ceiling and only a fraction of the keys are resident at once.
+//
+// Correctness rests on two properties, both of which must survive any edit here:
+//
+//   1. SHARD BY KEY, NEVER BY FILE. dedupBucketOf is pure in the key, so equal
+//      keys always land in the same bucket. Partitioning by key therefore loses
+//      no comparison that a single Map would have made.
+//   2. Feed each bucket in ascending (candidateIndex, ordinal). First-wins is a
+//      total order over that pair; a bucket is a subsequence of it, so the first
+//      sighting seen inside a bucket IS the globally first sighting.
+//
+// The hash only decides which file a key is FILED INTO. Inside a bucket the
+// comparison is still exact-string Map<string,string>, so two colliding-but-
+// different keys still compare unequal and no URL is ever silently dropped.
+
+// URLs per bucket to aim for. Deliberately far below the 2^24 ceiling: it also
+// bounds resident heap (~155 bytes/entry measured, so ~620MB/bucket worst case)
+// and leaves headroom for dupReport entries in the same bucket.
+//
+// Env-overridable (mirroring CLEANER_PARALLEL_THRESHOLD) so the sharded and
+// single-Map paths can be exercised over the SAME input — which is how the
+// byte-identical equivalence test drives real sharding without needing 33M URLs,
+// and how this can be tuned in the field without a rebuild.
+export function dedupUrlsPerBucket(): number {
+  const raw = Number.parseInt(
+    process.env.CLEANER_DEDUP_URLS_PER_BUCKET ?? "",
+    10
+  );
+
+  return Number.isFinite(raw) && raw > 0 ? raw : 4_000_000;
+}
+
+// Choose the shard count for an expected URL volume. Returns 1 — meaning "use
+// the single-Map path exactly as before" — for anything that comfortably fits,
+// so every input that works today is untouched by this change.
+export function dedupBucketCount(expectedUrls: number): number {
+  const perBucket = dedupUrlsPerBucket();
+
+  if (expectedUrls <= perBucket) {
+    return 1;
+  }
+
+  const needed = Math.ceil(expectedUrls / perBucket);
+  let buckets = 1;
+
+  while (buckets < needed) {
+    buckets *= 2;
+  }
+
+  return buckets;
+}
+
+// Which bucket a dedup key belongs to. djb2-xor: cheap, no allocation, and good
+// enough spread for balancing spill files. NOT used for equality — see the note
+// above — so collisions cost nothing but a slightly fuller bucket.
+export function dedupBucketOf(key: string, buckets: number): number {
+  if (buckets <= 1) {
+    return 0;
+  }
+
+  let hash = 5381;
+
+  for (let i = 0; i < key.length; i += 1) {
+    hash = (((hash << 5) + hash) ^ key.charCodeAt(i)) | 0;
+  }
+
+  return (hash >>> 0) % buckets;
+}
+
 // Decide ONE on-domain loc against the running cross-file dedup state
 // (first-occurrence-across-files wins), given its precomputed dedup `key`.
 // Returns true when this loc is the first sighting and should be written; false
@@ -447,6 +541,35 @@ async function writeCandidateFile(
   return { kept: true, url_count: keptCount, path: outPath };
 }
 
+// ---- Verdict bitsets ----------------------------------------------------
+//
+// One bit per on-domain loc per candidate: 1 = this loc is the first sighting
+// and must be written, 0 = duplicate, skip it. At 33.4M URLs that is ~4.2MB in
+// total, which is why the verdicts can all be held in memory even when the keys
+// cannot.
+export type VerdictSet = {
+  bits: Uint8Array;
+  // How many locs this candidate's provisional actually contained. Sized from
+  // the provisional itself, never from Pass 1's onDomainCount — those come from
+  // two independent parses, and if they ever disagree a size taken from the
+  // wrong one shifts every subsequent verdict silently.
+  count: number;
+  kept: number;
+};
+
+function createVerdictSet(count: number): VerdictSet {
+  return { bits: new Uint8Array(Math.ceil(count / 8)), count, kept: 0 };
+}
+
+function markKept(verdicts: VerdictSet, ordinal: number) {
+  verdicts.bits[ordinal >> 3] |= 1 << (ordinal & 7);
+  verdicts.kept += 1;
+}
+
+function isKept(verdicts: VerdictSet, ordinal: number): boolean {
+  return (verdicts.bits[ordinal >> 3] & (1 << (ordinal & 7))) !== 0;
+}
+
 // Read a provisional "<key>\t<loc>" file line by line, calling onPair in order.
 function readProvisionalPairs(
   provisionalPath: string,
@@ -504,6 +627,398 @@ async function runBoundedByIndex<T>(
   );
 
   return results;
+}
+
+// ---- Pass 2 SHARDED engine (used when dedupBucketCount() > 1) -----------
+//
+// Two phases, because the single-Map engine below decides and writes in the same
+// pass: its `emit` consults the dedup state and writes the <url> immediately.
+// That cannot work once keys are spread across buckets — while writing a.xml
+// holding bucket 3, a.xml's next loc may belong to bucket 17, whose Map is not
+// resident. So every verdict is computed BEFORE any cleaned file is written:
+//
+//   Phase A  partition all provisionals into per-bucket spill files (append
+//            only, in ascending candidate order), then load ONE bucket at a
+//            time and record keep/drop into per-candidate bitsets.
+//   Phase B  re-read each provisional in candidate order and write the cleaned
+//            XML from the bitsets.
+//
+// Phase B is a cheap re-read of a "<key>\t<loc>" text file, NOT a second XML
+// parse — the keys were already materialized by writeProvisionalOnDomainFile.
+//
+// The ordering invariant is STRENGTHENED versus the single-Map engine: verdicts
+// depend only on (candidateIndex, ordinal), so they cannot vary with worker
+// completion order at all, rather than relying on one loop's consume-in-order
+// discipline.
+export async function writeCandidatesSharded(options: {
+  candidates: CleanerCandidate[];
+  concurrency: number;
+  buckets: number;
+  today: string;
+  outDir: string;
+  scratchDir: string;
+  survivors: SurvivorFile[];
+  dropped: { filename: string; reason: DropReason }[];
+  loadProvisional: (
+    candidate: CleanerCandidate,
+    index: number
+  ) => Promise<string>;
+  // Called once per duplicate group, in ascending first-sighting order, so the
+  // caller can stream the CSV row and keep only a bounded prefix in memory.
+  onDuplicate: (row: {
+    url: string;
+    kept_in: string;
+    also_in: string[];
+  }) => void;
+  onProgress?: CleanerProgress;
+  cleanupProvisional?: boolean;
+}): Promise<{ duplicatesRemoved: number }> {
+  const {
+    candidates,
+    buckets,
+    today,
+    outDir,
+    scratchDir,
+    survivors,
+    dropped,
+    loadProvisional,
+    onDuplicate,
+    onProgress,
+    cleanupProvisional = true
+  } = options;
+  const window = Math.max(1, options.concurrency);
+  const inFlight = new Map<number, Promise<string>>();
+
+  const dispatch = (index: number) => {
+    if (index < candidates.length) {
+      inFlight.set(index, loadProvisional(candidates[index], index));
+    }
+  };
+
+  for (let k = 0; k < Math.min(window, candidates.length); k += 1) {
+    dispatch(k);
+  }
+
+  // ---- Phase A1: partition into bucket spill files ----------------------
+  //
+  // Each line carries its origin as "<i>\t<ordinal>\t<key>\t<loc>". Because
+  // candidates are visited in ascending i and lines in ascending ordinal, every
+  // spill file is ALREADY in (i, ordinal) order — so the bucket pass needs no
+  // sort, just a sequential read.
+  const spillPaths = Array.from({ length: buckets }, (_, b) =>
+    path.join(scratchDir, `.bucket${b}.spill`)
+  );
+  // Writes go through a batching writer per bucket rather than straight to the
+  // stream. Two reasons, both of which bit at scale:
+  //   - a bare stream.write() per loc ignores backpressure, so 33M lines across
+  //     N streams queue unboundedly in memory — an OOM by another route.
+  //   - one syscall per URL is far slower than one per megabyte.
+  const spillWriters = spillPaths.map((p) => createBatchedWriter(p));
+  const provisionalPaths: string[] = [];
+  const verdicts: VerdictSet[] = [];
+
+  for (let i = 0; i < candidates.length; i += 1) {
+    const provisionalPath = await (inFlight.get(i) as Promise<string>);
+    inFlight.delete(i);
+    dispatch(i + window);
+    provisionalPaths.push(provisionalPath);
+
+    onProgress?.({
+      stage: "dedup",
+      current: i + 1,
+      total: candidates.length,
+      message: `Indexing ${candidates[i].file.filename} (${i + 1} of ${
+        candidates.length
+      })`
+    });
+
+    let ordinal = 0;
+
+    await readProvisionalPairs(provisionalPath, (loc, key) => {
+      const bucket = dedupBucketOf(key, buckets);
+      spillWriters[bucket].push(`${i}\t${ordinal}\t${key}\t${loc}\n`);
+      ordinal += 1;
+    });
+
+    // Let the spill streams catch up between files. Done here rather than per
+    // line so the readline handler stays synchronous — awaiting inside it cannot
+    // apply backpressure to the reader anyway.
+    for (const writer of spillWriters) {
+      await writer.drain();
+    }
+
+    // Sized from the provisional's own line count — see VerdictSet.count.
+    verdicts.push(createVerdictSet(ordinal));
+  }
+
+  await Promise.all(spillWriters.map((writer) => writer.close()));
+
+  // Cumulative loc offset of each candidate, so a (candidateIndex, ordinal) pair
+  // collapses to one globally comparable rank. Used only to order the duplicates
+  // report the way an unsharded run would have emitted it.
+  const candidateOffsets: number[] = [];
+  let runningOffset = 0;
+
+  for (const verdict of verdicts) {
+    candidateOffsets.push(runningOffset);
+    runningOffset += verdict.count;
+  }
+
+  // ---- Phase A2: decide, one bucket at a time ---------------------------
+  //
+  // Duplicate groups are collected per bucket and flushed at the end of that
+  // bucket, so dupReport never grows across the whole run either — it had the
+  // same 2^24 ceiling as keptBy.
+  //
+  // Buckets are visited in bucket order, which is NOT the order a single Map
+  // would have first spotted these duplicates in. Each group therefore records
+  // the (i, ordinal) of its first sighting and the flush is sorted by it, so the
+  // rows come out in the same sequence as the unsharded path.
+  let duplicatesRemoved = 0;
+  const pendingDuplicates: {
+    url: string;
+    kept_in: string;
+    also_in: string[];
+    firstSeen: number;
+  }[] = [];
+
+  for (let b = 0; b < buckets; b += 1) {
+    onProgress?.({
+      stage: "dedup",
+      current: b + 1,
+      total: buckets,
+      message: `Deduplicating URLs (part ${b + 1} of ${buckets})…`
+    });
+
+    const keptBy = new Map<string, string>();
+    const dupReport = new Map<
+      string,
+      { url: string; kept_in: string; also_in: string[]; firstSeen: number }
+    >();
+
+    await readSpillLines(spillPaths[b], (i, ordinal, key, loc) => {
+      const outputName = candidates[i].outputName;
+      // Position in the GLOBAL first-wins sequence, not within this bucket: a
+      // per-bucket line counter is not comparable across buckets, which put the
+      // report rows in bucket order rather than sighting order.
+      //
+      // (i, ordinal) is the total order first-wins is defined over, so rank by
+      // the cumulative line offset of file i plus the ordinal within it.
+      const position = candidateOffsets[i] + ordinal;
+
+      if (!keptBy.has(key)) {
+        keptBy.set(key, outputName);
+        markKept(verdicts[i], ordinal);
+
+        return;
+      }
+
+      duplicatesRemoved += 1;
+      const keptIn = keptBy.get(key) as string;
+      let entry = dupReport.get(key);
+
+      if (!entry) {
+        // firstSeen orders the report rows the way a single-Map run would have
+        // emitted them: by where the duplicate was FIRST spotted.
+        entry = { url: loc, kept_in: keptIn, also_in: [], firstSeen: position };
+        dupReport.set(key, entry);
+      }
+
+      if (!entry.also_in.includes(outputName)) {
+        entry.also_in.push(outputName);
+      }
+    });
+
+    for (const entry of dupReport.values()) {
+      pendingDuplicates.push(entry);
+    }
+
+    if (cleanupProvisional) {
+      await unlink(spillPaths[b]).catch(() => undefined);
+    }
+  }
+
+  // Sorted across ALL buckets so report order matches the single-Map path. Only
+  // duplicate GROUPS are held here, not every URL — on a heavily-duplicated set
+  // this is the one structure that still scales with distinct duplicates, which
+  // is why the caller also caps what it keeps for the JSON summary.
+  pendingDuplicates.sort((a, b) => a.firstSeen - b.firstSeen);
+
+  for (const entry of pendingDuplicates) {
+    onDuplicate({
+      url: entry.url,
+      kept_in: entry.kept_in,
+      also_in: entry.also_in
+    });
+  }
+
+  // ---- Phase B: write the cleaned files from the verdicts ---------------
+  for (let i = 0; i < candidates.length; i += 1) {
+    const { file, outputName, onDomainCount } = candidates[i];
+
+    onProgress?.({
+      stage: "output",
+      current: i + 1,
+      total: candidates.length,
+      message: `Cleaning ${file.filename} (${i + 1} of ${candidates.length})`
+    });
+
+    const outPath = path.join(outDir, outputName);
+    const { sink, done } = openCleanedSink(outPath);
+    sink.write(URLSET_HEADER);
+    let ordinal = 0;
+    let keptCount = 0;
+
+    await readProvisionalPairs(provisionalPaths[i], (loc) => {
+      if (isKept(verdicts[i], ordinal)) {
+        sink.write(urlEntry(loc, today));
+        keptCount += 1;
+      }
+
+      ordinal += 1;
+    });
+
+    if (keptCount === 0) {
+      await done();
+      await unlink(outPath).catch(() => undefined);
+      dropped.push({ filename: file.filename, reason: "empty" });
+    } else {
+      sink.write(URLSET_FOOTER);
+      await done();
+      survivors.push({
+        filename: outputName,
+        url_count: keptCount,
+        path: outPath,
+        onDomainCount
+      });
+    }
+
+    if (cleanupProvisional) {
+      await unlink(provisionalPaths[i]).catch(() => undefined);
+    }
+  }
+
+  return { duplicatesRemoved };
+}
+
+// A write sink that accumulates lines in a string buffer and flushes a chunk at
+// a time, reporting when the caller should await drain().
+//
+// `push` returns true when the flush it triggered was refused by the stream
+// (buffer full), which is the caller's signal that backpressure is pending. It
+// never awaits, so it can be called from a synchronous readline handler.
+//
+// Waiting for backpressure is done by checking writableNeedDrain rather than by
+// remembering that a past write() returned false. A stream can drain in the gap
+// between the refused write and the await, and a "drain" listener attached after
+// the event already fired waits for an event that will never come again — which
+// deadlocked the partition phase.
+function createBatchedWriter(filePath: string) {
+  // ~1MB of text per write: large enough that syscalls stop dominating, small
+  // enough to stay negligible against the heap budget even times 64 buckets.
+  const FLUSH_AT = 1 << 20;
+  const stream = createWriteStream(filePath);
+  let buffer = "";
+
+  const waitForDrain = () =>
+    new Promise<void>((resolve, reject) => {
+      // Re-check under the promise: if it drained already there is nothing to
+      // wait for.
+      if (!stream.writableNeedDrain) {
+        resolve();
+
+        return;
+      }
+
+      const onDrain = () => {
+        stream.off("error", onError);
+        resolve();
+      };
+      const onError = (error: Error) => {
+        stream.off("drain", onDrain);
+        reject(error);
+      };
+
+      stream.once("drain", onDrain);
+      stream.once("error", onError);
+    });
+
+  const flush = () => {
+    if (buffer.length === 0) {
+      return;
+    }
+
+    const chunk = buffer;
+    buffer = "";
+    stream.write(chunk);
+  };
+
+  return {
+    // Returns true if the stream is asking us to wait before writing more.
+    push(line: string): boolean {
+      buffer += line;
+
+      if (buffer.length < FLUSH_AT) {
+        return false;
+      }
+
+      flush();
+
+      return stream.writableNeedDrain;
+    },
+    async drain(): Promise<void> {
+      if (stream.writableNeedDrain) {
+        await waitForDrain();
+      }
+    },
+    async close(): Promise<void> {
+      flush();
+
+      if (stream.writableNeedDrain) {
+        await waitForDrain();
+      }
+
+      await finishStream(stream);
+    }
+  };
+}
+
+// Read a spill file's "<i>\t<ordinal>\t<key>\t<loc>" lines in order. Split by
+// hand rather than String.split so a <loc> containing a tab (escaped in XML but
+// legal in the raw string) cannot shift the columns.
+function readSpillLines(
+  spillPath: string,
+  onLine: (i: number, ordinal: number, key: string, loc: string) => void
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const rl = createInterface({
+      input: createReadStream(spillPath),
+      crlfDelay: Infinity
+    });
+
+    rl.on("line", (line) => {
+      if (!line) {
+        return;
+      }
+
+      const t1 = line.indexOf("\t");
+      const t2 = line.indexOf("\t", t1 + 1);
+      const t3 = line.indexOf("\t", t2 + 1);
+
+      if (t1 < 0 || t2 < 0 || t3 < 0) {
+        return;
+      }
+
+      onLine(
+        Number(line.slice(0, t1)),
+        Number(line.slice(t1 + 1, t2)),
+        line.slice(t2 + 1, t3),
+        line.slice(t3 + 1)
+      );
+    });
+    rl.on("close", () => resolve());
+    rl.on("error", reject);
+  });
 }
 
 // ---- Pass 2 parallel engine (exported for the ordering test) ------------
@@ -706,7 +1221,99 @@ export async function cleanSitemaps(options: {
   const state = createDedupState();
   const survivors: SurvivorFile[] = [];
 
-  if (parallel) {
+  // Shard the dedup only when the volume genuinely needs it. Below the
+  // threshold this is 1 and the original single-Map engines below run unchanged,
+  // so every input that worked before is byte-for-byte unaffected.
+  const expectedUrls = candidates.reduce(
+    (sum, candidate) => sum + candidate.onDomainCount,
+    0
+  );
+  const buckets = dedupBucketCount(expectedUrls);
+
+  // The duplicates report is streamed to CSV as rows arrive; only a bounded
+  // prefix is kept for the JSON summary (see DUPLICATE_URLS_LIMIT).
+  const reportPath = path.join(outDir, REPORT_FILENAME);
+  const reportStream = createWriteStream(reportPath);
+  reportStream.write("url,kept_in_file,duplicate_in_files\r\n");
+
+  const duplicateUrls: { url: string; kept_in: string; also_in: string[] }[] =
+    [];
+  let duplicateGroups = 0;
+
+  const recordDuplicate = (row: {
+    url: string;
+    kept_in: string;
+    also_in: string[];
+  }) => {
+    duplicateGroups += 1;
+
+    if (duplicateUrls.length < DUPLICATE_URLS_LIMIT) {
+      duplicateUrls.push(row);
+    }
+
+    reportStream.write(
+      `${csvField(row.url)},${csvField(row.kept_in)},${csvField(
+        row.also_in.join("; ")
+      )}\r\n`
+    );
+  };
+
+  let shardedDuplicatesRemoved: number | null = null;
+
+  if (buckets > 1) {
+    // Provisionals live in a scratch dir, NOT outDir: the sharded path must keep
+    // them alive until Phase B, and anything left in outDir gets swept into the
+    // ZIP handed to the user.
+    const scratchDir = path.join(outDir, ".cleaner-scratch");
+    await mkdir(scratchDir, { recursive: true });
+
+    const { duplicatesRemoved: removed } = await writeCandidatesSharded({
+      candidates,
+      concurrency: CLEANER_MAX_WORKERS,
+      buckets,
+      today,
+      outDir,
+      scratchDir,
+      survivors,
+      dropped,
+      loadProvisional: (candidate, index) =>
+        parallel
+          ? runCleanerParse({
+              inputPath: candidate.file.path,
+              provisionalPath: path.join(
+                scratchDir,
+                `.p${index}.provisional`
+              ),
+              isGzip: isGzipName(candidate.file.filename),
+              domainHost
+            }).then((r) => r.provisionalPath)
+          : // Under the worker threshold there is no pool to offload to, but the
+            // same two-phase machinery is still required: a handful of files can
+            // hold far more than 2^24 URLs between them, which crashed the API
+            // on this path too.
+            (async () => {
+              const provisionalPath = path.join(
+                scratchDir,
+                `.p${index}.provisional`
+              );
+              await writeProvisionalOnDomainFile(
+                candidate.file.path,
+                provisionalPath,
+                isGzipName(candidate.file.filename),
+                domainHost
+              );
+
+              return provisionalPath;
+            })(),
+      onDuplicate: recordDuplicate,
+      onProgress
+    });
+
+    shardedDuplicatesRemoved = removed;
+    await rm(scratchDir, { recursive: true, force: true }).catch(
+      () => undefined
+    );
+  } else if (parallel) {
     await writeCandidatesParallel({
       candidates,
       concurrency: CLEANER_MAX_WORKERS,
@@ -771,7 +1378,21 @@ export async function cleanSitemaps(options: {
     }
   }
 
-  const duplicatesRemoved = state.duplicatesRemoved;
+  // The sharded engine counts as it decides; the single-Map engines accumulate
+  // into `state`. Only one of the two ran.
+  const duplicatesRemoved =
+    shardedDuplicatesRemoved ?? state.duplicatesRemoved;
+
+  // The single-Map engines hold the whole report in `state.dupReport` and can
+  // only flush it now. The sharded engine already streamed its rows through
+  // recordDuplicate as each bucket finished.
+  if (shardedDuplicatesRemoved === null) {
+    for (const row of state.dupReport.values()) {
+      recordDuplicate(row);
+    }
+  }
+
+  await finishStream(reportStream);
 
   // ---- Rebuild the index -------------------------------------------------
   onProgress?.({
@@ -796,25 +1417,6 @@ export async function cleanSitemaps(options: {
   const indexStream = createWriteStream(indexPath);
   indexStream.write(indexXml);
   await finishStream(indexStream);
-
-  // ---- Write the duplicates report (streamed, never one big string) ------
-  const reportPath = path.join(outDir, REPORT_FILENAME);
-  const reportStream = createWriteStream(reportPath);
-  reportStream.write("url,kept_in_file,duplicate_in_files\r\n");
-
-  const duplicateUrls: { url: string; kept_in: string; also_in: string[] }[] =
-    [];
-
-  for (const row of state.dupReport.values()) {
-    duplicateUrls.push(row);
-    reportStream.write(
-      `${csvField(row.url)},${csvField(row.kept_in)},${csvField(
-        row.also_in.join("; ")
-      )}\r\n`
-    );
-  }
-
-  await finishStream(reportStream);
 
   // ---- Assemble the manifest --------------------------------------------
   const outputManifest: CleanerOutputFile[] = survivors.map((file) => ({
@@ -854,6 +1456,8 @@ export async function cleanSitemaps(options: {
     dropped_files: dropped,
     duplicates_removed: duplicatesRemoved,
     duplicate_urls: duplicateUrls,
+    duplicate_urls_truncated: duplicateGroups > duplicateUrls.length,
+    duplicate_urls_total: duplicateGroups,
     output_files: survivors.map((file) => ({
       filename: file.filename,
       url_count: file.url_count

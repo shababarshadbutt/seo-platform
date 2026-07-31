@@ -22,6 +22,7 @@ import {
 } from "../sftp/sftpClient.js";
 import {
   cleanSitemaps,
+  REPORT_FILENAME,
   type CleanerInputFile,
   type CleanerOutputFile
 } from "../sitemaps/cleaner.js";
@@ -617,6 +618,63 @@ export async function cleanerRoutes(app: FastifyInstance) {
       );
 
       return reply.send(createReadStream(entry.zipPath));
+    }
+  );
+
+  // Stream the COMPLETE duplicates report for a run.
+  //
+  // The summary's `duplicate_urls` is capped at DUPLICATE_URLS_LIMIT rows,
+  // because a run can find tens of millions of duplicate groups and neither the
+  // SSE frame nor a browser can carry that. The UI used to rebuild the CSV
+  // client-side from that array — which, once capped, would hand the user a
+  // silently incomplete report. This serves the full file the cleaner already
+  // wrote to disk instead, so the download is complete at any scale.
+  app.get<{ Params: { token: string } }>(
+    "/api/cleaner/report/:token",
+    async (request, reply) => {
+      const entry = runCache.get(request.params.token);
+
+      if (!entry) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "download expired or not found — run the cleaner again"
+        });
+      }
+
+      const report = entry.files.find(
+        (file) => file.filename === REPORT_FILENAME
+      );
+
+      if (!report) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "this run produced no duplicates report"
+        });
+      }
+
+      let size: number;
+
+      try {
+        size = (await stat(report.path)).size;
+      } catch {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "download expired or not found — run the cleaner again"
+        });
+      }
+
+      const downloadName = entry.filename
+        .replace(/\.zip$/i, "")
+        .replace(/^cleaned-sitemaps/, "duplicates-report");
+
+      reply.header("content-type", "text/csv; charset=utf-8");
+      reply.header("content-length", size);
+      reply.header(
+        "content-disposition",
+        `attachment; filename="${downloadName}.csv"`
+      );
+
+      return reply.send(createReadStream(report.path));
     }
   );
 

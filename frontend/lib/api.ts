@@ -1800,7 +1800,13 @@ export type CleanerSummary = {
   files_dropped: number;
   dropped_files: { filename: string; reason: CleanerDropReason }[];
   duplicates_removed: number;
+  // Capped server-side (10,000 rows) — a run can find tens of millions of
+  // duplicate groups, which no JSON response can carry. Use
+  // duplicate_urls_total for the real count and the report endpoint for the
+  // complete CSV. Optional so an older backend's summary still parses.
   duplicate_urls: { url: string; kept_in: string; also_in: string[] }[];
+  duplicate_urls_truncated?: boolean;
+  duplicate_urls_total?: number;
   output_files: { filename: string; url_count: number }[];
   index_files_detected: number;
   total_urls_kept_files: number;
@@ -2268,34 +2274,29 @@ export async function downloadCleanerZip(token: string, filename: string) {
   await saveBlobWithPicker(blob, filename, { "application/zip": [".zip"] });
 }
 
-function csvField(value: string) {
-  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
-}
-
-// Build the duplicates CSV client-side from the summary (same columns the
-// backend writes into the ZIP), so the standalone CSV download needs no extra
-// round-trip or server state.
-export function buildDuplicatesCsv(
-  rows: { url: string; kept_in: string; also_in: string[] }[]
-) {
-  const header = "url,kept_in_file,duplicate_in_files";
-  const lines = rows.map(
-    (row) =>
-      `${csvField(row.url)},${csvField(row.kept_in)},${csvField(
-        row.also_in.join("; ")
-      )}`
-  );
-
-  return `${[header, ...lines].join("\r\n")}\r\n`;
-}
-
-export async function downloadDuplicatesCsv(
-  rows: { url: string; kept_in: string; also_in: string[] }[],
-  filename: string
-) {
-  const blob = new Blob([buildDuplicatesCsv(rows)], {
-    type: "text/csv;charset=utf-8"
+// Fetch the COMPLETE duplicates report from the server rather than rebuilding it
+// from `summary.duplicate_urls`.
+//
+// That array is capped at 10,000 rows server-side, so building the file here
+// would hand the user a CSV silently missing most of its rows on exactly the
+// large runs where the report matters most. The backend streams the full report
+// it already wrote to disk.
+export async function downloadDuplicatesCsv(token: string, filename: string) {
+  const response = await fetch(backendUrl(`/api/cleaner/report/${token}`), {
+    cache: "no-store"
   });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+
+    throw new ApiError(
+      text || `Download failed with status ${response.status}`,
+      response.status,
+      null
+    );
+  }
+
+  const blob = await response.blob();
 
   await saveBlobWithPicker(blob, filename, { "text/csv": [".csv"] });
 }
