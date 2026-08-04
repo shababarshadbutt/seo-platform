@@ -197,6 +197,20 @@ function openDuplicateReport(reportPath: string): DuplicateReportSink & {
 
   let buffer = "";
   let closed = false;
+  // writeRow does NOT throw synchronously — a WriteStream.write() on a doomed or
+  // destroyed stream returns normally and reports the failure as an asynchronous
+  // 'error' event (verified: write() returned normally, then EISDIR arrived as an
+  // event). That makes it the OPPOSITE hazard to considerLoc's: harmless in the
+  // handler, fatal afterwards, because until close() ran finishStream there was
+  // no 'error' listener at all — and an unhandled 'error' on a stream is an
+  // uncaughtException, so a full disk during Pass 2 took the API down exactly
+  // like the budget refusal did. Hold the first error and surface it at close(),
+  // where it fails the one run that hit it.
+  let streamError: Error | null = null;
+
+  stream.on("error", (error: Error) => {
+    streamError ??= error;
+  });
 
   const flush = () => {
     if (buffer.length > 0) {
@@ -225,7 +239,17 @@ function openDuplicateReport(reportPath: string): DuplicateReportSink & {
 
       closed = true;
       flush();
-      await finishStream(stream);
+      // Let the stream finish first, then report any error it recorded. On the
+      // cleanup path the caller already swallows this (the run is failing for
+      // another reason); on the success path it correctly turns a half-written
+      // report into a failed run rather than a silently truncated CSV.
+      await finishStream(stream).catch((error: Error) => {
+        streamError ??= error;
+      });
+
+      if (streamError) {
+        throw streamError;
+      }
     }
   };
 }
@@ -351,7 +375,28 @@ function openCleanedSink(outPath: string): {
   const fileStream = createWriteStream(outPath);
 
   if (!isGzipName(outPath)) {
-    return { sink: fileStream, done: () => finishStream(fileStream) };
+    // Same asynchronous-'error' hazard as openDuplicateReport: between the
+    // sink.write() calls and done()'s finishStream there was no error listener,
+    // so a disk failure mid-file was an uncaughtException rather than a failed
+    // run. The gzip branch below already binds one for the whole window.
+    let sinkError: Error | null = null;
+
+    fileStream.on("error", (error: Error) => {
+      sinkError ??= error;
+    });
+
+    return {
+      sink: fileStream,
+      done: async () => {
+        await finishStream(fileStream).catch((error: Error) => {
+          sinkError ??= error;
+        });
+
+        if (sinkError) {
+          throw sinkError;
+        }
+      }
+    };
   }
 
   const gzip = createGzip();
@@ -671,7 +716,20 @@ async function writeCandidateFile(
     }
   };
 
-  await produce(emit);
+  // produce() can now REJECT — considerLoc raises CleanerCapacityError on a
+  // ledger sync boundary and streamUrlsetLocs propagates it instead of swallowing
+  // it. The cleaned sink is already open at that point, so without this the
+  // failure would leak a file descriptor (and a partial output file) per failed
+  // candidate: the same fd-exhaustion-by-way-of-the-guard problem 7f7d046c fixed
+  // for the duplicates report.
+  try {
+    await produce(emit);
+  } catch (error) {
+    await done().catch(() => undefined);
+    await unlink(outPath).catch(() => undefined);
+
+    throw error;
+  }
 
   if (keptCount === 0) {
     await done();
@@ -716,18 +774,42 @@ function isKept(verdicts: VerdictSet, ordinal: number): boolean {
 }
 
 // Read a provisional "<key>\t<loc>" file line by line, calling onPair in order.
+//
+// onPair IS ALLOWED TO THROW and the throw must reach our caller. It runs
+// considerLoc, which raises CleanerCapacityError on a ledger sync boundary. A
+// throw out of a readline "line" listener does NOT reject this promise on its
+// own — it propagates through EventEmitter.emit into the read stream's own data
+// callback and surfaces as an uncaughtException, which exits the API process and
+// kills every concurrent Cleaner run. The budget refusing one oversized run then
+// took the whole service down: strictly worse than the unbounded heap it
+// replaced. So the callback is invoked under a try and its error is turned into
+// a rejection here.
 function readProvisionalPairs(
   provisionalPath: string,
   onPair: (loc: string, key: string) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const rl = createInterface({
-      input: createReadStream(provisionalPath),
-      crlfDelay: Infinity
-    });
+    const input = createReadStream(provisionalPath);
+    const rl = createInterface({ input, crlfDelay: Infinity });
+    // Re-entry guard: readline can emit buffered lines after close() is called,
+    // and destroying the input emits its own events. Without this the callback
+    // would keep running after the run has already failed, and a second reject
+    // would be silently dropped while the work continued.
+    let failed = false;
+
+    const fail = (error: unknown) => {
+      if (failed) {
+        return;
+      }
+
+      failed = true;
+      rl.close();
+      input.destroy();
+      reject(error);
+    };
 
     rl.on("line", (line) => {
-      if (!line) {
+      if (failed || !line) {
         return;
       }
 
@@ -737,10 +819,21 @@ function readProvisionalPairs(
         return;
       }
 
-      onPair(line.slice(tab + 1), line.slice(0, tab));
+      try {
+        onPair(line.slice(tab + 1), line.slice(0, tab));
+      } catch (error) {
+        fail(error);
+      }
     });
-    rl.on("close", () => resolve());
-    rl.on("error", reject);
+    rl.on("close", () => {
+      if (!failed) {
+        resolve();
+      }
+    });
+    rl.on("error", fail);
+    // Read errors reach the interface inconsistently; bind the source too so a
+    // mid-read disk failure rejects rather than hanging this promise forever.
+    input.on("error", fail);
   });
 }
 
@@ -1060,6 +1153,16 @@ function createBatchedWriter(filePath: string) {
   const FLUSH_AT = 1 << 20;
   const stream = createWriteStream(filePath);
   let buffer = "";
+  // Same asynchronous-'error' hazard as openDuplicateReport: waitForDrain binds
+  // an error listener only while it is actually waiting, so a write failure with
+  // no drain pending had no listener and became an uncaughtException. Spill files
+  // are the multi-GB part of a sharded run, so ENOSPC here is the likeliest
+  // version of it.
+  let streamError: Error | null = null;
+
+  stream.on("error", (error: Error) => {
+    streamError ??= error;
+  });
 
   const waitForDrain = () =>
     new Promise<void>((resolve, reject) => {
@@ -1108,6 +1211,10 @@ function createBatchedWriter(filePath: string) {
       return stream.writableNeedDrain;
     },
     async drain(): Promise<void> {
+      if (streamError) {
+        throw streamError;
+      }
+
       if (stream.writableNeedDrain) {
         await waitForDrain();
       }
@@ -1115,11 +1222,19 @@ function createBatchedWriter(filePath: string) {
     async close(): Promise<void> {
       flush();
 
-      if (stream.writableNeedDrain) {
-        await waitForDrain();
+      if (stream.writableNeedDrain && !streamError) {
+        await waitForDrain().catch((error: Error) => {
+          streamError ??= error;
+        });
       }
 
-      await finishStream(stream);
+      await finishStream(stream).catch((error: Error) => {
+        streamError ??= error;
+      });
+
+      if (streamError) {
+        throw streamError;
+      }
     }
   };
 }
@@ -1127,18 +1242,32 @@ function createBatchedWriter(filePath: string) {
 // Read a spill file's "<i>\t<ordinal>\t<key>\t<loc>" lines in order. Split by
 // hand rather than String.split so a <loc> containing a tab (escaped in XML but
 // legal in the raw string) cannot shift the columns.
+// onLine IS ALLOWED TO THROW — it charges the dedup ledger and so raises
+// CleanerCapacityError on a sync boundary. See readProvisionalPairs for why a
+// throw out of a readline listener has to be converted into a rejection here
+// rather than left to propagate through EventEmitter as an uncaughtException.
 function readSpillLines(
   spillPath: string,
   onLine: (i: number, ordinal: number, key: string, loc: string) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const rl = createInterface({
-      input: createReadStream(spillPath),
-      crlfDelay: Infinity
-    });
+    const input = createReadStream(spillPath);
+    const rl = createInterface({ input, crlfDelay: Infinity });
+    let failed = false;
+
+    const fail = (error: unknown) => {
+      if (failed) {
+        return;
+      }
+
+      failed = true;
+      rl.close();
+      input.destroy();
+      reject(error);
+    };
 
     rl.on("line", (line) => {
-      if (!line) {
+      if (failed || !line) {
         return;
       }
 
@@ -1150,15 +1279,24 @@ function readSpillLines(
         return;
       }
 
-      onLine(
-        Number(line.slice(0, t1)),
-        Number(line.slice(t1 + 1, t2)),
-        line.slice(t2 + 1, t3),
-        line.slice(t3 + 1)
-      );
+      try {
+        onLine(
+          Number(line.slice(0, t1)),
+          Number(line.slice(t1 + 1, t2)),
+          line.slice(t2 + 1, t3),
+          line.slice(t3 + 1)
+        );
+      } catch (error) {
+        fail(error);
+      }
     });
-    rl.on("close", () => resolve());
-    rl.on("error", reject);
+    rl.on("close", () => {
+      if (!failed) {
+        resolve();
+      }
+    });
+    rl.on("error", fail);
+    input.on("error", fail);
   });
 }
 

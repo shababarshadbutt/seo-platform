@@ -456,7 +456,7 @@ export async function streamUrlsetLocs(
   isGzip: boolean,
   onLoc: (loc: string) => void
 ): Promise<CleanerLocStreamResult> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const parser = sax.parser(true, {});
     const { decodedInput, input } = createSitemapInput(source, isGzip);
     let rootElement: string | null = null;
@@ -464,6 +464,16 @@ export async function streamUrlsetLocs(
     let inLoc = false;
     let locText = "";
     let settled = false;
+    // An error thrown by onLoc, kept apart from parse errors. The two must NOT be
+    // conflated: `parser.write` below is wrapped in a try that treats anything
+    // escaping it as a malformed document. onLoc runs considerLoc, which raises
+    // CleanerCapacityError on a ledger sync boundary — and that was being
+    // swallowed by exactly that try, marking the FILE unparsable and resolving
+    // normally. The run then reported success having silently written only part
+    // of its URLs (measured: 12,286 of 32,768, with no error and no dropped
+    // file), so a user would publish a truncated sitemap believing it complete.
+    // A caller error is the caller's to handle, so it is rejected instead.
+    let callbackError: unknown = null;
 
     function settle() {
       if (settled) {
@@ -475,8 +485,29 @@ export async function streamUrlsetLocs(
       resolve({ rootElement, isValid });
     }
 
+    // Reject rather than resolve-as-invalid. Used only for an onLoc failure.
+    function failHard(error: unknown) {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      destroySitemapInput(source, decodedInput, input);
+      reject(error);
+    }
+
     function fail() {
       if (settled) {
+        return;
+      }
+
+      // An onLoc failure reaches here via the parser.write / parser.close catch
+      // below, because unwinding sax is how it escapes the callback. Route it to
+      // the rejection path instead of reporting a parse failure that never
+      // happened.
+      if (callbackError !== null) {
+        failHard(callbackError);
+
         return;
       }
 
@@ -526,7 +557,16 @@ export async function streamUrlsetLocs(
       const loc = locText.trim();
 
       if (loc && rootElement === "urlset") {
-        onLoc(loc);
+        try {
+          onLoc(loc);
+        } catch (error) {
+          // Record it, then rethrow: unwinding sax is the only way out of this
+          // callback, and `fail()` reads callbackError to tell a caller failure
+          // apart from a genuine parse error.
+          callbackError = error;
+
+          throw error;
+        }
       }
 
       inLoc = false;

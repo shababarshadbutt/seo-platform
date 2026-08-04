@@ -922,3 +922,190 @@ test("a sharded run that THROWS mid-bucket still releases that bucket's charge",
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---- Mid-handler budget refusal reaches the caller ----------------------
+//
+// The test above deliberately puts its refusal on the bucket-END sync, which is
+// plain async code. These cover the harder case: the refusal raised on an
+// IN-HANDLER sync, from inside a synchronous readline/sax callback.
+//
+// That case used to be unsurvivable, differently on each engine:
+//   - readSpillLines / readProvisionalPairs: the throw propagated through
+//     EventEmitter.emit and became an uncaughtException — server.ts exited 1,
+//     Docker restarted the API, and EVERY concurrent run died. The budget
+//     refusing one run took the whole service down.
+//   - streamUrlsetLocs: worse, it was SWALLOWED. `parser.write` is wrapped in a
+//     try that treats anything escaping as a malformed document, so the run
+//     resolved as a SUCCESS having written only part of its URLs — measured at
+//     12,286 of 32,768, with no error and no dropped file. A user would publish a
+//     truncated sitemap believing it complete.
+//
+// Sizing: TOTAL is 8 syncs' worth and the budget admits one, so the refusal lands
+// on sync #2 — inside the handler, never on a tail sync. Asserted below.
+const MID_HANDLER_TOTAL = LEDGER_SYNC_INTERVAL * 8;
+
+function midHandlerLocs(): string[] {
+  return Array.from(
+    { length: MID_HANDLER_TOTAL },
+    (_, i) => `${DOMAIN}/mh/page-${String(i).padStart(7, "0")}`
+  );
+}
+
+// Budget that admits sync #1 (LEDGER_SYNC_INTERVAL entries) and refuses sync #2.
+function tightBudgetFor(locs: string[]): number {
+  return dedupEntryCost(normalizeForDedup(locs[0]).length) * (LEDGER_SYNC_INTERVAL + 10);
+}
+
+test("SHARDED engine: an in-handler budget refusal rejects instead of killing the process", async () => {
+  const { dir, inDir, outDir } = scratch("mid-handler-shard");
+  resetDedupLedgerForTest();
+  const before = dedupLedger();
+  const locs = midHandlerLocs();
+
+  try {
+    const a = path.join(inDir, "0__a.xml");
+    const b = path.join(inDir, "1__b.xml");
+    writeFileSync(a, urlsetXml(locs.slice(0, MID_HANDLER_TOTAL / 2)));
+    writeFileSync(b, urlsetXml(locs.slice(MID_HANDLER_TOTAL / 2)));
+
+    setDedupBudgetForTest(tightBudgetFor(locs));
+
+    let threw: unknown = null;
+
+    try {
+      // Two buckets, each 4 syncs' worth — so the refusal cannot be a tail sync.
+      await cleanWithBucketSize(
+        [
+          { filename: "a.xml", path: a },
+          { filename: "b.xml", path: b }
+        ],
+        outDir,
+        String(MID_HANDLER_TOTAL / 2)
+      );
+    } catch (error) {
+      threw = error;
+    }
+
+    // The whole point: it arrives as a value the caller can handle. If it were
+    // still escaping through EventEmitter this would be an uncaughtException and
+    // `threw` would be null (the test runner would attribute the crash instead).
+    assert.ok(
+      threw instanceof CleanerCapacityError,
+      "the caller must receive a CleanerCapacityError, not an uncaughtException"
+    );
+    // And the run must still have unwound cleanly on the way out.
+    const after = dedupLedger();
+    assert.equal(after.totalBytes, before.totalBytes, "ledger bytes must unwind");
+    assert.equal(after.runs, before.runs, "ledger entries must unwind");
+  } finally {
+    setDedupBudgetForTest(null);
+    resetDedupLedgerForTest();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The single-Map engine, sequential variant — 2 files is below
+// CLEANER_PARALLEL_THRESHOLD and the corpus stays on one bucket, so this drives
+// considerLoc from inside streamUrlsetLocs' sax callback. This is the path that
+// silently truncated: asserting the error REACHES the caller is what proves the
+// output can no longer be quietly incomplete.
+test("SINGLE-MAP engine: an in-handler budget refusal rejects instead of truncating silently", async () => {
+  const { dir, inDir, outDir } = scratch("mid-handler-single");
+  resetDedupLedgerForTest();
+  const before = dedupLedger();
+  const locs = midHandlerLocs();
+
+  try {
+    const a = path.join(inDir, "0__a.xml");
+    const b = path.join(inDir, "1__b.xml");
+    writeFileSync(a, urlsetXml(locs.slice(0, MID_HANDLER_TOTAL / 2)));
+    writeFileSync(b, urlsetXml(locs.slice(MID_HANDLER_TOTAL / 2)));
+
+    setDedupBudgetForTest(tightBudgetFor(locs));
+
+    let threw: unknown = null;
+
+    try {
+      // perBucket undefined → the 4M default → buckets === 1, the single-Map path.
+      await cleanWithBucketSize(
+        [
+          { filename: "a.xml", path: a },
+          { filename: "b.xml", path: b }
+        ],
+        outDir,
+        undefined
+      );
+    } catch (error) {
+      threw = error;
+    }
+
+    assert.ok(
+      threw instanceof CleanerCapacityError,
+      "the caller must receive a CleanerCapacityError, not a silently truncated success"
+    );
+    const after = dedupLedger();
+    assert.equal(after.totalBytes, before.totalBytes, "ledger bytes must unwind");
+    assert.equal(after.runs, before.runs, "ledger entries must unwind");
+  } finally {
+    setDedupBudgetForTest(null);
+    resetDedupLedgerForTest();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The third call site: readProvisionalPairs, used by the single-Map engine's
+// PARALLEL variant. Driven through writeCandidatesParallel directly — the same
+// injection the ordering test uses — because reaching it via cleanSitemaps would
+// need CLEANER_PARALLEL_THRESHOLD (200) real files and a live worker pool, and
+// the threshold is read once at module load so a test cannot move it.
+//
+// Ledger release is cleanSitemaps' job, not this function's, so this asserts only
+// that the refusal REACHES the caller — the two tests above cover the unwind.
+test("PARALLEL provisional reader: an in-handler budget refusal rejects instead of killing the process", async () => {
+  const { dir, inDir, outDir } = scratch("mid-handler-parallel");
+  resetDedupLedgerForTest();
+  const locs = midHandlerLocs();
+
+  try {
+    const provPath = path.join(inDir, "p0.provisional");
+    writeFileSync(
+      provPath,
+      locs.map((loc) => `${normalizeForDedup(loc)}\t${loc}`).join("\n") + "\n"
+    );
+
+    setDedupBudgetForTest(tightBudgetFor(locs));
+
+    let threw: unknown = null;
+
+    try {
+      await writeCandidatesParallel({
+        candidates: [
+          {
+            file: { filename: "a.xml", path: provPath },
+            outputName: "a.xml",
+            onDomainCount: MID_HANDLER_TOTAL
+          }
+        ],
+        concurrency: 1,
+        today: TODAY,
+        outDir,
+        state: createDedupState({ runId: "mid-handler-parallel" }),
+        survivors: [],
+        dropped: [],
+        cleanupProvisional: false,
+        loadProvisional: async () => provPath
+      });
+    } catch (error) {
+      threw = error;
+    }
+
+    assert.ok(
+      threw instanceof CleanerCapacityError,
+      "the caller must receive a CleanerCapacityError, not an uncaughtException"
+    );
+  } finally {
+    setDedupBudgetForTest(null);
+    resetDedupLedgerForTest();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
