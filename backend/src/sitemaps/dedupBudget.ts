@@ -152,6 +152,15 @@ export function dedupLedger(): {
 
 // Gate a run BEFORE it starts pulling and parsing. Throws when the runs already
 // in flight have consumed too much of the shared budget for another to be safe.
+//
+// KNOWN COSMETIC ISSUE (deliberately not fixed). `charged.size` is used below and
+// in chargeDedupBytes as a count of "runs in progress", but a sharded run holds
+// TWO kinds of key at once: the run-level placeholder this function inserts, and
+// one `<runId>#b<n>` entry per live bucket. So the count can read 2 while a
+// single run is in flight, and the message says "2 run(s) already in progress".
+// It affects only the wording of an error/log message — enforcement is on
+// totalBytes, which is charged and released correctly — so it is left alone
+// rather than risk churn in the accounting this module exists to get right.
 export function admitDedupRun(runId: string): void {
   const budgetBytes = dedupBudgetBytes();
   const ceiling = Math.floor(budgetBytes * ADMISSION_WATERMARK);

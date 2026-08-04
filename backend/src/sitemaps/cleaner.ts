@@ -453,7 +453,12 @@ export type DuplicateReportSink = {
 // How many entries to accumulate locally before syncing the shared ledger.
 // The hot path is then a counter increment; the process-wide total trails by at
 // most this many entries (~1 MB), which the budget's 45% margin absorbs.
-const LEDGER_SYNC_INTERVAL = 4096;
+//
+// Exported for the bucket-release regression test, which has to size a budget
+// that admits exactly ONE sync and refuses the next — so it must derive the
+// boundary from this value rather than restate it, or a change here would leave
+// the test passing while no longer forcing the failure it exists to cover.
+export const LEDGER_SYNC_INTERVAL = 4096;
 
 export type DedupState = {
   keptBy: Map<string, string>; // normalized URL -> kept-in filename
@@ -938,36 +943,50 @@ export async function writeCandidatesSharded(options: {
       runId: `${ledgerRunId}#b${b}`
     });
 
-    await readSpillLines(spillPaths[b], (i, ordinal, key, loc) => {
-      const outputName = candidates[i].outputName;
+    // The release MUST be in a finally. A bucket charges the shared ledger
+    // incrementally (every LEDGER_SYNC_INTERVAL entries), so by the time
+    // anything in here throws — the tail sync refusing on a concurrent run's
+    // pressure, an ENOSPC reading the multi-GB spill, the report sink erroring —
+    // this bucket already holds bytes under its own `#b<n>` key. cleanSitemaps'
+    // finally releases the RUN id, which is a different key and cannot free
+    // them, so a throw on the straight-line path leaked one bucket's charge
+    // permanently: the budget shrinks for every user and only an API restart
+    // recovers it, which is the exact outage this accounting exists to prevent.
+    try {
+      await readSpillLines(spillPaths[b], (i, ordinal, key, loc) => {
+        const outputName = candidates[i].outputName;
 
-      if (!bucketState.keptBy.has(key)) {
-        bucketState.keptBy.set(key, outputName);
-        bucketState.unsyncedBytes += dedupEntryCost(key.length);
-        bucketState.unsyncedEntries += 1;
+        if (!bucketState.keptBy.has(key)) {
+          bucketState.keptBy.set(key, outputName);
+          bucketState.unsyncedBytes += dedupEntryCost(key.length);
+          bucketState.unsyncedEntries += 1;
 
-        if (bucketState.unsyncedEntries >= LEDGER_SYNC_INTERVAL) {
-          syncDedupLedger(bucketState);
+          if (bucketState.unsyncedEntries >= LEDGER_SYNC_INTERVAL) {
+            syncDedupLedger(bucketState);
+          }
+
+          markKept(verdicts[i], ordinal);
+
+          return;
         }
 
-        markKept(verdicts[i], ordinal);
-
-        return;
-      }
-
-      duplicatesRemoved += 1;
-      onDuplicate({
-        url: loc,
-        kept_in: bucketState.keptBy.get(key) as string,
-        also_in: [outputName]
+        duplicatesRemoved += 1;
+        onDuplicate({
+          url: loc,
+          kept_in: bucketState.keptBy.get(key) as string,
+          also_in: [outputName]
+        });
       });
-    });
 
-    // Charge the tail, then hand the whole bucket back: its Map is about to be
-    // unreachable, so continuing to hold its bytes against the shared budget
-    // would shrink the budget for everyone for the rest of the run.
-    syncDedupLedger(bucketState);
-    releaseDedupRun(bucketState.runId);
+      // Charge the tail while the Map is still resident, so a concurrent run
+      // sees this bucket's real cost for the moment it genuinely holds it.
+      syncDedupLedger(bucketState);
+    } finally {
+      // Hand the whole bucket back: its Map is about to be unreachable, so
+      // continuing to hold its bytes against the shared budget would shrink the
+      // budget for everyone for the rest of the run.
+      releaseDedupRun(bucketState.runId);
+    }
 
     if (cleanupProvisional) {
       await unlink(spillPaths[b]).catch(() => undefined);

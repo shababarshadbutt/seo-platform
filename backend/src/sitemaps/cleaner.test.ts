@@ -20,6 +20,7 @@ import {
   createDedupState,
   dedupBucketCount,
   dedupBucketOf,
+  LEDGER_SYNC_INTERVAL,
   normalizeForDedup,
   REPORT_FILENAME,
   uniqueOutputName,
@@ -27,7 +28,13 @@ import {
   type CleanerInputFile,
   type DropReason
 } from "./cleaner.js";
-import { dedupLedger, resetDedupLedgerForTest } from "./dedupBudget.js";
+import {
+  CleanerCapacityError,
+  dedupEntryCost,
+  dedupLedger,
+  resetDedupLedgerForTest,
+  setDedupBudgetForTest
+} from "./dedupBudget.js";
 
 // Pass 2's cross-file dedup ("first occurrence across files wins") must depend
 // on FILE ORDER, not the order the parallel workers finish in. These tests
@@ -788,6 +795,130 @@ test("a sharded run releases every bucket's dedup charge", async () => {
     assert.equal(dedupLedger().runs, 0);
   } finally {
     resetDedupLedgerForTest();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The SAME guarantee on the path that actually broke it: a run that THROWS
+// part-way through a bucket.
+//
+// This is the second resource-release bug in this file found only by forcing a
+// failure — the first leaked the duplicates-report fd — so the failure path gets
+// a permanent test rather than the straight-line path being trusted twice.
+//
+// The bug: a bucket charges the shared ledger incrementally, every
+// LEDGER_SYNC_INTERVAL entries, under its OWN key (`<runId>#b<n>`). The release
+// used to sit on the straight-line path after readSpillLines, so any throw after
+// the first sync skipped it — and cleanSitemaps' own finally releases the RUN
+// key, which is a different key and cannot free a bucket's bytes. Measured leak:
+// 598,016 bytes and one ledger entry surviving a failed run, permanently. In
+// production a bucket is up to 4M URLs (~890MB) against an ADMISSION_WATERMARK of
+// 0.8, so a handful of failed runs would refuse every subsequent Cleaner run
+// until the API restarted — the exact outage the ledger exists to prevent.
+//
+// Forcing it: shrink the budget to admit exactly one sync and refuse the next, so
+// the throw is guaranteed to land AFTER real bytes are charged. Both halves of
+// that ordering are asserted below, because a budget that threw too early would
+// leave nothing charged and the test would pass while proving nothing.
+test("a sharded run that THROWS mid-bucket still releases that bucket's charge", async () => {
+  const { dir, inDir, outDir } = scratch("release-shard-throw");
+  resetDedupLedgerForTest();
+
+  // The state every assertion is measured against — not a hardcoded 0, so this
+  // keeps meaning the right thing if the ledger ever starts out non-empty.
+  const before = dedupLedger();
+  // Two files of all-distinct URLs, split into 2 buckets sized so each holds
+  // BETWEEN one and two syncs' worth of entries. That puts exactly one in-handler
+  // sync (which succeeds and charges real bytes under `#b<n>`) before the
+  // bucket-end tail sync, which is the one that gets refused. See the note below
+  // on why the throw is deliberately placed at the tail sync.
+  const perBucket = Math.floor(LEDGER_SYNC_INTERVAL * 1.25);
+  const total = perBucket * 2;
+  // dedupBucketCount reads this env var, so it has to be set before the
+  // precondition below consults it — not just inside cleanWithBucketSize.
+  const previousPerBucket = process.env.CLEANER_DEDUP_URLS_PER_BUCKET;
+  process.env.CLEANER_DEDUP_URLS_PER_BUCKET = String(perBucket);
+
+  try {
+    const locs = Array.from(
+      { length: total },
+      (_, i) => `${DOMAIN}/leak/page-${String(i).padStart(7, "0")}`
+    );
+
+    // Precondition, asserted rather than assumed: the corpus must really shard,
+    // and one bucket must hold more than one sync's worth of entries. Otherwise
+    // the throw could precede any charge and the test would be vacuous.
+    const buckets = dedupBucketCount(total);
+    assert.ok(buckets > 1, "the corpus must take the sharded path");
+    assert.ok(
+      total / buckets > LEDGER_SYNC_INTERVAL,
+      "a bucket must hold more than one sync's worth, or nothing is charged before the throw"
+    );
+    // Upper bound matters too: it keeps the refusal on the bucket-END sync rather
+    // than a second in-handler one. A throw raised inside readline's 'line'
+    // callback does NOT reject readSpillLines' promise — it escapes as an
+    // uncaughtException, a separate and worse defect that is NOT what this test
+    // covers (see docs/ticket-mid-handler-throw-escapes.md). Keeping the refusal
+    // at the tail sync isolates the release guarantee from that bug, so this test
+    // fails for one reason only.
+    assert.ok(
+      total / buckets < LEDGER_SYNC_INTERVAL * 2,
+      "a bucket must hold fewer than two syncs' worth, so the refusal lands on the tail sync"
+    );
+
+    const a = path.join(inDir, "0__a.xml");
+    const b = path.join(inDir, "1__b.xml");
+    writeFileSync(a, urlsetXml(locs.slice(0, total / 2)));
+    writeFileSync(b, urlsetXml(locs.slice(total / 2)));
+
+    // All keys are the same length, so per-entry cost is uniform and the
+    // boundary is exact: one full sync fits, the next charge cannot.
+    const cost = dedupEntryCost(normalizeForDedup(locs[0]).length);
+    setDedupBudgetForTest(cost * (LEDGER_SYNC_INTERVAL + 10));
+
+    let threw: unknown = null;
+
+    try {
+      await cleanWithBucketSize(
+        [
+          { filename: "a.xml", path: a },
+          { filename: "b.xml", path: b }
+        ],
+        outDir,
+        String(perBucket)
+      );
+    } catch (error) {
+      threw = error;
+    }
+
+    assert.ok(
+      threw instanceof CleanerCapacityError,
+      "the run must be refused by the budget — that is what forces the mid-bucket throw"
+    );
+
+    // The actual regression: the ledger is back where it started. Before the fix
+    // this read totalBytes=598016, runs=1.
+    const after = dedupLedger();
+    assert.equal(
+      after.totalBytes,
+      before.totalBytes,
+      "a failed sharded run must not leave bucket bytes charged"
+    );
+    assert.equal(
+      after.runs,
+      before.runs,
+      "a failed sharded run must not leave a bucket ledger entry behind"
+    );
+  } finally {
+    setDedupBudgetForTest(null);
+    resetDedupLedgerForTest();
+
+    if (previousPerBucket === undefined) {
+      delete process.env.CLEANER_DEDUP_URLS_PER_BUCKET;
+    } else {
+      process.env.CLEANER_DEDUP_URLS_PER_BUCKET = previousPerBucket;
+    }
+
     rmSync(dir, { recursive: true, force: true });
   }
 });
