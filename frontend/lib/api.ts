@@ -342,6 +342,268 @@ async function fetchWithTimeout(
   }
 }
 
+// ---- Streaming downloads -------------------------------------------------
+//
+// Every download in this file used to be `await response.blob()`, which has two
+// consequences that together produced "the button does nothing for 15 minutes":
+//
+//   1. NO FEEDBACK. blob() resolves only when the LAST byte has arrived, so a
+//      multi-GB ZIP shows nothing at all until it is completely downloaded, then
+//      the save dialog appears. There is no point at which the UI can say how far
+//      along it is, because it is never told.
+//   2. NO TIMEOUT ON THE BODY. fetchWithTimeout clears its timer in a `finally`
+//      that runs when fetch() RESOLVES — which is when the response HEADERS
+//      arrive, not when the body finishes. So EXPORT_API_TIMEOUT_MS only ever
+//      bounded time-to-headers, and the blob() read afterwards was unbounded.
+//      (downloadCleanerZip and downloadDuplicatesCsv had no timeout at all.)
+//
+// (2) is also why a failed download appeared to show nothing. The UI callers DO
+// catch and route to setError/friendlyApiErrorMessage — that part was never
+// broken. On a stalled body the promise simply never settles, so neither the
+// resolve nor the reject path is ever reached and there is nothing to display.
+// Nothing was swallowed; the catch was never entered.
+//
+// This helper fixes both: it streams via getReader() so progress is observable,
+// and it bounds the whole transfer with a STALL timer rather than a total-time
+// cap — see DOWNLOAD_STALL_TIMEOUT_MS.
+//
+// Abort on INACTIVITY, not on total elapsed time. A legitimate multi-GB export
+// over a slow link can take an hour and must be allowed to finish, so any total
+// ceiling would be a guess that eventually kills real work. Sixty seconds with
+// zero bytes received, by contrast, is not slow — it is broken.
+export const DOWNLOAD_STALL_TIMEOUT_MS = 60000;
+
+export type DownloadProgress = {
+  receivedBytes: number;
+  // null when the server sent no Content-Length; the UI then shows bytes rather
+  // than a percentage instead of inventing one.
+  totalBytes: number | null;
+  percent: number | null;
+};
+
+export type DownloadOptions = {
+  onProgress?: (progress: DownloadProgress) => void;
+  // Caller-owned cancellation (e.g. a Cancel button), kept distinct from a stall.
+  signal?: AbortSignal;
+  stallTimeoutMs?: number;
+};
+
+// A stall is NOT the same as a request timeout, and must not reuse that message:
+// friendlyApiErrorMessage renders AbortError as "the operation may still be
+// running in the background", which is true of a slow server-side export and
+// false of a dead socket. Its own type keeps the two messages honest.
+export class DownloadStalledError extends Error {
+  readonly receivedBytes: number;
+  readonly stallMs: number;
+
+  constructor(receivedBytes: number, stallMs: number) {
+    super(
+      `Download stalled — no data received for ${Math.round(
+        stallMs / 1000
+      )}s after ${formatBytes(receivedBytes)}`
+    );
+    this.name = "DownloadStalledError";
+    this.receivedBytes = receivedBytes;
+    this.stallMs = stallMs;
+  }
+}
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+
+  if (bytes < 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+// Human-readable "X of Y MB" / "X MB" for a progress event.
+export function formatDownloadProgress(progress: DownloadProgress): string {
+  if (progress.totalBytes === null) {
+    return `${formatBytes(progress.receivedBytes)} downloaded`;
+  }
+
+  return `${formatBytes(progress.receivedBytes)} of ${formatBytes(
+    progress.totalBytes
+  )}`;
+}
+
+// Shared !response.ok handling, identical to what each download helper used to
+// inline: prefer the backend's own JSON `message`, fall back to raw text.
+async function downloadResponseError(
+  response: Response,
+  fallback: string
+): Promise<ApiError> {
+  const text = await response.text().catch(() => "");
+  let message = fallback;
+  let payload: unknown = null;
+
+  try {
+    payload = text ? JSON.parse(text) : null;
+
+    if (typeof (payload as { message?: unknown })?.message === "string") {
+      message = (payload as { message: string }).message;
+    } else if (text) {
+      message = text;
+    }
+  } catch {
+    if (text) {
+      message = text;
+    }
+  }
+
+  return new ApiError(message, response.status, payload);
+}
+
+// Fetch a URL into a Blob, streaming, with progress and stall detection. THE one
+// place this file downloads bytes — the blob() anti-pattern was duplicated across
+// six helpers, so a fix applied to one of them (or a timeout added to one of
+// them) silently left the other five behind.
+export async function downloadToBlob(
+  url: string,
+  init: RequestInit = {},
+  options: DownloadOptions = {},
+  notOkFallback = "Download failed"
+): Promise<{ blob: Blob; response: Response }> {
+  const stallMs = options.stallTimeoutMs ?? DOWNLOAD_STALL_TIMEOUT_MS;
+  const controller = new AbortController();
+  let stalled = false;
+  let received = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const disarm = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  // Re-armed on every chunk, so the timer measures INACTIVITY rather than total
+  // duration. Armed before fetch() too, so a server that accepts the connection
+  // and never sends headers also fails instead of hanging.
+  const arm = () => {
+    disarm();
+    timer = setTimeout(() => {
+      stalled = true;
+      controller.abort();
+    }, stallMs);
+  };
+
+  if (options.signal) {
+    if (options.signal.aborted) {
+      controller.abort();
+    } else {
+      options.signal.addEventListener("abort", () => controller.abort(), {
+        once: true
+      });
+    }
+  }
+
+  arm();
+
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+
+    if (!response.ok) {
+      disarm();
+
+      throw await downloadResponseError(
+        response,
+        `${notOkFallback} with status ${response.status}`
+      );
+    }
+
+    const header = response.headers.get("content-length");
+    const parsed = header === null ? Number.NaN : Number(header);
+    const totalBytes =
+      Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+    const contentType =
+      response.headers.get("content-type") ?? "application/octet-stream";
+
+    // Headers are in: the caller can stop saying "Preparing…" and show a bar.
+    options.onProgress?.({
+      receivedBytes: 0,
+      totalBytes,
+      percent: totalBytes === null ? null : 0
+    });
+
+    if (!response.body) {
+      // No streaming support in this browser. Fall back to blob(), and disarm
+      // rather than leave a timer that no chunk can reset armed over a
+      // legitimately long download — a false abort is worse than no stall
+      // detection on a path modern browsers never take.
+      disarm();
+      const blob = await response.blob();
+
+      options.onProgress?.({
+        receivedBytes: blob.size,
+        totalBytes: totalBytes ?? blob.size,
+        percent: 100
+      });
+
+      return { blob, response };
+    }
+
+    const reader = response.body.getReader();
+    const chunks: BlobPart[] = [];
+    let lastReportAt = 0;
+
+    for (;;) {
+      const { done, value } = await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      arm();
+      chunks.push(value);
+      received += value.byteLength;
+
+      // Throttled: a multi-GB body arrives in tens of thousands of chunks and a
+      // setState per chunk would cost more than the download. ~10 updates/sec is
+      // past the point a human can read anyway.
+      const now = Date.now();
+
+      if (now - lastReportAt >= 100) {
+        lastReportAt = now;
+        options.onProgress?.({
+          receivedBytes: received,
+          totalBytes,
+          percent:
+            totalBytes === null
+              ? null
+              : Math.min(100, Math.round((received / totalBytes) * 100))
+        });
+      }
+    }
+
+    options.onProgress?.({
+      receivedBytes: received,
+      totalBytes: totalBytes ?? received,
+      percent: 100
+    });
+
+    return { blob: new Blob(chunks, { type: contentType }), response };
+  } catch (error) {
+    // Our own stall abort, not the caller's cancellation — report it as what it
+    // is. A caller-initiated abort keeps its AbortError so existing cancel
+    // handling behaves as before.
+    if (stalled) {
+      throw new DownloadStalledError(received, stallMs);
+    }
+
+    throw error;
+  } finally {
+    disarm();
+  }
+}
+
 async function readJsonResponse<T>(response: Response): Promise<T> {
   const text = await response.text();
   let payload: any = null;
@@ -403,6 +665,14 @@ export function friendlyApiErrorMessage(
     }
 
     return error.message || fallback;
+  }
+
+  // A stalled download is not a timed-out request: nothing is still running, the
+  // transfer died. Checked BEFORE the AbortError branch below, which it would
+  // otherwise fall into (a stall is implemented as an abort) and be reported as
+  // "may still be running in the background" — the opposite of what happened.
+  if (error instanceof DownloadStalledError) {
+    return error.message;
   }
 
   // A timeout aborts the in-flight request client-side; the backend may still be
@@ -1480,37 +1750,16 @@ export function getSessionExportUrl(sessionId: string, format: ExportFormat) {
 
 export async function downloadCorrectedSitemap(
   sessionId: string,
-  patternId: string
+  patternId: string,
+  options: DownloadOptions = {}
 ) {
-  const response = await fetchWithTimeout(
+  const { blob, response } = await downloadToBlob(
     backendUrl(
       `/api/sessions/${sessionId}/patterns/${patternId}/download-sitemap`
     ),
     { cache: "no-store" },
-    EXPORT_API_TIMEOUT_MS
+    options
   );
-
-  if (!response.ok) {
-    const text = await response.text();
-    let message = `Download failed with status ${response.status}`;
-    let payload: unknown = null;
-
-    try {
-      payload = text ? JSON.parse(text) : null;
-
-      if (typeof (payload as { message?: unknown })?.message === "string") {
-        message = (payload as { message: string }).message;
-      }
-    } catch {
-      if (text) {
-        message = text;
-      }
-    }
-
-    throw new ApiError(message, response.status, payload);
-  }
-
-  const blob = await response.blob();
   const objectUrl = URL.createObjectURL(blob);
   const link = document.createElement("a");
 
@@ -1686,6 +1935,7 @@ export async function fetchSitemapsZipBlob(
     filter?: boolean;
     excludeFileIds?: string[];
     signal?: AbortSignal;
+    onProgress?: (progress: DownloadProgress) => void;
   } = {}
 ): Promise<{ blob: Blob; filename: string }> {
   const query = new URLSearchParams({ type });
@@ -1698,35 +1948,13 @@ export async function fetchSitemapsZipBlob(
     query.set("exclude", options.excludeFileIds.join(","));
   }
 
-  const response = await fetchWithTimeout(
+  const { blob, response } = await downloadToBlob(
     backendUrl(
       `/api/sessions/${sessionId}/download-sitemaps?${query.toString()}`
     ),
-    { cache: "no-store", signal: options.signal },
-    EXPORT_API_TIMEOUT_MS
+    { cache: "no-store" },
+    { signal: options.signal, onProgress: options.onProgress }
   );
-
-  if (!response.ok) {
-    const text = await response.text();
-    let message = `Download failed with status ${response.status}`;
-    let payload: unknown = null;
-
-    try {
-      payload = text ? JSON.parse(text) : null;
-
-      if (typeof (payload as { message?: unknown })?.message === "string") {
-        message = (payload as { message: string }).message;
-      }
-    } catch {
-      if (text) {
-        message = text;
-      }
-    }
-
-    throw new ApiError(message, response.status, payload);
-  }
-
-  const blob = await response.blob();
   const filename = downloadFilename(response, `${type}-sitemaps.zip`);
 
   return { blob, filename };
@@ -1752,35 +1980,15 @@ function downloadFilename(response: Response, fallback: string) {
 
 export async function downloadSessionExport(
   sessionId: string,
-  format: ExportFormat
+  format: ExportFormat,
+  options: DownloadOptions = {}
 ) {
-  const response = await fetchWithTimeout(
+  const { blob, response } = await downloadToBlob(
     getSessionExportUrl(sessionId, format),
     {},
-    EXPORT_API_TIMEOUT_MS
+    options,
+    "Export failed"
   );
-
-  if (!response.ok) {
-    const text = await response.text();
-    let message = `Export failed with status ${response.status}`;
-    let payload: unknown = null;
-
-    try {
-      payload = text ? JSON.parse(text) : null;
-
-      if (typeof (payload as { message?: unknown })?.message === "string") {
-        message = (payload as { message: string }).message;
-      }
-    } catch {
-      if (text) {
-        message = text;
-      }
-    }
-
-    throw new ApiError(message, response.status, payload);
-  }
-
-  const blob = await response.blob();
   const objectUrl = URL.createObjectURL(blob);
   const link = document.createElement("a");
 
@@ -1821,6 +2029,19 @@ export type CleanerSummary = {
   total_urls_kept_files: number;
   clean_urls_remaining: number;
   reduction_pct: number;
+  // Source files that packed several URLs into ONE <loc> with no separator, and
+  // how the halves were resolved. Optional so a summary produced by an older
+  // backend still parses rather than rendering NaN.
+  concatenated_locs?: CleanerConcatenatedLocs;
+};
+
+export type CleanerConcatenatedLocs = {
+  detected: number;
+  parts_kept: number;
+  parts_discarded: number;
+  fully_resolved: number;
+  partially_resolved: number;
+  unresolved: number;
 };
 
 export type CleanerProgressEvent =
@@ -2188,23 +2409,15 @@ export async function getCleanerHandoff(token: string) {
 // a File so it can be dropped straight into the normal upload flow. (v1.37 Fix 2)
 export async function fetchCleanerHandoffFile(
   token: string,
-  file: CleanerHandoffFile
+  file: CleanerHandoffFile,
+  options: DownloadOptions = {}
 ): Promise<File> {
-  const response = await fetchWithTimeout(
+  const { blob } = await downloadToBlob(
     backendUrl(`/api/cleaner/handoff/${token}/file/${file.index}`),
     { cache: "no-store" },
-    EXPORT_API_TIMEOUT_MS
+    options,
+    `Could not load cleaned file ${file.filename}`
   );
-
-  if (!response.ok) {
-    throw new ApiError(
-      `Could not load cleaned file ${file.filename}`,
-      response.status,
-      null
-    );
-  }
-
-  const blob = await response.blob();
 
   return new File([blob], file.filename, { type: "application/xml" });
 }
@@ -2263,22 +2476,16 @@ export async function saveBlobWithPicker(
   URL.revokeObjectURL(url);
 }
 
-export async function downloadCleanerZip(token: string, filename: string) {
-  const response = await fetch(backendUrl(`/api/cleaner/download/${token}`), {
-    cache: "no-store"
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-
-    throw new ApiError(
-      text || `Download failed with status ${response.status}`,
-      response.status,
-      null
-    );
-  }
-
-  const blob = await response.blob();
+export async function downloadCleanerZip(
+  token: string,
+  filename: string,
+  options: DownloadOptions = {}
+) {
+  const { blob } = await downloadToBlob(
+    backendUrl(`/api/cleaner/download/${token}`),
+    { cache: "no-store" },
+    options
+  );
 
   await saveBlobWithPicker(blob, filename, { "application/zip": [".zip"] });
 }
@@ -2293,22 +2500,16 @@ export async function downloadCleanerZip(token: string, filename: string) {
 // of MB of heap on the API for zero benefit. Same bytes, same columns, one
 // source of truth — and the browser no longer receives a payload proportional to
 // the duplicate count.
-export async function downloadDuplicatesCsv(token: string, filename: string) {
-  const response = await fetch(backendUrl(`/api/cleaner/report/${token}`), {
-    cache: "no-store"
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-
-    throw new ApiError(
-      text || `Download failed with status ${response.status}`,
-      response.status,
-      null
-    );
-  }
-
-  const blob = await response.blob();
+export async function downloadDuplicatesCsv(
+  token: string,
+  filename: string,
+  options: DownloadOptions = {}
+) {
+  const { blob } = await downloadToBlob(
+    backendUrl(`/api/cleaner/report/${token}`),
+    { cache: "no-store" },
+    options
+  );
 
   await saveBlobWithPicker(blob, filename, { "text/csv": [".csv"] });
 }

@@ -1,4 +1,7 @@
-import { classifyCleanerFile } from "../sitemaps/cleaner.js";
+import {
+  classifyCleanerFile,
+  type LocSplitStats
+} from "../sitemaps/cleaner.js";
 
 // piscina worker: classify ONE uploaded sitemap file (Pass 1) off the server
 // process's main thread. Streams the file, counts total vs on-domain <loc>s,
@@ -19,6 +22,9 @@ export type CleanerClassifyResult = {
   rootElement: string | null;
   total: number;
   matching: number;
+  // Concatenated-loc counts for this file. A plain data object, so it survives
+  // the structured clone back to the main thread like the counters beside it.
+  splits: LocSplitStats;
 };
 
 export default async function classify(

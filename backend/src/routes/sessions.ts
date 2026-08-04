@@ -123,6 +123,10 @@ import { enqueuePreGenerateZipJob } from "../queue/preGenerateZipQueue.js";
 import { collectProblemFileGroups } from "../sitemaps/problemFiles.js";
 import { previewTrailingSlash } from "../sitemaps/trailingSlashApply.js";
 import {
+  checkTemplateConflict,
+  racedTemplateConflictRejection
+} from "../sitemaps/patternTemplateConflict.js";
+import {
   enqueueDeleteProblemUrlsJob,
   enqueueFixTrailingSlashesJob,
   enqueueFixTrailingSlashesUndoJob,
@@ -2766,6 +2770,21 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           .send(badRequest("new_template must differ from the current template"));
       }
 
+      // Renaming ONTO another pattern's template violates
+      // patterns_unique_template_per_session_role. Checked here so the user gets a
+      // real message; the catch below also maps a raced violation, because this is
+      // a check-then-act.
+      const renameConflict = await checkTemplateConflict(pool, {
+        sessionId: request.params.id,
+        sourceRole,
+        template: newTemplate,
+        excludePatternId: request.params.patternId
+      });
+
+      if (renameConflict) {
+        return reply.code(renameConflict.status).send(renameConflict.body);
+      }
+
       // Reverting to the most recent rename's old_template is an undo: pop that
       // history row instead of recording a new rename (one level of undo).
       const lastRename = await pool.query<{
@@ -2896,6 +2915,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           await unlinkQuietly(filesToDeleteOnError, request.log);
         }
 
+        // A collision that raced past the pre-check above. Same 400, same message
+        // — never the raw constraint text as a 500.
+        const raced = racedTemplateConflictRejection(error, newTemplate);
+
+        if (raced) {
+          return reply.code(raced.status).send(raced.body);
+        }
+
         throw error;
       } finally {
         client.release();
@@ -2994,6 +3021,26 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         return reply
           .code(400)
           .send(badRequest("new_template must be 500 characters or fewer"));
+      }
+
+      // The optional label update is the same UPDATE the rename route runs, so it
+      // can collide the same way — and this is the path the reported failure came
+      // from, because a transform's new structure can land on a template another
+      // pattern already holds. Only checked when the label actually changes: a
+      // structure-only transform leaves `template` alone and cannot collide.
+      if (newTemplate !== currentTemplate) {
+        const transformConflict = await checkTemplateConflict(pool, {
+          sessionId: request.params.id,
+          sourceRole,
+          template: newTemplate,
+          excludePatternId: request.params.patternId
+        });
+
+        if (transformConflict) {
+          return reply
+            .code(transformConflict.status)
+            .send(transformConflict.body);
+        }
       }
 
       const rewriteUrl: LocUrlRewriter = (url) =>
@@ -3189,6 +3236,12 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           await unlinkQuietly(filesToDeleteOnError, request.log);
         }
 
+        const raced = racedTemplateConflictRejection(error, newTemplate);
+
+        if (raced) {
+          return reply.code(raced.status).send(raced.body);
+        }
+
         throw error;
       } finally {
         client.release();
@@ -3224,6 +3277,33 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           error: "Not Found",
           message: "no transform to undo for this pattern"
         });
+      }
+
+      // Restoring old_template collides if ANOTHER pattern has taken that
+      // structure since the transform (e.g. it was renamed into the gap this
+      // transform left). Rarer than the forward paths but the same violation, so
+      // it gets the same explicit handling instead of a 500.
+      const undoTemplate = last.rows[0].old_template;
+      const undoRole = await pool.query<{ source_role: string }>(
+        "SELECT source_role FROM patterns WHERE session_id = $1 AND id = $2",
+        [request.params.id, request.params.patternId]
+      );
+
+      if (undoRole.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "pattern not found" });
+      }
+
+      const undoConflict = await checkTemplateConflict(pool, {
+        sessionId: request.params.id,
+        sourceRole: undoRole.rows[0].source_role,
+        template: undoTemplate,
+        excludePatternId: request.params.patternId
+      });
+
+      if (undoConflict) {
+        return reply.code(undoConflict.status).send(undoConflict.body);
       }
 
       const oldFiles = last.rows[0].original_file_paths ?? [];
@@ -3318,6 +3398,13 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         });
       } catch (error) {
         await client.query("ROLLBACK");
+
+        const raced = racedTemplateConflictRejection(error, undoTemplate);
+
+        if (raced) {
+          return reply.code(raced.status).send(raced.body);
+        }
+
         throw error;
       } finally {
         client.release();
@@ -5500,9 +5587,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         files_done: number;
         items_changed: string;
         error: string | null;
+        // Patterns deliberately skipped (target template already taken). Distinct
+        // from `error`: the run succeeded.
+        skipped:
+          | { template: string; conflicting_template: string; source_role: string }[]
+          | null;
       }>(
         `
-          SELECT id, kind, status, files_total, files_done, items_changed, error
+          SELECT id, kind, status, files_total, files_done, items_changed, error, skipped
           FROM maintenance_jobs
           WHERE session_id = $1 AND kind IN ('fix-trailing-slashes', 'fix-trailing-slashes-undo')
           ORDER BY started_at DESC

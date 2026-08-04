@@ -210,7 +210,7 @@ export async function processFixTrailingSlashesJob(
     // rough count so the status endpoint is populated immediately.
     await markRunning(jobRowId, 0);
 
-    const { urlsFixed } = await applyTrailingSlash({
+    const { urlsFixed, skipped } = await applyTrailingSlash({
       sessionId,
       selectedFiles: data.selected_files,
       onProgress: async (filesDone, filesTotal, urls) => {
@@ -221,17 +221,28 @@ export async function processFixTrailingSlashesJob(
       }
     });
 
+    // Skipped patterns are recorded on the job row, not in `error`: the run
+    // succeeded, and marking it FAILED for a deliberate skip would be a lie. NULL
+    // when nothing was skipped so the UI shows no notice at all in the normal case.
     await pool.query(
       `
         UPDATE maintenance_jobs
         SET status = 'COMPLETE',
             files_done = files_total,
             items_changed = $2,
+            skipped = $3,
             completed_at = now()
         WHERE id = $1
       `,
-      [jobRowId, urlsFixed]
+      [jobRowId, urlsFixed, skipped.length > 0 ? JSON.stringify(skipped) : null]
     );
+
+    if (skipped.length > 0) {
+      logger.warn(
+        { session_id: sessionId, job_row_id: jobRowId, skipped },
+        "fix trailing slashes: patterns skipped, target template already in use"
+      );
+    }
     // Stamp when this session last had trailing slashes applied, so the UI can
     // warn before silently re-running the fix (v1.31 Fix 4).
     await pool.query(
@@ -277,7 +288,7 @@ export async function processFixTrailingSlashesUndoJob(
       [jobRowId]
     );
 
-    await undoTrailingSlash({
+    const { skipped } = await undoTrailingSlash({
       sessionId,
       onProgress: async (filesDone, filesTotal, _urls) => {
         await pool.query(
@@ -288,8 +299,8 @@ export async function processFixTrailingSlashesUndoJob(
     });
 
     await pool.query(
-      "UPDATE maintenance_jobs SET status = 'UNDONE', completed_at = now() WHERE id = $1",
-      [jobRowId]
+      "UPDATE maintenance_jobs SET status = 'UNDONE', skipped = $2, completed_at = now() WHERE id = $1",
+      [jobRowId, skipped.length > 0 ? JSON.stringify(skipped) : null]
     );
     // Slashes are no longer applied → clear the stamp so the re-run warning
     // doesn't fire on a session that's back to its pre-fix state (v1.31 Fix 4).

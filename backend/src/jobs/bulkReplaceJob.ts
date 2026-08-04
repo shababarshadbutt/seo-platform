@@ -12,6 +12,7 @@ import {
   displaySourceFilename,
   isHttpUrl
 } from "../sitemaps/filenames.js";
+import { checkTemplateConflict } from "../sitemaps/patternTemplateConflict.js";
 import {
   buildPatternTemplateRewriter,
   rewriteSitemapLocFile
@@ -120,6 +121,22 @@ async function revertDbPatternChange(
 
     if (patternResult.rowCount && patternResult.rowCount > 0) {
       const patternId = patternResult.rows[0].id;
+
+      // The undo restores `fromPattern`, which another pattern may have taken
+      // since the bulk replace ran. Same violation, and this job's catch also
+      // reports error.message to the UI — so check inside the transaction (the
+      // check and the UPDATE then share one snapshot, which the HTTP routes
+      // cannot do because their pre-check runs on the pool before BEGIN).
+      const collision = await checkTemplateConflict(client, {
+        sessionId,
+        sourceRole: "current",
+        template: fromPattern,
+        excludePatternId: patternId
+      });
+
+      if (collision) {
+        throw new Error(collision.body.message);
+      }
 
       await client.query("UPDATE patterns SET template = $2 WHERE id = $1", [
         patternId,
@@ -296,6 +313,27 @@ export async function processBulkReplaceJob(
   }
 
   const patternId = patternResult.rows[0].id;
+
+  // Same collision as the rename/transform routes — applyDbPatternChange below
+  // runs the identical `UPDATE patterns SET template`, and this job's catch feeds
+  // error.message straight into bulk_replace_jobs.error, which the UI shows. So
+  // without this the raw "duplicate key value violates unique constraint" text
+  // reached the user here too, just through a job row instead of an HTTP 500.
+  // Checked BEFORE any file is rewritten: failing at the final DB write would
+  // leave the sitemaps already rewritten on disk. Returns (not throws) so BullMQ
+  // does not retry a failure that cannot succeed, matching the not-found case
+  // above.
+  const collision = await checkTemplateConflict(pool, {
+    sessionId,
+    sourceRole: "current",
+    template: toPattern,
+    excludePatternId: patternId
+  });
+
+  if (collision) {
+    await markFailed(jobRowId, collision.body.message);
+    return;
+  }
 
   // Display filenames that contributed URLs to this pattern.
   const occurrenceResult = await pool.query<{ source_file: string }>(

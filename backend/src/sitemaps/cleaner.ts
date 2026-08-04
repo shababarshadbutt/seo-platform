@@ -117,6 +117,11 @@ export interface CleanerResult {
   // duplicates_removed as a share of every on-domain URL that entered dedup
   // (all candidate files, including any later emptied) * 100 ("Reduction %").
   reduction_pct: number;
+  // Concatenated <loc> values found and how they were resolved. Aggregated over
+  // CANDIDATE files only — the ones that actually produce output — so these
+  // numbers reconcile with total_urls_kept_files rather than counting URLs from
+  // files that were dropped as wrong-domain and never cleaned.
+  concatenated_locs: LocSplitStats;
 }
 
 // A generated output file, referenced by its on-disk path rather than its
@@ -288,6 +293,172 @@ export function normalizeForDedup(url: string): string {
   }
 }
 
+// ---- Concatenated <loc> values ------------------------------------------
+//
+// Some generators drop the boundary between two entries and emit both URLs
+// inside ONE <loc>, with no separator:
+//
+//   <loc>https://site.com/a/x14080169010https://site.com/b/39109236</loc>
+//
+// That value still parses: `new URL()` accepts it, the host is real, and the
+// existing domain filter passes it — so it used to be written straight through
+// as a single malformed URL that resolves to nothing.
+//
+// SPLIT SIGNAL: a scheme occurrence in the PATH, i.e. at an index > 0 and before
+// any "?". The query restriction is load-bearing, not defensive. A redirect
+// parameter legitimately embeds an absolute URL:
+//
+//   https://site.com/r?u=https://other.com/x     <- ONE url, must NOT be split
+//
+// A naive "second scheme anywhere" rule flags that at index 18 (verified), which
+// would corrupt a perfectly good URL. Scanning all 31,522,938 <loc>s in the
+// available corpus found zero values with a second scheme of either kind, so the
+// rule is unexercised there rather than proven safe on it — the query guard is
+// what makes it safe on a corpus we have not seen.
+//
+// Returns [loc] unchanged when there is nothing to split, so every input that
+// worked before takes the same path it always did. Expects an already-trimmed
+// value: streamUrlsetLocs trims before calling, and re-trimming 31.5M strings on
+// the hot path is a cost with no reader.
+export function splitConcatenatedLoc(loc: string): string[] {
+  const first = loc.indexOf("://");
+
+  if (first === -1) {
+    return [loc];
+  }
+
+  // FAST PATH: exactly one "://", which is the overwhelming majority of real
+  // locs. One extra indexOf, no regex, no allocation. This function runs once
+  // per <loc> — 31.5M times on a real corpus — so the common case has to stay
+  // free or it shows up in the run timing.
+  if (loc.indexOf("://", first + 3) === -1) {
+    return [loc];
+  }
+
+  // A value that does not itself start with a scheme is not a concatenation of
+  // absolute URLs; leave it to the existing filter.
+  if (!/^https?:\/\//i.test(loc)) {
+    return [loc];
+  }
+
+  const query = loc.indexOf("?");
+  const limit = query === -1 ? loc.length : query;
+  const scheme = /https?:\/\//gi;
+  const boundaries: number[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = scheme.exec(loc)) !== null) {
+    if (match.index >= limit) {
+      break;
+    }
+
+    if (match.index > 0) {
+      boundaries.push(match.index);
+    }
+  }
+
+  if (boundaries.length === 0) {
+    return [loc];
+  }
+
+  const parts: string[] = [];
+  let start = 0;
+
+  for (const boundary of boundaries) {
+    parts.push(loc.slice(start, boundary));
+    start = boundary;
+  }
+
+  parts.push(loc.slice(start));
+
+  return parts.filter((part) => part.length > 0);
+}
+
+// How a run's concatenated locs were resolved. Reported in the summary so this
+// never happens silently — a source-data defect that quietly changes the URL set
+// is exactly the kind of thing that should be visible in the output.
+export type LocSplitStats = {
+  // <loc> values that contained more than one URL.
+  detected: number;
+  // Split parts that passed the syntactic + on-domain check and were kept...
+  parts_kept: number;
+  // ...and those discarded because they did not.
+  parts_discarded: number;
+  // Every part valid — both URLs recovered as separate entries.
+  fully_resolved: number;
+  // Some parts valid: one half kept, the other discarded.
+  partially_resolved: number;
+  // No part valid — nothing recoverable from that loc.
+  unresolved: number;
+};
+
+export function createLocSplitStats(): LocSplitStats {
+  return {
+    detected: 0,
+    parts_kept: 0,
+    parts_discarded: 0,
+    fully_resolved: 0,
+    partially_resolved: 0,
+    unresolved: 0
+  };
+}
+
+export function addLocSplitStats(
+  into: LocSplitStats,
+  from: LocSplitStats
+): void {
+  into.detected += from.detected;
+  into.parts_kept += from.parts_kept;
+  into.parts_discarded += from.parts_discarded;
+  into.fully_resolved += from.fully_resolved;
+  into.partially_resolved += from.partially_resolved;
+  into.unresolved += from.unresolved;
+}
+
+// Visit the on-domain URLs one raw <loc> contributes: split it, then apply the
+// SAME per-part host check every other loc already gets. "Valid" is syntactic
+// (parses as a URL) plus on-domain — deterministic and free, versus a live
+// reachability probe that would make the output depend on the network and on
+// whether a WAF felt like answering.
+//
+// A VISITOR, not an array return, because this runs once per <loc> — 31.5M times
+// on a real corpus. Returning string[] meant allocating a one-element array for
+// every ordinary loc, which measured +13.7% on the per-loc filter. The
+// no-second-scheme fast path below allocates nothing at all, so an unaffected
+// corpus pays one extra indexOf and nothing else. Pass a visitor hoisted OUT of
+// the per-loc callback (once per file) so the closure is not rebuilt per URL.
+//
+// `visit` receives plain URLs with no marker, so nothing downstream can tell a
+// split part from an ordinary loc: both halves flow through dedup, the report,
+// and the verdict bitsets identically.
+export function forEachOnDomainLocPart(
+  rawLoc: string,
+  domainHost: string,
+  visit: (part: string) => void
+): void {
+  const first = rawLoc.indexOf("://");
+
+  // FAST PATH: fewer than two "://" means no split is possible, so do exactly
+  // what the pre-split code did — no array, no regex.
+  if (first === -1 || rawLoc.indexOf("://", first + 3) === -1) {
+    const host = hostOf(rawLoc);
+
+    if (host !== null && isSameDomain(host, domainHost)) {
+      visit(rawLoc);
+    }
+
+    return;
+  }
+
+  for (const part of splitConcatenatedLoc(rawLoc)) {
+    const host = hostOf(part);
+
+    if (host !== null && isSameDomain(host, domainHost)) {
+      visit(part);
+    }
+  }
+}
+
 // One <url> block, byte-identical to the pre-v1.38 buildUrlsetXml join: every
 // surviving <url> gets a fresh <lastmod> of today (after <loc>).
 function urlEntry(loc: string, today: string) {
@@ -424,6 +595,11 @@ export type CleanerClassification = {
   rootElement: string | null;
   total: number;
   matching: number;
+  // Concatenated-loc resolution for THIS file. Counted here, in Pass 1, because
+  // it already visits every loc of every file and already returns a small struct
+  // across the worker boundary — Pass 2 then applies the identical split without
+  // recounting, so no number can be attributed twice.
+  splits: LocSplitStats;
 };
 
 // Pass 1 core: stream a file and count total vs on-domain <loc>s + report
@@ -434,16 +610,41 @@ export async function classifyCleanerFile(
 ): Promise<CleanerClassification> {
   let total = 0;
   let matching = 0;
+  const splits = createLocSplitStats();
 
   const parsed = await streamUrlsetLocs(
     createReadStream(file.path),
     isGzipName(file.filename),
     (loc) => {
-      total += 1;
-      const host = hostOf(loc);
+      const parts = splitConcatenatedLoc(loc);
 
-      if (host !== null && isSameDomain(host, domainHost)) {
-        matching += 1;
+      // `total` counts URLs, not <loc> elements, so a split loc contributes its
+      // parts. The wrong-domain decision is matching/total < 0.5, and counting
+      // one raw element against two matched URLs could push that ratio above 1.
+      let keptHere = 0;
+
+      for (const part of parts) {
+        total += 1;
+        const host = hostOf(part);
+
+        if (host !== null && isSameDomain(host, domainHost)) {
+          matching += 1;
+          keptHere += 1;
+        }
+      }
+
+      if (parts.length > 1) {
+        splits.detected += 1;
+        splits.parts_kept += keptHere;
+        splits.parts_discarded += parts.length - keptHere;
+
+        if (keptHere === parts.length) {
+          splits.fully_resolved += 1;
+        } else if (keptHere > 0) {
+          splits.partially_resolved += 1;
+        } else {
+          splits.unresolved += 1;
+        }
       }
     }
   );
@@ -452,7 +653,8 @@ export async function classifyCleanerFile(
     isValid: parsed.isValid,
     rootElement: parsed.rootElement,
     total,
-    matching
+    matching,
+    splits
   };
 }
 
@@ -470,15 +672,18 @@ export async function writeProvisionalOnDomainFile(
   const out = createWriteStream(provisionalPath);
   let count = 0;
 
-  await streamUrlsetLocs(createReadStream(inputPath), isGzip, (loc) => {
-    const host = hostOf(loc);
-
-    if (host === null || !isSameDomain(host, domainHost)) {
-      return;
-    }
-
-    out.write(`${normalizeForDedup(loc)}\t${loc}\n`);
+  // Hoisted out of the per-loc callback so the closure is built once per file
+  // rather than once per URL.
+  const writePart = (part: string) => {
+    out.write(`${normalizeForDedup(part)}\t${part}\n`);
     count += 1;
+  };
+
+  await streamUrlsetLocs(createReadStream(inputPath), isGzip, (loc) => {
+    // One line per on-domain URL this loc contributes — normally exactly one,
+    // and more when the source concatenated several into a single <loc>. Pass 1
+    // counted these; here they are just URLs like any other.
+    forEachOnDomainLocPart(loc, domainHost, writePart);
   });
 
   await finishStream(out);
@@ -1491,6 +1696,8 @@ async function cleanSitemapsInner(
   // Output filenames claimed so far, so two uploads sharing a basename get
   // distinct output files instead of one silently overwriting the other.
   const usedOutputNames = new Set<string>();
+  // Concatenated-loc resolution, accumulated across candidate files.
+  const concatenatedLocs = createLocSplitStats();
   // Name of the first uploaded <sitemapindex>, reused for the rebuilt index.
   let detectedIndexName: string | null = null;
   let indexFilesDetected = 0;
@@ -1532,6 +1739,9 @@ async function cleanSitemapsInner(
       outputName: uniqueOutputName(file.filename, usedOutputNames),
       onDomainCount: info.matching
     });
+    // Only candidates: a wrong-domain file's splits describe URLs that are never
+    // cleaned or written, so counting them would not reconcile with the output.
+    addLocSplitStats(concatenatedLocs, info.splits);
   }
 
   // ---- Pass 2: dedup + write cleaned files (streaming, first wins) -------
@@ -1665,21 +1875,21 @@ async function cleanSitemapsInner(
         outDir,
         today,
         state,
-        (emit) =>
-          streamUrlsetLocs(
+        (emit) => {
+          // Filter stray foreign URLs even inside a kept (mostly-on-domain)
+          // file, then dedup the survivors. Key computed inline here (the
+          // sequential path has no worker to offload it to). A concatenated loc
+          // contributes each of its on-domain parts, which then dedup exactly
+          // like any other URL. Visitor hoisted out of the per-loc callback.
+          const emitPart = (part: string) =>
+            emit(part, normalizeForDedup(part));
+
+          return streamUrlsetLocs(
             createReadStream(file.path),
             isGzipName(file.filename),
-            (loc) => {
-              const host = hostOf(loc);
-
-              // Filter stray foreign URLs even inside a kept (mostly-on-domain)
-              // file, then dedup the survivors. Key computed inline here (the
-              // sequential path has no worker to offload it to).
-              if (host !== null && isSameDomain(host, domainHost)) {
-                emit(loc, normalizeForDedup(loc));
-              }
-            }
-          )
+            (loc) => forEachOnDomainLocPart(loc, domainHost, emitPart)
+          );
+        }
       );
 
       if (result.kept) {
@@ -1784,7 +1994,8 @@ async function cleanSitemapsInner(
     index_filename: indexFilename,
     total_urls_kept_files: totalUrlsKeptFiles,
     clean_urls_remaining: cleanUrlsRemaining,
-    reduction_pct: reductionPct
+    reduction_pct: reductionPct,
+    concatenated_locs: concatenatedLocs
   };
 
   return { result, files: outputManifest };

@@ -18,6 +18,7 @@ import {
   apiErrorPayload,
   downloadCleanerZip,
   downloadDuplicatesCsv,
+  formatDownloadProgress,
   friendlyApiErrorMessage,
   getRuntimeConfig,
   getSftpDomains,
@@ -25,7 +26,8 @@ import {
   processCleanerFromSftp,
   type CleanerDropReason,
   type CleanerProgressEvent,
-  type CleanerSummary
+  type CleanerSummary,
+  type DownloadProgress
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -120,6 +122,10 @@ export default function CleanerPage() {
   const [downloadToken, setDownloadToken] = useState("");
   const [zipFilename, setZipFilename] = useState("cleaned-sitemaps.zip");
   const [error, setError] = useState("");
+  // Which download is in flight (null = none) and its latest progress event.
+  const [downloading, setDownloading] = useState<"zip" | "csv" | null>(null);
+  const [downloadProgress, setDownloadProgress] =
+    useState<DownloadProgress | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const domainValid = isValidDomain(domain);
@@ -299,16 +305,40 @@ export default function CleanerPage() {
       )}`
     : "";
 
+  // Which download is running, and how far along. A cleaned-sitemaps ZIP is
+  // routinely multi-GB, so without this the button looked hung for the entire
+  // transfer — the complaint that prompted this. `null` progress means the
+  // request is out but no headers have come back yet ("Preparing…").
+  async function runDownload(
+    kind: "zip" | "csv",
+    start: (onProgress: (progress: DownloadProgress) => void) => Promise<void>,
+    failure: string
+  ) {
+    setDownloading(kind);
+    setDownloadProgress(null);
+    setError("");
+
+    try {
+      await start(setDownloadProgress);
+    } catch (nextError) {
+      setError(friendlyApiErrorMessage(nextError, failure));
+    } finally {
+      setDownloading(null);
+      setDownloadProgress(null);
+    }
+  }
+
   async function handleDownloadZip() {
     if (!downloadToken) {
       return;
     }
 
-    try {
-      await downloadCleanerZip(downloadToken, zipFilename);
-    } catch (nextError) {
-      setError(friendlyApiErrorMessage(nextError, "Could not download the ZIP."));
-    }
+    await runDownload(
+      "zip",
+      (onProgress) =>
+        downloadCleanerZip(downloadToken, zipFilename, { onProgress }),
+      "Could not download the ZIP."
+    );
   }
 
   async function handleDownloadCsv() {
@@ -318,17 +348,40 @@ export default function CleanerPage() {
       return;
     }
 
-    try {
-      // Fetched from the server (same token as the ZIP) rather than rebuilt from
-      // a copy of the rows held in the summary.
-      await downloadDuplicatesCsv(
-        downloadToken,
-        zipFilename.replace(/\.zip$/i, "").replace(/^cleaned-sitemaps/, "duplicates-report") +
-          ".csv"
-      );
-    } catch (nextError) {
-      setError(friendlyApiErrorMessage(nextError, "Could not download the CSV."));
+    await runDownload(
+      "csv",
+      (onProgress) =>
+        // Fetched from the server (same token as the ZIP) rather than rebuilt
+        // from a copy of the rows held in the summary.
+        downloadDuplicatesCsv(
+          downloadToken,
+          zipFilename
+            .replace(/\.zip$/i, "")
+            .replace(/^cleaned-sitemaps/, "duplicates-report") + ".csv",
+          { onProgress }
+        ),
+      "Could not download the CSV."
+    );
+  }
+
+  // "Preparing…" until Content-Length is known, then a real percentage or a byte
+  // count when the server sent no length.
+  function downloadLabel(kind: "zip" | "csv", idle: string) {
+    if (downloading !== kind) {
+      return idle;
     }
+
+    if (downloadProgress === null) {
+      return "Preparing…";
+    }
+
+    if (downloadProgress.percent === null) {
+      return `${formatDownloadProgress(downloadProgress)}…`;
+    }
+
+    return `${downloadProgress.percent}% — ${formatDownloadProgress(
+      downloadProgress
+    )}`;
   }
 
   const progressPercent =
@@ -740,6 +793,51 @@ export default function CleanerPage() {
                 </p>
               ) : null}
 
+              {/* A source-data defect: the generator dropped the boundary between
+                  entries, so one <loc> held several URLs. Surfaced because a
+                  silent repair that changes the URL set is exactly what should
+                  not be invisible. */}
+              {summary.concatenated_locs &&
+              summary.concatenated_locs.detected > 0 ? (
+                <div className="space-y-1 rounded-md border border-amber-200 bg-amber-50 px-3 py-2">
+                  <p className="text-xs font-semibold text-amber-900">
+                    {formatNumber(summary.concatenated_locs.detected)} malformed{" "}
+                    {summary.concatenated_locs.detected === 1
+                      ? "URL entry"
+                      : "URL entries"}{" "}
+                    contained more than one URL and{" "}
+                    {summary.concatenated_locs.detected === 1 ? "was" : "were"}{" "}
+                    split
+                  </p>
+                  <p className="text-xs text-amber-800">
+                    {formatNumber(summary.concatenated_locs.parts_kept)} URL
+                    {summary.concatenated_locs.parts_kept === 1 ? "" : "s"}{" "}
+                    recovered
+                    {summary.concatenated_locs.parts_discarded > 0
+                      ? `, ${formatNumber(
+                          summary.concatenated_locs.parts_discarded
+                        )} discarded as invalid or off-domain`
+                      : ""}
+                    .{" "}
+                    {summary.concatenated_locs.fully_resolved > 0
+                      ? `${formatNumber(
+                          summary.concatenated_locs.fully_resolved
+                        )} split cleanly into separate entries. `
+                      : ""}
+                    {summary.concatenated_locs.partially_resolved > 0
+                      ? `${formatNumber(
+                          summary.concatenated_locs.partially_resolved
+                        )} kept only the valid half. `
+                      : ""}
+                    {summary.concatenated_locs.unresolved > 0
+                      ? `${formatNumber(
+                          summary.concatenated_locs.unresolved
+                        )} had no usable URL and were dropped.`
+                      : ""}
+                  </p>
+                </div>
+              ) : null}
+
               {summary.dropped_files.length > 0 ? (
                 <div className="space-y-1.5">
                   <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
@@ -772,25 +870,62 @@ export default function CleanerPage() {
                 </div>
               ) : null}
 
-              <div className="flex flex-wrap gap-3 pt-1">
-                <Button
-                  type="button"
-                  onClick={() => void handleDownloadZip()}
-                  className="gap-2"
-                >
-                  <Download className="h-4 w-4" />
-                  Download cleaned sitemaps (ZIP)
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => void handleDownloadCsv()}
-                  className="gap-2"
-                  disabled={summary.duplicates_removed === 0 || !downloadToken}
-                >
-                  <Download className="h-4 w-4" />
-                  Download duplicates report (CSV)
-                </Button>
+              <div className="space-y-2 pt-1">
+                <div className="flex flex-wrap gap-3">
+                  <Button
+                    type="button"
+                    onClick={() => void handleDownloadZip()}
+                    className="gap-2"
+                    disabled={downloading !== null}
+                  >
+                    <Download className="h-4 w-4" />
+                    {downloadLabel("zip", "Download cleaned sitemaps (ZIP)")}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => void handleDownloadCsv()}
+                    className="gap-2"
+                    disabled={
+                      summary.duplicates_removed === 0 ||
+                      !downloadToken ||
+                      downloading !== null
+                    }
+                  >
+                    <Download className="h-4 w-4" />
+                    {downloadLabel("csv", "Download duplicates report (CSV)")}
+                  </Button>
+                </div>
+
+                {/* A determinate bar once Content-Length is known. Without it the
+                    only signal was the button label, and a multi-GB ZIP gave no
+                    indication it was moving at all. */}
+                {downloading !== null ? (
+                  <div className="space-y-1">
+                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                      <div
+                        className={cn(
+                          "h-full rounded-full bg-primary transition-all",
+                          downloadProgress?.percent === null && "animate-pulse"
+                        )}
+                        style={{
+                          width:
+                            downloadProgress?.percent === null ||
+                            downloadProgress === null
+                              ? "100%"
+                              : `${downloadProgress.percent}%`
+                        }}
+                      />
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {downloadProgress === null
+                        ? "Preparing the download…"
+                        : `Downloading ${formatDownloadProgress(
+                            downloadProgress
+                          )}`}
+                    </p>
+                  </div>
+                ) : null}
               </div>
 
               {/* Hand off the cleaned files to the Migration Health Checker with

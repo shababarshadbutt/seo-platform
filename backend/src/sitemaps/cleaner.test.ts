@@ -22,6 +22,7 @@ import {
   dedupBucketOf,
   LEDGER_SYNC_INTERVAL,
   normalizeForDedup,
+  splitConcatenatedLoc,
   REPORT_FILENAME,
   uniqueOutputName,
   writeCandidatesParallel,
@@ -1106,6 +1107,227 @@ test("PARALLEL provisional reader: an in-handler budget refusal rejects instead 
   } finally {
     setDedupBudgetForTest(null);
     resetDedupLedgerForTest();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- Concatenated <loc> values ------------------------------------------
+//
+// A real client file emitted two URLs inside one <loc> with no separator. The
+// value still parses as a URL and passes the domain filter, so it used to be
+// written straight through as a single address that resolves to nothing.
+
+// The exact value from the reported file, as one unbroken string.
+const CONCAT_HOST = "https://www.buyautomationspareparts.com";
+const CONCAT_FIRST = `${CONCAT_HOST}/rfq/product/industrial-automation-tools/ingersoll-rand/x14080169010`;
+const CONCAT_SECOND = `${CONCAT_HOST}/rfq/product/industrial-control/ingersol-rand/39109236`;
+const CONCAT_LOC = `${CONCAT_FIRST}${CONCAT_SECOND}`;
+
+test("splitConcatenatedLoc splits on a scheme in the PATH, never in the query", () => {
+  // The reported defect: two absolute URLs, no separator.
+  assert.deepEqual(splitConcatenatedLoc(CONCAT_LOC), [
+    CONCAT_FIRST,
+    CONCAT_SECOND
+  ]);
+
+  // An ordinary URL comes back untouched, in the same array shape, so callers
+  // have exactly one code path.
+  assert.deepEqual(splitConcatenatedLoc(`${CONCAT_HOST}/a/b`), [
+    `${CONCAT_HOST}/a/b`
+  ]);
+
+  // THE FALSE POSITIVE THAT MATTERS. A redirect parameter legitimately embeds an
+  // absolute URL; a naive "second scheme anywhere" rule flags this at index 18
+  // and would corrupt a perfectly good URL. It must NOT split.
+  const redirect = `${CONCAT_HOST}/r?u=https://other.com/x`;
+  assert.deepEqual(splitConcatenatedLoc(redirect), [redirect]);
+  // Including the http:// variant and more than one embedded parameter.
+  const multiParam = `${CONCAT_HOST}/go?a=http://x.com/1&b=https://y.com/2`;
+  assert.deepEqual(splitConcatenatedLoc(multiParam), [multiParam]);
+
+  // Generalised to N: a generator that dropped one boundary can drop two. A query
+  // on the LAST part must survive the split.
+  assert.deepEqual(
+    splitConcatenatedLoc(
+      `${CONCAT_HOST}/1${CONCAT_HOST}/2${CONCAT_HOST}/3?q=1`
+    ),
+    [`${CONCAT_HOST}/1`, `${CONCAT_HOST}/2`, `${CONCAT_HOST}/3?q=1`]
+  );
+
+  // Case-insensitive scheme; a non-absolute loc is left alone.
+  assert.deepEqual(splitConcatenatedLoc(`${CONCAT_HOST}/1HTTPS://a.com/2`), [
+    `${CONCAT_HOST}/1`,
+    "HTTPS://a.com/2"
+  ]);
+  assert.deepEqual(splitConcatenatedLoc("/relative/path"), ["/relative/path"]);
+});
+
+// Case (c): BOTH halves valid → two separate <loc> entries in the output, rather
+// than one half kept and the other thrown away.
+test("a concatenated loc with two valid halves becomes two output URLs", async () => {
+  const { dir, inDir, outDir } = scratch("concat-both");
+
+  try {
+    const a = path.join(inDir, "0__a.xml");
+    writeFileSync(a, urlsetXml([`${CONCAT_HOST}/keep-me`, CONCAT_LOC]));
+
+    const { result } = await cleanSitemaps({
+      files: [{ filename: "a.xml", path: a }],
+      domain: CONCAT_HOST,
+      subfolder: "sitemaps",
+      today: TODAY,
+      outDir
+    });
+
+    const xml = readFileSync(path.join(outDir, "a.xml"), "utf8");
+    const locs = [...xml.matchAll(/<loc>([^<]*)<\/loc>/g)].map((m) => m[1]);
+
+    // Both halves present as their own entries, and the malformed concatenation
+    // is gone entirely.
+    assert.deepEqual(locs, [
+      `${CONCAT_HOST}/keep-me`,
+      CONCAT_FIRST,
+      CONCAT_SECOND
+    ]);
+    assert.ok(
+      !xml.includes(CONCAT_LOC),
+      "the concatenated value must not survive in the output"
+    );
+
+    // 1 ordinary loc + 1 loc split into 2 = 3 URLs, and the counts say so.
+    assert.equal(result.clean_urls_remaining, 3);
+    assert.equal(result.concatenated_locs.detected, 1);
+    assert.equal(result.concatenated_locs.fully_resolved, 1);
+    assert.equal(result.concatenated_locs.partially_resolved, 0);
+    assert.equal(result.concatenated_locs.unresolved, 0);
+    assert.equal(result.concatenated_locs.parts_kept, 2);
+    assert.equal(result.concatenated_locs.parts_discarded, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Cases (a) and (b): only ONE half is valid. Whichever side it is on, keep it and
+// discard the other — the position of the good half must not matter.
+test("a concatenated loc with one valid half keeps that half, either side", async () => {
+  const { dir, inDir, outDir } = scratch("concat-one");
+
+  try {
+    const firstOnly = `${CONCAT_HOST}/only-first-good https://elsewhere.example/nope`
+      .split(" ")
+      .join("");
+    const secondOnly = `https://elsewhere.example/nope ${CONCAT_HOST}/only-second-good`
+      .split(" ")
+      .join("");
+    const a = path.join(inDir, "0__a.xml");
+    writeFileSync(a, urlsetXml([firstOnly, secondOnly]));
+
+    const { result } = await cleanSitemaps({
+      files: [{ filename: "a.xml", path: a }],
+      domain: CONCAT_HOST,
+      subfolder: "sitemaps",
+      today: TODAY,
+      outDir
+    });
+
+    const xml = readFileSync(path.join(outDir, "a.xml"), "utf8");
+    const locs = [...xml.matchAll(/<loc>([^<]*)<\/loc>/g)].map((m) => m[1]);
+
+    assert.deepEqual(locs, [
+      `${CONCAT_HOST}/only-first-good`,
+      `${CONCAT_HOST}/only-second-good`
+    ]);
+    assert.ok(
+      !xml.includes("elsewhere.example"),
+      "the foreign half must be dropped"
+    );
+
+    assert.equal(result.concatenated_locs.detected, 2);
+    assert.equal(result.concatenated_locs.partially_resolved, 2);
+    assert.equal(result.concatenated_locs.fully_resolved, 0);
+    assert.equal(result.concatenated_locs.parts_kept, 2);
+    assert.equal(result.concatenated_locs.parts_discarded, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The split parts must be ORDINARY locs downstream — no special-casing. If a half
+// duplicates a URL already seen, cross-file dedup must remove it and the
+// duplicates report must record it, exactly as for any other URL.
+test("split halves go through dedup and the duplicates report like any other loc", async () => {
+  const { dir, inDir, outDir } = scratch("concat-dedup");
+
+  try {
+    const a = path.join(inDir, "0__a.xml");
+    const b = path.join(inDir, "1__b.xml");
+    // a.xml lists CONCAT_SECOND on its own first, so the second HALF of the
+    // concatenation in b.xml is a cross-file duplicate.
+    writeFileSync(a, urlsetXml([CONCAT_SECOND]));
+    writeFileSync(b, urlsetXml([CONCAT_LOC]));
+
+    const { result } = await cleanSitemaps({
+      files: [
+        { filename: "a.xml", path: a },
+        { filename: "b.xml", path: b }
+      ],
+      domain: CONCAT_HOST,
+      subfolder: "sitemaps",
+      today: TODAY,
+      outDir
+    });
+
+    // The duplicate half is removed; only the first half survives in b.xml.
+    assert.equal(result.duplicates_removed, 1);
+    const bXml = readFileSync(path.join(outDir, "b.xml"), "utf8");
+    const bLocs = [...bXml.matchAll(/<loc>([^<]*)<\/loc>/g)].map((m) => m[1]);
+    assert.deepEqual(bLocs, [CONCAT_FIRST]);
+
+    // And it is in the report as a normal duplicate row.
+    const report = readFileSync(path.join(outDir, REPORT_FILENAME), "utf8");
+    assert.ok(
+      report.includes(`${CONCAT_SECOND},a.xml,b.xml`),
+      "the duplicated half must appear in the duplicates report"
+    );
+
+    // Still fully resolved: both halves were valid and on-domain at split time.
+    // Dedup is a separate, later decision.
+    assert.equal(result.concatenated_locs.detected, 1);
+    assert.equal(result.concatenated_locs.fully_resolved, 1);
+    assert.equal(result.concatenated_locs.parts_kept, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A clean corpus must report all zeros, so a non-zero count in the summary always
+// means the defect was genuinely present.
+test("a corpus with no concatenated locs reports zeros", async () => {
+  const { dir, inDir, outDir } = scratch("concat-none");
+
+  try {
+    const a = path.join(inDir, "0__a.xml");
+    writeFileSync(
+      a,
+      urlsetXml([
+        `${CONCAT_HOST}/a`,
+        // A legitimately embedded URL must not be counted as a split.
+        `${CONCAT_HOST}/r?u=https://other.com/x`
+      ])
+    );
+
+    const { result } = await cleanSitemaps({
+      files: [{ filename: "a.xml", path: a }],
+      domain: CONCAT_HOST,
+      subfolder: "sitemaps",
+      today: TODAY,
+      outDir
+    });
+
+    assert.equal(result.concatenated_locs.detected, 0);
+    assert.equal(result.concatenated_locs.parts_kept, 0);
+    assert.equal(result.clean_urls_remaining, 2, "both URLs kept intact");
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

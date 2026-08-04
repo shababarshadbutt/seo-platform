@@ -5,6 +5,10 @@ import path from "node:path";
 import { config } from "../config.js";
 import { pool } from "../db/pool.js";
 import {
+  planTemplateChanges,
+  type SkippedTemplateChange
+} from "./patternTemplateConflict.js";
+import {
   FILE_REWRITE_PARALLEL_THRESHOLD,
   runFileRewriteJob
 } from "../jobs/fileRewritePool.js";
@@ -176,17 +180,38 @@ async function applyTrailingSlashDbChanges(
       );
     }
 
-    // patterns.template.
-    const patternRows = await client.query<{ id: string; template: string }>(
-      "SELECT id, template FROM patterns WHERE session_id = $1",
-      [sessionId]
-    );
-    const patternUpdates = patternRows.rows
+    // patterns.template. source_role is selected because the uniqueness that can
+    // block a slash is per (session_id, source_role, template).
+    const patternRows = await client.query<{
+      id: string;
+      template: string;
+      source_role: string;
+    }>("SELECT id, template, source_role FROM patterns WHERE session_id = $1", [
+      sessionId
+    ]);
+    const existing = patternRows.rows.map((row) => ({
+      id: row.id,
+      sourceRole: row.source_role,
+      template: row.template
+    }));
+    const wanted = patternRows.rows
       .map((row) => ({
         id: row.id,
+        sourceRole: row.source_role,
+        template: row.template,
         next: addTrailingSlashToPathString(row.template)
       }))
-      .filter((u): u is { id: string; next: string } => u.next !== null);
+      .filter(
+        (u): u is (typeof existing)[number] & { next: string } => u.next !== null
+      );
+
+    // Slashing "/x" collides when a separate "/x/" pattern already exists. One
+    // statement meant one collision aborted the whole apply; skip those and apply
+    // the rest, then report them.
+    const { applied: patternUpdates, skipped } = planTemplateChanges(
+      wanted,
+      existing
+    );
 
     if (patternUpdates.length > 0) {
       await client.query(
@@ -201,6 +226,8 @@ async function applyTrailingSlashDbChanges(
     }
 
     await client.query("COMMIT");
+
+    return { skipped };
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;
@@ -215,7 +242,13 @@ export async function applyTrailingSlash(options: {
   sessionId: string;
   selectedFiles: string[] | null;
   onProgress?: TrailingSlashProgress;
-}): Promise<{ filesChanged: number; urlsFixed: number }> {
+}): Promise<{
+  filesChanged: number;
+  urlsFixed: number;
+  // Patterns left unslashed because another pattern already holds the slashed
+  // form. Not failures — reported so a skip is never silent.
+  skipped: SkippedTemplateChange[];
+}> {
   const files = await loadCurrentLocalFiles(options.sessionId);
   const selected =
     options.selectedFiles && options.selectedFiles.length > 0
@@ -343,9 +376,12 @@ export async function applyTrailingSlash(options: {
     }
   }
 
-  await applyTrailingSlashDbChanges(options.sessionId, selected);
+  const { skipped } = await applyTrailingSlashDbChanges(
+    options.sessionId,
+    selected
+  );
 
-  return { filesChanged, urlsFixed };
+  return { filesChanged, urlsFixed, skipped };
 }
 
 // Undo a trailing-slash fix: restore every rewritten file to its pre-fix
@@ -353,7 +389,10 @@ export async function applyTrailingSlash(options: {
 export async function undoTrailingSlash(options: {
   sessionId: string;
   onProgress?: TrailingSlashProgress;
-}): Promise<{ filesRestored: number }> {
+}): Promise<{
+  filesRestored: number;
+  skipped: SkippedTemplateChange[];
+}> {
   const filesResult = await pool.query<CurrentFileRow>(
     `
       SELECT id, filename, trailing_slash_original_path
@@ -398,9 +437,9 @@ export async function undoTrailingSlash(options: {
     await options.onProgress?.(filesDone, files.length, 0);
   }
 
-  await reverseTrailingSlashDbChanges(options.sessionId);
+  const { skipped } = await reverseTrailingSlashDbChanges(options.sessionId);
 
-  return { filesRestored };
+  return { filesRestored, skipped };
 }
 
 async function reverseTrailingSlashDbChanges(sessionId: string) {
@@ -474,16 +513,45 @@ async function reverseTrailingSlashDbChanges(sessionId: string) {
       [sessionId]
     );
 
-    const patternRows = await client.query<{ id: string; template: string }>(
-      "SELECT id, template FROM patterns WHERE session_id = $1 AND trailing_slash_fixed = true",
+    // Captured before the flags are cleared below, so the strip set is known even
+    // though the "already taken" set has to span the whole session.
+    const flaggedRows = await client.query<{ id: string }>(
+      "SELECT id FROM patterns WHERE session_id = $1 AND trailing_slash_fixed = true",
       [sessionId]
     );
-    const patternUpdates = patternRows.rows
+    const flaggedPatternIds = new Set(flaggedRows.rows.map((row) => row.id));
+
+    // Every pattern in the session, not just the flagged ones: an unslashed
+    // pattern that was never touched by the fix is exactly what a strip can
+    // collide with, so it has to be in the "already taken" set.
+    const allPatternRows = await client.query<{
+      id: string;
+      template: string;
+      source_role: string;
+    }>("SELECT id, template, source_role FROM patterns WHERE session_id = $1", [
+      sessionId
+    ]);
+    const existing = allPatternRows.rows.map((row) => ({
+      id: row.id,
+      sourceRole: row.source_role,
+      template: row.template
+    }));
+    const wanted = allPatternRows.rows
+      .filter((row) => flaggedPatternIds.has(row.id))
       .map((row) => ({
         id: row.id,
+        sourceRole: row.source_role,
+        template: row.template,
         next: stripTrailingSlashFromPathString(row.template)
       }))
-      .filter((u): u is { id: string; next: string } => u.next !== null);
+      .filter(
+        (u): u is (typeof existing)[number] & { next: string } => u.next !== null
+      );
+
+    const { applied: patternUpdates, skipped } = planTemplateChanges(
+      wanted,
+      existing
+    );
 
     if (patternUpdates.length > 0) {
       await client.query(
@@ -503,6 +571,8 @@ async function reverseTrailingSlashDbChanges(sessionId: string) {
     );
 
     await client.query("COMMIT");
+
+    return { skipped };
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;

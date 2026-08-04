@@ -55,9 +55,11 @@ import {
   downloadCorrectedSitemap,
   downloadSessionExport,
   fetchSitemapsZipBlob,
+  formatDownloadProgress,
   getDownloadFolderName,
   getDownloadPreview,
   saveDownloadZip,
+  type DownloadProgress,
   supportsDirectoryPicker,
   ApiError,
   friendlyApiErrorMessage,
@@ -892,7 +894,16 @@ export default function ResultsDashboardPage({
     fileTotal: number;
     etaSeconds: number | null;
     cancelling: boolean;
+    // Server-side zipping and the TRANSFER of the finished ZIP are two different
+    // phases. `percent` above tracks the zip build; this tracks the bytes coming
+    // down the wire, which was previously invisible — the overlay sat at
+    // "Starting download…" for the whole multi-GB transfer.
+    transfer: DownloadProgress | null;
   } | null>(null);
+  // Byte progress for the downloads that have no overlay (pre-generated ZIP,
+  // corrected sitemap, session export).
+  const [downloadTransfer, setDownloadTransfer] =
+    useState<DownloadProgress | null>(null);
   // Persistent download-folder name for the dropdown label (v1.31 Fix 3). The
   // actual directory handle lives at module level in lib/api.
   const [downloadFolderName, setDownloadFolderName] = useState<string | null>(
@@ -1615,13 +1626,16 @@ export default function ResultsDashboardPage({
     setExportingFormat(format);
 
     try {
-      await downloadSessionExport(params.id, format);
+      await downloadSessionExport(params.id, format, {
+        onProgress: setDownloadTransfer
+      });
     } catch (nextError) {
       setExportError(
         friendlyApiErrorMessage(nextError, "Unable to generate export.")
       );
     } finally {
       setExportingFormat(null);
+      setDownloadTransfer(null);
     }
   }
 
@@ -1922,7 +1936,9 @@ export default function ResultsDashboardPage({
     setDownloadingSitemapId(rowData.id);
 
     try {
-      await downloadCorrectedSitemap(params.id, rowData.id);
+      await downloadCorrectedSitemap(params.id, rowData.id, {
+        onProgress: setDownloadTransfer
+      });
     } catch (nextError) {
       setFindReplaceToast({
         tone: "error",
@@ -1933,6 +1949,7 @@ export default function ResultsDashboardPage({
       });
     } finally {
       setDownloadingSitemapId(null);
+      setDownloadTransfer(null);
     }
   }
 
@@ -2594,7 +2611,8 @@ export default function ResultsDashboardPage({
 
       try {
         const { blob, filename } = await fetchSitemapsZipBlob(params.id, type, {
-          filter: filtered
+          filter: filtered,
+          onProgress: setDownloadTransfer
         });
         const savedTo = await saveDownloadZip(blob, filename);
 
@@ -2608,6 +2626,7 @@ export default function ResultsDashboardPage({
         showDownloadError(nextError);
       } finally {
         setDownloadingSitemaps(null);
+        setDownloadTransfer(null);
       }
 
       return;
@@ -2623,6 +2642,7 @@ export default function ResultsDashboardPage({
 
     setDownloadOverlay({
       type,
+      transfer: null,
       percent: 0,
       fileCurrent: 0,
       fileTotal: (type === "edited" ? editedSitemapCount : allSitemapCount) + 1,
@@ -2684,7 +2704,9 @@ export default function ResultsDashboardPage({
       const { blob, filename } = await fetchSitemapsZipBlob(params.id, type, {
         filter: filtered,
         excludeFileIds,
-        signal: controller.signal
+        signal: controller.signal,
+        onProgress: (transfer) =>
+          setDownloadOverlay((prev) => (prev ? { ...prev, transfer } : prev))
       });
 
       await finishDownload(blob, filename);
@@ -2694,7 +2716,11 @@ export default function ResultsDashboardPage({
         if (switchToCacheRef.current) {
           try {
             const cached = await fetchSitemapsZipBlob(params.id, type, {
-              filter: true
+              filter: true,
+              onProgress: (transfer) =>
+                setDownloadOverlay((prev) =>
+                  prev ? { ...prev, transfer } : prev
+                )
             });
 
             await finishDownload(cached.blob, cached.filename);
@@ -5350,6 +5376,33 @@ export default function ResultsDashboardPage({
         </Dialog>
 
         {/* On-demand download progress overlay (v1.31 Fix 2) — non-blocking. */}
+        {/* The downloads with no overlay (pre-generated ZIP, corrected sitemap,
+            session export) get the same byte feedback here, so no download in
+            this page can look hung. */}
+        {!downloadOverlay && downloadTransfer ? (
+          <div
+            className="fixed bottom-4 right-4 z-50 w-80 rounded-lg border border-slate-200 bg-background p-4 shadow-lg"
+            role="status"
+            aria-live="polite"
+          >
+            <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
+              <Download className="h-4 w-4 text-indigo-600" aria-hidden="true" />
+              Downloading…
+            </div>
+            <div className="mt-3">
+              <Progress value={downloadTransfer.percent ?? 0} />
+            </div>
+            <div className="mt-1.5 flex items-center justify-between text-xs text-slate-500">
+              <span>
+                {downloadTransfer.percent === null
+                  ? "in progress"
+                  : `${downloadTransfer.percent}%`}
+              </span>
+              <span>{formatDownloadProgress(downloadTransfer)}</span>
+            </div>
+          </div>
+        ) : null}
+
         {downloadOverlay ? (
           <div
             className="fixed bottom-4 right-4 z-50 w-80 rounded-lg border border-slate-200 bg-background p-4 shadow-lg"
@@ -5358,17 +5411,32 @@ export default function ResultsDashboardPage({
           >
             <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
               <Download className="h-4 w-4 text-indigo-600" aria-hidden="true" />
-              {downloadOverlay.percent >= 100
-                ? "Starting download…"
-                : "Preparing download…"}
+              {downloadOverlay.transfer !== null
+                ? "Downloading…"
+                : downloadOverlay.percent >= 100
+                  ? "Starting download…"
+                  : "Preparing download…"}
             </div>
+            {/* Once bytes start arriving, the bar tracks the TRANSFER rather than
+                staying pinned at a finished zip build. */}
             <div className="mt-3">
-              <Progress value={downloadOverlay.percent} />
+              <Progress
+                value={
+                  downloadOverlay.transfer?.percent ?? downloadOverlay.percent
+                }
+              />
             </div>
             <div className="mt-1.5 flex items-center justify-between text-xs text-slate-500">
-              <span>{Math.round(downloadOverlay.percent)}%</span>
-              {downloadOverlay.percent < 100 &&
-              downloadOverlay.fileTotal > 0 ? (
+              <span>
+                {Math.round(
+                  downloadOverlay.transfer?.percent ?? downloadOverlay.percent
+                )}
+                %
+              </span>
+              {downloadOverlay.transfer !== null ? (
+                <span>{formatDownloadProgress(downloadOverlay.transfer)}</span>
+              ) : downloadOverlay.percent < 100 &&
+                downloadOverlay.fileTotal > 0 ? (
                 <span>
                   Zipping file{" "}
                   {formatNumber(
