@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { createInterface } from "node:readline";
@@ -12,6 +13,12 @@ import {
   runCleanerClassify,
   runCleanerParse
 } from "../jobs/cleanerPool.js";
+import {
+  admitDedupRun,
+  chargeDedupBytes,
+  dedupEntryCost,
+  releaseDedupRun
+} from "./dedupBudget.js";
 
 // Sitemap Cleaner — a stateless port of the SEO team's Streamlit script
 // (sitemap_dashboard_4.py). Given a set of uploaded XML sitemap files it:
@@ -25,8 +32,23 @@ import {
 //
 // Memory model (v1.38): only URL strings are ever held in memory. Files are
 // read one at a time and streamed; a file's kept URLs are written straight to
-// disk. The only unavoidable heap cost is the cross-file dedup Set plus the
-// duplicates report.
+// disk. The only unavoidable heap cost is the cross-file dedup index.
+//
+// Memory model (v1.48): that "only unavoidable cost" was unbounded, and past
+// ~25-30M unique URLs it reached V8's heap limit and ABORTED the process,
+// killing every concurrent run. Two things changed:
+//
+//   - The dedup index is now BYTE-ACCOUNTED against a process-wide budget
+//     derived from the live heap limit (sitemaps/dedupBudget.ts). Crossing it
+//     fails the run with a message naming the real numbers instead of taking
+//     the whole API down. Still in memory — moving `keptBy` to a disk-backed
+//     store is a separate, larger change.
+//   - The duplicates report is now STREAMED to its CSV as duplicates are found.
+//     It used to accumulate a full Map<url, {url, kept_in, also_in[]}> (~250 B
+//     per duplicated URL) AND then a second complete array copy of the same
+//     data to return to the caller — so a run with few unique URLs but tens of
+//     millions of duplicates blew the heap no matter what a unique-URL ceiling
+//     said. Nothing about the report is held now beyond the current row.
 //
 // Concurrency model (v1.45): on large file sets both passes run across a
 // piscina worker pool.
@@ -56,7 +78,13 @@ export interface CleanerResult {
   files_dropped: number;
   dropped_files: { filename: string; reason: DropReason }[];
   duplicates_removed: number;
-  duplicate_urls: { url: string; kept_in: string; also_in: string[] }[];
+  // NOTE: there is deliberately no `duplicate_urls` array here any more. It was
+  // a second complete in-memory copy of the duplicates report, built purely to
+  // ship to the browser so the browser could rebuild the CSV that this module
+  // had ALREADY written to disk. The frontend downloads that file instead (see
+  // GET /api/cleaner/report/:token), so the rows exist in exactly one place.
+  // `duplicates_removed` is what the UI needs to know whether the report is
+  // worth offering, and it counts occurrences, matching the CSV's rows.
   output_files: { filename: string; url_count: number }[];
   // Uploaded <sitemapindex> files are excluded from cleaning and replaced by a
   // freshly rebuilt index; surfaced separately so the count stays honest.
@@ -129,6 +157,66 @@ function csvField(value: string) {
   }
 
   return value;
+}
+
+// Duplicates report, written as duplicates are found.
+//
+// Rows are batched into a small string buffer and flushed at BUFFER_FLUSH_BYTES.
+// The batching is not for speed, it is for bounded memory: considerLoc runs
+// inside a sax callback and cannot await, so it cannot honour stream
+// backpressure. Handing every row straight to createWriteStream would let
+// Node's internal write queue grow without limit whenever the parser outruns
+// the disk — which would reintroduce the unbounded heap growth this replaced,
+// just one layer down. A fixed-size buffer plus `write()`'s own queue is bounded
+// in practice because a CSV append is far cheaper than the XML parse feeding it.
+//
+// FORMAT CHANGE (v1.48): one row per duplicate OCCURRENCE, header
+// `url,kept_in_file,duplicate_in_file`. It was previously one row per duplicated
+// URL with a "; "-joined `duplicate_in_files` list — and building that list is
+// precisely what required the whole report to stay resident until the run ended.
+// The occurrence form also matches `duplicates_removed` 1:1, which the grouped
+// form did not.
+const REPORT_BUFFER_FLUSH_BYTES = 64 * 1024;
+
+function openDuplicateReport(reportPath: string): DuplicateReportSink & {
+  close: () => Promise<void>;
+} {
+  const stream = createWriteStream(reportPath);
+  stream.write("url,kept_in_file,duplicate_in_file\r\n");
+
+  let buffer = "";
+  let closed = false;
+
+  const flush = () => {
+    if (buffer.length > 0) {
+      stream.write(buffer);
+      buffer = "";
+    }
+  };
+
+  return {
+    writeRow: (url, keptIn, duplicateIn) => {
+      buffer += `${csvField(url)},${csvField(keptIn)},${csvField(
+        duplicateIn
+      )}\r\n`;
+
+      if (buffer.length >= REPORT_BUFFER_FLUSH_BYTES) {
+        flush();
+      }
+    },
+    // Idempotent: the success path closes this before the manifest lists the
+    // file, and the caller ALSO registers it as a cleanup for the throwing
+    // paths. Closing twice must not reject or double-end the stream.
+    close: async () => {
+      if (closed) {
+        return;
+      }
+
+      closed = true;
+      flush();
+      await finishStream(stream);
+    }
+  };
 }
 
 function isGzipName(filename: string) {
@@ -344,14 +432,58 @@ export async function writeProvisionalOnDomainFile(
 
 // ---- Cross-file dedup: the single source of truth -----------------------
 
-export type DedupState = {
-  keptBy: Map<string, string>; // normalized URL -> kept-in filename
-  dupReport: Map<string, { url: string; kept_in: string; also_in: string[] }>;
-  duplicatesRemoved: number;
+// Sink for duplicate rows. Written as they are found so no report data
+// accumulates on the heap. `write` is synchronous-looking on purpose:
+// considerLoc is called from inside a sax callback and cannot await.
+export type DuplicateReportSink = {
+  writeRow: (url: string, keptIn: string, duplicateIn: string) => void;
 };
 
-export function createDedupState(): DedupState {
-  return { keptBy: new Map(), dupReport: new Map(), duplicatesRemoved: 0 };
+// How many entries to accumulate locally before syncing the shared ledger.
+// The hot path is then a counter increment; the process-wide total trails by at
+// most this many entries (~1 MB), which the budget's 45% margin absorbs.
+const LEDGER_SYNC_INTERVAL = 4096;
+
+export type DedupState = {
+  keptBy: Map<string, string>; // normalized URL -> kept-in filename
+  duplicatesRemoved: number;
+  // Ledger identity + byte accounting. Bytes, not a URL count, because a
+  // 100-char corpus costs ~1.7x a 60-char one for the same count.
+  runId: string;
+  bytes: number;
+  unsyncedBytes: number;
+  unsyncedEntries: number;
+  report: DuplicateReportSink | null;
+};
+
+export function createDedupState(
+  options: { runId?: string; report?: DuplicateReportSink } = {}
+): DedupState {
+  const runId = options.runId ?? `dedup-${Math.random().toString(36).slice(2)}`;
+
+  return {
+    keptBy: new Map(),
+    duplicatesRemoved: 0,
+    runId,
+    bytes: 0,
+    unsyncedBytes: 0,
+    unsyncedEntries: 0,
+    report: options.report ?? null
+  };
+}
+
+// Push any locally-accumulated bytes into the shared ledger. Throws
+// CleanerCapacityError when this run would push the PROCESS-WIDE total over
+// budget. Called on the batch boundary and once more at the end of a run.
+export function syncDedupLedger(state: DedupState): void {
+  if (state.unsyncedBytes === 0) {
+    return;
+  }
+
+  const delta = state.unsyncedBytes;
+  state.unsyncedBytes = 0;
+  state.unsyncedEntries = 0;
+  chargeDedupBytes(state.runId, delta, state.keptBy.size);
 }
 
 // Decide ONE on-domain loc against the running cross-file dedup state
@@ -370,21 +502,31 @@ export function considerLoc(
   if (!state.keptBy.has(key)) {
     state.keptBy.set(key, filename);
 
+    // Charge the entry we just added. Accumulated locally and synced to the
+    // shared ledger every LEDGER_SYNC_INTERVAL entries; the sync is what throws
+    // CleanerCapacityError, so the run stops HERE — incrementally, mid-Pass-2 —
+    // rather than after the heap is already gone. A pre-flight estimate cannot
+    // do this: the unique count is not known until dedup has actually run.
+    const cost = dedupEntryCost(key.length);
+    state.bytes += cost;
+    state.unsyncedBytes += cost;
+    state.unsyncedEntries += 1;
+
+    if (state.unsyncedEntries >= LEDGER_SYNC_INTERVAL) {
+      syncDedupLedger(state);
+    }
+
     return true;
   }
 
   state.duplicatesRemoved += 1;
-  const keptIn = state.keptBy.get(key) as string;
-  let entry = state.dupReport.get(key);
 
-  if (!entry) {
-    entry = { url: loc, kept_in: keptIn, also_in: [] };
-    state.dupReport.set(key, entry);
-  }
-
-  if (!entry.also_in.includes(filename)) {
-    entry.also_in.push(filename);
-  }
+  // Streamed, not accumulated. One row per duplicate OCCURRENCE, which is why
+  // the report no longer needs a Map keyed by URL to collect an `also_in` list:
+  // collecting that list is exactly what forced the whole report to be resident
+  // until the run ended. Occurrence rows also line up 1:1 with
+  // duplicates_removed, which the old URL-grouped rows did not.
+  state.report?.writeRow(loc, state.keptBy.get(key) as string, filename);
 
   return false;
 }
@@ -593,7 +735,7 @@ export async function writeCandidatesParallel(options: {
   }
 }
 
-export async function cleanSitemaps(options: {
+export type CleanSitemapsOptions = {
   files: CleanerInputFile[];
   domain: string;
   subfolder: string;
@@ -601,7 +743,47 @@ export async function cleanSitemaps(options: {
   // Directory the cleaned output files (+ index + report) are written into.
   outDir: string;
   onProgress?: CleanerProgress;
-}): Promise<CleanerOutput> {
+  // Ledger identity. Supplied by the SFTP path (which already has a runId);
+  // minted here for the upload path, which does not.
+  runId?: string;
+};
+
+// Admission + release wrapper around the clean itself.
+//
+// The release is in a `finally` for a reason: a charge that outlives its run
+// permanently shrinks the shared budget for every later run, and only a restart
+// recovers it — the exact class of failure this accounting exists to prevent. So
+// every exit path (success, CleanerCapacityError, parse failure, abort) gives the
+// bytes back.
+export async function cleanSitemaps(
+  options: CleanSitemapsOptions
+): Promise<CleanerOutput> {
+  const runId = options.runId ?? `cleaner-${randomUUID()}`;
+
+  // Refuse up front when the runs already in flight leave no room, rather than
+  // pulling and parsing for minutes and dying on the first dedup entry.
+  admitDedupRun(runId);
+
+  // Resources the clean opens that must be released even when it throws — which
+  // it now can, mid-stream, on a budget refusal.
+  const cleanups: (() => Promise<void>)[] = [];
+
+  try {
+    return await cleanSitemapsInner(options, runId, cleanups);
+  } finally {
+    for (const cleanup of cleanups) {
+      await cleanup().catch(() => undefined);
+    }
+
+    releaseDedupRun(runId);
+  }
+}
+
+async function cleanSitemapsInner(
+  options: CleanSitemapsOptions,
+  runId: string,
+  cleanups: (() => Promise<void>)[]
+): Promise<CleanerOutput> {
   const domainHost = new URL(options.domain).host;
   const { today, outDir, files, onProgress } = options;
   const parallel = files.length >= CLEANER_PARALLEL_THRESHOLD;
@@ -703,8 +885,21 @@ export async function cleanSitemaps(options: {
   // ---- Pass 2: dedup + write cleaned files (streaming, first wins) -------
   onProgress?.({ stage: "dedup", message: "Deduplicating URLs…" });
 
-  const state = createDedupState();
+  // The duplicates CSV is opened BEFORE Pass 2 now, not written from a Map
+  // afterwards, so a duplicate is on disk moments after it is found and nothing
+  // about the report is retained.
+  const reportPath = path.join(outDir, REPORT_FILENAME);
+  const report = openDuplicateReport(reportPath);
+  const state = createDedupState({ runId, report });
   const survivors: SurvivorFile[] = [];
+
+  // Pass 2 can now throw where it previously could not: exceeding the dedup
+  // budget aborts mid-stream, after this write stream is already open. Register
+  // the close so it happens on EVERY exit path — leaking one file descriptor per
+  // refused run would be fd exhaustion arrived at by way of the guard meant to
+  // prevent an outage. close() is idempotent, so the success path below still
+  // closes it at the right moment (before the manifest lists it).
+  cleanups.push(() => report.close());
 
   if (parallel) {
     await writeCandidatesParallel({
@@ -771,7 +966,15 @@ export async function cleanSitemaps(options: {
     }
   }
 
+  // Final sync: charge whatever the last partial batch accumulated, so a run
+  // that ends just under a batch boundary is still accounted for while it lives.
+  syncDedupLedger(state);
+
   const duplicatesRemoved = state.duplicatesRemoved;
+
+  // Report rows are all written by now (they were emitted during Pass 2); close
+  // the file before it is listed in the manifest and packed into the ZIP.
+  await report.close();
 
   // ---- Rebuild the index -------------------------------------------------
   onProgress?.({
@@ -797,24 +1000,7 @@ export async function cleanSitemaps(options: {
   indexStream.write(indexXml);
   await finishStream(indexStream);
 
-  // ---- Write the duplicates report (streamed, never one big string) ------
-  const reportPath = path.join(outDir, REPORT_FILENAME);
-  const reportStream = createWriteStream(reportPath);
-  reportStream.write("url,kept_in_file,duplicate_in_files\r\n");
-
-  const duplicateUrls: { url: string; kept_in: string; also_in: string[] }[] =
-    [];
-
-  for (const row of state.dupReport.values()) {
-    duplicateUrls.push(row);
-    reportStream.write(
-      `${csvField(row.url)},${csvField(row.kept_in)},${csvField(
-        row.also_in.join("; ")
-      )}\r\n`
-    );
-  }
-
-  await finishStream(reportStream);
+  // (The duplicates report was written during Pass 2 and closed above.)
 
   // ---- Assemble the manifest --------------------------------------------
   const outputManifest: CleanerOutputFile[] = survivors.map((file) => ({
@@ -853,7 +1039,6 @@ export async function cleanSitemaps(options: {
     files_dropped: dropped.length,
     dropped_files: dropped,
     duplicates_removed: duplicatesRemoved,
-    duplicate_urls: duplicateUrls,
     output_files: survivors.map((file) => ({
       filename: file.filename,
       url_count: file.url_count

@@ -23,6 +23,12 @@ import {
   type CleanerInputFile,
   type DropReason
 } from "./cleaner.js";
+import {
+  CleanerCapacityError,
+  dedupLedger,
+  resetDedupLedgerForTest,
+  setDedupBudgetForTest
+} from "./dedupBudget.js";
 
 // Pass 2's cross-file dedup ("first occurrence across files wins") must depend
 // on FILE ORDER, not the order the parallel workers finish in. These tests
@@ -52,11 +58,18 @@ const candidates = FIXTURE.map((f) => ({
 }));
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+type ReportRow = { url: string; kept_in: string; duplicate_in: string };
+
 type RunResult = {
   survivors: { filename: string; url_count: number }[];
   dropped: { filename: string; reason: DropReason }[];
   duplicates_removed: number;
-  duplicate_urls: { url: string; kept_in: string; also_in: string[] }[];
+  // The rows the duplicates report RECEIVED, in the order it received them.
+  // Since v1.48 the report is streamed one row per duplicate occurrence rather
+  // than accumulated in a Map, so the ordering guarantee has to be asserted on
+  // the emitted sequence — which is a stronger check than the old grouped
+  // snapshot: it would catch a reordering that a per-URL grouping hid.
+  report_rows: ReportRow[];
   outDir: string;
 };
 
@@ -66,7 +79,13 @@ async function run(
 ): Promise<RunResult> {
   const outDir = mkdtempSync(path.join(os.tmpdir(), "cleaner-order-"));
   const provDir = mkdtempSync(path.join(os.tmpdir(), "cleaner-prov-"));
-  const state = createDedupState();
+  const reportRows: ReportRow[] = [];
+  const state = createDedupState({
+    report: {
+      writeRow: (url, kept_in, duplicate_in) =>
+        reportRows.push({ url, kept_in, duplicate_in })
+    }
+  });
   const survivors: {
     filename: string;
     url_count: number;
@@ -107,7 +126,7 @@ async function run(
     })),
     dropped,
     duplicates_removed: state.duplicatesRemoved,
-    duplicate_urls: [...state.dupReport.values()],
+    report_rows: reportRows,
     outDir
   };
 }
@@ -122,23 +141,27 @@ test("Pass 2 dedup + output is identical whatever order the workers finish in", 
     { filename: "c.xml", url_count: 1 }
   ];
   const expectedDropped = [{ filename: "d.xml", reason: "empty" as DropReason }];
-  const expectedDuplicates = [
-    { url: `${HOST}/dup/`, kept_in: "a.xml", also_in: ["b.xml", "c.xml"] },
-    { url: `${HOST}/x`, kept_in: "a.xml", also_in: ["d.xml"] },
-    { url: `${HOST}/y`, kept_in: "a.xml", also_in: ["d.xml"] }
+  // One row per duplicate OCCURRENCE, in file order — so the row count equals
+  // duplicates_removed (4), which the old URL-grouped form could not express.
+  const expectedDuplicates: ReportRow[] = [
+    { url: `${HOST}/dup/`, kept_in: "a.xml", duplicate_in: "b.xml" },
+    { url: `${HOST}/dup`, kept_in: "a.xml", duplicate_in: "c.xml" },
+    { url: `${HOST}/x`, kept_in: "a.xml", duplicate_in: "d.xml" },
+    { url: `${HOST}/y`, kept_in: "a.xml", duplicate_in: "d.xml" }
   ];
 
   // Reference matches the hand-computed first-wins expectation.
   assert.deepEqual(reference.survivors, expectedSurvivors);
   assert.deepEqual(reference.dropped, expectedDropped);
   assert.equal(reference.duplicates_removed, 4);
-  assert.deepEqual(reference.duplicate_urls, expectedDuplicates);
+  assert.deepEqual(reference.report_rows, expectedDuplicates);
+  assert.equal(reference.report_rows.length, reference.duplicates_removed);
 
   // Scrambled completion is identical in every reported dimension...
   assert.deepEqual(scrambled.survivors, reference.survivors);
   assert.deepEqual(scrambled.dropped, reference.dropped);
   assert.equal(scrambled.duplicates_removed, reference.duplicates_removed);
-  assert.deepEqual(scrambled.duplicate_urls, reference.duplicate_urls);
+  assert.deepEqual(scrambled.report_rows, reference.report_rows);
 
   // ...and so are the actual cleaned files on disk.
   for (const { filename } of expectedSurvivors) {
@@ -308,6 +331,178 @@ test("reduction_pct counts every URL that entered dedup, not just survivors", as
     // 2 duplicates out of the 4 on-domain URLs that entered dedup = 50%.
     assert.equal(result.reduction_pct, 50);
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- v1.48: dedup memory budget + streamed duplicates report ---------------
+
+// The report is no longer built from an in-memory Map, so the thing to prove is
+// that the FILE is still correct — right header, right rows, right order — and
+// that its row count matches duplicates_removed (which the old URL-grouped form
+// could not, since it collapsed N occurrences into one row).
+test("the duplicates report is streamed to disk with one row per occurrence", async () => {
+  const { dir, inDir, outDir } = scratch("report");
+
+  try {
+    const a = path.join(inDir, "a.xml");
+    const b = path.join(inDir, "b.xml");
+    const c = path.join(inDir, "c.xml");
+    writeFileSync(a, urlsetXml([`${DOMAIN}/p1`, `${DOMAIN}/p2`]));
+    writeFileSync(b, urlsetXml([`${DOMAIN}/p1`, `${DOMAIN}/p3`]));
+    writeFileSync(c, urlsetXml([`${DOMAIN}/p1`, `${DOMAIN}/p2`]));
+
+    const { result, files } = await cleanSitemaps({
+      files: [
+        { filename: "a.xml", path: a },
+        { filename: "b.xml", path: b },
+        { filename: "c.xml", path: c }
+      ],
+      domain: DOMAIN,
+      subfolder: "sitemaps",
+      today: TODAY,
+      outDir
+    });
+
+    // p1 duplicated in b and c, p2 duplicated in c → 3 occurrences.
+    assert.equal(result.duplicates_removed, 3);
+
+    const csv = readFileSync(path.join(outDir, "duplicates-report.csv"), "utf8");
+    const lines = csv.trim().split("\r\n");
+
+    assert.equal(lines[0], "url,kept_in_file,duplicate_in_file");
+    assert.deepEqual(lines.slice(1), [
+      `${DOMAIN}/p1,a.xml,b.xml`,
+      `${DOMAIN}/p1,a.xml,c.xml`,
+      `${DOMAIN}/p2,a.xml,c.xml`
+    ]);
+
+    // Row count matches the counter — the property the grouped form lacked.
+    assert.equal(lines.length - 1, result.duplicates_removed);
+
+    // And the report is still in the manifest so it reaches the ZIP.
+    assert.ok(files.some((f) => f.filename === "duplicates-report.csv"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The summary must NOT carry the rows any more. This is the memory win: a run
+// with millions of duplicates used to return all of them (plus hold a Map of
+// them) purely so the browser could rebuild a CSV that already existed on disk.
+test("the summary does not carry the duplicate rows", async () => {
+  const { dir, inDir, outDir } = scratch("nocopy");
+
+  try {
+    const a = path.join(inDir, "a.xml");
+    const b = path.join(inDir, "b.xml");
+    writeFileSync(a, urlsetXml([`${DOMAIN}/q1`]));
+    writeFileSync(b, urlsetXml([`${DOMAIN}/q1`]));
+
+    const { result } = await cleanSitemaps({
+      files: [
+        { filename: "a.xml", path: a },
+        { filename: "b.xml", path: b }
+      ],
+      domain: DOMAIN,
+      subfolder: "sitemaps",
+      today: TODAY,
+      outDir
+    });
+
+    assert.equal(result.duplicates_removed, 1);
+    assert.equal(
+      (result as unknown as Record<string, unknown>).duplicate_urls,
+      undefined,
+      "duplicate_urls must be gone — the CSV on disk is the only copy"
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The real fix, end to end: an oversized run is REFUSED with an actionable
+// message instead of aborting the process. Before this, the only outcome
+// available at the heap limit was `FATAL ERROR: Reached heap limit` — which is
+// uncatchable, so it took every concurrent run down with it and could not be
+// turned into a message at all.
+test("a run over the dedup budget fails with a clear error, not a heap abort", async () => {
+  const { dir, inDir, outDir } = scratch("budget");
+
+  // Shrink the budget so a handful of URLs exceeds it. Sizing this via the
+  // public seam rather than allocating gigabytes is the only way to exercise the
+  // guard in a test that anyone will actually run.
+  setDedupBudgetForTest(200);
+  resetDedupLedgerForTest();
+
+  try {
+    const a = path.join(inDir, "a.xml");
+    writeFileSync(
+      a,
+      urlsetXml(
+        Array.from({ length: 200 }, (_, i) => `${DOMAIN}/budget-probe-${i}`)
+      )
+    );
+
+    const error = await cleanSitemaps({
+      files: [{ filename: "a.xml", path: a }],
+      domain: DOMAIN,
+      subfolder: "sitemaps",
+      today: TODAY,
+      outDir
+    }).then(
+      () => null,
+      (e: unknown) => e
+    );
+
+    assert.ok(
+      error instanceof CleanerCapacityError,
+      `expected CleanerCapacityError, got ${String(error)}`
+    );
+    // The message has to be actionable: it names the count and the ceiling.
+    assert.match(error.message, /unique URLs/);
+    assert.match(error.message, /smaller batches|max-old-space-size/);
+
+    // And the charge is released, so the failure does not shrink the budget for
+    // every later run — a leak here would need a restart to recover.
+    assert.equal(dedupLedger().totalBytes, 0);
+    assert.equal(dedupLedger().runs, 0);
+
+    // The report's write stream is opened BEFORE the point that throws, so the
+    // refusal path has to close it too. An unclosed stream per refused run is an
+    // fd leak — fd exhaustion reached by way of the guard meant to prevent an
+    // outage. A readable file with its header flushed proves it was ended.
+    const csv = readFileSync(path.join(outDir, "duplicates-report.csv"), "utf8");
+    assert.match(csv, /^url,kept_in_file,duplicate_in_file/);
+  } finally {
+    setDedupBudgetForTest(null);
+    resetDedupLedgerForTest();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A normal run must leave the ledger clean too, or the budget bleeds away one
+// successful run at a time.
+test("a successful run releases its dedup charge", async () => {
+  const { dir, inDir, outDir } = scratch("release");
+  resetDedupLedgerForTest();
+
+  try {
+    const a = path.join(inDir, "a.xml");
+    writeFileSync(a, urlsetXml([`${DOMAIN}/r1`, `${DOMAIN}/r2`]));
+
+    await cleanSitemaps({
+      files: [{ filename: "a.xml", path: a }],
+      domain: DOMAIN,
+      subfolder: "sitemaps",
+      today: TODAY,
+      outDir
+    });
+
+    assert.equal(dedupLedger().totalBytes, 0);
+    assert.equal(dedupLedger().runs, 0);
+  } finally {
+    resetDedupLedgerForTest();
     rmSync(dir, { recursive: true, force: true });
   }
 });

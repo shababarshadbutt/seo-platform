@@ -312,13 +312,15 @@ export default function CleanerPage() {
   }
 
   async function handleDownloadCsv() {
-    if (!summary) {
+    if (!summary || !downloadToken) {
       return;
     }
 
     try {
+      // Fetched from the server (same token as the ZIP) rather than rebuilt from
+      // a copy of the rows held in the summary.
       await downloadDuplicatesCsv(
-        summary.duplicate_urls,
+        downloadToken,
         zipFilename.replace(/\.zip$/i, "").replace(/^cleaned-sitemaps/, "duplicates-report") +
           ".csv"
       );
@@ -782,7 +784,7 @@ export default function CleanerPage() {
                   variant="outline"
                   onClick={() => void handleDownloadCsv()}
                   className="gap-2"
-                  disabled={summary.duplicate_urls.length === 0}
+                  disabled={summary.duplicates_removed === 0 || !downloadToken}
                 >
                   <Download className="h-4 w-4" />
                   Download duplicates report (CSV)

@@ -242,6 +242,16 @@ const DEFAULT_API_TIMEOUT_MS = 10000;
 const EXPORT_API_TIMEOUT_MS = 180000;
 const UPLOAD_API_TIMEOUT_MS = 30 * 60 * 1000;
 
+// GET /api/sessions/:id is the heaviest read in the app — it aggregates over
+// every sitemap_file in the session and lists them all — and it was inheriting
+// the 10s default, which is what produced "Unable to load this analysis —
+// Request timed out" on large sessions. The real fix is server-side (the
+// connectivity count is now bounded and indexed; see migration 035), because a
+// bigger timeout on an unbounded query only moves the failure. This is the
+// belt-and-braces half: enough headroom that a session which is merely large,
+// rather than pathological, loads instead of aborting.
+const SESSION_API_TIMEOUT_MS = 60000;
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -621,9 +631,11 @@ export async function submitSitemapUrls(
 }
 
 export async function getSession(sessionId: string) {
-  const response = await fetchWithTimeout(backendUrl(`/api/sessions/${sessionId}`), {
-    cache: "no-store"
-  });
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}`),
+    { cache: "no-store" },
+    SESSION_API_TIMEOUT_MS
+  );
 
   return readJsonResponse<SessionResponse>(response);
 }
@@ -1800,7 +1812,10 @@ export type CleanerSummary = {
   files_dropped: number;
   dropped_files: { filename: string; reason: CleanerDropReason }[];
   duplicates_removed: number;
-  duplicate_urls: { url: string; kept_in: string; also_in: string[] }[];
+  // No `duplicate_urls`: the rows are no longer shipped in the summary. They
+  // live only in the CSV the backend wrote, fetched on demand by
+  // downloadDuplicatesCsv. `duplicates_removed` counts occurrences and so
+  // matches the CSV's row count exactly.
   output_files: { filename: string; url_count: number }[];
   index_files_detected: number;
   total_urls_kept_files: number;
@@ -2268,34 +2283,32 @@ export async function downloadCleanerZip(token: string, filename: string) {
   await saveBlobWithPicker(blob, filename, { "application/zip": [".zip"] });
 }
 
-function csvField(value: string) {
-  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
-}
-
-// Build the duplicates CSV client-side from the summary (same columns the
-// backend writes into the ZIP), so the standalone CSV download needs no extra
-// round-trip or server state.
-export function buildDuplicatesCsv(
-  rows: { url: string; kept_in: string; also_in: string[] }[]
-) {
-  const header = "url,kept_in_file,duplicate_in_files";
-  const lines = rows.map(
-    (row) =>
-      `${csvField(row.url)},${csvField(row.kept_in)},${csvField(
-        row.also_in.join("; ")
-      )}`
-  );
-
-  return `${[header, ...lines].join("\r\n")}\r\n`;
-}
-
-export async function downloadDuplicatesCsv(
-  rows: { url: string; kept_in: string; also_in: string[] }[],
-  filename: string
-) {
-  const blob = new Blob([buildDuplicatesCsv(rows)], {
-    type: "text/csv;charset=utf-8"
+// Download the duplicates report the BACKEND already wrote to disk during the
+// clean, instead of rebuilding it here.
+//
+// This used to take the whole row set as an argument and assemble the CSV
+// client-side, which meant the API had to hold every duplicate row in memory and
+// serialize it through the `done` frame just so this function could reproduce a
+// file that already existed on the server. On a large run that copy was hundreds
+// of MB of heap on the API for zero benefit. Same bytes, same columns, one
+// source of truth — and the browser no longer receives a payload proportional to
+// the duplicate count.
+export async function downloadDuplicatesCsv(token: string, filename: string) {
+  const response = await fetch(backendUrl(`/api/cleaner/report/${token}`), {
+    cache: "no-store"
   });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+
+    throw new ApiError(
+      text || `Download failed with status ${response.status}`,
+      response.status,
+      null
+    );
+  }
+
+  const blob = await response.blob();
 
   await saveBlobWithPicker(blob, filename, { "text/csv": [".csv"] });
 }

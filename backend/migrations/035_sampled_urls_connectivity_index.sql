@@ -1,0 +1,29 @@
+-- v1.48 — make the connectivity heuristic on GET /api/sessions/:id cheap.
+--
+-- THE BUG THIS CLOSES. That endpoint ran an UNBOUNDED
+--   SELECT COUNT(*), COUNT(*) FILTER (WHERE http_status IS NULL)
+--   FROM sampled_urls JOIN patterns ON patterns.id = sampled_urls.pattern_id
+--   WHERE patterns.session_id = $1
+-- to decide a single boolean: "did >90% of sampled URLs get no HTTP response?".
+-- On a session with 1000+ sitemap files that visits millions of rows, and it
+-- routinely exceeded the frontend's request timeout — which the UI reported as
+-- "Unable to load this analysis — Request timed out", on a session that was
+-- perfectly healthy. It reads as a crash or a hung backend; it was a slow query.
+--
+-- Two changes together fix it, and BOTH are needed:
+--   1. The route now samples at most 5,000 rows (a bounded LIMIT subquery), since
+--      a ratio tested against one 0.9 threshold does not need a full scan.
+--   2. This index, so even that bounded read is an index-only scan instead of a
+--      heap visit per row.
+--
+-- Raising the client's timeout was explicitly rejected as a fix: an unbounded
+-- scan just fails at the larger number once the session grows again.
+--
+-- idx_sampled_urls_pattern_id (migration 001) already covers the join key, but
+-- not http_status, so Postgres still had to visit every matching heap tuple to
+-- evaluate the IS NULL filter. Including http_status makes the count answerable
+-- from the index alone. This SUPERSEDES the pattern_id-only index for this query;
+-- the old one is left in place because the pattern-drawer sample lookup
+-- (SELECT ... WHERE pattern_id = $1) still uses it and is unaffected.
+CREATE INDEX IF NOT EXISTS idx_sampled_urls_pattern_id_http_status
+  ON sampled_urls (pattern_id, http_status);

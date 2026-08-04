@@ -113,7 +113,31 @@ services:
     environment:
       NODE_ENV: production
       PORT: "3001"
-      NODE_OPTIONS: "--max-old-space-size=4096"
+      # V8 heap ceiling for the API. 12 GiB, derived — not a round fraction of
+      # the host's 32 GB:
+      #
+      #   32.0  host
+      #   -1.5  OS + Docker daemon
+      #   -4.0  Postgres (holds the large sessions; page cache matters here)
+      #   -2.0  Mongo (WiredTiger is UNCAPPED and defaults to ~50% of RAM)
+      #   -0.5  Redis
+      #   -1.0  frontend (Next, production)
+      #   -1.0  seo-desk (Next, production)
+      #   -4.0  worker — same image, so it takes the Dockerfile's 4096 default
+      #   =18.0 remaining
+      #   -6.0  cleaner piscina threads (CLEANER_MAX_WORKERS=4, each its own V8
+      #         heap) + off-heap zlib/ssh2/Buffers + RSS overshoot, none of which
+      #         --max-old-space-size governs
+      #   =12.0 GiB main-thread heap
+      #
+      # NOTE this is the BACKEND only. The worker deliberately keeps the image
+      # default; raising the shared Dockerfile ENV would give both containers
+      # 12 GiB and blow the budget above.
+      #
+      # Overridable without a rebuild, and the Cleaner's dedup budget is derived
+      # from the LIVE heap limit at runtime (sitemaps/dedupBudget.ts), so tuning
+      # this moves the guard with it automatically — the two cannot drift.
+      NODE_OPTIONS: "--max-old-space-size=${BACKEND_HEAP_MB:-12288}"
       # Corporate SSL-inspection proxy workaround (v1.39) — this VM is on AWS,
       # not behind that laptop-side proxy, so this almost certainly should be
       # "1" here. Left overridable rather than hardcoded off in case AWS

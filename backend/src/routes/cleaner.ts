@@ -22,9 +22,11 @@ import {
 } from "../sftp/sftpClient.js";
 import {
   cleanSitemaps,
+  REPORT_FILENAME,
   type CleanerInputFile,
   type CleanerOutputFile
 } from "../sitemaps/cleaner.js";
+import { CleanerCapacityError } from "../sitemaps/dedupBudget.js";
 import { StageTimer } from "../sitemaps/stageTimer.js";
 import {
   createRun,
@@ -266,10 +268,33 @@ async function cleanPackageAndFinish(options: {
 
     return true;
   } catch (error) {
-    log.error({ error }, "cleaner process failed");
+    // A capacity refusal is not a crash and must not read like one: it is the
+    // guard doing its job, with actionable numbers in the message. Logged at
+    // warn so it does not sit in the error budget alongside real failures, and
+    // tagged with a `code` so the UI can present it as a limit rather than a
+    // generic "Cleaning failed".
+    if (error instanceof CleanerCapacityError) {
+      log.warn(
+        {
+          domain,
+          files: inputFiles.length,
+          unique_urls: error.uniqueUrls,
+          bytes: error.bytes,
+          budget_bytes: error.budgetBytes,
+          concurrent_runs: error.concurrentRuns
+        },
+        "cleaner run refused: dedup memory budget"
+      );
+    } else {
+      log.error({ error }, "cleaner process failed");
+    }
+
     const errorFrame = {
       type: "error",
-      message: error instanceof Error ? error.message : "Cleaning failed"
+      message: error instanceof Error ? error.message : "Cleaning failed",
+      ...(error instanceof CleanerCapacityError
+        ? { code: "dedup_budget_exceeded" }
+        : {})
     };
 
     if (options.runId) {
@@ -617,6 +642,52 @@ export async function cleanerRoutes(app: FastifyInstance) {
       );
 
       return reply.send(createReadStream(entry.zipPath));
+    }
+  );
+
+  // Stream the duplicates report CSV that the clean already wrote to disk.
+  //
+  // This route exists so the summary no longer has to CARRY the report. The
+  // rows used to be returned in the `done` frame as `duplicate_urls` purely so
+  // the browser could rebuild a CSV byte-for-byte identical to the one sitting
+  // in the run's working directory — a second complete copy of the same data,
+  // held on the API heap and then serialized through JSON, for no gain. A run
+  // with tens of millions of duplicates could exhaust the heap on that copy
+  // alone, regardless of how the unique-URL budget was set.
+  app.get<{ Params: { token: string } }>(
+    "/api/cleaner/report/:token",
+    async (request, reply) => {
+      const entry = runCache.get(request.params.token);
+      const file = entry?.files.find(
+        (candidate) => candidate.filename === REPORT_FILENAME
+      );
+
+      if (!entry || !file) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "duplicates report expired or not found — run the cleaner again"
+        });
+      }
+
+      let size: number;
+
+      try {
+        size = (await stat(file.path)).size;
+      } catch {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "duplicates report expired or not found — run the cleaner again"
+        });
+      }
+
+      reply.header("content-type", "text/csv; charset=utf-8");
+      reply.header("content-length", size);
+      reply.header(
+        "content-disposition",
+        `attachment; filename="${REPORT_FILENAME}"`
+      );
+
+      return reply.send(createReadStream(file.path));
     }
   );
 
