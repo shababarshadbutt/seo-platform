@@ -265,6 +265,12 @@ const uploadFileWriteConcurrency = 5;
 const uploadRouteBodyLimitBytes = 10 * 1024 * 1024 * 1024;
 const uploadRouteTimeoutMs = 30 * 60 * 1000;
 
+// Rows the connectivity heuristic on GET /api/sessions/:id samples. It only
+// decides one boolean (">90% of sampled URLs got no HTTP status"), so a bounded
+// sample is as good as a full scan and turns an O(all sampled URLs) count into a
+// fixed cost. See the query for the full reasoning.
+const CONNECTIVITY_SAMPLE_LIMIT = 5000;
+
 function parseSampleSize(body: CreateSessionBody) {
   const value = body.sample_size ?? body.sampleSize ?? 10;
 
@@ -2136,6 +2142,20 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     // artifact (e.g. a corporate SSL-inspection proxy) rather than a broken
     // site. sampled_urls has no session_id column, so reach the session through
     // patterns. Only meaningful once enough URLs were actually sampled (>10).
+    //
+    // BOUNDED SINCE v1.48. This was an unbounded COUNT(*) over every sampled URL
+    // in the session, and it is what made this endpoint exceed the frontend's
+    // request timeout on large sessions — surfacing as "Unable to load this
+    // analysis / Request timed out" on a session that was perfectly healthy. On a
+    // 1000+ file session it visits millions of rows to compute a RATIO that is
+    // then compared against a single 0.9 threshold.
+    //
+    // A bounded sample answers that question just as well: at 90% vs 10% the
+    // sampling error over 5,000 rows is negligible, and the flag only ever gates
+    // a banner. Raising the client timeout instead would have been a
+    // non-fix — an unbounded scan just fails at the larger number on a bigger
+    // session. Paired with idx_sampled_urls_pattern_id_http_status (migration
+    // 035) this is an index-only scan of at most CONNECTIVITY_SAMPLE_LIMIT rows.
     const connectivityResult = await pool.query<{
       total: string;
       no_response: string;
@@ -2143,11 +2163,15 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       `
         SELECT
           COUNT(*)::bigint AS total,
-          COUNT(*) FILTER (WHERE sampled_urls.http_status IS NULL)::bigint
+          COUNT(*) FILTER (WHERE sample.http_status IS NULL)::bigint
             AS no_response
-        FROM sampled_urls
-        JOIN patterns ON patterns.id = sampled_urls.pattern_id
-        WHERE patterns.session_id = $1::uuid
+        FROM (
+          SELECT sampled_urls.http_status
+          FROM sampled_urls
+          JOIN patterns ON patterns.id = sampled_urls.pattern_id
+          WHERE patterns.session_id = $1::uuid
+          LIMIT ${CONNECTIVITY_SAMPLE_LIMIT}
+        ) AS sample
       `,
       [request.params.id]
     );
@@ -2199,7 +2223,16 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     // the UI shows a spinner while the background job runs but falls back to an
     // (always-available) on-demand download once it's clearly not coming — the
     // download button must NEVER be blocked indefinitely on ZIP readiness.
-    const zipReady = Boolean(session.zip_all_path && existsSync(session.zip_all_path));
+    // Async stat, not existsSync: this is the hottest read in the app and a
+    // synchronous disk call here blocks the event loop for every other request
+    // on the way past — which on a slow or busy volume adds latency to exactly
+    // the endpoint that was already timing out.
+    const zipReady = session.zip_all_path
+      ? await access(session.zip_all_path).then(
+          () => true,
+          () => false
+        )
+      : false;
     const zipGeneratedAt = session.zip_generated_at;
     const completedAt = session.completed_at;
     const ZIP_GENERATING_WINDOW_MS = 5 * 60 * 1000;

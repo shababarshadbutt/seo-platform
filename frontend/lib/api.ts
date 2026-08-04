@@ -242,6 +242,16 @@ const DEFAULT_API_TIMEOUT_MS = 10000;
 const EXPORT_API_TIMEOUT_MS = 180000;
 const UPLOAD_API_TIMEOUT_MS = 30 * 60 * 1000;
 
+// GET /api/sessions/:id is the heaviest read in the app — it aggregates over
+// every sitemap_file in the session and lists them all — and it was inheriting
+// the 10s default, which is what produced "Unable to load this analysis —
+// Request timed out" on large sessions. The real fix is server-side (the
+// connectivity count is now bounded and indexed; see migration 035), because a
+// bigger timeout on an unbounded query only moves the failure. This is the
+// belt-and-braces half: enough headroom that a session which is merely large,
+// rather than pathological, loads instead of aborting.
+const SESSION_API_TIMEOUT_MS = 60000;
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -621,9 +631,11 @@ export async function submitSitemapUrls(
 }
 
 export async function getSession(sessionId: string) {
-  const response = await fetchWithTimeout(backendUrl(`/api/sessions/${sessionId}`), {
-    cache: "no-store"
-  });
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}`),
+    { cache: "no-store" },
+    SESSION_API_TIMEOUT_MS
+  );
 
   return readJsonResponse<SessionResponse>(response);
 }
@@ -1800,13 +1812,10 @@ export type CleanerSummary = {
   files_dropped: number;
   dropped_files: { filename: string; reason: CleanerDropReason }[];
   duplicates_removed: number;
-  // Capped server-side (10,000 rows) — a run can find tens of millions of
-  // duplicate groups, which no JSON response can carry. Use
-  // duplicate_urls_total for the real count and the report endpoint for the
-  // complete CSV. Optional so an older backend's summary still parses.
-  duplicate_urls: { url: string; kept_in: string; also_in: string[] }[];
-  duplicate_urls_truncated?: boolean;
-  duplicate_urls_total?: number;
+  // No `duplicate_urls`: the rows are no longer shipped in the summary. They
+  // live only in the CSV the backend wrote, fetched on demand by
+  // downloadDuplicatesCsv. `duplicates_removed` counts occurrences and so
+  // matches the CSV's row count exactly.
   output_files: { filename: string; url_count: number }[];
   index_files_detected: number;
   total_urls_kept_files: number;
@@ -2274,13 +2283,16 @@ export async function downloadCleanerZip(token: string, filename: string) {
   await saveBlobWithPicker(blob, filename, { "application/zip": [".zip"] });
 }
 
-// Fetch the COMPLETE duplicates report from the server rather than rebuilding it
-// from `summary.duplicate_urls`.
+// Download the duplicates report the BACKEND already wrote to disk during the
+// clean, instead of rebuilding it here.
 //
-// That array is capped at 10,000 rows server-side, so building the file here
-// would hand the user a CSV silently missing most of its rows on exactly the
-// large runs where the report matters most. The backend streams the full report
-// it already wrote to disk.
+// This used to take the whole row set as an argument and assemble the CSV
+// client-side, which meant the API had to hold every duplicate row in memory and
+// serialize it through the `done` frame just so this function could reproduce a
+// file that already existed on the server. On a large run that copy was hundreds
+// of MB of heap on the API for zero benefit. Same bytes, same columns, one
+// source of truth — and the browser no longer receives a payload proportional to
+// the duplicate count.
 export async function downloadDuplicatesCsv(token: string, filename: string) {
   const response = await fetch(backendUrl(`/api/cleaner/report/${token}`), {
     cache: "no-store"

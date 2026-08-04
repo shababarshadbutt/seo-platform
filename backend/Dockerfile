@@ -11,9 +11,18 @@ RUN apk add --no-cache \
   ttf-freefont
 
 # Raise the V8 heap ceiling above the 2GB default so a large Sitemap Cleaner run
-# (many big XML files → a multi-million-entry dedup Set) has headroom. The
+# (many big XML files → a multi-million-entry dedup index) has headroom. The
 # cleaner itself streams files to/from disk (v1.38) so this is a safety net, not
-# the fix. Overridable per-service via NODE_OPTIONS in docker-compose.yml.
+# the fix. Overridable per-service via NODE_OPTIONS in the compose files.
+#
+# Deliberately left at 4096 as the IMAGE default. Both the backend and the worker
+# run this image, and only the backend runs the Cleaner's dedup index — so the
+# larger ceiling is set on the backend SERVICE (see docker-compose.aws.yml, which
+# derives 12 GiB from that host's 32 GB). Raising it here would silently give the
+# worker the same ceiling and double-count it against the host's memory.
+#
+# Note this is not a Cleaner memory LIMIT: the dedup budget is derived from
+# whatever this ends up being, at runtime (src/sitemaps/dedupBudget.ts).
 ENV NODE_OPTIONS="--max-old-space-size=4096"
 
 COPY package*.json ./

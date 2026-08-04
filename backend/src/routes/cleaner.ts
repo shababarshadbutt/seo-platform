@@ -26,6 +26,7 @@ import {
   type CleanerInputFile,
   type CleanerOutputFile
 } from "../sitemaps/cleaner.js";
+import { CleanerCapacityError } from "../sitemaps/dedupBudget.js";
 import { StageTimer } from "../sitemaps/stageTimer.js";
 import {
   createRun,
@@ -267,10 +268,33 @@ async function cleanPackageAndFinish(options: {
 
     return true;
   } catch (error) {
-    log.error({ error }, "cleaner process failed");
+    // A capacity refusal is not a crash and must not read like one: it is the
+    // guard doing its job, with actionable numbers in the message. Logged at
+    // warn so it does not sit in the error budget alongside real failures, and
+    // tagged with a `code` so the UI can present it as a limit rather than a
+    // generic "Cleaning failed".
+    if (error instanceof CleanerCapacityError) {
+      log.warn(
+        {
+          domain,
+          files: inputFiles.length,
+          unique_urls: error.uniqueUrls,
+          bytes: error.bytes,
+          budget_bytes: error.budgetBytes,
+          concurrent_runs: error.concurrentRuns
+        },
+        "cleaner run refused: dedup memory budget"
+      );
+    } else {
+      log.error({ error }, "cleaner process failed");
+    }
+
     const errorFrame = {
       type: "error",
-      message: error instanceof Error ? error.message : "Cleaning failed"
+      message: error instanceof Error ? error.message : "Cleaning failed",
+      ...(error instanceof CleanerCapacityError
+        ? { code: "dedup_budget_exceeded" }
+        : {})
     };
 
     if (options.runId) {
@@ -621,48 +645,43 @@ export async function cleanerRoutes(app: FastifyInstance) {
     }
   );
 
-  // Stream the COMPLETE duplicates report for a run.
+  // Stream the duplicates report CSV that the clean already wrote to disk.
   //
-  // The summary's `duplicate_urls` is capped at DUPLICATE_URLS_LIMIT rows,
-  // because a run can find tens of millions of duplicate groups and neither the
-  // SSE frame nor a browser can carry that. The UI used to rebuild the CSV
-  // client-side from that array — which, once capped, would hand the user a
-  // silently incomplete report. This serves the full file the cleaner already
-  // wrote to disk instead, so the download is complete at any scale.
+  // This route exists so the summary no longer has to CARRY the report. The
+  // rows used to be returned in the `done` frame as `duplicate_urls` purely so
+  // the browser could rebuild a CSV byte-for-byte identical to the one sitting
+  // in the run's working directory — a second complete copy of the same data,
+  // held on the API heap and then serialized through JSON, for no gain. A run
+  // with tens of millions of duplicates could exhaust the heap on that copy
+  // alone, regardless of how the dedup index itself was bounded.
   app.get<{ Params: { token: string } }>(
     "/api/cleaner/report/:token",
     async (request, reply) => {
       const entry = runCache.get(request.params.token);
-
-      if (!entry) {
-        return reply.code(404).send({
-          error: "Not Found",
-          message: "download expired or not found — run the cleaner again"
-        });
-      }
-
-      const report = entry.files.find(
-        (file) => file.filename === REPORT_FILENAME
+      const file = entry?.files.find(
+        (candidate) => candidate.filename === REPORT_FILENAME
       );
 
-      if (!report) {
+      if (!entry || !file) {
         return reply.code(404).send({
           error: "Not Found",
-          message: "this run produced no duplicates report"
+          message: "duplicates report expired or not found — run the cleaner again"
         });
       }
 
       let size: number;
 
       try {
-        size = (await stat(report.path)).size;
+        size = (await stat(file.path)).size;
       } catch {
         return reply.code(404).send({
           error: "Not Found",
-          message: "download expired or not found — run the cleaner again"
+          message: "duplicates report expired or not found — run the cleaner again"
         });
       }
 
+      // Named after this run rather than the bare REPORT_FILENAME, so downloading
+      // reports for several domains doesn't produce duplicates-report(1).csv etc.
       const downloadName = entry.filename
         .replace(/\.zip$/i, "")
         .replace(/^cleaned-sitemaps/, "duplicates-report");
@@ -674,7 +693,7 @@ export async function cleanerRoutes(app: FastifyInstance) {
         `attachment; filename="${downloadName}.csv"`
       );
 
-      return reply.send(createReadStream(report.path));
+      return reply.send(createReadStream(file.path));
     }
   );
 
