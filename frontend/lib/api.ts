@@ -2508,23 +2508,112 @@ async function consumeCleanerRun(
 // already on the server, so this replaces "download every file to the browser and
 // re-upload it as multipart": no second trip over the wire, nothing held in
 // browser memory, and no exposure to request-size limits between browser and app.
-export async function ingestCleanerRun(sessionId: string, token: string) {
+export type CleanerIngestResult = {
+  ingested: number;
+  failed: number;
+  total: number;
+  domain: string;
+};
+
+export type CleanerIngestProgress = { current: number; total: number };
+
+type CleanerIngestStatus =
+  | { status: "NONE" }
+  | {
+      status: "RUNNING";
+      current: number;
+      total: number;
+      message: string | null;
+    }
+  | {
+      status: "COMPLETE";
+      current: number;
+      total: number;
+      result: CleanerIngestResult | null;
+    }
+  | { status: "FAILED"; current: number; total: number; error: string };
+
+export async function getCleanerIngestStatus(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/sources/cleaner/status`),
+    { cache: "no-store" }
+  );
+
+  return readJsonResponse<CleanerIngestStatus>(response);
+}
+
+// Ingest a finished cleaner run into a session SERVER-SIDE. The cleaned files are
+// already on the server, so this replaces "download every file to the browser and
+// re-upload it as multipart": no second trip over the wire, nothing held in
+// browser memory, and no exposure to request-size limits between browser and app.
+//
+// The copy+insert work runs as a BACKGROUND JOB and this polls it. It used to be
+// one request that did all the work: at ~2,700 files that ran for minutes and died
+// as "Server error — fetch failed", which is undici inside our own Next proxy
+// abandoning the wait for response headers at 300s (measured 305.1s,
+// UND_ERR_HEADERS_TIMEOUT) while the backend was still ingesting. No client-side
+// timeout could fix that — the request simply must not be long-running, which is
+// why the kickoff now uses the ORDINARY timeout rather than UPLOAD_API_TIMEOUT_MS.
+export async function ingestCleanerRun(
+  sessionId: string,
+  token: string,
+  onProgress?: (progress: CleanerIngestProgress) => void
+): Promise<CleanerIngestResult> {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/sources/cleaner`),
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token })
-    },
-    UPLOAD_API_TIMEOUT_MS
+    }
   );
-
-  return readJsonResponse<{
-    ingested: number;
-    failed: number;
+  const kickoff = await readJsonResponse<{
+    queued: boolean;
+    job_id: string;
     total: number;
     domain: string;
   }>(response);
+
+  onProgress?.({ current: 0, total: kickoff.total });
+
+  const deadline = Date.now() + 2 * 60 * 60 * 1000;
+
+  for (;;) {
+    if (Date.now() > deadline) {
+      throw new ApiError(
+        "The handoff is taking far longer than expected. It may still be running — reload to check.",
+        504,
+        null
+      );
+    }
+
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 1500);
+    });
+
+    const status = await getCleanerIngestStatus(sessionId);
+
+    if (status.status === "NONE") {
+      throw new ApiError("This handoff is no longer available.", 404, null);
+    }
+
+    onProgress?.({ current: status.current, total: status.total });
+
+    if (status.status === "FAILED") {
+      throw new ApiError(status.error, 500, status);
+    }
+
+    if (status.status === "COMPLETE") {
+      return (
+        status.result ?? {
+          ingested: status.total,
+          failed: 0,
+          total: status.total,
+          domain: kickoff.domain
+        }
+      );
+    }
+  }
 }
 
 export type CleanerHandoffFile = {

@@ -28,13 +28,16 @@ import {
   PUBLISH_WORKER_CONCURRENCY,
   SFTP_PULL_JOB,
   S3_PUBLISH_JOB,
+  CLEANER_INGEST_JOB,
   closePublishQueue,
   type PublishQueueData,
   type PublishJobName,
   type SftpPullJobData,
-  type S3PublishJobData
+  type S3PublishJobData,
+  type CleanerIngestJobData
 } from "./queue/publishQueue.js";
 import { processSftpPullJob } from "./jobs/sftpPullJob.js";
+import { processCleanerIngestJob } from "./jobs/cleanerIngestJob.js";
 import { processS3PublishJob } from "./jobs/s3PublishJob.js";
 import { closePublishLockClient } from "./publish/publishLock.js";
 import {
@@ -327,6 +330,16 @@ async function start() {
           // both for the same reasons as the publish job below.
           return await processSftpPullJob(
             job.data as SftpPullJobData,
+            app.log,
+            job
+          );
+        }
+
+        if (job.name === CLEANER_INGEST_JOB) {
+          // Same contract as the pull above: `job` for progress, result returned
+          // so the status endpoint can read it off returnvalue.
+          return await processCleanerIngestJob(
+            job.data as CleanerIngestJobData,
             app.log,
             job
           );

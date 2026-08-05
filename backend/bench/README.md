@@ -1,3 +1,44 @@
+# Cleaner -> Migration handoff ingest
+
+Two scripts, because the interesting number and the interesting wiring cannot be
+measured by the same run.
+
+`cleanerHandoffIngest.mjs` drives the REAL flow — clean N generated sitemaps,
+create a session, POST the handoff — and reports what the handoff returned and how
+long it took. `--proxy` sends the handoff through the frontend's `/api/backend`
+proxy instead of straight at the backend, which is the distinction that matters:
+
+**The backend has no handler timeout at all.** Measured on Fastify 4.29 / Node 24,
+`server.timeout` and `server.requestTimeout` are both `0` (Fastify pins
+requestTimeout back to 0 even though Node 18+ defaults it to 300s). Nothing
+server-side aborts a slow request. The 300s wall is **undici's `headersTimeout`
+inside the Next proxy's `fetch`**, which throws `TypeError: fetch failed`
+(`cause: UND_ERR_HEADERS_TIMEOUT`) — and the proxy puts that bare "fetch failed"
+in its 502 body, which is what reaches the user. `undici-timeout-probe`-style
+check, if you need to re-confirm it: hold a request open with no response and
+fetch it; it gives up at ~305s.
+
+```sh
+node backend/bench/cleanerHandoffIngest.mjs 4000 150 --proxy --poll
+```
+
+`ingestRate.ts` isolates the ingest loop and times the OLD sequential version
+against the NEW bounded-concurrency one over the same corpus. It exists because
+the Cleaner will not accept a corpus big enough to make the ingest slow on a fast
+local disk — its dedup budget is sized by URL **bytes**, and refuses with "too
+large to deduplicate in memory", while the ingest cost is per **file**.
+
+```sh
+npx tsx bench/ingestRate.ts 25000 40    # <fileCount> [kbPerFile]
+```
+
+It prints `files_to_exceed_proxy_timeout` for both paths: the file count at which a
+single synchronous request would cross 300s at the measured per-file rate. Note
+that per-file cost here is dominated by the DB round trip, not bytes — 1MB files
+measured the same as 40KB — so this number is very sensitive to how far away
+Postgres is. On a laptop with Postgres in local Docker it takes ~22,000 files; the
+production report was 2,700, i.e. ~8x slower per file.
+
 # Pattern rename / transform at scale
 
 `seedLargeSession.ts` creates a session with N sitemap files of M URLs each, wired

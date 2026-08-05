@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync, statSync } from "node:fs";
 import {
   access,
-  copyFile,
   mkdir,
   readdir,
   readFile,
@@ -110,6 +109,8 @@ import {
 } from "../publish/publishTarget.js";
 import { cleanerHandoffFiles, getCleanerRun } from "./cleaner.js";
 import {
+  CLEANER_INGEST_JOB,
+  enqueueCleanerIngestJob,
   enqueueS3PublishJob,
   enqueueSftpPullJob,
   publishQueue,
@@ -5238,6 +5239,27 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
   // round trip, no multipart, no size limits.
   app.post<{ Params: SessionParams; Body: { token?: unknown } }>(
     "/api/sessions/:id/sources/cleaner",
+    {
+      // For consistency with every other heavy route here (upload,
+      // cleaner/process, cleaner/process-sftp), which all lift the per-request
+      // socket timeout.
+      //
+      // HONEST NOTE ON WHAT THIS DOES NOT FIX. It was not what broke this route,
+      // and adding it alone would have fixed nothing: measured on this Fastify
+      // (4.29) and Node (24), the server's own timeouts are already
+      // `server.timeout = 0` and `server.requestTimeout = 0`, so nothing here was
+      // aborting a slow handler. The 300s wall that produced "fetch failed" is
+      // undici's headersTimeout inside the FRONTEND's proxy fetch — outside this
+      // process entirely, and unreachable from any backend setting. The route no
+      // longer runs long anyway; this is belt-and-braces against a future Node
+      // changing those defaults (18 shipped requestTimeout = 300s before Fastify
+      // pinned it back to 0) and against direct, non-proxied callers.
+      onRequest: (request, reply, done) => {
+        request.raw.setTimeout(uploadRouteTimeoutMs);
+        reply.raw.setTimeout(uploadRouteTimeoutMs);
+        done();
+      }
+    },
     async (request, reply) => {
       const sessionResult = await pool.query(
         "SELECT 1 FROM sessions WHERE id = $1",
@@ -5271,61 +5293,102 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // XML sitemaps only: the run also contains a duplicates-report.csv, which
       // must never be ingested as a sitemap.
       const cleaned = cleanerHandoffFiles(run.files);
-      let stored = 0;
-      let failed = 0;
 
-      for (const file of cleaned) {
-        const storedFilename = buildStoredUploadFilename(
-          request.params.id,
-          file.filename,
-          "current"
-        );
-        const destination = path.join(config.uploadDir, storedFilename);
-
-        try {
-          // Copy rather than move: the run keeps serving its ZIP download until
-          // its TTL expires, so its files must stay put.
-          await copyFile(file.path, destination);
-          await createStoredSitemapFile(
-            request.params.id,
-            storedFilename,
-            "current",
-            file.filename
-          );
-          stored += 1;
-        } catch (error) {
-          failed += 1;
-          await unlink(destination).catch(() => undefined);
-          request.log.error(
-            { session_id: request.params.id, file: file.filename, error },
-            "cleaner handoff: file failed"
-          );
-        }
-      }
-
-      if (stored === 0) {
+      if (cleaned.length === 0) {
         return reply.code(500).send({
           error: "Internal Server Error",
           message: "Could not ingest any cleaned files."
         });
       }
 
-      // Same completion signal the upload flow sends.
-      await pool.query(
-        "UPDATE sessions SET upload_complete = TRUE WHERE id = $1",
-        [request.params.id]
-      );
+      // Enqueued, not done here. The copy+insert work is per file and strictly
+      // additive, so at a few thousand files this handler ran for minutes; the
+      // frontend proxy's undici gives up waiting for response headers at 300s and
+      // reports `TypeError: fetch failed`, which reached the user as
+      // "Server error — fetch failed" while the backend was still working (nothing
+      // server-side aborts it — see the onRequest note above). Resolving the file
+      // list HERE is deliberate: the run cache is process-local to the API, so the
+      // worker is handed paths rather than a token it could not look up.
+      const job = await enqueueCleanerIngestJob({
+        session_id: request.params.id,
+        domain: run.domain,
+        files: cleaned.map((file) => ({
+          path: file.path,
+          filename: file.filename
+        }))
+      });
 
       request.log.info(
-        { session_id: request.params.id, stored, failed, total: cleaned.length },
-        "cleaner handoff ingested"
+        {
+          session_id: request.params.id,
+          total: cleaned.length,
+          job_id: job.id
+        },
+        "cleaner handoff queued"
       );
 
-      return reply.send({
-        ingested: stored,
-        failed,
+      return reply.code(202).send({
+        queued: true,
+        job_id: job.id,
         total: cleaned.length,
         domain: run.domain
+      });
+    }
+  );
+
+  // Progress of the cleaner handoff ingest. Polled rather than streamed: the
+  // client needs a count, not a narrative, and a plain JSON GET travels through
+  // the proxy without hijacking a socket. Reads the BullMQ job directly — the
+  // ingest needs no tracking table of its own (the SFTP pull, which does the same
+  // work from a different source, has none either).
+  app.get<{ Params: SessionParams }>(
+    "/api/sessions/:id/sources/cleaner/status",
+    async (request, reply) => {
+      const jobId = `${CLEANER_INGEST_JOB}-${request.params.id}`;
+      const job = await publishQueue.getJob(jobId);
+
+      if (!job) {
+        return reply.send({ status: "NONE" });
+      }
+
+      const state = await job.getState();
+      const progress = job.progress as
+        | {
+            stage?: string;
+            current?: number;
+            total?: number;
+            message?: string;
+          }
+        | number
+        | undefined;
+      const detail =
+        progress && typeof progress === "object" ? progress : undefined;
+
+      if (state === "completed") {
+        // returnvalue, not progress: BullMQ persists it atomically with
+        // completion, so it is never the stale half of a race.
+        return reply.send({
+          status: "COMPLETE",
+          current: detail?.total ?? detail?.current ?? 0,
+          total: detail?.total ?? 0,
+          result: job.returnvalue ?? null
+        });
+      }
+
+      if (state === "failed") {
+        return reply.send({
+          status: "FAILED",
+          current: detail?.current ?? 0,
+          total: detail?.total ?? 0,
+          error: job.failedReason || "The cleaner handoff failed."
+        });
+      }
+
+      return reply.send({
+        status: "RUNNING",
+        current: detail?.current ?? 0,
+        total: detail?.total ?? 0,
+        message: detail?.message ?? null
       });
     }
   );

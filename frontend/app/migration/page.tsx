@@ -42,6 +42,7 @@ import {
   type CleanerHandoffFile,
   type SftpPullProgressEvent,
   type SitemapUrlPreview,
+  type CleanerIngestProgress,
   type UploadProgress,
   type UploadRejectedFile,
   uploadSitemap
@@ -283,6 +284,11 @@ export default function Home() {
   const [isDragging, setIsDragging] = useState(false);
   const [isPreviewingUrl, setIsPreviewingUrl] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  // Cleaner handoff ingest progress. The handoff is a background job now, so this
+  // reports "N of M files ingested" instead of the button sitting on a spinner for
+  // minutes and then failing with "fetch failed" (see ingestCleanerRun).
+  const [ingestProgress, setIngestProgress] =
+    useState<CleanerIngestProgress | null>(null);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(
     null
   );
@@ -978,7 +984,8 @@ export default function Home() {
       if (cleanerHandoff?.token && selectedFiles.length === 0) {
         const ingested = await ingestCleanerRun(
           created.session_id,
-          cleanerHandoff.token
+          cleanerHandoff.token,
+          setIngestProgress
         );
 
         setQueuedSessionId(created.session_id);
@@ -1137,6 +1144,7 @@ export default function Home() {
       setFormError(friendlyApiErrorMessage(error, "Unable to start analysis."));
       setUploadProgress(null);
       setUploadBatchInfo(null);
+      setIngestProgress(null);
       uploadedBatchIndexesRef.current = new Set();
       uploadStartedRef.current = false;
       setIsSubmitting(false);
@@ -2026,6 +2034,34 @@ export default function Home() {
                         indicatorClassName="bg-sky-500"
                       />
                     ) : null}
+                  </div>
+                ) : null}
+
+                {ingestProgress && ingestProgress.total > 0 ? (
+                  <div
+                    className="space-y-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-sm text-slate-700"
+                    role="status"
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <span>
+                        Adding cleaned sitemaps to this analysis...{" "}
+                        {ingestProgress.current.toLocaleString()} of{" "}
+                        {ingestProgress.total.toLocaleString()} files ingested
+                      </span>
+                      <span className="font-medium text-slate-900">
+                        {Math.round(
+                          (ingestProgress.current / ingestProgress.total) * 100
+                        )}
+                        %
+                      </span>
+                    </div>
+                    <Progress
+                      value={
+                        (ingestProgress.current / ingestProgress.total) * 100
+                      }
+                      className="bg-sky-100"
+                      indicatorClassName="bg-sky-500"
+                    />
                   </div>
                 ) : null}
 
