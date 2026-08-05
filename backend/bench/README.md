@@ -1,3 +1,34 @@
+# Pattern rename / transform at scale
+
+`seedLargeSession.ts` creates a session with N sitemap files of M URLs each, wired
+up the way extraction leaves them (`sitemap_files`, one `patterns` row,
+`pattern_file_occurrences`, a bounded sample), so the pattern rename / structure
+transform / transform-undo endpoints can be driven at real scale.
+
+It exists because those three ran synchronously inside the HTTP request and timed
+out client-side at 823 files. **Per-file URL count is the variable that matters**,
+and sizing a repro by file count alone actively misleads: 900 files x 500 URLs
+transformed in 17s, while 823 files x 8000 URLs took 136s. They are background jobs
+as of migration 037; use this to reproduce or to A/B a change to the rewrite path.
+
+```sh
+# 823 files x 8000 URLs — ~960MB on disk, the size that broke the old path
+npx tsx bench/seedLargeSession.ts 823 8000
+# prints {session_id, pattern_id, files}; then drive
+#   POST /api/sessions/:id/patterns/:patternId/transform      (202 + job_id)
+#   GET  /api/sessions/:id/patterns/:patternId/structure-job  (poll progress)
+```
+
+Needs `DATABASE_URL` and a real `UPLOAD_DIR` (it writes the files itself). It
+writes hundreds of MB — delete the session and its `$UPLOAD_DIR/<session-id>-*`
+files afterwards, or the concurrency-1 ZIP pre-gen queue will spend minutes
+building archives for it and stall `sessionZipCache.integration.test.ts` into a
+failure that looks like a real regression.
+
+`patterns.template` uses a literal `{param}` per variable segment; only the
+transform *structure* syntax uses named `{A}`/`{B}` tokens. Mixing them up gives
+"current structure defines 2 params but the pattern has 0".
+
 # Cleaner SFTP stage timing
 
 `cleaner-sftp-stage-timing.mjs` drives `POST /api/cleaner/process-sftp` and

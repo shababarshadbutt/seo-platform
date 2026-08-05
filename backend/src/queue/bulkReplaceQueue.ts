@@ -14,6 +14,15 @@ export const BULK_REPLACE_UNDO_JOB = "bulk-replace-undo" as const;
 // heavy whole-pattern file rewrite never blocks the API event loop or starves
 // parse/extract/sample jobs.
 export const APPLY_REDIRECTS_JOB = "apply-redirects" as const;
+// Pattern rename / structure transform / transform undo (v1.48). Same reason
+// again: each rewrites every file the pattern spans, which measured 136s on an
+// 823-file session — past what any HTTP client should wait on. Sharing this
+// single-concurrency queue is deliberate: bulk replace, apply-redirects and these
+// all rewrite the SAME sitemap files, so serialising them is what keeps two
+// whole-pattern rewrites from interleaving their copy-on-write file swaps.
+export const PATTERN_RENAME_JOB = "pattern-rename" as const;
+export const PATTERN_TRANSFORM_JOB = "pattern-transform" as const;
+export const PATTERN_TRANSFORM_UNDO_JOB = "pattern-transform-undo" as const;
 
 export type BulkReplaceJobData = {
   session_id: string;
@@ -42,14 +51,28 @@ export type ApplyRedirectsJobData = {
   inferred_urls: string[];
 };
 
+// Pattern structure operations. Everything the worker needs is in the
+// pattern_structure_jobs row (params jsonb), so the payload stays a pointer to
+// it — the row is the single source of truth for both progress and inputs.
+export type PatternStructureJobData = {
+  session_id: string;
+  pattern_id: string;
+  // pattern_structure_jobs.id — the progress/status row this job drives.
+  job_row_id: string;
+};
+
 export type BulkReplaceQueueData =
   | BulkReplaceJobData
   | BulkReplaceUndoJobData
-  | ApplyRedirectsJobData;
+  | ApplyRedirectsJobData
+  | PatternStructureJobData;
 export type BulkReplaceJobName =
   | typeof BULK_REPLACE_JOB
   | typeof BULK_REPLACE_UNDO_JOB
-  | typeof APPLY_REDIRECTS_JOB;
+  | typeof APPLY_REDIRECTS_JOB
+  | typeof PATTERN_RENAME_JOB
+  | typeof PATTERN_TRANSFORM_JOB
+  | typeof PATTERN_TRANSFORM_UNDO_JOB;
 
 export const bulkReplaceQueue = new Queue<
   BulkReplaceQueueData,
@@ -131,6 +154,37 @@ export async function enqueueApplyRedirectsJob(data: ApplyRedirectsJobData) {
     removeOnComplete: { count: 100 },
     removeOnFail: { count: 100 },
     attempts: 3
+  });
+}
+
+// One in-flight structure operation per pattern. The jobId is pattern-scoped (not
+// pattern+kind): a rename, a transform and an undo all rewrite the same files, so
+// only one may be queued for a pattern at a time. The authoritative guard is the
+// partial unique index in migration 037 — this just avoids duplicate BullMQ jobs.
+export async function enqueuePatternStructureJob(
+  name:
+    | typeof PATTERN_RENAME_JOB
+    | typeof PATTERN_TRANSFORM_JOB
+    | typeof PATTERN_TRANSFORM_UNDO_JOB,
+  data: PatternStructureJobData
+) {
+  const jobId = `pattern-structure-${data.pattern_id}`;
+  const existingJob = await reusableSingletonJob(jobId);
+
+  if (existingJob) {
+    return existingJob;
+  }
+
+  return bulkReplaceQueue.add(name, data, {
+    jobId,
+    removeOnComplete: { count: 100 },
+    removeOnFail: { count: 100 },
+    // NO retries. Unlike bulk replace (whose per-file rewrite is idempotent —
+    // a redone file no longer matches the from-pattern), a transform's replace
+    // rules can compound when re-applied, and its undo bookkeeping is one level
+    // deep. A half-finished transform must surface as FAILED for the user to
+    // undo deliberately, not be silently re-run from the top.
+    attempts: 1
   });
 }
 

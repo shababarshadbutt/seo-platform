@@ -78,6 +78,7 @@ import {
   restoreSampledUrlToFiles,
   resumeSession,
   transformPatternStructure,
+  type PatternStructureProgress,
   undoFindReplace,
   undoPatternTransform,
   undoTrailingSlashes,
@@ -829,6 +830,12 @@ export default function ResultsDashboardPage({
   );
   const [isLoadingRenameFiles, setIsLoadingRenameFiles] = useState(false);
   const [isRenaming, setIsRenaming] = useState(false);
+  // Live "N of M files rewritten" for whichever structure operation is running.
+  // Rename / transform / transform-undo are background jobs (they rewrite every
+  // file the pattern spans), so the button reports progress instead of just
+  // spinning for minutes with no sign of life.
+  const [structureProgress, setStructureProgress] =
+    useState<PatternStructureProgress | null>(null);
   const [undoingRenameId, setUndoingRenameId] = useState<string | null>(null);
   const [transformCurrentStructure, setTransformCurrentStructure] =
     useState("");
@@ -1808,22 +1815,30 @@ export default function ResultsDashboardPage({
     }
 
     setIsRenaming(true);
+    setStructureProgress(null);
 
     try {
-      const result = await renamePatternTemplate(params.id, renameRow.id, {
-        newTemplate: renameValue,
-        sourceFiles: Array.from(selectedRenameFiles)
-      });
+      const result = await renamePatternTemplate(
+        params.id,
+        renameRow.id,
+        {
+          newTemplate: renameValue,
+          sourceFiles: Array.from(selectedRenameFiles)
+        },
+        setStructureProgress
+      );
 
       await loadResults({ silent: true });
       setRenameRow(null);
       setFindReplaceToast({
         tone: "success",
-        message: `Pattern renamed — ${formatNumber(
-          result.occurrence_count
-        )} occurrences across ${result.source_files_count} file${
-          result.source_files_count === 1 ? "" : "s"
-        }`
+        message: result.already_completed
+          ? "This rename had already finished — showing the result of that run."
+          : `Pattern renamed — ${formatNumber(
+              result.occurrence_count
+            )} occurrences across ${result.source_files_count} file${
+              result.source_files_count === 1 ? "" : "s"
+            }`
       });
     } catch (nextError) {
       setFindReplaceToast({
@@ -1832,6 +1847,7 @@ export default function ResultsDashboardPage({
       });
     } finally {
       setIsRenaming(false);
+      setStructureProgress(null);
     }
   }
 
@@ -1841,17 +1857,25 @@ export default function ResultsDashboardPage({
     }
 
     setUndoingRenameId(rowData.id);
+    setStructureProgress(null);
 
     try {
-      await renamePatternTemplate(params.id, rowData.id, {
-        newTemplate: rowData.originalTemplate,
-        sourceFiles: []
-      });
+      const result = await renamePatternTemplate(
+        params.id,
+        rowData.id,
+        {
+          newTemplate: rowData.originalTemplate,
+          sourceFiles: []
+        },
+        setStructureProgress
+      );
 
       await loadResults({ silent: true });
       setFindReplaceToast({
         tone: "success",
-        message: "Pattern name reverted"
+        message: result.already_completed
+          ? "This revert had already finished."
+          : "Pattern name reverted"
       });
     } catch (nextError) {
       setFindReplaceToast({
@@ -1860,6 +1884,7 @@ export default function ResultsDashboardPage({
       });
     } finally {
       setUndoingRenameId(null);
+      setStructureProgress(null);
     }
   }
 
@@ -1869,24 +1894,32 @@ export default function ResultsDashboardPage({
     }
 
     setIsTransforming(true);
+    setStructureProgress(null);
 
     try {
-      const result = await transformPatternStructure(params.id, renameRow.id, {
-        newTemplate: renameValue,
-        currentStructure: transformCurrentStructure,
-        newStructure: transformNewStructure,
-        sourceFiles: Array.from(selectedRenameFiles)
-      });
+      const result = await transformPatternStructure(
+        params.id,
+        renameRow.id,
+        {
+          newTemplate: renameValue,
+          currentStructure: transformCurrentStructure,
+          newStructure: transformNewStructure,
+          sourceFiles: Array.from(selectedRenameFiles)
+        },
+        setStructureProgress
+      );
 
       await loadResults({ silent: true });
       setRenameRow(null);
       setFindReplaceToast({
         tone: "success",
-        message: `Transformed ${formatNumber(
-          result.urls_transformed
-        )} URL${result.urls_transformed === 1 ? "" : "s"} across ${
-          result.files_rewritten
-        } file${result.files_rewritten === 1 ? "" : "s"}`
+        message: result.already_completed
+          ? "This transformation had already finished — showing the result of that run."
+          : `Transformed ${formatNumber(
+              result.urls_transformed
+            )} URL${result.urls_transformed === 1 ? "" : "s"} across ${
+              result.files_rewritten
+            } file${result.files_rewritten === 1 ? "" : "s"}`
       });
     } catch (nextError) {
       setFindReplaceToast({
@@ -1898,6 +1931,7 @@ export default function ResultsDashboardPage({
       });
     } finally {
       setIsTransforming(false);
+      setStructureProgress(null);
     }
   }
 
@@ -1907,13 +1941,21 @@ export default function ResultsDashboardPage({
     }
 
     setUndoingTransformId(rowData.id);
+    setStructureProgress(null);
 
     try {
-      await undoPatternTransform(params.id, rowData.id);
+      const result = await undoPatternTransform(
+        params.id,
+        rowData.id,
+        setStructureProgress
+      );
+
       await loadResults({ silent: true });
       setFindReplaceToast({
         tone: "success",
-        message: "URL structure transformation reverted"
+        message: result.already_completed
+          ? "This transformation had already been reverted."
+          : "URL structure transformation reverted"
       });
     } catch (nextError) {
       setFindReplaceToast({
@@ -1925,6 +1967,7 @@ export default function ResultsDashboardPage({
       });
     } finally {
       setUndoingTransformId(null);
+      setStructureProgress(null);
     }
   }
 
@@ -2407,6 +2450,15 @@ export default function ResultsDashboardPage({
       setIsDeletingRedirects(false);
     }
   }
+
+  // "340 of 823 files" while a structure job runs. Suppressed until the job has
+  // published a total, so the button never flashes "0 of 0".
+  const structureProgressLabel =
+    structureProgress && structureProgress.filesTotal > 0
+      ? `${formatNumber(structureProgress.filesDone)} of ${formatNumber(
+          structureProgress.filesTotal
+        )} files`
+      : null;
 
   const fixActionFor = (candidate: RedirectCandidate): FixAction =>
     fixActions[candidate.key] ?? defaultFixAction(candidate);
@@ -4590,7 +4642,7 @@ export default function ResultsDashboardPage({
                       {isRenaming ? (
                         <>
                           <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                          Renaming
+                          {structureProgressLabel ?? "Renaming"}
                         </>
                       ) : (
                         "Rename Pattern"
@@ -4671,7 +4723,7 @@ export default function ResultsDashboardPage({
                     {isTransforming ? (
                       <>
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        Applying
+                        {structureProgressLabel ?? "Applying"}
                       </>
                     ) : (
                       `Apply to ${formatNumber(selectedRenameFiles.size)} file${

@@ -7,6 +7,10 @@ import {
   type LocUrlRewriter
 } from "../sitemaps/rewriteLocs.js";
 import type { RedirectRule } from "../sitemaps/redirectRule.js";
+import {
+  parseStructure,
+  transformUrl
+} from "../sitemaps/transformStructure.js";
 
 // piscina worker: streams ONE sitemap file through a <loc> rewriter from
 // inputPath to outputPath (copy-on-write) off the worker PROCESS's main thread,
@@ -36,6 +40,15 @@ export type FileRewriteSpec =
       kind: "redirectApply";
       replacements: [string, string][];
       rule: RedirectRule | null;
+    }
+  // Pattern structure transform (v1.48). The RAW structure strings cross the
+  // thread edge, not the parsed form — parseStructure is cheap, deterministic and
+  // total on strings the route already validated, so re-parsing per worker is
+  // simpler than keeping ParsedStructure structured-clone-safe.
+  | {
+      kind: "structureTransform";
+      currentStructure: string;
+      newStructure: string;
     };
 
 export type FileRewriteInput = {
@@ -58,6 +71,13 @@ function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
 
   if (spec.kind === "redirectApply") {
     return buildRedirectApplyRewriter(new Map(spec.replacements), spec.rule);
+  }
+
+  if (spec.kind === "structureTransform") {
+    const current = parseStructure(spec.currentStructure);
+    const next = parseStructure(spec.newStructure);
+
+    return (url) => transformUrl(url, current, next);
   }
 
   return buildTrailingSlashRewriter();

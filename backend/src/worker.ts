@@ -42,12 +42,16 @@ import {
   BULK_REPLACE_JOB,
   BULK_REPLACE_QUEUE_NAME,
   BULK_REPLACE_UNDO_JOB,
+  PATTERN_RENAME_JOB,
+  PATTERN_TRANSFORM_JOB,
+  PATTERN_TRANSFORM_UNDO_JOB,
   closeBulkReplaceQueue,
   type ApplyRedirectsJobData,
   type BulkReplaceJobData,
   type BulkReplaceUndoJobData,
   type BulkReplaceQueueData,
-  type BulkReplaceJobName
+  type BulkReplaceJobName,
+  type PatternStructureJobData
 } from "./queue/bulkReplaceQueue.js";
 import {
   DELETE_PROBLEM_URLS_JOB,
@@ -79,6 +83,11 @@ import {
   processBulkReplaceUndoJob
 } from "./jobs/bulkReplaceJob.js";
 import { processApplyRedirectsJob } from "./jobs/applyRedirectsJob.js";
+import {
+  processPatternRenameJob,
+  processPatternTransformJob,
+  processPatternTransformUndoJob
+} from "./jobs/patternStructureJob.js";
 import {
   processCleanupZipsJob,
   processPreGenerateZipJob
@@ -255,6 +264,30 @@ async function start() {
         if (job.name === APPLY_REDIRECTS_JOB) {
           await processApplyRedirectsJob(
             job.data as ApplyRedirectsJobData,
+            app.log
+          );
+          return;
+        }
+
+        if (job.name === PATTERN_RENAME_JOB) {
+          await processPatternRenameJob(
+            job.data as PatternStructureJobData,
+            app.log
+          );
+          return;
+        }
+
+        if (job.name === PATTERN_TRANSFORM_JOB) {
+          await processPatternTransformJob(
+            job.data as PatternStructureJobData,
+            app.log
+          );
+          return;
+        }
+
+        if (job.name === PATTERN_TRANSFORM_UNDO_JOB) {
+          await processPatternTransformUndoJob(
+            job.data as PatternStructureJobData,
             app.log
           );
           return;

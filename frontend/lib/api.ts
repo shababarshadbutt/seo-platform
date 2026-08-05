@@ -1151,10 +1151,143 @@ export async function getPatternSourceFiles(
   return data.source_files;
 }
 
+// ---- Pattern structure operations run as background jobs -------------------
+//
+// Rename / transform / transform-undo each rewrite every sitemap file the pattern
+// spans. Measured at 823 files / 6.58M URLs that took 136s, and the server keeps
+// going after the client's timeout fires — so the old "just use the long timeout"
+// approach reported failures for operations that had actually SUCCEEDED, and the
+// user's natural retry re-applied them. They are now jobs: the POST/PATCH returns
+// a job id in well under a second, and we poll for progress and the result.
+//
+// The kickoff therefore uses the ORDINARY timeout, not EXPORT_API_TIMEOUT_MS.
+// There is no longer any request whose duration scales with the session's size.
+
+export type PatternStructureJobStatus = {
+  job_id: string;
+  kind: "RENAME" | "TRANSFORM" | "TRANSFORM_UNDO";
+  status: "PENDING" | "RUNNING" | "COMPLETE" | "FAILED";
+  files_total: number;
+  files_done: number;
+  urls_rewritten: number;
+  result: unknown;
+  error: string | null;
+  already_completed?: boolean;
+};
+
+// Progress of the newest structure operation on a pattern. `status: "NONE"` when
+// the pattern has never had one.
+export async function getPatternStructureJob(
+  sessionId: string,
+  patternId: string
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/structure-job`
+    ),
+    { cache: "no-store" }
+  );
+
+  return readJsonResponse<PatternStructureJobStatus | { status: "NONE" }>(
+    response
+  );
+}
+
+export type PatternStructureProgress = {
+  filesDone: number;
+  filesTotal: number;
+};
+
+type PatternStructureKickoff = {
+  job_id: string;
+  files_total?: number;
+  files_done?: number;
+  status?: string;
+  // Set when this request attached to an operation that was already in flight —
+  // i.e. it is the retry of a request whose client gave up.
+  already_running?: boolean;
+  // Set when the SAME operation had already finished; `result` is replayed.
+  already_completed?: boolean;
+  result?: unknown;
+};
+
+const JOB_POLL_INTERVAL_MS = 1500;
+// A backstop so a job row that somehow never reaches a terminal state cannot spin
+// forever. Far above any realistic run (the 823-file transform takes ~70s).
+const JOB_POLL_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+// Drive a kicked-off structure job to completion and hand back its result — the
+// same payload the old synchronous route returned, so callers read it unchanged.
+async function awaitPatternStructureJob<T>(
+  sessionId: string,
+  patternId: string,
+  kickoff: PatternStructureKickoff,
+  onProgress?: (progress: PatternStructureProgress) => void
+): Promise<T & { already_completed?: boolean; already_running?: boolean }> {
+  if (kickoff.already_completed && kickoff.result) {
+    return {
+      ...(kickoff.result as T),
+      already_completed: true
+    };
+  }
+
+  onProgress?.({
+    filesDone: kickoff.files_done ?? 0,
+    filesTotal: kickoff.files_total ?? 0
+  });
+
+  const deadline = Date.now() + JOB_POLL_TIMEOUT_MS;
+
+  for (;;) {
+    if (Date.now() > deadline) {
+      throw new ApiError(
+        "This operation is taking far longer than expected. It may still be running — reload to check.",
+        504,
+        null
+      );
+    }
+
+    await sleep(JOB_POLL_INTERVAL_MS);
+
+    const job = await getPatternStructureJob(sessionId, patternId);
+
+    if (!("job_id" in job)) {
+      // No job row at all: the row was pruned with its session.
+      throw new ApiError("This operation is no longer available.", 404, null);
+    }
+
+    onProgress?.({
+      filesDone: job.files_done,
+      filesTotal: job.files_total
+    });
+
+    if (job.status === "FAILED") {
+      throw new ApiError(
+        job.error ?? "The operation failed.",
+        500,
+        job
+      );
+    }
+
+    if (job.status === "COMPLETE") {
+      return {
+        ...(job.result as T),
+        ...(kickoff.already_running ? { already_running: true } : {})
+      };
+    }
+  }
+}
+
 export async function renamePatternTemplate(
   sessionId: string,
   patternId: string,
-  input: { newTemplate: string; sourceFiles: string[] }
+  input: { newTemplate: string; sourceFiles: string[] },
+  onProgress?: (progress: PatternStructureProgress) => void
 ) {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/rename`),
@@ -1165,11 +1298,16 @@ export async function renamePatternTemplate(
         new_template: input.newTemplate,
         source_files: input.sourceFiles
       })
-    },
-    EXPORT_API_TIMEOUT_MS
+    }
   );
+  const kickoff = await readJsonResponse<PatternStructureKickoff>(response);
 
-  return readJsonResponse<RenamePatternResult>(response);
+  return awaitPatternStructureJob<RenamePatternResult>(
+    sessionId,
+    patternId,
+    kickoff,
+    onProgress
+  );
 }
 
 export type TransformPatternResult = {
@@ -1181,7 +1319,7 @@ export type TransformPatternResult = {
 };
 
 // Apply a pattern-scoped URL structure transformation (+ optional label rename).
-// Heavy like rename, so it uses the long timeout.
+// Runs as a background job — see awaitPatternStructureJob.
 export async function transformPatternStructure(
   sessionId: string,
   patternId: string,
@@ -1190,7 +1328,8 @@ export async function transformPatternStructure(
     currentStructure: string;
     newStructure: string;
     sourceFiles: string[];
-  }
+  },
+  onProgress?: (progress: PatternStructureProgress) => void
 ) {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/transform`),
@@ -1203,16 +1342,22 @@ export async function transformPatternStructure(
         new_structure: input.newStructure,
         source_files: input.sourceFiles
       })
-    },
-    EXPORT_API_TIMEOUT_MS
+    }
   );
+  const kickoff = await readJsonResponse<PatternStructureKickoff>(response);
 
-  return readJsonResponse<TransformPatternResult>(response);
+  return awaitPatternStructureJob<TransformPatternResult>(
+    sessionId,
+    patternId,
+    kickoff,
+    onProgress
+  );
 }
 
 export async function undoPatternTransform(
   sessionId: string,
-  patternId: string
+  patternId: string,
+  onProgress?: (progress: PatternStructureProgress) => void
 ) {
   const response = await fetchWithTimeout(
     backendUrl(
@@ -1223,15 +1368,15 @@ export async function undoPatternTransform(
       headers: { "content-type": "application/json" },
       // Fastify rejects an empty body when content-type is JSON — send "{}".
       body: JSON.stringify({})
-    },
-    EXPORT_API_TIMEOUT_MS
+    }
   );
+  const kickoff = await readJsonResponse<PatternStructureKickoff>(response);
 
-  return readJsonResponse<{
+  return awaitPatternStructureJob<{
     undo: boolean;
     files_restored: number;
     template: string;
-  }>(response);
+  }>(sessionId, patternId, kickoff, onProgress);
 }
 
 // A single row in the Fix Redirect URLs modal (v1.42): every URL in the
