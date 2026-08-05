@@ -3,8 +3,26 @@
 # navbar can never claim a version different from the images actually running.
 # Bumping a release = editing that one line. The :-vX.YZ fallbacks only apply
 # when .env is missing entirely; they are not a second place to maintain.
+# Container log rotation, applied to every service below via *default-logging.
+#
+# Docker's default json-file driver has NO size cap, so a chatty service writes an
+# unbounded log file that only ever gets smaller when the container is REPLACED (a
+# rebuild-and-recreate deploy discards the old container's log with it). On a
+# long-lived VM that is a steady upward drift in disk use with an occasional sharp
+# drop at deploy time, and nothing in the app can clean it up because the files
+# belong to the daemon, not the volume.
+#
+# 10MB x 3 files caps each service at 30MB and each volume-independent of the app's
+# own cleanup. Raise max-file if you need longer history for debugging.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   frontend:
+    logging: *default-logging
     image: shababarshadbutt/sitemap-frontend:${APP_VERSION:-v1.47}
     build:
       context: ./frontend
@@ -32,6 +50,7 @@ services:
       start_period: 45s
 
   backend:
+    logging: *default-logging
     image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.47}
     build:
       context: ./backend
@@ -75,6 +94,7 @@ services:
       start_period: 30s
 
   worker:
+    logging: *default-logging
     image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.47}
     build:
       context: ./backend
@@ -112,6 +132,7 @@ services:
       start_period: 30s
 
   postgres:
+    logging: *default-logging
     image: postgres:15-alpine
     environment:
       POSTGRES_USER: sitemap
@@ -128,6 +149,7 @@ services:
       retries: 10
 
   redis:
+    logging: *default-logging
     image: redis:7-alpine
     ports:
       - "${REDIS_PORT:-6380}:6379"
@@ -142,6 +164,7 @@ services:
   # SEO Team Desk — separate Next.js + MongoDB app, linked from the sitemap
   # tool navbar (NEXT_PUBLIC_SEO_DESK_URL). Its own auth context (NextAuth).
   seo-desk:
+    logging: *default-logging
     build:
       context: ./apps/seo-desk
     environment:
@@ -158,6 +181,7 @@ services:
         condition: service_healthy
 
   mongo:
+    logging: *default-logging
     image: mongo:7
     volumes:
       - mongo_data:/data/db

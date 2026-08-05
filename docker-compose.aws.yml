@@ -36,8 +36,26 @@
 # and the implementation stay in sync. Adjust values/comments as needed once
 # real code lands, but don't rename the keys without updating this file too.
 
+# Container log rotation, applied to every service below via *default-logging.
+#
+# Docker's default json-file driver has NO size cap, so a chatty service writes an
+# unbounded log file that only ever gets smaller when the container is REPLACED (a
+# rebuild-and-recreate deploy discards the old container's log with it). On a
+# long-lived VM that is a steady upward drift in disk use with an occasional sharp
+# drop at deploy time, and nothing in the app can clean it up because the files
+# belong to the daemon, not the volume.
+#
+# 10MB x 3 files caps each service at 30MB and each volume-independent of the app's
+# own cleanup. Raise max-file if you need longer history for debugging.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   frontend:
+    logging: *default-logging
     image: shababarshadbutt/sitemap-frontend:${APP_VERSION}
     build:
       context: ./frontend
@@ -107,6 +125,7 @@ services:
     restart: unless-stopped
 
   backend:
+    logging: *default-logging
     image: shababarshadbutt/sitemap-backend:${APP_VERSION}
     build:
       context: ./backend
@@ -223,6 +242,7 @@ services:
     restart: unless-stopped
 
   worker:
+    logging: *default-logging
     image: shababarshadbutt/sitemap-backend:${APP_VERSION}
     build:
       context: ./backend
@@ -283,6 +303,7 @@ services:
     restart: unless-stopped
 
   postgres:
+    logging: *default-logging
     image: postgres:15-alpine
     environment:
       POSTGRES_USER: sitemap
@@ -301,6 +322,7 @@ services:
     restart: unless-stopped
 
   redis:
+    logging: *default-logging
     image: redis:7-alpine
     # No published port — internal-only, same reasoning as Postgres above.
     volumes:
@@ -313,6 +335,7 @@ services:
     restart: unless-stopped
 
   seo-desk:
+    logging: *default-logging
     build:
       context: ./apps/seo-desk
     environment:
@@ -330,6 +353,7 @@ services:
     restart: unless-stopped
 
   mongo:
+    logging: *default-logging
     image: mongo:7
     volumes:
       - mongo_data:/data/db

@@ -9,6 +9,7 @@ import { pool } from "../db/pool.js";
 import { isZipCacheFresh } from "../exports/sessionZipCache.js";
 import { resolveSessionZipPlan } from "../routes/sessions.js";
 import { runZipJob } from "./zipPool.js";
+import { sweepStaleArtifacts } from "../sitemaps/staleArtifactSweep.js";
 import {
   ZIP_MAX_AGE_MS,
   type PreGenerateZipJobData
@@ -164,6 +165,13 @@ export async function processPreGenerateZipJob(
 
 // Daily maintenance: delete pre-generated ZIPs older than ZIP_MAX_AGE_MS and
 // clear any DB paths whose file is gone, so /exports never fills the disk.
+//
+// It also runs the uploads-volume stale sweep (sitemaps/staleArtifactSweep.ts).
+// That is a deliberate reuse rather than a second repeatable job: this is already
+// the only periodic, restart-safe, filesystem-age-based cleanup in the system, on a
+// concurrency-1 queue, and a parallel timer would duplicate its scheduling for no
+// benefit. The job id stays CLEANUP_ZIPS_JOB so the existing repeat entry in Redis
+// is not orphaned — read it as "periodic disk cleanup" rather than only ZIPs.
 export async function processCleanupZipsJob(logger: FastifyBaseLogger) {
   let removed = 0;
   const now = Date.now();
@@ -213,4 +221,13 @@ export async function processCleanupZipsJob(logger: FastifyBaseLogger) {
   }
 
   logger.info({ removed }, "cleanup-zips complete");
+
+  // Uploads-volume artifacts whose only other cleanup is an in-process timer.
+  // Awaited but never allowed to fail the job: a sweep error must not stop the ZIP
+  // half from having run, and the next tick will try again.
+  try {
+    await sweepStaleArtifacts(config.uploadDir, logger);
+  } catch (error) {
+    logger.error({ error }, "stale artifact sweep failed");
+  }
 }

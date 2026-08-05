@@ -1,0 +1,257 @@
+import { readdir, rm, stat, unlink } from "node:fs/promises";
+import path from "node:path";
+
+import type { FastifyBaseLogger } from "fastify";
+
+// Defined HERE rather than alongside the queue constants: the queue module builds a
+// BullMQ Queue (and a Redis connection) at import time, so importing a number from
+// it would drag Redis into every consumer — including this module's unit tests,
+// which must run on a bare filesystem.
+//
+// SIX HOURS, and the number is doing real work. The primary cleanup for a run dir is
+// an in-process setTimeout (RUN_TTL_MS, 1 hour after the run is cached), so this only
+// ever fires for runs whose timer never got the chance — an API restart or crash. It
+// must therefore sit comfortably above "longest plausible run + that 1h retention":
+// the SFTP pull alone has been measured at ~25 minutes for 2,264 files, and a large
+// clean adds minutes more. Six hours clears that by a wide margin while still
+// bounding a leak to a fraction of a day. The sweep also treats a run as fresh if any
+// of its immediate children were touched recently, so a genuinely long clean is never
+// swept out from under itself.
+export const CLEANER_RUN_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+// AGE-BASED, RESTART-SAFE sweep of the uploads volume for artifacts whose only
+// other cleanup lives in process memory.
+//
+// THE LEAK THIS EXISTS FOR. A Cleaner run's working directory
+// (<uploadDir>/cleaner/<runId>/, holding the spilled inputs, the cleaned outputs,
+// the dedup bucket spill files under out/.cleaner-scratch/, and the generated ZIP)
+// is removed by a setTimeout scheduled in storeRun — RUN_TTL_MS after the run is
+// cached. That timer lives in the API process and nothing else knows the directory
+// exists, so an API restart or crash in that window orphans the whole directory
+// PERMANENTLY. Reproduced: a 14MB run dir survived a hard kill of the API, a full
+// restart, and a worker running every pre-existing periodic and backstop job.
+//
+// WHY THE EXISTING BACKSTOPS DID NOT COVER IT. There were two, and both are
+// scoped in ways that exclude this:
+//   * deleteSessionUploads (the 48h cleanup-uploads job) matches uploadDir entries
+//     by `entry.isFile() && name.startsWith("<sessionId>-")`. A run directory is a
+//     DIRECTORY, and it is keyed by RUN id, not session id — it fails both tests.
+//     A Cleaner run also has no session until the handoff, so there is no session
+//     whose cleanup could ever own it.
+//   * processCleanupZipsJob only ever reads config.exportDir.
+// So this is a genuine gap rather than a redundant third sweep, and it is the class
+// of bug this codebase has hit repeatedly: cleanup that assumes an in-memory timer
+// always fires, with nothing durable behind it.
+//
+// It is filesystem-driven ON PURPOSE. It consults no Map, no job row and no DB
+// table — it looks at what is actually on disk and how old it is, which is the only
+// signal that survives the process that created it.
+
+export type SweepResult = {
+  cleanerRunsRemoved: number;
+  cleanerBytesFreed: number;
+  partFilesRemoved: number;
+  partBytesFreed: number;
+};
+
+// A directory's own mtime changes when entries are added or removed directly in it,
+// NOT when a file deep inside is written. A run dir creates in/ and out/ up front,
+// so its own mtime can be stale while the run is very much alive. Taking the newest
+// mtime across the directory and its immediate children makes an active run look
+// fresh, so a long clean can never be swept out from under itself.
+async function newestMtimeMs(dir: string): Promise<number> {
+  let newest = 0;
+
+  try {
+    newest = (await stat(dir)).mtimeMs;
+  } catch {
+    return 0;
+  }
+
+  let entries: string[];
+
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return newest;
+  }
+
+  for (const entry of entries) {
+    try {
+      const info = await stat(path.join(dir, entry));
+
+      if (info.mtimeMs > newest) {
+        newest = info.mtimeMs;
+      }
+    } catch {
+      // Raced with a delete; the other candidates still decide the answer.
+    }
+  }
+
+  return newest;
+}
+
+async function directorySizeBytes(dir: string): Promise<number> {
+  let total = 0;
+  let entries;
+
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+
+    if (entry.isDirectory()) {
+      total += await directorySizeBytes(full);
+      continue;
+    }
+
+    try {
+      total += (await stat(full)).size;
+    } catch {
+      // Gone mid-walk.
+    }
+  }
+
+  return total;
+}
+
+// Cleaner run working directories older than the cutoff.
+async function sweepCleanerRuns(
+  uploadDir: string,
+  logger: FastifyBaseLogger,
+  now: number
+): Promise<{ removed: number; bytes: number }> {
+  const root = path.join(uploadDir, "cleaner");
+  let entries;
+
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch {
+    // No cleaner root yet — nothing has ever run here.
+    return { removed: 0, bytes: 0 };
+  }
+
+  let removed = 0;
+  let bytes = 0;
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+
+    const dir = path.join(root, entry.name);
+    const newest = await newestMtimeMs(dir);
+    const age = now - newest;
+
+    if (newest === 0 || age <= CLEANER_RUN_MAX_AGE_MS) {
+      continue;
+    }
+
+    // Size measured BEFORE the delete so the log line can report what was actually
+    // reclaimed rather than an estimate.
+    const size = await directorySizeBytes(dir);
+
+    try {
+      await rm(dir, { recursive: true, force: true });
+      removed += 1;
+      bytes += size;
+      logger.warn(
+        {
+          run_dir: entry.name,
+          age_hours: Math.round(age / 3_600_000),
+          bytes: size
+        },
+        "stale sweep: removed an orphaned Cleaner run directory (its in-process TTL timer never fired — API restart or crash)"
+      );
+    } catch (error) {
+      logger.error(
+        { run_dir: entry.name, error },
+        "stale sweep: could not remove a Cleaner run directory"
+      );
+    }
+  }
+
+  return { removed, bytes };
+}
+
+// Half-written copies from the handoff ingest: <stored>.<uuid>.part. The ingest
+// renames its temp into place the moment the copy completes and unlinks it on a
+// handled failure, so any .part still around minutes later belongs to a process
+// that died mid-copy. They carry the session-id prefix, so deleteSessionUploads
+// does reach them — but only for a session that actually reaches its 48h cleanup,
+// which a session abandoned before completion never does.
+async function sweepPartFiles(
+  uploadDir: string,
+  logger: FastifyBaseLogger,
+  now: number
+): Promise<{ removed: number; bytes: number }> {
+  let entries;
+
+  try {
+    entries = await readdir(uploadDir, { withFileTypes: true });
+  } catch {
+    return { removed: 0, bytes: 0 };
+  }
+
+  let removed = 0;
+  let bytes = 0;
+
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".part")) {
+      continue;
+    }
+
+    const full = path.join(uploadDir, entry.name);
+
+    try {
+      const info = await stat(full);
+
+      if (now - info.mtimeMs <= CLEANER_RUN_MAX_AGE_MS) {
+        continue;
+      }
+
+      await unlink(full);
+      removed += 1;
+      bytes += info.size;
+      logger.warn(
+        { file: entry.name, bytes: info.size },
+        "stale sweep: removed an abandoned partial copy"
+      );
+    } catch {
+      // Already gone, or not ours to remove.
+    }
+  }
+
+  return { removed, bytes };
+}
+
+// `uploadDir` is a parameter rather than read from config so the sweep can be
+// exercised against a temp directory with real files and real mtimes — the whole
+// behaviour IS filesystem age, so a test that stubbed the filesystem would prove
+// nothing.
+export async function sweepStaleArtifacts(
+  uploadDir: string,
+  logger: FastifyBaseLogger
+): Promise<SweepResult> {
+  const now = Date.now();
+  const runs = await sweepCleanerRuns(uploadDir, logger, now);
+  const parts = await sweepPartFiles(uploadDir, logger, now);
+
+  const result: SweepResult = {
+    cleanerRunsRemoved: runs.removed,
+    cleanerBytesFreed: runs.bytes,
+    partFilesRemoved: parts.removed,
+    partBytesFreed: parts.bytes
+  };
+
+  // Logged at info even when it found nothing, so "is the sweep running at all?"
+  // is answerable from the logs — the previous cleanup's whole problem was being
+  // invisible until a volume filled up.
+  logger.info(result, "stale artifact sweep complete");
+
+  return result;
+}
