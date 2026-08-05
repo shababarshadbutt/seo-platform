@@ -58,11 +58,18 @@ export async function processCleanerIngestJob(
   });
 
   let stored = 0;
+  let skipped = 0;
   let failed = 0;
 
   for (const outcome of outcomes) {
     if (outcome.ok) {
       stored += 1;
+
+      // Already ingested by an earlier attempt — counted as ingested (it IS), and
+      // reported separately so a retry's cheapness is visible rather than looking
+      // like it silently did nothing.
+      if (outcome.skipped) skipped += 1;
+
       continue;
     }
 
@@ -89,11 +96,26 @@ export async function processCleanerIngestJob(
   ]);
 
   logger.info(
-    { session_id: sessionId, domain, stored, failed, total },
+    {
+      session_id: sessionId,
+      domain,
+      stored,
+      // newly_copied vs already_present makes a resumed retry legible in the logs.
+      newly_copied: stored - skipped,
+      already_present: skipped,
+      failed,
+      total
+    },
     "cleaner ingest complete"
   );
 
-  const result = { ingested: stored, failed, total, domain };
+  const result = {
+    ingested: stored,
+    already_present: skipped,
+    failed,
+    total,
+    domain
+  };
 
   await job?.updateProgress({
     stage: "done",
@@ -102,7 +124,9 @@ export async function processCleanerIngestJob(
     message:
       failed > 0
         ? `Ingested ${stored} of ${total} file(s), ${failed} failed`
-        : `Ingested ${stored} file(s)`,
+        : skipped > 0
+          ? `Ingested ${stored} file(s) (${skipped} already present)`
+          : `Ingested ${stored} file(s)`,
     result
   });
 

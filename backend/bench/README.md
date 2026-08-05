@@ -1,3 +1,39 @@
+# Retry / crash-recovery audits
+
+`handoffRetryWaste.mjs` answers whether retrying the Cleaner handoff redoes work
+that already succeeded. **The instrument matters:** mtime is useless here —
+`fs.copyFile` on Windows copies the SOURCE's timestamps to the destination, so a
+re-copied file keeps its old mtime and you get a false "nothing was redone". It
+stamps a marker into every stored file after run 1 instead; a re-copy from the
+pristine source erases the stamp, a skip leaves it.
+
+```sh
+UPLOAD_DIR=<real dir> node backend/bench/handoffRetryWaste.mjs 800 50
+```
+
+Measured before the resume fix: retry re-copied **801/801** files in the same 6.2s.
+After: **0** re-copied, 801 skipped, 1.1s. With a partially-complete first attempt
+(100 rows+files removed, 50 files removed but rows kept) it copies exactly those
+150 and skips 651 — the row-exists-but-file-missing case must NOT skip, or you get
+a row pointing at nothing.
+
+`patternJobCrashRecovery.ts` answers what BullMQ does when the worker dies
+mid-transform. Timers are shortened (lockDuration 6s vs production's 60 min) so the
+stalled-job path is observable in seconds; the semantics don't depend on the values.
+
+```sh
+npx tsx bench/patternJobCrashRecovery.ts crash <sessionId> <patternId>   # dies at ~10 files
+npx tsx bench/patternJobCrashRecovery.ts recover                          # watches the re-run
+```
+
+Result: BullMQ re-runs the same job and correctly redoes ALL files, because the
+crashed attempt committed nothing (`pattern_transforms` = 0 rows, no
+`sitemap_files.filename` moved — the transaction died with the connection).
+`pattern_structure_jobs.files_done` is a progress indicator, NOT a resume cursor —
+see the long comment in `jobs/patternStructureJob.ts` before considering a resume
+there. Note stalled recovery is independent of `attempts: 1`, which only suppresses
+retries after a *reported* failure.
+
 # Cleaner -> Migration handoff ingest
 
 Two scripts, because the interesting number and the interesting wiring cannot be

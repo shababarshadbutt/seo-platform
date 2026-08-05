@@ -1,7 +1,8 @@
-import { copyFile, unlink } from "node:fs/promises";
+import { access, copyFile, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import { config } from "../config.js";
+import { pool } from "../db/pool.js";
 import { runWithBoundedConcurrency } from "./boundedConcurrency.js";
 import { buildStoredUploadFilename } from "./filenames.js";
 import { createStoredSitemapFile } from "./ingest.js";
@@ -38,6 +39,9 @@ export type IngestOutcome = {
   filename: string;
   storedFilename: string;
   ok: boolean;
+  // True when this file was ALREADY ingested for this session and was left alone.
+  // Counts as success — the file is present and its row exists.
+  skipped?: boolean;
   error?: unknown;
 };
 
@@ -47,6 +51,31 @@ export type IngestOutcome = {
 // the API of connections. Each unit of work holds at most one connection, and
 // only for the INSERT.
 export const INGEST_CONCURRENCY = 4;
+
+// Every stored filename this session already holds for `sourceRole`. Deliberately
+// NOT filtered by is_deleted: a soft-deleted file's row still exists, and a retry
+// must not resurrect something the user deliberately deleted.
+async function existingStoredFilenames(
+  sessionId: string,
+  sourceRole: string
+): Promise<Set<string>> {
+  const result = await pool.query<{ filename: string }>(
+    "SELECT filename FROM sitemap_files WHERE session_id = $1 AND source_role = $2",
+    [sessionId, sourceRole]
+  );
+
+  return new Set(result.rows.map((row) => row.filename));
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath);
+
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export async function ingestFilesIntoSession(options: {
   sessionId: string;
@@ -64,6 +93,21 @@ export async function ingestFilesIntoSession(options: {
 }): Promise<IngestOutcome[]> {
   const sourceRole = options.sourceRole ?? "current";
 
+  // RESUME, rather than redoing everything a previous attempt already finished.
+  //
+  // Measured before this existed: retrying an 801-file handoff re-copied all 801
+  // files and spent the same 6.2s doing it, for zero effect — every row already
+  // existed (createStoredSitemapFile is idempotent per (session_id, filename), and
+  // buildStoredUploadFilename is deterministic, so the second pass wrote the same
+  // names and ON CONFLICT DO NOTHING swallowed all 801 inserts). The DB stayed
+  // correct; the I/O was pure waste, and it is the per-file DB round trip that
+  // dominates the cost, so the waste scales with the whole file set on every retry.
+  //
+  // ONE query up front instead of a per-file check: for a few thousand short
+  // filenames this is a single round trip, where per-file existence checks would
+  // reintroduce exactly the pattern being removed.
+  const existing = await existingStoredFilenames(options.sessionId, sourceRole);
+
   return runWithBoundedConcurrency(
     options.files,
     options.concurrency ?? INGEST_CONCURRENCY,
@@ -74,6 +118,15 @@ export async function ingestFilesIntoSession(options: {
         sourceRole
       );
       const destination = path.join(config.uploadDir, storedFilename);
+
+      // Skip only when the row AND the file are both there. A row alone is not
+      // enough: the copy happens before the insert, so a row implies the copy
+      // succeeded once, but the file can be gone afterwards (upload cleanup reaps
+      // old uploads), and skipping then would leave a row pointing at nothing.
+      // The stat is ~100x cheaper than the copy + round trip it avoids.
+      if (existing.has(storedFilename) && (await fileExists(destination))) {
+        return { filename: file.filename, storedFilename, ok: true, skipped: true };
+      }
 
       try {
         // Copy rather than move: the source set must stay where it is.

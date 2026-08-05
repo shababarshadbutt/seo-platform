@@ -38,6 +38,37 @@ import type { PatternStructureJobData } from "../queue/bulkReplaceQueue.js";
 // makes "340 of 823" visible while that transaction is still open. (Bulk replace
 // commits per file instead because it is resumable by design; a transform's undo
 // is one level deep, so partial application is the thing to avoid here.)
+//
+// DO NOT ADD A RESUME CURSOR HERE. It looks like an obvious win — bulk replace has
+// one (bulk_replace_jobs.files_done), and a crashed transform re-does every file
+// from the start. It would be a BUG, because there is nothing to resume from:
+//
+// Verified by killing a worker mid-transform at 10/600 files. The job row was left
+// reading RUNNING 10/600, but pattern_transforms held ZERO rows and no
+// sitemap_files.filename had moved — the transaction died with the connection and
+// Postgres rolled the whole thing back. BullMQ then re-ran the same job (stalled-job
+// recovery, which is independent of `attempts: 1` — that only suppresses retries
+// after a reported failure) and it correctly redid all 600.
+//
+// So files_done is a PROGRESS INDICATOR, not a durable cursor: it is written on a
+// separate connection precisely so it survives outside the transaction, which means
+// it does NOT describe committed work. Skipping the first 10 files on the re-run
+// would skip 10 files whose rewrite was rolled back, silently producing a session
+// where 10 files kept the old structure and 590 got the new one — the exact
+// half-applied state the single transaction exists to prevent, and one the
+// one-level-deep undo could not repair.
+//
+// Bulk replace can resume only because it commits per file, so its cursor points at
+// work that is actually on disk and in the DB. Resume is a property of per-file
+// commits, not of having a counter.
+//
+// Known accepted costs of this choice, neither of which resume would fix:
+//   * a crash leaks the transformed-* copies the dead attempt had written (its
+//     rollback cleanup never ran) — the upload-cleanup safety net reaps them;
+//   * with lockDuration at 60 minutes the stalled job is not re-run for up to an
+//     hour, and the row reads RUNNING throughout, so the UI shows a stuck bar.
+//     That is a recovery-LATENCY problem to solve in the lock/stall settings if it
+//     ever bites, not a reason to make the rewrite resumable.
 
 const PROGRESS_FLUSH_EVERY = 10;
 
