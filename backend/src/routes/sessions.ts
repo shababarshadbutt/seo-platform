@@ -5357,6 +5357,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             stage?: string;
             current?: number;
             total?: number;
+            already_present?: number;
             message?: string;
           }
         | number
@@ -5388,6 +5389,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         status: "RUNNING",
         current: detail?.current ?? 0,
         total: detail?.total ?? 0,
+        // How much of `current` is work a previous attempt had already done.
+        already_present: detail?.already_present ?? 0,
         message: detail?.message ?? null
       });
     }

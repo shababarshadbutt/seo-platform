@@ -2515,7 +2515,13 @@ export type CleanerIngestResult = {
   domain: string;
 };
 
-export type CleanerIngestProgress = { current: number; total: number };
+export type CleanerIngestProgress = {
+  current: number;
+  total: number;
+  // How many of `current` were already ingested by a previous attempt and skipped.
+  // Surfaced so a resumed retry does not read as a full re-ingest.
+  alreadyPresent: number;
+};
 
 type CleanerIngestStatus =
   | { status: "NONE" }
@@ -2523,6 +2529,7 @@ type CleanerIngestStatus =
       status: "RUNNING";
       current: number;
       total: number;
+      already_present?: number;
       message: string | null;
     }
   | {
@@ -2574,7 +2581,7 @@ export async function ingestCleanerRun(
     domain: string;
   }>(response);
 
-  onProgress?.({ current: 0, total: kickoff.total });
+  onProgress?.({ current: 0, total: kickoff.total, alreadyPresent: 0 });
 
   const deadline = Date.now() + 2 * 60 * 60 * 1000;
 
@@ -2597,7 +2604,12 @@ export async function ingestCleanerRun(
       throw new ApiError("This handoff is no longer available.", 404, null);
     }
 
-    onProgress?.({ current: status.current, total: status.total });
+    onProgress?.({
+      current: status.current,
+      total: status.total,
+      alreadyPresent:
+        status.status === "RUNNING" ? (status.already_present ?? 0) : 0
+    });
 
     if (status.status === "FAILED") {
       throw new ApiError(status.error, 500, status);

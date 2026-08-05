@@ -44,15 +44,28 @@ export async function processCleanerIngestJob(
     message: `Ingesting ${total} cleaned file(s)`
   });
 
+  // Counted as outcomes settle so the LIVE frames can say how much of the progress
+  // is resumed work rather than new work. Without this a retry that skipped all 801
+  // files reported "801 of 801 files ingested" — indistinguishable from having
+  // re-done the whole thing, which is exactly the impression the resume fix should
+  // not leave.
+  let skippedSoFar = 0;
+
   const outcomes = await ingestFilesIntoSession({
     sessionId,
     files,
     onSettled: async (outcome, completed) => {
+      if (outcome.skipped) skippedSoFar += 1;
+
       await job?.updateProgress({
         stage: "ingest",
         current: completed,
         total,
-        message: `${completed} of ${total} files ingested`
+        already_present: skippedSoFar,
+        message:
+          skippedSoFar > 0
+            ? `${completed} of ${total} files ingested (${skippedSoFar} already present)`
+            : `${completed} of ${total} files ingested`
       });
     }
   });

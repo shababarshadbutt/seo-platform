@@ -1,3 +1,44 @@
+# Is a partial copy visible at its real path?
+
+`copyVisibility.mjs` polls the destination's size while a copy runs and reports
+whether a truncated file is ever observable at the REAL path. This is the property
+the handoff resume depends on: it skips a file when the row and the file both exist,
+which is only sound if a file at its real path is always complete.
+
+**Run it on Linux, not on the Windows host.** The answer differs by platform and the
+Windows answer is misleading:
+
+```sh
+# host (Windows/NTFS): reports NO partial ever visible — size metadata is not
+# updated while the write handle is open, so this hides the hazard
+node backend/bench/copyVisibility.mjs 1200 direct
+
+# production platform — this is the one that matters
+MSYS_NO_PATHCONV=1 docker run --rm \
+  -v "E:/path/to/backend/bench:/bench:ro" -e COPY_DIR=/data node:20-alpine \
+  node /bench/copyVisibility.mjs 1200 direct   # -> PARTIAL_VISIBLE_AT_REAL_PATH: true
+MSYS_NO_PATHCONV=1 docker run --rm \
+  -v "E:/path/to/backend/bench:/bench:ro" -e COPY_DIR=/data node:20-alpine \
+  node /bench/copyVisibility.mjs 1200 atomic   # -> false, partials only at <dest>.part
+```
+
+Measured on Linux with a 1.2GB file: direct copy exposed a partial at the real path
+in **4,009 of 4,263** observations (largest 1.258GB of 1.2582GB); with copy-to-temp
++ rename, **0** at the real path and 4,107 at the temp path. That is why
+`batchIngest.ts` writes to `<dest>.<uuid>.part` and renames.
+
+`ingestPartialCopy.ts` drives the same question end to end (ingest -> delete the
+file, keep the row -> re-ingest killed mid-copy -> resume). Note the kill is hard to
+land mid-copy on a fast local disk: 400MB copied in under 30ms here, so the phases
+mostly observe "absent" or "complete". Use it for the resume-behaviour phases and
+rely on `copyVisibility.mjs` for the partial-file property itself.
+
+It also demonstrates the consequence the fix prevents: with a row present and a
+truncated file at the real path, `resume` reports `SKIPPED` and
+`STILL_WRONG_SIZE: true` — that state, once created, is permanent. The fix removes
+the only way a crash could create it; it does not detect corruption arriving from
+outside (nothing short of checksums would).
+
 # Retry / crash-recovery audits
 
 `handoffRetryWaste.mjs` answers whether retrying the Cleaner handoff redoes work

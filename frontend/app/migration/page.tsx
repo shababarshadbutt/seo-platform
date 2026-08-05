@@ -2047,6 +2047,9 @@ export default function Home() {
                         Adding cleaned sitemaps to this analysis...{" "}
                         {ingestProgress.current.toLocaleString()} of{" "}
                         {ingestProgress.total.toLocaleString()} files ingested
+                        {ingestProgress.alreadyPresent > 0
+                          ? ` (${ingestProgress.alreadyPresent.toLocaleString()} already added earlier)`
+                          : ""}
                       </span>
                       <span className="font-medium text-slate-900">
                         {Math.round(
