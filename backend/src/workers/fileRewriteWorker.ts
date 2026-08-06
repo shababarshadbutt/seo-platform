@@ -11,6 +11,10 @@ import {
   parseStructure,
   transformUrl
 } from "../sitemaps/transformStructure.js";
+import {
+  applyStructureFilterToRewriter,
+  type ResolvedStructureFilter
+} from "../sitemaps/structureClusters.js";
 
 // piscina worker: streams ONE sitemap file through a <loc> rewriter from
 // inputPath to outputPath (copy-on-write) off the worker PROCESS's main thread,
@@ -29,7 +33,16 @@ import {
 
 export type FileRewriteSpec =
   | { kind: "trailingSlash" }
-  | { kind: "patternTemplate"; from: string; to: string }
+  // structureFilter (v1.49) scopes the rewrite to ONE detected URL structure
+  // inside the pattern — locs outside it pass through byte-for-byte. It crosses
+  // the thread edge FULLY RESOLVED (a path-segment index, not a param ordinal)
+  // so the worker applies it without any template parsing.
+  | {
+      kind: "patternTemplate";
+      from: string;
+      to: string;
+      structureFilter?: ResolvedStructureFilter | null;
+    }
   // Exact whole-URL replacements (apply-redirects, v1.42). Passed as [old, new]
   // pairs because a Map isn't structured-clone friendly across the thread edge.
   | { kind: "locMap"; replacements: [string, string][] }
@@ -49,6 +62,7 @@ export type FileRewriteSpec =
       kind: "structureTransform";
       currentStructure: string;
       newStructure: string;
+      structureFilter?: ResolvedStructureFilter | null;
     };
 
 export type FileRewriteInput = {
@@ -62,7 +76,10 @@ export type FileRewriteResult = { rewrittenCount: number };
 
 function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
   if (spec.kind === "patternTemplate") {
-    return buildPatternTemplateRewriter(spec.from, spec.to);
+    return applyStructureFilterToRewriter(
+      buildPatternTemplateRewriter(spec.from, spec.to),
+      spec.structureFilter ?? null
+    );
   }
 
   if (spec.kind === "locMap") {
@@ -77,7 +94,10 @@ function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
     const current = parseStructure(spec.currentStructure);
     const next = parseStructure(spec.newStructure);
 
-    return (url) => transformUrl(url, current, next);
+    return applyStructureFilterToRewriter(
+      (url) => transformUrl(url, current, next),
+      spec.structureFilter ?? null
+    );
   }
 
   return buildTrailingSlashRewriter();

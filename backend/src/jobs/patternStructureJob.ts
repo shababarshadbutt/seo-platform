@@ -19,6 +19,12 @@ import {
   transformUrl,
   type ParsedStructure
 } from "../sitemaps/transformStructure.js";
+import {
+  applyStructureFilterToRewriter,
+  isValidStructureFilter,
+  resolveStructureFilter,
+  type StructureFilter
+} from "../sitemaps/structureClusters.js";
 import type { PatternStructureJobData } from "../queue/bulkReplaceQueue.js";
 
 // Pattern rename / structure transform / transform undo, run in the background
@@ -83,8 +89,20 @@ type JobRow = {
     source_files?: string[];
     occurrence_count?: number;
     is_undo?: boolean;
+    // Scope the edit to one detected structure inside the pattern (v1.49).
+    // Absent/null = whole-pattern, the pre-v1.49 behaviour.
+    structure_filter?: unknown;
   };
 };
+
+// The validated filter from job params, or null for a whole-pattern edit. The
+// route validated this before enqueueing; re-checking here keeps a hand-edited
+// params blob from silently widening a scoped edit to the whole pattern.
+function jobStructureFilter(params: JobRow["params"]): StructureFilter | null {
+  return isValidStructureFilter(params.structure_filter)
+    ? params.structure_filter
+    : null;
+}
 
 async function markFailed(jobRowId: string, message: string) {
   await pool.query(
@@ -246,24 +264,72 @@ export async function processPatternRenameJob(
 
   try {
     await client.query("BEGIN");
-    await client.query("UPDATE patterns SET template = $1 WHERE id = $2", [
-      newTemplate,
-      patternId
-    ]);
 
     // Reverting to the most recent rename's old_template is an undo: pop that
     // history row instead of recording a new rename (one level of undo).
-    const lastRename = await client.query<{ id: string }>(
-      "SELECT id FROM pattern_renames WHERE pattern_id = $1 ORDER BY renamed_at DESC LIMIT 1",
+    const lastRename = await client.query<{
+      id: string;
+      new_template: string;
+      structure_filter: unknown;
+    }>(
+      `
+        SELECT id, new_template, structure_filter
+        FROM pattern_renames
+        WHERE pattern_id = $1
+        ORDER BY renamed_at DESC
+        LIMIT 1
+      `,
       [patternId]
     );
+
+    // A scoped rename edits ONE structure inside the pattern. An undo re-applies
+    // the scope recorded on the history row it reverses (never the job params —
+    // undo has none).
+    const structureFilter: StructureFilter | null = isUndo
+      ? (lastRename.rowCount ?? 0) > 0 &&
+        isValidStructureFilter(lastRename.rows[0].structure_filter)
+        ? lastRename.rows[0].structure_filter
+        : null
+      : jobStructureFilter(job.params);
+    const scoped = structureFilter !== null;
+
+    // Which template the file rewrite matches against. For an undo this must be
+    // the rename row's new_template, NOT patterns.template: a scoped rename
+    // never moved patterns.template (the pattern still holds its other
+    // structures), so the pattern row cannot tell us what the moved URLs look
+    // like now. For unscoped undos the two are identical, so this is also
+    // correct for every pre-v1.49 rename.
+    const fromTemplate =
+      isUndo && (lastRename.rowCount ?? 0) > 0
+        ? lastRename.rows[0].new_template
+        : currentTemplate;
+
+    const resolvedFilter = structureFilter
+      ? resolveStructureFilter(structureFilter, fromTemplate)
+      : null;
+
+    if (structureFilter && !resolvedFilter) {
+      throw new Error(
+        `structure filter param #${structureFilter.param_index} does not exist in template ${fromTemplate}`
+      );
+    }
+
+    if (!scoped) {
+      // A whole-pattern rename moves the pattern's identity; a scoped one must
+      // NOT — the template still describes the structures left behind.
+      await client.query("UPDATE patterns SET template = $1 WHERE id = $2", [
+        newTemplate,
+        patternId
+      ]);
+    }
 
     const rewrite = await rewritePatternSourceFilesOnDisk(client, {
       sessionId,
       sourceRole,
-      oldTemplate: currentTemplate,
+      oldTemplate: fromTemplate,
       newTemplate,
       selectedDisplayFiles: selectedFiles,
+      structureFilter: resolvedFilter,
       onFilesTotal: (total) => progress.setTotal(total),
       onFileDone: (done) => progress.onFileDone(done)
     });
@@ -286,9 +352,10 @@ export async function processPatternRenameJob(
             new_template,
             source_files,
             occurrence_count,
-            renamed_file_path
+            renamed_file_path,
+            structure_filter
           )
-          VALUES ($1, $2, $3, $4, $5, $6)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
         `,
         [
           patternId,
@@ -298,7 +365,8 @@ export async function processPatternRenameJob(
           job.params.occurrence_count ?? 0,
           rewrite.renamedStoredFilenames.length > 0
             ? rewrite.renamedStoredFilenames.join(",")
-            : null
+            : null,
+          structureFilter ? JSON.stringify(structureFilter) : null
         ]
       );
     }
@@ -313,11 +381,12 @@ export async function processPatternRenameJob(
     );
 
     await markComplete(jobRowId, {
-      old_template: currentTemplate,
+      old_template: fromTemplate,
       new_template: newTemplate,
       occurrence_count: isUndo ? 0 : (job.params.occurrence_count ?? 0),
       source_files_count: isUndo ? 0 : selectedFiles.length,
       files_rewritten: rewrite.renamedStoredFilenames.length,
+      ...(structureFilter ? { structure_filter: structureFilter } : {}),
       ...(isUndo ? { undo: true } : {})
     });
 
@@ -394,7 +463,26 @@ export async function processPatternTransformJob(
 
   const currentTemplate = patternResult.rows[0].template;
   const sourceRole = patternResult.rows[0].source_role;
+
+  // A scoped transform edits one structure inside the pattern, so the pattern's
+  // template label must stay put — it still describes the untouched structures.
+  const structureFilter = jobStructureFilter(job.params);
+  const scoped = structureFilter !== null;
+  const resolvedFilter = structureFilter
+    ? resolveStructureFilter(structureFilter, currentStructureRaw)
+    : null;
+
+  if (structureFilter && !resolvedFilter) {
+    await markFailed(
+      jobRowId,
+      `structure filter param #${structureFilter.param_index} does not exist in structure ${currentStructureRaw}`
+    );
+
+    return;
+  }
+
   const newTemplate =
+    !scoped &&
     typeof job.params.new_template === "string" &&
     job.params.new_template.trim().length > 0
       ? job.params.new_template
@@ -419,7 +507,12 @@ export async function processPatternTransformJob(
     }
   }
 
-  const rewriteUrl = (url: string) => transformUrl(url, current, next);
+  // The guard runs FIRST: URLs outside the scoped structure return null before
+  // transformUrl sees them, in files and in the DB-sample rewrites alike.
+  const rewriteUrl = applyStructureFilterToRewriter(
+    (url: string) => transformUrl(url, current, next),
+    resolvedFilter
+  );
   const client = await pool.connect();
   // New files are removed on ROLLBACK; pre-transform originals are KEPT (undo
   // restores them), so there is nothing to delete after COMMIT.
@@ -443,6 +536,7 @@ export async function processPatternTransformJob(
       currentStructure: currentStructureRaw,
       newStructure: newStructureRaw,
       rewriteUrl,
+      structureFilter: resolvedFilter,
       onFilesTotal: (total) => progress.setTotal(total),
       onFileDone: (done) => progress.onFileDone(done)
     });
@@ -457,7 +551,7 @@ export async function processPatternTransformJob(
       .map((row) => ({
         id: row.id,
         oldUrl: row.url,
-        newUrl: transformUrl(row.url, current, next)
+        newUrl: rewriteUrl(row.url)
       }))
       .filter(
         (update): update is { id: string; oldUrl: string; newUrl: string } =>
@@ -497,7 +591,7 @@ export async function processPatternTransformJob(
     ]);
     const patternUrlUpdates = patternUrls.rows
       .map((row) => {
-        const newSourceUrl = transformUrl(row.source_url, current, next);
+        const newSourceUrl = rewriteUrl(row.source_url);
 
         if (newSourceUrl === null) {
           return null;
@@ -598,7 +692,8 @@ export async function processPatternTransformJob(
       files_rewritten: rewrite.newStoredFilenames.length,
       old_template: currentTemplate,
       new_template: newTemplate,
-      sample_before_after: sampleBeforeAfter
+      sample_before_after: sampleBeforeAfter,
+      ...(structureFilter ? { structure_filter: structureFilter } : {})
     });
 
     logger.info(

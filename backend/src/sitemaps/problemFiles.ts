@@ -12,6 +12,10 @@ export type ProblemFileGroup = {
   // sampled_urls ids whose <loc> physically appears in this file. Used by the
   // delete job to mark exactly the URLs that will be removed.
   url_ids: string[];
+  // verified_urls ids whose <loc> physically appears in this file — populated
+  // only when includeVerified is set (empty otherwise). Kept SEPARATE from
+  // url_ids because the two id spaces mark different tables.
+  verified_url_ids: string[];
 };
 
 const SAMPLE_LIMIT = 5;
@@ -21,6 +25,9 @@ type ProblemEntry = {
   http_status: number;
   pattern_id: string;
   template: string;
+  // Which table `id` belongs to — decides which of url_ids / verified_url_ids
+  // the loc-scan files it under.
+  source: "sampled" | "verified";
 };
 
 // Group confirmed (sampled) problem URLs by the file their <loc> physically
@@ -50,6 +57,13 @@ export async function collectProblemFileGroups(options: {
   urls?: string[];
   // When set, only these display filenames are scanned (the delete path).
   restrictToDisplays?: string[];
+  // When true, the confirmed problem set draws from verified_urls (the full
+  // verified population, migration 038) UNIONED with sampled rows whose urls
+  // the verifier hasn't covered — so a verified session's counts reflect every
+  // verified URL, not just the sample, while an unverified session behaves
+  // exactly as before. Default false: existing callers (the sampled delete
+  // path, the file-first listing) are byte-for-byte unchanged.
+  includeVerified?: boolean;
 }): Promise<ProblemFileGroup[]> {
   const { sessionId } = options;
   const byUrls = options.urls !== undefined;
@@ -85,17 +99,68 @@ export async function collectProblemFileGroups(options: {
     [sessionId, byUrls ? (options.urls ?? []) : (options.statuses ?? [])]
   );
 
-  if (problemResult.rowCount === 0) {
-    return [];
-  }
-
-  // loc -> problem entry. If a loc maps to several sampled rows (rare), keep the
-  // first; the deletion removes that loc regardless of which row it came from.
+  // loc -> problem entry. If a loc maps to several rows (rare), keep the first;
+  // the deletion removes that loc regardless of which row it came from.
   const problemByUrl = new Map<string, ProblemEntry>();
   const patternIds = new Set<string>();
   // Candidate display names harvested from patterns.source_file (a comma-joined
   // list for multi-file patterns) — a cheap first narrowing hint.
   const candidateDisplays = new Set<string>();
+
+  // Verified rows go in FIRST so they win over a sampled row for the same url:
+  // the verifier re-checked the whole population more recently than sampling,
+  // and its rows carry per-URL source_files that sharpen the candidate-file
+  // narrowing below. Sampled rows whose urls the verifier has not covered are
+  // still merged in after, so partial verification loses nothing.
+  if (options.includeVerified) {
+    const verifiedResult = await pool.query<{
+      id: string;
+      url: string;
+      http_status: number;
+      pattern_id: string | null;
+      template: string | null;
+      source_files: string[] | null;
+    }>(
+      byUrls
+        ? `
+          SELECT v.id, v.url, v.http_status, v.pattern_id, p.template, v.source_files
+          FROM verified_urls v
+          LEFT JOIN patterns p ON p.id = v.pattern_id
+          WHERE v.session_id = $1
+            AND v.is_deleted_from_sitemap = false
+            AND v.url = ANY($2::text[])
+        `
+        : `
+          SELECT v.id, v.url, v.http_status, v.pattern_id, p.template, v.source_files
+          FROM verified_urls v
+          LEFT JOIN patterns p ON p.id = v.pattern_id
+          WHERE v.session_id = $1
+            AND v.is_deleted_from_sitemap = false
+            AND v.http_status = ANY($2::int[])
+        `,
+      [sessionId, byUrls ? (options.urls ?? []) : (options.statuses ?? [])]
+    );
+
+    for (const row of verifiedResult.rows) {
+      if (!problemByUrl.has(row.url)) {
+        problemByUrl.set(row.url, {
+          id: row.id,
+          http_status: row.http_status,
+          pattern_id: row.pattern_id ?? "",
+          template: row.template ?? "",
+          source: "verified"
+        });
+      }
+
+      if (row.pattern_id) {
+        patternIds.add(row.pattern_id);
+      }
+
+      for (const display of row.source_files ?? []) {
+        candidateDisplays.add(display);
+      }
+    }
+  }
 
   for (const row of problemResult.rows) {
     if (!problemByUrl.has(row.url)) {
@@ -103,7 +168,8 @@ export async function collectProblemFileGroups(options: {
         id: row.id,
         http_status: row.http_status,
         pattern_id: row.pattern_id,
-        template: row.template
+        template: row.template,
+        source: "sampled"
       });
     }
 
@@ -116,6 +182,10 @@ export async function collectProblemFileGroups(options: {
         candidateDisplays.add(display);
       }
     }
+  }
+
+  if (problemByUrl.size === 0) {
+    return [];
   }
 
   // Also take the files these problem patterns occur in (single display names).
@@ -171,7 +241,8 @@ export async function collectProblemFileGroups(options: {
       sample_urls: [],
       statuses: [],
       patterns: [],
-      url_ids: []
+      url_ids: [],
+      verified_url_ids: []
     };
 
     try {
@@ -185,14 +256,24 @@ export async function collectProblemFileGroups(options: {
 
         seenUrls.add(loc);
         group.problem_url_count += 1;
-        group.url_ids.push(entry.id);
+
+        // File the id under the table it belongs to — the delete job updates
+        // sampled_urls and verified_urls separately.
+        if (entry.source === "verified") {
+          group.verified_url_ids.push(entry.id);
+        } else {
+          group.url_ids.push(entry.id);
+        }
+
         statusSet.add(entry.http_status);
 
         if (group.sample_urls.length < SAMPLE_LIMIT) {
           group.sample_urls.push({ url: loc, http_status: entry.http_status });
         }
 
-        if (!seenPatternIds.has(entry.pattern_id)) {
+        // pattern_id can be empty for a verified row whose pattern was deleted;
+        // there is nothing meaningful to list for it.
+        if (entry.pattern_id && !seenPatternIds.has(entry.pattern_id)) {
           seenPatternIds.add(entry.pattern_id);
           group.patterns.push({
             id: entry.pattern_id,

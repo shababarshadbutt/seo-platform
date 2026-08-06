@@ -76,6 +76,37 @@ export function buildRedirectApplyRewriter(
   };
 }
 
+// Does a URL pathname belong to a pattern template? The EXACT segment matcher
+// buildPatternTemplateRewriter applies before rewriting, extracted so the
+// full-population verifier classifies each streamed <loc> with the same rule the
+// rewriters use: split on "/", filter(Boolean) (so trailing/double slashes never
+// create phantom segments — see segmentsFromTemplate), segment counts must be
+// equal, "{param}" positions match anything, static segments must be strictly
+// equal. Kept as a pure predicate here (not a new module) so it can never drift
+// from the rewriter's matching semantics.
+export function pathMatchesTemplate(
+  pathname: string,
+  template: string
+): boolean {
+  const templateSegments = segmentsFromTemplate(template);
+  const pathSegments = pathname.split("/").filter(Boolean);
+
+  if (pathSegments.length !== templateSegments.length) {
+    return false;
+  }
+
+  for (let index = 0; index < templateSegments.length; index += 1) {
+    if (
+      templateSegments[index] !== PARAM_SEGMENT &&
+      templateSegments[index] !== pathSegments[index]
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 // Number of "{param}" placeholders in a pattern template.
 export function countTemplateParams(template: string): number {
   return segmentsFromTemplate(template).filter(

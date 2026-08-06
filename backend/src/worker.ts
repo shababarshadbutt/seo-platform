@@ -71,6 +71,13 @@ import {
   type RestoreDeletedUrlsJobData
 } from "./queue/maintenanceQueue.js";
 import {
+  VERIFICATION_QUEUE_NAME,
+  VERIFY_URLS_JOB,
+  closeVerificationQueue,
+  type VerificationJobName,
+  type VerifyUrlsJobData
+} from "./queue/verificationQueue.js";
+import {
   CLEANUP_ZIPS_JOB,
   PRE_GENERATE_ZIP_JOB,
   PRE_GENERATE_ZIP_QUEUE_NAME,
@@ -103,6 +110,7 @@ import {
 } from "./jobs/maintenanceJobs.js";
 import { destroyZipPool } from "./jobs/zipPool.js";
 import { destroyFileRewritePool } from "./jobs/fileRewritePool.js";
+import { processVerifyUrlsJob } from "./jobs/verifyUrlsJob.js";
 import { processCleanupUploadsJob } from "./jobs/cleanupUploadsJob.js";
 import { processExtractPatternsJob } from "./jobs/extractPatternsJob.js";
 import { processParseSitemapJob } from "./jobs/parseSitemapJob.js";
@@ -144,6 +152,14 @@ let publishWorker: Worker<
   PublishQueueData,
   unknown,
   PublishJobName
+> | null = null;
+// Full-population URL verification on its own concurrency-1 queue: an
+// hours-long verification must never block maintenance ops (deletes/restores)
+// behind it — see queue/verificationQueue.ts.
+let verificationWorker: Worker<
+  VerifyUrlsJobData,
+  void,
+  VerificationJobName
 > | null = null;
 // Download-ZIP pre-generation + daily cleanup on its own concurrency-1 queue, so
 // a heavy 1000-file archive write never starves the other workers.
@@ -444,6 +460,41 @@ async function start() {
         "maintenance worker job failed"
       );
     });
+    verificationWorker = new Worker<
+      VerifyUrlsJobData,
+      void,
+      VerificationJobName
+    >(
+      VERIFICATION_QUEUE_NAME,
+      async (job) => {
+        if (job.name === VERIFY_URLS_JOB) {
+          await processVerifyUrlsJob(job.data, app.log);
+          return;
+        }
+
+        throw new Error(`Unsupported job: ${job.name}`);
+      },
+      {
+        connection: redisConnectionOptions(),
+        concurrency: 1,
+        // Verifying every URL of a large session is hundreds of thousands of
+        // HTTP probes — far past BullMQ's default 30s job lock. Same 60-minute
+        // lock (and reasoning) as the maintenance and bulk-replace workers.
+        lockDuration: 60 * 60 * 1000
+      }
+    );
+    verificationWorker.on("failed", (job, error) => {
+      app.log.error(
+        {
+          job_id: job?.id,
+          job_name: job?.name,
+          session_id: (job?.data as { session_id?: string } | undefined)
+            ?.session_id,
+          error
+        },
+        "verification worker job failed"
+      );
+    });
     preGenerateZipWorker = new Worker<
       PreGenerateZipQueueData,
       void,
@@ -500,6 +551,7 @@ async function close() {
   await bulkReplaceWorker?.close();
   await publishWorker?.close();
   await maintenanceWorker?.close();
+  await verificationWorker?.close();
   await preGenerateZipWorker?.close();
   await destroyZipPool();
   await destroyFileRewritePool();
@@ -508,6 +560,7 @@ async function close() {
   await closePublishQueue();
   await closePublishLockClient();
   await closeMaintenanceQueue();
+  await closeVerificationQueue();
   await closePreGenerateZipQueue();
   await app.close();
   await closePool();

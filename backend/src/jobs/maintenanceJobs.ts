@@ -76,45 +76,119 @@ export async function processDeleteProblemUrlsJob(
       session_id: sessionId,
       job_row_id: jobRowId,
       files: fileDisplays.length,
-      statuses
+      statuses,
+      use_verified: Boolean(data.use_verified)
     },
     "delete problem urls job started"
   );
 
   try {
-    // Scan the selected files to find exactly which confirmed problem URLs (of
-    // the requested statuses) physically appear in them — the same match the
-    // rebuild uses. Then mark only those URLs deleted, scoped to the selected
-    // files. This keeps the is_deleted_from_sitemap flag honest (set only for
-    // URLs actually removed) even for multi-file patterns whose source_file is a
-    // comma-joined list.
-    const groups = await collectProblemFileGroups({
-      sessionId,
-      // Explicit URL list (redirect-modal delete) takes precedence over the
-      // status filter (Delete Problem URLs feature).
-      ...(urls ? { urls } : { statuses }),
-      restrictToDisplays: fileDisplays
-    });
-
-    const urlIds = Array.from(
-      new Set(groups.flatMap((group) => group.url_ids))
-    );
-
     await markRunning(jobRowId, fileDisplays.length);
 
-    if (urlIds.length > 0) {
-      await pool.query(
+    if (data.use_verified) {
+      // Verify-then-delete: the candidate set is the FULL verified population
+      // (verified_urls, migration 038), not the sampled preview. Rows are
+      // selected by session + optional pattern + status filter (or explicit URL
+      // list), restricted to rows whose source_files overlap the selected
+      // display files — verified rows already record exactly which files their
+      // <loc> appeared in, so no per-file loc scan is needed here.
+      const targets = await pool.query<{ id: string; url: string }>(
         `
-          UPDATE sampled_urls AS s
-          SET is_deleted_from_sitemap = true,
-              deleted_from_files = $2::text[]
-          FROM patterns p
-          WHERE p.id = s.pattern_id
-            AND p.session_id = $1
-            AND s.id = ANY($3::uuid[])
+          SELECT id, url
+          FROM verified_urls
+          WHERE session_id = $1
+            AND is_deleted_from_sitemap = false
+            AND ($2::uuid IS NULL OR pattern_id = $2::uuid)
+            AND (
+              CASE WHEN $3::text[] IS NOT NULL
+                THEN url = ANY($3::text[])
+                ELSE http_status = ANY($4::int[])
+              END
+            )
+            AND source_files && $5::text[]
         `,
-        [sessionId, fileDisplays, urlIds]
+        [
+          sessionId,
+          data.pattern_id ?? null,
+          urls ?? null,
+          statuses,
+          fileDisplays
+        ]
       );
+
+      if (targets.rowCount && targets.rowCount > 0) {
+        const targetIds = targets.rows.map((row) => row.id);
+        const targetUrls = targets.rows.map((row) => row.url);
+
+        await pool.query(
+          `
+            UPDATE verified_urls
+            SET is_deleted_from_sitemap = true,
+                deleted_from_files = $2::text[]
+            WHERE session_id = $1
+              AND id = ANY($3::uuid[])
+          `,
+          [sessionId, fileDisplays, targetIds]
+        );
+
+        // ALSO mark any sampled rows carrying the same URLs, so the two mark
+        // tables agree: the rebuild UNIONs them, and a later sampled-only
+        // restore or listing must not resurrect a URL the verified flow removed.
+        await pool.query(
+          `
+            UPDATE sampled_urls AS s
+            SET is_deleted_from_sitemap = true,
+                deleted_from_files = $2::text[]
+            FROM patterns p
+            WHERE p.id = s.pattern_id
+              AND p.session_id = $1
+              AND s.is_deleted_from_sitemap = false
+              AND s.url = ANY($3::text[])
+          `,
+          [sessionId, fileDisplays, targetUrls]
+        );
+      }
+    }
+
+    {
+      // Sampled path (unchanged behaviour): scan the selected files to find
+      // exactly which confirmed problem URLs (of the requested statuses)
+      // physically appear in them — the same match the rebuild uses. Then mark
+      // only those URLs deleted, scoped to the selected files. This keeps the
+      // is_deleted_from_sitemap flag honest (set only for URLs actually removed)
+      // even for multi-file patterns whose source_file is a comma-joined list.
+      //
+      // Runs even when use_verified is set: a PARTIAL verification (one pattern)
+      // must not stop the delete from removing sampled-confirmed problem URLs
+      // in patterns verification never covered. Re-marking a URL the verified
+      // branch already marked is idempotent, and the rebuild UNIONs both mark
+      // tables anyway.
+      const groups = await collectProblemFileGroups({
+        sessionId,
+        // Explicit URL list (redirect-modal delete) takes precedence over the
+        // status filter (Delete Problem URLs feature).
+        ...(urls ? { urls } : { statuses }),
+        restrictToDisplays: fileDisplays
+      });
+
+      const urlIds = Array.from(
+        new Set(groups.flatMap((group) => group.url_ids))
+      );
+
+      if (urlIds.length > 0) {
+        await pool.query(
+          `
+            UPDATE sampled_urls AS s
+            SET is_deleted_from_sitemap = true,
+                deleted_from_files = $2::text[]
+            FROM patterns p
+            WHERE p.id = s.pattern_id
+              AND p.session_id = $1
+              AND s.id = ANY($3::uuid[])
+          `,
+          [sessionId, fileDisplays, urlIds]
+        );
+      }
     }
 
     // Rebuild only the selected files from their originals against the updated
@@ -152,7 +226,9 @@ export async function processRestoreDeletedUrlsJob(
 
   try {
     // Clear all deletion marks for the session, then rebuild every file (each
-    // now has an empty deleted-set and is restored to its original).
+    // now has an empty deleted-set and is restored to its original). BOTH mark
+    // tables are cleared — the rebuild takes their union, so leaving verified
+    // marks behind would keep those URLs deleted after a "restore all".
     await pool.query(
       `
         UPDATE sampled_urls AS s
@@ -161,6 +237,15 @@ export async function processRestoreDeletedUrlsJob(
         WHERE p.id = s.pattern_id
           AND p.session_id = $1
           AND s.is_deleted_from_sitemap = true
+      `,
+      [sessionId]
+    );
+    await pool.query(
+      `
+        UPDATE verified_urls
+        SET is_deleted_from_sitemap = false, deleted_from_files = NULL
+        WHERE session_id = $1
+          AND is_deleted_from_sitemap = true
       `,
       [sessionId]
     );

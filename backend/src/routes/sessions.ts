@@ -167,6 +167,12 @@ import {
   validateStructures,
   type ParsedStructure
 } from "../sitemaps/transformStructure.js";
+import {
+  detectPatternStructures,
+  isValidStructureFilter,
+  resolveStructureFilter,
+  type StructureFilter
+} from "../sitemaps/structureClusters.js";
 
 type CreateSessionBody = {
   name?: string;
@@ -233,6 +239,8 @@ type FindReplaceBody = {
 type RenameBody = {
   new_template?: string;
   source_files?: unknown[];
+  // Scope the rename to one detected structure inside the pattern (v1.49).
+  structure_filter?: unknown;
 };
 
 type TransformBody = {
@@ -240,6 +248,7 @@ type TransformBody = {
   current_structure?: string;
   new_structure?: string;
   source_files?: unknown[];
+  structure_filter?: unknown;
 };
 
 type SessionHistoryRow = {
@@ -2646,7 +2655,54 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       const currentTemplate = patternResult.rows[0].template;
       const sourceRole = patternResult.rows[0].source_role;
 
-      if (newTemplate === currentTemplate) {
+      // Scope the rename to one detected structure (v1.49). Validated against
+      // the CURRENT template — the {param} ordinal it names must exist there.
+      const rawStructureFilter = request.body?.structure_filter;
+      let structureFilter: StructureFilter | null = null;
+
+      if (rawStructureFilter !== undefined && rawStructureFilter !== null) {
+        if (!isValidStructureFilter(rawStructureFilter)) {
+          return reply
+            .code(400)
+            .send(
+              badRequest(
+                "structure_filter must be { param_index, anchor: prefix|suffix, value }"
+              )
+            );
+        }
+
+        if (!resolveStructureFilter(rawStructureFilter, currentTemplate)) {
+          return reply
+            .code(400)
+            .send(
+              badRequest(
+                `structure_filter param_index ${rawStructureFilter.param_index} does not exist in ${currentTemplate}`
+              )
+            );
+        }
+
+        structureFilter = rawStructureFilter;
+      }
+
+      // Reverting to the most recent rename's old_template is an undo: pop that
+      // history row instead of recording a new rename (one level of undo).
+      // Looked up BEFORE the same-template check because undoing a SCOPED
+      // rename asks for the template the pattern row still holds — patterns.
+      // template never moved, so `newTemplate === currentTemplate` is the
+      // normal shape of that undo, not a mistake.
+      const lastRename = await pool.query<{
+        id: string;
+        old_template: string;
+        source_files: string[] | null;
+      }>(
+        "SELECT id, old_template, source_files FROM pattern_renames WHERE pattern_id = $1 ORDER BY renamed_at DESC LIMIT 1",
+        [request.params.patternId]
+      );
+      const isUndo =
+        (lastRename.rowCount ?? 0) > 0 &&
+        lastRename.rows[0].old_template === newTemplate;
+
+      if (newTemplate === currentTemplate && !isUndo) {
         // The template ALREADY being the requested one is exactly what a retry
         // after a client timeout looks like: the first attempt committed this
         // rename, the client never saw the response, and the user pressed the
@@ -2656,7 +2712,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           request.params.patternId,
           patternStructureFingerprint("RENAME", {
             new_template: newTemplate,
-            source_files: sourceFiles
+            source_files: sourceFiles,
+            structure_filter: structureFilter
           })
         );
 
@@ -2675,7 +2732,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // Renaming ONTO another pattern's template violates
       // patterns_unique_template_per_session_role. Checked here so the user gets a
       // real message; the catch below also maps a raced violation, because this is
-      // a check-then-act.
+      // a check-then-act. A scoped-rename undo targets currentTemplate itself,
+      // which the exclusion below already permits.
       const renameConflict = await checkTemplateConflict(pool, {
         sessionId: request.params.id,
         sourceRole,
@@ -2686,20 +2744,6 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       if (renameConflict) {
         return reply.code(renameConflict.status).send(renameConflict.body);
       }
-
-      // Reverting to the most recent rename's old_template is an undo: pop that
-      // history row instead of recording a new rename (one level of undo).
-      const lastRename = await pool.query<{
-        id: string;
-        old_template: string;
-        source_files: string[] | null;
-      }>(
-        "SELECT id, old_template, source_files FROM pattern_renames WHERE pattern_id = $1 ORDER BY renamed_at DESC LIMIT 1",
-        [request.params.patternId]
-      );
-      const isUndo =
-        (lastRename.rowCount ?? 0) > 0 &&
-        lastRename.rows[0].old_template === newTemplate;
 
       const breakdown = await patternSourceFileBreakdown(
         request.params.patternId,
@@ -2728,13 +2772,15 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // changed patterns.template and popped/pushed pattern_renames.
         fingerprint: patternStructureFingerprint("RENAME", {
           new_template: newTemplate,
-          source_files: sourceFiles
+          source_files: sourceFiles,
+          structure_filter: structureFilter
         }),
         params: {
           new_template: newTemplate,
           source_files: selectedFiles,
           occurrence_count: occurrenceCount,
-          is_undo: isUndo
+          is_undo: isUndo,
+          structure_filter: structureFilter
         },
         filesTotal: selectedFiles.length
       });
@@ -2820,11 +2866,45 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         return reply.code(400).send(badRequest(validationError));
       }
 
+      // Scope the transform to one detected structure (v1.49). The ordinal is
+      // resolved against the current structure string — the same segments the
+      // transform itself matches URLs with.
+      const rawStructureFilter = request.body?.structure_filter;
+      let structureFilter: StructureFilter | null = null;
+
+      if (rawStructureFilter !== undefined && rawStructureFilter !== null) {
+        if (!isValidStructureFilter(rawStructureFilter)) {
+          return reply
+            .code(400)
+            .send(
+              badRequest(
+                "structure_filter must be { param_index, anchor: prefix|suffix, value }"
+              )
+            );
+        }
+
+        if (!resolveStructureFilter(rawStructureFilter, currentStructureRaw)) {
+          return reply
+            .code(400)
+            .send(
+              badRequest(
+                `structure_filter param_index ${rawStructureFilter.param_index} does not exist in ${currentStructureRaw}`
+              )
+            );
+        }
+
+        structureFilter = rawStructureFilter;
+      }
+
       // The label rename is optional; default to the existing template so a
-      // structure-only transform leaves the pattern name untouched.
+      // structure-only transform leaves the pattern name untouched. A SCOPED
+      // transform never moves the label — the template still describes the
+      // pattern's other structures (the job enforces this too).
       const newTemplateRaw = request.body?.new_template;
       const newTemplate =
-        typeof newTemplateRaw === "string" && newTemplateRaw.trim().length > 0
+        !structureFilter &&
+        typeof newTemplateRaw === "string" &&
+        newTemplateRaw.trim().length > 0
           ? newTemplateRaw
           : currentTemplate;
 
@@ -2876,16 +2956,58 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           current_structure: currentStructureRaw,
           new_structure: newStructureRaw,
           new_template: newTemplateRaw ?? null,
-          source_files: sourceFiles
+          source_files: sourceFiles,
+          structure_filter: structureFilter
         }),
         params: {
           current_structure: currentStructureRaw,
           new_structure: newStructureRaw,
           new_template: newTemplate,
-          source_files: selectedFiles
+          source_files: selectedFiles,
+          structure_filter: structureFilter
         },
         filesTotal: selectedFiles.length
       });
+    }
+  );
+
+  // Distinct URL structures detected INSIDE one pattern (v1.49): cluster the
+  // pattern's real URL pool (pattern_urls — up to ~1,000 actual URLs, not the
+  // ≤20 HTTP samples) by literal token anchors around each {param} slot, so
+  // /nsn/{param} surfaces niin-parts-{var} / part-types-{var} / … as separately
+  // editable structures. Read-only; the scoped edit itself goes through the
+  // rename/transform routes with a structure_filter.
+  app.get<{ Params: PatternParams }>(
+    "/api/sessions/:id/patterns/:patternId/structures",
+    async (request, reply) => {
+      const patternResult = await pool.query<{ template: string }>(
+        "SELECT template FROM patterns WHERE session_id = $1 AND id = $2",
+        [request.params.id, request.params.patternId]
+      );
+
+      if (patternResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "pattern not found" });
+      }
+
+      const template = patternResult.rows[0].template;
+      const urls = await pool.query<{ path: string }>(
+        "SELECT path FROM pattern_urls WHERE pattern_id = $1",
+        [request.params.patternId]
+      );
+      // pattern_urls.path keeps the query string; clustering is over path
+      // segments only.
+      const paths = urls.rows.map((row) => row.path.split("?")[0]);
+
+      return {
+        template,
+        // The clusters describe this many REAL urls (the candidate pool), which
+        // may be fewer than patterns.total_urls — the UI labels counts as
+        // "of the sampled pool" beyond this size.
+        url_pool_size: paths.length,
+        positions: detectPatternStructures(template, paths)
+      };
     }
   );
 
@@ -4980,6 +5102,11 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
   // Lightweight count of still-present confirmed problem URLs (redirects / 404s)
   // for the results-page "Delete URLs (N)" badge. Cheap query — no file scan —
   // so it is safe to call on every page load.
+  //
+  // Confirmed = sampled_urls UNION verified_urls (v1.49): once a verification
+  // run has HTTP-checked the full population, the badge counts every confirmed
+  // problem URL, not just the ≤ sample_size sampled ones. Deduped on the URL
+  // string — a sampled URL is (re)checked by verification too.
   app.get<{ Params: SessionParams; Querystring: { status?: string } }>(
     "/api/sessions/:id/problem-urls/count",
     async (request) => {
@@ -4987,12 +5114,21 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
       const result = await pool.query<{ count: string }>(
         `
-          SELECT COUNT(*)::text AS count
-          FROM sampled_urls s
-          JOIN patterns p ON p.id = s.pattern_id
-          WHERE p.session_id = $1
-            AND s.is_deleted_from_sitemap = false
-            AND s.http_status = ANY($2::int[])
+          SELECT COUNT(DISTINCT url)::text AS count
+          FROM (
+            SELECT s.url
+            FROM sampled_urls s
+            JOIN patterns p ON p.id = s.pattern_id
+            WHERE p.session_id = $1
+              AND s.is_deleted_from_sitemap = false
+              AND s.http_status = ANY($2::int[])
+            UNION ALL
+            SELECT v.url
+            FROM verified_urls v
+            WHERE v.session_id = $1
+              AND v.is_deleted_from_sitemap = false
+              AND v.http_status = ANY($2::int[])
+          ) AS confirmed
         `,
         [request.params.id, statuses]
       );
@@ -5014,7 +5150,11 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
       const groups = await collectProblemFileGroups({
         sessionId: request.params.id,
-        statuses
+        statuses,
+        // Verified rows (full-population HTTP checks, v1.49) win per-URL;
+        // sampled rows fill any URL verification hasn't covered. Sessions
+        // without a verification run merge an empty set — behaviour unchanged.
+        includeVerified: true
       });
 
       const files = groups.map((group) => ({
@@ -5074,6 +5214,15 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         return reply.code(400).send(badRequest("no matching files"));
       }
 
+      // Act on the verified full population when a verification run exists for
+      // this session (v1.49). Gated on actual rows — with use_verified set and
+      // an EMPTY verified_urls, the job's verified branch would select nothing
+      // and the delete would silently no-op for never-verified sessions.
+      const hasVerified = await pool.query(
+        "SELECT 1 FROM verified_urls WHERE session_id = $1 LIMIT 1",
+        [request.params.id]
+      );
+
       const jobRow = await pool.query<{ id: string }>(
         "INSERT INTO maintenance_jobs (session_id, kind) VALUES ($1, 'delete-problem-urls') RETURNING id",
         [request.params.id]
@@ -5084,7 +5233,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         session_id: request.params.id,
         job_row_id: jobRowId,
         file_displays: fileDisplays,
-        statuses
+        statuses,
+        use_verified: (hasVerified.rowCount ?? 0) > 0
       });
 
       return { job_row_id: jobRowId, status: "PENDING" };

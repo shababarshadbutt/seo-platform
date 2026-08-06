@@ -54,6 +54,11 @@ async function loadCurrentFiles(sessionId: string): Promise<CurrentFile[]> {
 // URLs currently marked deleted that apply to a given display file: either a
 // global deletion (deleted_from_files IS NULL — the top-level "Delete URLs"
 // job) or one explicitly scoped to this file (the per-file drawer flow).
+//
+// The deleted-set is the UNION of BOTH mark tables: sampled_urls (the original
+// sampled-preview deletion flows) and verified_urls (the full-population
+// verify-then-delete flow, migration 038). UNION dedupes, so a URL marked in
+// both — the delete job marks both tables so they agree — is removed once.
 async function deletedUrlsForFile(
   sessionId: string,
   displayName: string
@@ -66,6 +71,12 @@ async function deletedUrlsForFile(
       WHERE p.session_id = $1
         AND s.is_deleted_from_sitemap = true
         AND (s.deleted_from_files IS NULL OR $2 = ANY(s.deleted_from_files))
+      UNION
+      SELECT v.url
+      FROM verified_urls v
+      WHERE v.session_id = $1
+        AND v.is_deleted_from_sitemap = true
+        AND (v.deleted_from_files IS NULL OR $2 = ANY(v.deleted_from_files))
     `,
     [sessionId, displayName]
   );

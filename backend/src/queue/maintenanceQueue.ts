@@ -27,6 +27,13 @@ export type DeleteProblemUrlsJobData = {
   // Redirect URLs modal's Delete action (v1.42.1). Reuses the same deletion
   // pipeline; only URLs backed by a sampled_urls row are removable.
   urls?: string[];
+  // Verify-then-delete (migration 038): when true, the candidate rows come from
+  // verified_urls (the FULL verified population) instead of sampled_urls, so
+  // deletion is no longer capped at the sampled preview. Absent/false → the
+  // sampled behaviour above, unchanged.
+  use_verified?: boolean;
+  // Optional pattern scope for the verified path (the per-pattern Fix modal).
+  pattern_id?: string;
 };
 
 export type RestoreDeletedUrlsJobData = {
