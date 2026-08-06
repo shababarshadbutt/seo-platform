@@ -13,8 +13,11 @@ import {
   deleteProblemUrls,
   getDeleteProblemUrlsStatus,
   getProblemFiles,
+  getVerificationStatus,
+  startUrlVerification,
   type MaintenanceJob,
-  type ProblemFile
+  type ProblemFile,
+  type VerificationStatus
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
@@ -65,6 +68,17 @@ export function ProblemUrlsDialog({
   const [status, setStatus] = useState<MaintenanceJob | null>(null);
   const [error, setError] = useState("");
   const finishedRef = useRef(false);
+  // Full-population verification (verify-then-act, v1.49). Until a verification
+  // has run, the counts below only cover the sampled URLs (≤ sample_size per
+  // pattern); after one, they cover every URL in the uploaded files.
+  const [verification, setVerification] = useState<VerificationStatus | null>(
+    null
+  );
+  const [verifyPolling, setVerifyPolling] = useState(false);
+  const [verifyStartError, setVerifyStartError] = useState("");
+  // Bumped when a verification completes so the file list refetches with the
+  // verified counts.
+  const [refreshKey, setRefreshKey] = useState(0);
 
   // "All" (empty set) means every problem status.
   const effectiveStatuses = useMemo(
@@ -89,8 +103,72 @@ export function ProblemUrlsDialog({
     setExpanded(new Set());
     setStatus(null);
     setError("");
+    setVerifyStartError("");
     finishedRef.current = false;
-  }, [open]);
+
+    // Pick up the verification state on open — and resume the progress display
+    // if a run is already going (it survives the dialog being closed).
+    void (async () => {
+      try {
+        const current = await getVerificationStatus(sessionId);
+
+        setVerification(current);
+
+        if (
+          current.job &&
+          (current.job.status === "PENDING" || current.job.status === "RUNNING")
+        ) {
+          setVerifyPolling(true);
+        }
+      } catch {
+        // Non-fatal: the dialog still works sample-backed.
+      }
+    })();
+  }, [open, sessionId]);
+
+  // Poll the verification job while it runs; when it finishes, refetch the
+  // file list so counts/chips reflect the full verified population.
+  useEffect(() => {
+    if (!verifyPolling) {
+      return;
+    }
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+
+    const tick = async () => {
+      try {
+        const current = await getVerificationStatus(sessionId);
+
+        if (cancelled) {
+          return;
+        }
+
+        setVerification(current);
+
+        if (
+          current.job &&
+          (current.job.status === "PENDING" || current.job.status === "RUNNING")
+        ) {
+          timer = setTimeout(tick, 1500);
+        } else {
+          setVerifyPolling(false);
+          setRefreshKey((key) => key + 1);
+        }
+      } catch {
+        if (!cancelled) {
+          timer = setTimeout(tick, 1500);
+        }
+      }
+    };
+
+    void tick();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [verifyPolling, sessionId]);
 
   // Fetch (re-fetch on filter change) so counts + deletion stay aligned to the
   // active statuses.
@@ -139,7 +217,7 @@ export function ProblemUrlsDialog({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, sessionId, statusKey]);
+  }, [open, sessionId, statusKey, refreshKey]);
 
   const handleFinished = useCallback(() => {
     if (finishedRef.current) {
@@ -188,6 +266,21 @@ export function ProblemUrlsDialog({
       clearTimeout(timer);
     };
   }, [phase, sessionId, handleFinished]);
+
+  async function handleVerify() {
+    setVerifyStartError("");
+
+    try {
+      await startUrlVerification(sessionId);
+      setVerifyPolling(true);
+    } catch (nextError) {
+      setVerifyStartError(
+        nextError instanceof Error
+          ? nextError.message
+          : "Unable to start verification."
+      );
+    }
+  }
 
   function toggleStatus(code: number) {
     setActiveStatuses((current) => {
@@ -269,6 +362,22 @@ export function ProblemUrlsDialog({
     }
   }
 
+  // Per-status counts over the verified full population — shown on the chips
+  // once a fresh verification exists so "404 · 2,113" means every 404 in the
+  // files, not the sampled handful.
+  const verifiedCountByStatus = useMemo(() => {
+    const counts = new Map<number, number>();
+
+    for (const entry of verification?.counts_by_status ?? []) {
+      counts.set(entry.http_status, entry.count);
+    }
+
+    return counts;
+  }, [verification]);
+  const showVerifiedCounts = Boolean(
+    verification?.verified_at && !verification.stale && !verifyPolling
+  );
+
   const selectedCount = useMemo(
     () => files.filter((file) => selectedFiles.has(file.file_id)).length,
     [files, selectedFiles]
@@ -311,6 +420,57 @@ export function ProblemUrlsDialog({
 
         {phase === "list" ? (
           <div className="space-y-3">
+            {/* Full-population verification (v1.49) */}
+            {verifyPolling ? (
+              <div
+                className="space-y-2 rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2"
+                data-testid="verify-progress"
+              >
+                <p className="flex items-center gap-2 text-sm text-indigo-900">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Verifying{" "}
+                  {formatNumber(verification?.job?.urls_done ?? 0)} of{" "}
+                  {formatNumber(verification?.job?.urls_total ?? 0)} URLs…
+                </p>
+                <Progress
+                  value={
+                    (verification?.job?.urls_total ?? 0) > 0
+                      ? Math.round(
+                          ((verification?.job?.urls_done ?? 0) /
+                            (verification?.job?.urls_total ?? 1)) *
+                            100
+                        )
+                      : 0
+                  }
+                />
+              </div>
+            ) : verification?.verified_at && !verification.stale ? (
+              <p className="flex items-center gap-2 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+                <CheckCircle2 className="h-4 w-4 shrink-0" />
+                Every URL in the uploaded files has been HTTP-verified — the
+                counts below cover the full population, not just the samples.
+              </p>
+            ) : (
+              <div className="flex flex-wrap items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2">
+                <p className="min-w-0 flex-1 text-sm text-amber-900">
+                  {verification?.verified_at
+                    ? "Files changed since the last verification — re-verify to refresh the full-population counts."
+                    : "Counts below cover only the sampled URLs (a handful per pattern). Verify to find every problem URL in the uploaded files."}
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  className="shrink-0 bg-amber-600 hover:bg-amber-700"
+                  onClick={() => void handleVerify()}
+                >
+                  {verification?.verified_at ? "Re-verify all URLs" : "Verify all URLs"}
+                </Button>
+              </div>
+            )}
+            {verifyStartError ? (
+              <p className="text-sm text-red-500">{verifyStartError}</p>
+            ) : null}
+
             {/* Status filter */}
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="mr-1 text-xs font-medium text-slate-500">
@@ -339,6 +499,9 @@ export function ProblemUrlsDialog({
                   }`}
                 >
                   {code}
+                  {showVerifiedCounts && verifiedCountByStatus.has(code)
+                    ? ` · ${formatNumber(verifiedCountByStatus.get(code) ?? 0)}`
+                    : ""}
                 </button>
               ))}
               {listLoading ? (

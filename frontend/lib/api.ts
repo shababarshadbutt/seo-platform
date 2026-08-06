@@ -1079,6 +1079,189 @@ export async function getPatternSamples(
   return data.sampled_urls;
 }
 
+// ---- Distinct URL structures inside one pattern (v1.49) --------------------
+
+// Mirrors backend/src/sitemaps/structureClusters.ts.
+export type StructureFilter = {
+  // 0-based ordinal among the template's {param} slots.
+  param_index: number;
+  anchor: "prefix" | "suffix";
+  // Hyphen-joined literal tokens, e.g. "niin-parts".
+  value: string;
+};
+
+export type StructureCluster = {
+  label: string;
+  anchor: { direction: "prefix" | "suffix"; value: string } | null;
+  urlCount: number;
+  examples: string[];
+};
+
+export type PatternStructuresResponse = {
+  template: string;
+  url_pool_size: number;
+  positions: Array<{
+    segmentIndex: number;
+    paramIndex: number;
+    clusters: StructureCluster[];
+  }>;
+};
+
+export async function getPatternStructures(
+  sessionId: string,
+  patternId: string
+): Promise<PatternStructuresResponse> {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/structures`),
+    {
+      cache: "no-store"
+    }
+  );
+
+  return readJsonResponse<PatternStructuresResponse>(response);
+}
+
+// ---- Full-population URL verification (verify-then-act, v1.49) -------------
+
+export type VerificationJob = {
+  id: string;
+  status: string;
+  urls_total: number;
+  urls_done: number;
+  items_changed: number | null;
+  error: string | null;
+};
+
+export type VerificationStatus = {
+  job: VerificationJob | null;
+  // Newest checked_at across the session's verified URLs; null = never ran.
+  verified_at: string | null;
+  // Files were edited after the last verification — counts may be outdated.
+  stale: boolean;
+  counts_by_status: Array<{ http_status: number; count: number }>;
+};
+
+export async function startUrlVerification(
+  sessionId: string,
+  patternIds?: string[]
+): Promise<{ job_row_id: string }> {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/verify-urls`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patternIds ? { pattern_ids: patternIds } : {})
+    }
+  );
+
+  return readJsonResponse<{ job_row_id: string }>(response);
+}
+
+export async function getVerificationStatus(
+  sessionId: string
+): Promise<VerificationStatus> {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/verify-urls/status`),
+    {
+      cache: "no-store"
+    }
+  );
+
+  return readJsonResponse<VerificationStatus>(response);
+}
+
+const VERIFICATION_POLL_INTERVAL_MS = 1500;
+// Full-population checks on huge sessions can genuinely run for hours; the
+// backstop only exists so an orphaned poll loop cannot spin forever.
+const VERIFICATION_POLL_BACKSTOP_MS = 4 * 60 * 60 * 1000;
+
+// Poll until the verification job leaves PENDING/RUNNING, reporting progress
+// ("Verifying 187 of 269 URLs…") along the way. Resolves with the final status.
+export async function awaitUrlVerification(
+  sessionId: string,
+  onProgress?: (done: number, total: number) => void
+): Promise<VerificationStatus> {
+  const startedAt = Date.now();
+
+  for (;;) {
+    const status = await getVerificationStatus(sessionId);
+    const job = status.job;
+
+    if (!job || (job.status !== "PENDING" && job.status !== "RUNNING")) {
+      return status;
+    }
+
+    onProgress?.(job.urls_done, job.urls_total);
+
+    if (Date.now() - startedAt > VERIFICATION_POLL_BACKSTOP_MS) {
+      throw new Error("verification is still running; check back later");
+    }
+
+    await new Promise((resolve) =>
+      setTimeout(resolve, VERIFICATION_POLL_INTERVAL_MS)
+    );
+  }
+}
+
+export type VerifiedUrl = {
+  url: string;
+  http_status: number | null;
+  final_url: string | null;
+  source_files: string[];
+};
+
+export async function getVerifiedUrls(
+  sessionId: string,
+  patternId: string,
+  options: { statuses?: number[]; limit?: number; offset?: number } = {}
+): Promise<{ total: number; urls: VerifiedUrl[] }> {
+  const query = new URLSearchParams();
+
+  if (options.statuses && options.statuses.length > 0) {
+    query.set("statuses", options.statuses.join(","));
+  }
+
+  if (options.limit !== undefined) {
+    query.set("limit", String(options.limit));
+  }
+
+  if (options.offset !== undefined) {
+    query.set("offset", String(options.offset));
+  }
+
+  const queryString = query.toString();
+  const suffix = queryString.length > 0 ? `?${queryString}` : "";
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/verified-urls${suffix}`
+    ),
+    {
+      cache: "no-store"
+    }
+  );
+
+  return readJsonResponse<{ total: number; urls: VerifiedUrl[] }>(response);
+}
+
+export async function deleteVerifiedUrls(
+  sessionId: string,
+  patternId: string,
+  statuses: number[]
+): Promise<{ job_row_id: string }> {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/delete-verified-urls`
+    ),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ statuses })
+    }
+  );
+
+  return readJsonResponse<{ job_row_id: string }>(response);
+}
+
 export async function getMismatchedUrls(sessionId: string) {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/mismatched-urls`),
@@ -1286,7 +1469,12 @@ async function awaitPatternStructureJob<T>(
 export async function renamePatternTemplate(
   sessionId: string,
   patternId: string,
-  input: { newTemplate: string; sourceFiles: string[] },
+  input: {
+    newTemplate: string;
+    sourceFiles: string[];
+    // Scope the rename to one detected structure (v1.49) — see StructureFilter.
+    structureFilter?: StructureFilter | null;
+  },
   onProgress?: (progress: PatternStructureProgress) => void
 ) {
   const response = await fetchWithTimeout(
@@ -1296,7 +1484,8 @@ export async function renamePatternTemplate(
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         new_template: input.newTemplate,
-        source_files: input.sourceFiles
+        source_files: input.sourceFiles,
+        structure_filter: input.structureFilter ?? null
       })
     }
   );
@@ -1328,6 +1517,7 @@ export async function transformPatternStructure(
     currentStructure: string;
     newStructure: string;
     sourceFiles: string[];
+    structureFilter?: StructureFilter | null;
   },
   onProgress?: (progress: PatternStructureProgress) => void
 ) {
@@ -1340,7 +1530,8 @@ export async function transformPatternStructure(
         new_template: input.newTemplate,
         current_structure: input.currentStructure,
         new_structure: input.newStructure,
-        source_files: input.sourceFiles
+        source_files: input.sourceFiles,
+        structure_filter: input.structureFilter ?? null
       })
     }
   );

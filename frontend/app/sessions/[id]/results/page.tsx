@@ -1,12 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   AlertCircle,
   ArrowUpDown,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Clipboard,
   Download,
   ExternalLink,
@@ -67,8 +76,16 @@ import {
   getMismatchedUrls,
   getPatternSamples,
   getPatternSourceFiles,
+  getPatternStructures,
   getPatterns,
   getProblemUrlCount,
+  getVerificationStatus,
+  getVerifiedUrls,
+  startUrlVerification,
+  deleteVerifiedUrls,
+  type PatternStructuresResponse,
+  type StructureFilter,
+  type VerificationStatus,
   getSession,
   getDeleteProblemUrlsStatus,
   getTrailingSlashStatus,
@@ -157,7 +174,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 
-type PatternStatus = "GOOD" | "WARNING" | "BAD" | "UNKNOWN";
+import { showFixButton, type PatternStatus } from "@/lib/fix-visibility";
 type StatusFilter = "ALL" | "GOOD" | "WARNING" | "BAD";
 
 // Per-column layout hints consumed by the table th/td renderers. A fixed
@@ -830,6 +847,27 @@ export default function ResultsDashboardPage({
   );
   const [isLoadingRenameFiles, setIsLoadingRenameFiles] = useState(false);
   const [isRenaming, setIsRenaming] = useState(false);
+  // Scope for the Update Pattern modal (v1.49): when set, the rename/transform
+  // applies ONLY to URLs of this detected structure — the backend ANDs the
+  // filter into its matchers, other structures under the same pattern are
+  // untouched. Set by the per-structure Edit buttons in the expander row;
+  // openRenameModal resets it on every open.
+  const [renameStructureScope, setRenameStructureScope] = useState<{
+    filter: StructureFilter;
+    label: string;
+    urlCount: number;
+  } | null>(null);
+  // Structures expander (v1.49): which pattern row is expanded, plus a
+  // per-pattern cache of detected structures so re-expanding is instant.
+  const [expandedStructuresId, setExpandedStructuresId] = useState<
+    string | null
+  >(null);
+  const [structuresByPattern, setStructuresByPattern] = useState<
+    Record<string, PatternStructuresResponse>
+  >({});
+  const [structuresLoadingId, setStructuresLoadingId] = useState<string | null>(
+    null
+  );
   // Live "N of M files rewritten" for whichever structure operation is running.
   // Rename / transform / transform-undo are background jobs (they rewrite every
   // file the pattern spans), so the button reports progress instead of just
@@ -864,6 +902,21 @@ export default function ResultsDashboardPage({
   const [fixPatternTotal, setFixPatternTotal] = useState(0);
   const [fixLoading, setFixLoading] = useState(false);
   const [fixInferredWithoutRule, setFixInferredWithoutRule] = useState(false);
+  // Verify-then-act state for the Fix modal (v1.49): session-level verification
+  // status, THIS pattern's verified per-status counts, and the status-chip
+  // selection driving "delete every URL of that code in this pattern".
+  const [fixVerification, setFixVerification] =
+    useState<VerificationStatus | null>(null);
+  const [fixVerifiedCounts, setFixVerifiedCounts] = useState<Record<
+    number,
+    number
+  > | null>(null);
+  const [fixVerifyPolling, setFixVerifyPolling] = useState(false);
+  const [fixVerifyError, setFixVerifyError] = useState<string | null>(null);
+  const [fixDeleteStatuses, setFixDeleteStatuses] = useState<Set<number>>(
+    new Set()
+  );
+  const [fixVerifiedDeleting, setFixVerifiedDeleting] = useState(false);
   // Per-row action (v1.42.1): "fix" (adopt the redirect destination), "delete"
   // (remove the source URL — for not-found destinations), or "skip" (leave it
   // untouched — the inferred-row default). Keyed by candidate.key.
@@ -1355,6 +1408,25 @@ export default function ResultsDashboardPage({
         meta: { minWidth: "220px", sticky: true } satisfies PatternColumnMeta,
         cell: ({ row }) => (
           <div className="flex items-center gap-1">
+            {row.original.template.includes("{param}") ? (
+              <button
+                type="button"
+                aria-label={`Show URL structures inside ${row.original.template}`}
+                aria-expanded={expandedStructuresId === row.original.id}
+                title="Show distinct URL structures"
+                className="shrink-0 rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-indigo-600"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void togglePatternStructures(row.original);
+                }}
+              >
+                {expandedStructuresId === row.original.id ? (
+                  <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+              </button>
+            ) : null}
             <span
               className="min-w-0 flex-1 truncate font-medium"
               title={row.original.template}
@@ -1448,7 +1520,7 @@ export default function ResultsDashboardPage({
         enableSorting: false,
         meta: { width: "60px" } satisfies PatternColumnMeta,
         cell: ({ row }) =>
-          row.original.hasRedirects ? (
+          showFixButton(row.original) ? (
             <button
               type="button"
               aria-label={`Fix redirects for ${row.original.template}`}
@@ -1530,7 +1602,7 @@ export default function ResultsDashboardPage({
       }
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [undoingRenameId, downloadingSitemapId]
+    [undoingRenameId, downloadingSitemapId, expandedStructuresId]
   );
 
   const table = useReactTable({
@@ -1693,12 +1765,60 @@ export default function ResultsDashboardPage({
     }
   }
 
+  // Fetch (once) and toggle the detected-structures expander for a pattern row.
+  async function togglePatternStructures(rowData: PatternRow) {
+    if (expandedStructuresId === rowData.id) {
+      setExpandedStructuresId(null);
+
+      return;
+    }
+
+    setExpandedStructuresId(rowData.id);
+
+    if (structuresByPattern[rowData.id]) {
+      return;
+    }
+
+    setStructuresLoadingId(rowData.id);
+
+    try {
+      const structures = await getPatternStructures(params.id, rowData.id);
+
+      setStructuresByPattern((current) => ({
+        ...current,
+        [rowData.id]: structures
+      }));
+    } catch {
+      setExpandedStructuresId((current) =>
+        current === rowData.id ? null : current
+      );
+      setFindReplaceToast({
+        tone: "error",
+        message: "Unable to load URL structures for this pattern."
+      });
+    } finally {
+      setStructuresLoadingId((current) =>
+        current === rowData.id ? null : current
+      );
+    }
+  }
+
   async function openRenameModal(
     rowData: PatternRow,
-    options: { fromDrawer?: boolean } = {}
+    options: {
+      fromDrawer?: boolean;
+      structureScope?: {
+        filter: StructureFilter;
+        label: string;
+        urlCount: number;
+      } | null;
+    } = {}
   ) {
     setFindReplaceToast(null);
     setRenameRow(rowData);
+    // Reset on EVERY open: an unscoped Edit right after a scoped one must not
+    // inherit the previous scope.
+    setRenameStructureScope(options.structureScope ?? null);
 
     // Pre-populate the URL-structure fields from the pattern that's already on
     // screen, with {param} → {A}, {B}, {C}… so the user edits from a starting
@@ -1823,22 +1943,37 @@ export default function ResultsDashboardPage({
         renameRow.id,
         {
           newTemplate: renameValue,
-          sourceFiles: Array.from(selectedRenameFiles)
+          sourceFiles: Array.from(selectedRenameFiles),
+          structureFilter: renameStructureScope?.filter ?? null
         },
         setStructureProgress
       );
 
       await loadResults({ silent: true });
+      // A scoped edit changes the structure makeup — drop the cache so the
+      // expander refetches fresh clusters next open.
+      if (renameStructureScope) {
+        setStructuresByPattern((current) => {
+          const next = { ...current };
+
+          delete next[renameRow.id];
+
+          return next;
+        });
+      }
+
       setRenameRow(null);
       setFindReplaceToast({
         tone: "success",
         message: result.already_completed
           ? "This rename had already finished — showing the result of that run."
-          : `Pattern renamed — ${formatNumber(
-              result.occurrence_count
-            )} occurrences across ${result.source_files_count} file${
-              result.source_files_count === 1 ? "" : "s"
-            }`
+          : renameStructureScope
+            ? `Renamed the ${renameStructureScope.label} URLs — other structures under this pattern were left untouched.`
+            : `Pattern renamed — ${formatNumber(
+                result.occurrence_count
+              )} occurrences across ${result.source_files_count} file${
+                result.source_files_count === 1 ? "" : "s"
+              }`
       });
     } catch (nextError) {
       setFindReplaceToast({
@@ -1904,12 +2039,23 @@ export default function ResultsDashboardPage({
           newTemplate: renameValue,
           currentStructure: transformCurrentStructure,
           newStructure: transformNewStructure,
-          sourceFiles: Array.from(selectedRenameFiles)
+          sourceFiles: Array.from(selectedRenameFiles),
+          structureFilter: renameStructureScope?.filter ?? null
         },
         setStructureProgress
       );
 
       await loadResults({ silent: true });
+      if (renameStructureScope) {
+        setStructuresByPattern((current) => {
+          const next = { ...current };
+
+          delete next[renameRow.id];
+
+          return next;
+        });
+      }
+
       setRenameRow(null);
       setFindReplaceToast({
         tone: "success",
@@ -2328,6 +2474,217 @@ export default function ResultsDashboardPage({
       cancelled = true;
     };
   }, [params.id, fixPatternId]);
+
+  // The problem statuses the verified chips cover — mirrors the backend's
+  // PROBLEM_STATUSES and the Delete Problem URLs dialog.
+  const FIX_PROBLEM_STATUSES = useMemo(() => [301, 302, 307, 308, 404], []);
+
+  // This pattern's verified per-status totals (full population, not samples).
+  const loadFixVerifiedCounts = useCallback(
+    async (patternId: string) => {
+      const entries = await Promise.all(
+        FIX_PROBLEM_STATUSES.map(async (code) => {
+          const result = await getVerifiedUrls(params.id, patternId, {
+            statuses: [code],
+            limit: 1
+          });
+
+          return [code, result.total] as const;
+        })
+      );
+
+      return Object.fromEntries(entries) as Record<number, number>;
+    },
+    [params.id, FIX_PROBLEM_STATUSES]
+  );
+
+  // On Fix-modal open: pick up the verification state; with a fresh
+  // verification, load this pattern's verified counts so the chips show the
+  // real population sizes. Resumes the progress display for an in-flight run.
+  useEffect(() => {
+    if (!fixPatternId) {
+      return;
+    }
+
+    let cancelled = false;
+
+    setFixVerification(null);
+    setFixVerifiedCounts(null);
+    setFixVerifyError(null);
+    setFixDeleteStatuses(new Set());
+
+    void (async () => {
+      try {
+        const status = await getVerificationStatus(params.id);
+
+        if (cancelled) {
+          return;
+        }
+
+        setFixVerification(status);
+
+        if (
+          status.job &&
+          (status.job.status === "PENDING" || status.job.status === "RUNNING")
+        ) {
+          setFixVerifyPolling(true);
+        } else if (status.verified_at) {
+          const counts = await loadFixVerifiedCounts(fixPatternId);
+
+          if (!cancelled) {
+            setFixVerifiedCounts(counts);
+          }
+        }
+      } catch {
+        // Non-fatal: the modal still works rule-based.
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [params.id, fixPatternId, loadFixVerifiedCounts]);
+
+  // Poll a running verification while the Fix modal is open.
+  useEffect(() => {
+    if (!fixVerifyPolling || !fixPatternId) {
+      return;
+    }
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+
+    const tick = async () => {
+      try {
+        const status = await getVerificationStatus(params.id);
+
+        if (cancelled) {
+          return;
+        }
+
+        setFixVerification(status);
+
+        if (
+          status.job &&
+          (status.job.status === "PENDING" || status.job.status === "RUNNING")
+        ) {
+          timer = setTimeout(tick, 1500);
+        } else if (status.job?.status === "FAILED") {
+          setFixVerifyError(status.job.error ?? "Verification failed.");
+          setFixVerifyPolling(false);
+        } else {
+          // Load the counts BEFORE flipping the polling flag: the flip re-runs
+          // this effect, whose cleanup sets `cancelled` — any set-state gated on
+          // it after that point would be silently dropped.
+          const counts = await loadFixVerifiedCounts(fixPatternId);
+
+          if (cancelled) {
+            return;
+          }
+
+          setFixVerifiedCounts(counts);
+          setFixVerifyPolling(false);
+          await loadMaintenanceState();
+        }
+      } catch {
+        if (!cancelled) {
+          timer = setTimeout(tick, 1500);
+        }
+      }
+    };
+
+    void tick();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [
+    fixVerifyPolling,
+    fixPatternId,
+    params.id,
+    loadFixVerifiedCounts,
+    loadMaintenanceState
+  ]);
+
+  async function handleFixVerify() {
+    setFixVerifyError(null);
+
+    try {
+      await startUrlVerification(params.id);
+      setFixVerifyPolling(true);
+    } catch (nextError) {
+      setFixVerifyError(
+        friendlyApiErrorMessage(nextError, "Unable to start verification.")
+      );
+    }
+  }
+
+  function toggleFixDeleteStatus(code: number) {
+    setFixDeleteStatuses((current) => {
+      const next = new Set(current);
+
+      if (next.has(code)) {
+        next.delete(code);
+      } else {
+        next.add(code);
+      }
+
+      return next;
+    });
+  }
+
+  // Delete EVERY verified URL of the selected status codes in this pattern —
+  // across all uploaded files, not the sampled preview. Verified counts make
+  // the button label the true population size.
+  async function handleDeleteVerifiedUrls() {
+    if (!fixRow || fixVerifiedDeleting) {
+      return;
+    }
+
+    const statuses =
+      fixDeleteStatuses.size > 0
+        ? FIX_PROBLEM_STATUSES.filter((code) => fixDeleteStatuses.has(code))
+        : FIX_PROBLEM_STATUSES;
+
+    setFixVerifiedDeleting(true);
+    setFixVerifyError(null);
+
+    try {
+      await deleteVerifiedUrls(params.id, fixRow.id, statuses);
+
+      // Wait for the maintenance job so the toast reports the real count.
+      for (;;) {
+        const { job } = await getDeleteProblemUrlsStatus(params.id);
+
+        if (!job || !["PENDING", "RUNNING", "UNDOING"].includes(job.status)) {
+          if (job?.status === "FAILED") {
+            throw new Error(job.error ?? "The deletion failed.");
+          }
+
+          setFindReplaceToast({
+            tone: "success",
+            message: `Deleted ${formatNumber(
+              Number(job?.items_changed ?? 0)
+            )} verified URLs (${statuses.join(", ")}) from this pattern's files.`
+          });
+          break;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+
+      setFixRow(null);
+      await loadResults({ silent: true });
+      await loadMaintenanceState();
+    } catch (nextError) {
+      setFixVerifyError(
+        friendlyApiErrorMessage(nextError, "Unable to delete verified URLs.")
+      );
+    } finally {
+      setFixVerifiedDeleting(false);
+    }
+  }
 
   function setFixAction(key: string, action: FixAction) {
     setFixActions((current) => ({ ...current, [key]: action }));
@@ -3787,8 +4144,8 @@ export default function ResultsDashboardPage({
                     <tbody>
                       {table.getRowModel().rows.length > 0 ? (
                         table.getRowModel().rows.map((row) => (
+                          <Fragment key={row.id}>
                           <tr
-                            key={row.id}
                             data-pattern-row={row.original.id}
                             tabIndex={0}
                             className="group cursor-pointer border-b border-slate-100 odd:bg-slate-50 even:bg-white transition-colors hover:bg-indigo-50/60 focus:bg-indigo-50/60 focus:outline-none"
@@ -3828,6 +4185,119 @@ export default function ResultsDashboardPage({
                               );
                             })}
                           </tr>
+                          {expandedStructuresId === row.original.id ? (
+                            <tr
+                              data-structures-row={row.original.id}
+                              className="border-b border-slate-100 bg-indigo-50/30"
+                            >
+                              <td colSpan={columns.length} className="px-6 py-3">
+                                {structuresLoadingId === row.original.id ? (
+                                  <div className="flex items-center gap-2 py-2 text-sm text-slate-500">
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                    Detecting URL structures…
+                                  </div>
+                                ) : (
+                                  (() => {
+                                    const structures =
+                                      structuresByPattern[row.original.id];
+                                    const positions =
+                                      structures?.positions.filter(
+                                        (position) =>
+                                          position.clusters.length > 0
+                                      ) ?? [];
+
+                                    if (positions.length === 0) {
+                                      return (
+                                        <p className="py-2 text-sm text-slate-500">
+                                          No URL structures detected for this
+                                          pattern.
+                                        </p>
+                                      );
+                                    }
+
+                                    return (
+                                      <div className="space-y-3">
+                                        <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                                          Distinct URL structures detected in{" "}
+                                          {structures?.url_pool_size ?? 0} real
+                                          URLs — edit each independently
+                                        </p>
+                                        {positions.map((position) => (
+                                          <ul
+                                            key={position.segmentIndex}
+                                            className="space-y-1"
+                                          >
+                                            {position.clusters.map((cluster) => {
+                                              const anchor = cluster.anchor;
+
+                                              return (
+                                              <li
+                                                key={`${position.segmentIndex}:${cluster.label}`}
+                                                className="flex flex-wrap items-center gap-3 rounded-md border border-slate-200 bg-white px-3 py-2"
+                                              >
+                                                <code className="font-mono text-sm text-slate-800">
+                                                  {cluster.label}
+                                                </code>
+                                                <span className="text-xs text-slate-500">
+                                                  {formatNumber(cluster.urlCount)}{" "}
+                                                  URL{cluster.urlCount === 1 ? "" : "s"}
+                                                </span>
+                                                <span
+                                                  className="min-w-0 flex-1 truncate text-xs text-slate-400"
+                                                  title={cluster.examples.join(", ")}
+                                                >
+                                                  e.g. {cluster.examples.join(", ")}
+                                                </span>
+                                                {anchor ? (
+                                                  <button
+                                                    type="button"
+                                                    className="inline-flex shrink-0 items-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-xs font-semibold text-indigo-700 hover:bg-indigo-100"
+                                                    onClick={(event) => {
+                                                      event.stopPropagation();
+                                                      void openRenameModal(
+                                                        row.original,
+                                                        {
+                                                          structureScope: {
+                                                            filter: {
+                                                              param_index:
+                                                                position.paramIndex,
+                                                              anchor:
+                                                                anchor.direction,
+                                                              value: anchor.value
+                                                            },
+                                                            label: cluster.label,
+                                                            urlCount:
+                                                              cluster.urlCount
+                                                          }
+                                                        }
+                                                      );
+                                                    }}
+                                                  >
+                                                    <Pencil
+                                                      className="h-3 w-3"
+                                                      aria-hidden="true"
+                                                    />
+                                                    Edit
+                                                  </button>
+                                                ) : (
+                                                  <span className="shrink-0 text-xs text-slate-400">
+                                                    no shared anchor — edit via
+                                                    the whole pattern
+                                                  </span>
+                                                )}
+                                              </li>
+                                              );
+                                            })}
+                                          </ul>
+                                        ))}
+                                      </div>
+                                    );
+                                  })()
+                                )}
+                              </td>
+                            </tr>
+                          ) : null}
+                          </Fragment>
                         ))
                       ) : (
                         <tr>
@@ -4184,6 +4654,134 @@ export default function ResultsDashboardPage({
                   too varied to infer a single rewrite rule for the rest.
                 </p>
               ) : null}
+              {/* Verify-then-act (v1.49): status-code groups over the VERIFIED
+                  full population of this pattern. Selecting codes + Delete
+                  removes every such URL from all uploaded files. */}
+              <div
+                className="space-y-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2"
+                data-testid="fix-verified-section"
+              >
+                <p className="text-sm font-semibold text-slate-700">
+                  Delete by status code (full population)
+                </p>
+                {fixVerifyPolling ? (
+                  <div className="space-y-2">
+                    <p className="flex items-center gap-2 text-sm text-indigo-900">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Verifying{" "}
+                      {formatNumber(fixVerification?.job?.urls_done ?? 0)} of{" "}
+                      {formatNumber(fixVerification?.job?.urls_total ?? 0)} URLs…
+                    </p>
+                    <Progress
+                      value={
+                        (fixVerification?.job?.urls_total ?? 0) > 0
+                          ? Math.round(
+                              ((fixVerification?.job?.urls_done ?? 0) /
+                                (fixVerification?.job?.urls_total ?? 1)) *
+                                100
+                            )
+                          : 0
+                      }
+                    />
+                  </div>
+                ) : fixVerifiedCounts &&
+                  fixVerification?.verified_at &&
+                  !fixVerification.stale ? (
+                  <>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setFixDeleteStatuses(new Set())}
+                        className={`rounded-full px-3 py-1 text-xs font-medium ${
+                          fixDeleteStatuses.size === 0
+                            ? "bg-slate-800 text-white"
+                            : "bg-white text-slate-600 ring-1 ring-slate-200"
+                        }`}
+                      >
+                        All ·{" "}
+                        {formatNumber(
+                          Object.values(fixVerifiedCounts).reduce(
+                            (sum, count) => sum + count,
+                            0
+                          )
+                        )}
+                      </button>
+                      {FIX_PROBLEM_STATUSES.map((code) => (
+                        <button
+                          key={code}
+                          type="button"
+                          onClick={() => toggleFixDeleteStatus(code)}
+                          className={`rounded-full px-3 py-1 text-xs font-medium ${
+                            fixDeleteStatuses.has(code)
+                              ? "bg-slate-800 text-white"
+                              : "bg-white text-slate-600 ring-1 ring-slate-200"
+                          }`}
+                        >
+                          {code} · {formatNumber(fixVerifiedCounts[code] ?? 0)}
+                        </button>
+                      ))}
+                    </div>
+                    {(() => {
+                      const selected =
+                        fixDeleteStatuses.size > 0
+                          ? FIX_PROBLEM_STATUSES.filter((code) =>
+                              fixDeleteStatuses.has(code)
+                            )
+                          : FIX_PROBLEM_STATUSES;
+                      const targetCount = selected.reduce(
+                        (sum, code) => sum + (fixVerifiedCounts[code] ?? 0),
+                        0
+                      );
+
+                      return (
+                        <Button
+                          type="button"
+                          variant="destructive"
+                          size="sm"
+                          className="gap-1"
+                          disabled={targetCount === 0 || fixVerifiedDeleting}
+                          onClick={() => void handleDeleteVerifiedUrls()}
+                        >
+                          {fixVerifiedDeleting ? (
+                            <>
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              Deleting…
+                            </>
+                          ) : (
+                            <>
+                              <Trash2 className="h-3.5 w-3.5" />
+                              Delete all {formatNumber(targetCount)} matching URL
+                              {targetCount === 1 ? "" : "s"} from every file
+                            </>
+                          )}
+                        </Button>
+                      );
+                    })()}
+                  </>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="min-w-0 flex-1 text-xs text-slate-600">
+                      {fixVerification?.verified_at && fixVerification.stale
+                        ? "Files changed since the last verification — re-verify to act on exact per-status counts."
+                        : "HTTP-check every URL in this session's files to select and delete by exact status code."}
+                    </p>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="shrink-0"
+                      onClick={() => void handleFixVerify()}
+                    >
+                      {fixVerification?.verified_at
+                        ? "Re-verify all URLs"
+                        : "Verify all URLs"}
+                    </Button>
+                  </div>
+                )}
+                {fixVerifyError ? (
+                  <p className="text-xs text-red-500">{fixVerifyError}</p>
+                ) : null}
+              </div>
               <div className="rounded-md border border-slate-200">
                 <div className="flex items-center justify-between border-b border-slate-200 px-3 py-2">
                   <button
@@ -4443,6 +5041,20 @@ export default function ResultsDashboardPage({
                 across selected source files.
               </DialogDescription>
             </DialogHeader>
+            {renameStructureScope ? (
+              <div
+                className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm text-indigo-900"
+                data-testid="structure-scope-badge"
+              >
+                Scoped to{" "}
+                <code className="font-mono font-semibold">
+                  {renameStructureScope.label}
+                </code>{" "}
+                ({formatNumber(renameStructureScope.urlCount)} URL
+                {renameStructureScope.urlCount === 1 ? "" : "s"}) — other
+                structures under this pattern will not be touched.
+              </div>
+            ) : null}
             {transformStep === "form" ? (
               <div className="space-y-4">
                 <div className="space-y-1">
