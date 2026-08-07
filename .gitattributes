@@ -1,0 +1,54 @@
+# Line endings, pinned by the REPOSITORY rather than by each machine's git
+# config.
+#
+# WHY THIS FILE EXISTS. Every text blob committed here is LF, but the worktree
+# on a Windows checkout is CRLF, because core.autocrlf=true is set in this
+# machine's global and system git config. Those two facts are only compatible
+# while the reading git actually applies that config: it converts CRLF back to
+# LF when comparing, so the file reads as unchanged.
+#
+# A git that does NOT see that config — WSL reading /mnt, a GUI client with a
+# bundled git, a CI container, `git -c core.autocrlf=false` — does no such
+# conversion, so it sees a CRLF worktree against an LF index and reports EVERY
+# LINE of the file as deleted and re-added. That produced a 273-file,
+# ~70,900-line phantom diff on a branch whose real change was 8 files, and it
+# hid the actual review behind pure noise. (It also only appears for files whose
+# stat cache has gone stale, which is why the count moves around and why it can
+# look like something just rewrote the tree. Nothing had.)
+#
+# `text=auto` fixes it because it forces checkin normalisation REGARDLESS of
+# core.autocrlf: every git now converts to LF on the way in, so every git agrees
+# the file is unchanged. Deliberately no global `eol=` — that would additionally
+# pin the working copy and rewrite ~266 files on disk for no benefit, since the
+# index is already LF and the diff is what needed fixing.
+* text=auto
+
+# Windows batch files are the one real exception: cmd.exe can mis-parse a .bat
+# with LF endings (a label or a multi-line block can be read wrong), so these
+# must land CRLF in the working copy. Stored LF in the repo like everything
+# else — matching what is already committed for scripts/update.bat and
+# start-stop.bat.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Shell scripts are the mirror image: a CRLF shebang line breaks execution on
+# Linux, and these run inside the containers.
+*.sh text eol=lf
+
+# Never touch these. They are already detected as binary today (the five files
+# under apps/seo-desk), but detection is a heuristic and a corrupted font or
+# image is not obvious in review — so it is stated rather than inferred.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.xlsx binary
