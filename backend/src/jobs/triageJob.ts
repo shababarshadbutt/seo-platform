@@ -78,7 +78,7 @@ async function probePlan(
 
   await runWithBoundedConcurrency(
     items,
-    verifyConcurrency(session.concurrency),
+    verifyConcurrency(),
     async (item, index) => {
       const result = await probeUrl(
         session.base_url,

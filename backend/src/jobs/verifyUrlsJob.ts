@@ -221,7 +221,7 @@ export async function processVerifyUrlsJob(
         // in the logs — the whole scoping fix was diagnosed from the fact that
         // urls_total, not enumeration, was the number out of proportion.
         enumerate_ms: enumerateMs,
-        concurrency: verifyConcurrency(session.concurrency)
+        concurrency: verifyConcurrency()
       },
       "verify urls: population enumerated, checking started"
     );
@@ -234,11 +234,11 @@ export async function processVerifyUrlsJob(
 
     await runWithBoundedConcurrency(
       toCheck,
-      // Clamped to config.verification.maxConcurrency. sessions.concurrency can
-      // be set as high as 30, which is a defensible burst for a 20-URL sample
-      // and is not defensible for a sustained sweep of someone else's
-      // production origin. Rate is bounded separately, inside probeUrl.
-      verifyConcurrency(session.concurrency),
+      // config.verification.maxConcurrency, independent of sessions.concurrency
+      // (which sizes the SAMPLER's burst). Load is bounded separately and
+      // per-request by the rate limiter inside probeUrl, so this is a throughput
+      // parameter rather than a politeness one — see verifyConcurrency.
+      verifyConcurrency(),
       async (entry, index) => {
         // The loc itself is passed as source_url, so resolveSampleTarget applies
         // the same www-equivalence rule sampling uses when base_url and the

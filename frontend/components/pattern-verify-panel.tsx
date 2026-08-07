@@ -60,6 +60,15 @@ type Props = {
   // Called after a delete completes so the parent can refresh results and
   // close the modal.
   onDeleted: (message: string) => void;
+  // The status-chip selection, OWNED BY THE PARENT (v1.52).
+  //
+  // It used to be local state here, which made the chips look like a filter
+  // while filtering nothing: the URL list they sit above lives in the parent,
+  // so selecting 404 changed the delete target and the chip styling but left
+  // the list showing every status. Lifting it is what connects the two.
+  // Empty = all problem statuses.
+  selectedStatuses: Set<number>;
+  onSelectedStatusesChange: (next: Set<number>) => void;
 };
 
 function formatNumber(value: number) {
@@ -79,6 +88,28 @@ function formatRate(rate: number) {
   return `${percent < 0.1 ? percent.toFixed(2) : percent.toFixed(1)}%`;
 }
 
+// "about 4 minutes", "about 1 hour 20 minutes". Deliberately coarse: the rate
+// drifts with the mix of statuses still to come, so minute-level precision on a
+// 40-minute estimate would be false confidence.
+function formatEta(seconds: number) {
+  if (seconds < 60) {
+    return "under a minute";
+  }
+
+  const minutes = Math.round(seconds / 60);
+
+  if (minutes < 60) {
+    return `about ${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+
+  return `about ${hours} hour${hours === 1 ? "" : "s"}${
+    rest > 0 ? ` ${rest} minute${rest === 1 ? "" : "s"}` : ""
+  }`;
+}
+
 function statusLabel(codes: number[]) {
   if (codes.length === 0 || codes.length === PROBLEM_STATUSES.length) {
     return "problem";
@@ -91,22 +122,35 @@ export function PatternVerifyPanel({
   sessionId,
   patternId,
   template,
-  onDeleted
+  onDeleted,
+  selectedStatuses,
+  onSelectedStatusesChange
 }: Props) {
   const [verification, setVerification] = useState<VerificationStatus | null>(
     null
   );
   const [triage, setTriage] = useState<TriageRun | null>(null);
-  const [selected, setSelected] = useState<Set<number>>(new Set());
   const [error, setError] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [showStrata, setShowStrata] = useState(false);
   // Guards the initial load so a slow first fetch cannot overwrite state from a
   // Verify the user started in the meantime.
   const loadedForPattern = useRef<string | null>(null);
+  // First (time, urls_done) seen for the CURRENT job, which is what turns
+  // progress into a time estimate. Anchored per job id so re-opening the modal
+  // on a run already in flight starts a fresh measurement instead of dividing
+  // by the whole elapsed time of a run it did not watch.
+  const progressAnchor = useRef<{
+    jobId: string;
+    at: number;
+    done: number;
+  } | null>(null);
+  const [etaSeconds, setEtaSeconds] = useState<number | null>(null);
 
   // Empty selection means "every problem status" — same convention as the
   // Delete Problem URLs dialog, so the two read the same way.
+  const selected = selectedStatuses;
+  const setSelected = onSelectedStatusesChange;
   const effectiveStatuses = useMemo(
     () =>
       selected.size > 0
@@ -130,6 +174,39 @@ export function PatternVerifyPanel({
     setVerification(nextVerification);
     setTriage(nextTriage.run);
 
+    // Time remaining, from the rate this run is ACTUALLY achieving rather than
+    // from the configured ceiling. The two differ: one URL check costs one or
+    // two HTTP requests depending on what the URL returns, so a redirect-heavy
+    // pattern moves at roughly half the checks/second of a 404-heavy one under
+    // the same request budget. Measuring beats predicting.
+    const job = nextVerification.job;
+
+    if (job && IN_FLIGHT.includes(job.status) && job.urls_total > 0) {
+      const now = Date.now();
+      const anchor = progressAnchor.current;
+
+      if (!anchor || anchor.jobId !== job.id) {
+        progressAnchor.current = { jobId: job.id, at: now, done: job.urls_done };
+        setEtaSeconds(null);
+      } else {
+        const elapsed = (now - anchor.at) / 1000;
+        const completed = job.urls_done - anchor.done;
+
+        // Needs a real sample before quoting a number — a couple of polls in,
+        // one flush of the progress counter makes the rate look infinite.
+        if (elapsed >= 10 && completed > 0) {
+          const perSecond = completed / elapsed;
+
+          setEtaSeconds(
+            Math.max(0, Math.round((job.urls_total - job.urls_done) / perSecond))
+          );
+        }
+      }
+    } else {
+      progressAnchor.current = null;
+      setEtaSeconds(null);
+    }
+
     return { verification: nextVerification, triage: nextTriage.run };
   }, [sessionId, patternId]);
 
@@ -141,7 +218,6 @@ export function PatternVerifyPanel({
     loadedForPattern.current = patternId;
     setVerification(null);
     setTriage(null);
-    setSelected(new Set());
     setError("");
     setShowStrata(false);
 
@@ -314,17 +390,15 @@ export function PatternVerifyPanel({
   }
 
   function toggleStatus(code: number) {
-    setSelected((current) => {
-      const next = new Set(current);
+    const next = new Set(selected);
 
-      if (next.has(code)) {
-        next.delete(code);
-      } else {
-        next.add(code);
-      }
+    if (next.has(code)) {
+      next.delete(code);
+    } else {
+      next.add(code);
+    }
 
-      return next;
-    });
+    setSelected(next);
   }
 
   // Chip text carries the MODE in the number itself: a bare count is confirmed,
@@ -403,7 +477,23 @@ export function PatternVerifyPanel({
             }
           />
           <p className="text-xs text-indigo-800/80">
-            Rate-limited so the check cannot overload the site being crawled.
+            {etaSeconds !== null ? (
+              <>
+                <span className="font-semibold">
+                  {formatEta(etaSeconds)} remaining
+                </span>{" "}
+                ·{" "}
+              </>
+            ) : null}
+            Deliberately rate-limited so the check cannot overload the site
+            being crawled — this is the speed, not a stall.
+          </p>
+          {/* Background verification already worked: the job runs server-side
+              and re-attaches on reopen. It was simply never said, so a user
+              watching a 40-minute bar had no reason to think they could leave. */}
+          <p className="text-xs text-indigo-800/80">
+            You can close this and keep working — it keeps running, and
+            reopening this pattern shows the progress again.
           </p>
         </div>
       ) : triageRunning ? (

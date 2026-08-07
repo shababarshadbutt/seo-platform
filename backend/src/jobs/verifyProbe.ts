@@ -16,25 +16,45 @@ import { resolveSampleTarget } from "./sampleTarget.js";
 // the sampler and a different one from the verifier — with the per-host rate
 // limiter in front of it.
 //
-// The slot is taken BEFORE the request and covers the whole check, including
-// checkSampleUrl's internal follow-up requests (the soft-404 GET on a 2xx, the
-// redirect follow on a 3xx). That makes the configured rate a limit on CHECKS
-// rather than strictly on requests, so the true request rate can reach roughly
-// 2x the configured value on a population that is mostly 2xx. That is a
-// deliberate simplification, and it is why maxRequestsPerSecond is set to 25
-// against a measured ~35/s baseline rather than to something at the edge —
-// there is headroom for the multiplier inside the number.
+// A slot is charged PER HTTP REQUEST, not per check (fixed v1.52).
+//
+// It used to be one slot per check, on the reasoning that the multiplier was
+// small and the configured number had headroom for it. That was wrong, and
+// measurably so: one check is 1-2 requests (HEAD, plus a soft-404 GET on a 2xx
+// or a follow-up HEAD on a 3xx), so on a redirect-heavy pattern the origin saw
+// nearly double the configured rate. MEASURED at 49.17 requests/second against
+// a 25/s ceiling (bench/verifyThroughput.ts, 1,200 URLs, 25ms origin, 70% 301).
+//
+// It looked fine in earlier testing only by accident: against a 300ms origin,
+// concurrency 8 capped throughput at ~13 checks/s before the limiter ever
+// engaged, so the request rate landed near 25 by coincidence rather than by
+// control. The protection was a function of how slow the target happened to be.
+//
+// Charging per request makes the configured number mean what it says — the rate
+// the target actually experiences — which is the precondition for any informed
+// decision about raising it.
 //
 // Pacing keys on the RESOLVED target host, not the session's base_url, because
 // resolveSampleTarget can send the probe to a different host than base_url
 // names (the www-equivalence rule). The host actually receiving the traffic is
 // the host whose budget must be charged.
 
-export function verifyConcurrency(sessionConcurrency: number): number {
-  return Math.max(
-    1,
-    Math.min(sessionConcurrency, config.verification.maxConcurrency)
-  );
+// Verification's own concurrency, deliberately NOT derived from
+// sessions.concurrency (v1.52).
+//
+// It used to be min(session, config), which quietly made the sampler's knob the
+// governor: sessions.concurrency defaults to 10, so raising the verification cap
+// to 16 changed nothing and raising the rate ceiling to 50/s changed nothing
+// either — MEASURED at 31.7 req/s with max-in-flight pinned at 10 against a
+// 50/s ceiling.
+//
+// The two settings are about different operations. sessions.concurrency sizes
+// the SAMPLER's burst of 5-20 URLs per pattern. Verification is a sustained
+// sweep whose load is bounded by the per-request rate limiter, so its socket
+// count is a throughput parameter, not a politeness one — the politeness knob
+// is maxRequestsPerSecond, and it is enforced regardless of what this returns.
+export function verifyConcurrency(): number {
+  return Math.max(1, config.verification.maxConcurrency);
 }
 
 export async function probeUrl(
@@ -60,10 +80,22 @@ export async function probeUrl(
   }
 
   const target = resolveSampleTarget(baseUrl, path, sourceUrl);
-
-  await acquireHostSlot(rateLimitHostKey(target), verificationRateLimit());
+  const host = rateLimitHostKey(target);
 
   // checkSampleUrl never throws — failures come back classified
   // (timeout/ssl_cert/no_response), which is what we want persisted.
-  return checkSampleUrl(baseUrl, path, sourceUrl, userAgent, logger, context);
+  //
+  // The hook fires before each of the check's requests, including the follow-up
+  // ones, so a check that costs two requests spends two slots. Charging on the
+  // resolved target's host means a redirect that leaves the origin is billed to
+  // wherever it actually went.
+  return checkSampleUrl(baseUrl, path, sourceUrl, userAgent, logger, context, {
+    beforeRequest: () => acquireHostSlot(host, verificationRateLimit()),
+    // Verification exists to establish each URL's OWN status so delete-by-status
+    // can act on it. The follow-up HEAD on a redirect destination contributes
+    // only responseMs, which verified_urls does not store — finalUrl comes from
+    // the first response's Location header either way. Skipping it halves the
+    // request cost of a redirect-heavy pattern with byte-identical results.
+    skipRedirectFollow: true
+  });
 }

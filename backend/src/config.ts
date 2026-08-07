@@ -96,23 +96,43 @@ export const config = {
   //     That number is the thing to come in under. Anything at or above it
   //     would mean shipping a "protection" that protects nothing.
   //
-  // maxConcurrency 8 — simultaneous in-flight URL CHECKS. One check is 1-3 HTTP
-  // requests (HEAD, plus a soft-404 GET when the answer is 2xx or a follow when
-  // it is 3xx), so 8 checks is 8-24 sockets: twice the SFTP cap, and bracketing
-  // the sessions.concurrency default of 10 rather than exceeding it. This is
-  // also an upper clamp on sessions.concurrency, which a user may set to 30 —
-  // a value that is defensible for a 20-URL sample burst and is not defensible
-  // for a 25,744-URL sweep.
+  // maxConcurrency 16 — simultaneous in-flight URL checks, and an upper clamp on
+  // sessions.concurrency (which a user may set to 30, defensible for a 20-URL
+  // sample burst and not for a sustained sweep).
   //
-  // maxRequestsPerSecond 25 — the real governor, enforced per target host (see
-  // http/hostRateLimiter.ts). Below the ~35/s the broken run was already doing,
-  // so this strictly REDUCES load versus today. In absolute terms it is modest
-  // traffic for a production site — well under a typical Googlebot crawl rate,
-  // and a fraction of a percent of what a CDN-fronted origin serves — while
-  // still completing a 25,744-URL pattern in roughly 17 minutes rather than the
-  // hours a politeness-first 5/s would take. That trade is the whole reason the
-  // sample-triage layer exists: triage answers "is this worth 17 minutes?" in
-  // about ten seconds, so the expensive pass is only ever paid deliberately.
+  // CONCURRENCY AND RATE ARE COUPLED, and getting this wrong makes the rate
+  // setting a fiction. A check's requests are sequential, so sustaining R
+  // requests/second against an origin of latency L needs at least R x L requests
+  // in flight. At 50/s and a 300ms origin that is 15. MEASURED with this left at
+  // 8 after the ceiling went to 50: the run held 25.01 req/s against a 50/s
+  // ceiling and the limiter never engaged — concurrency was the entire
+  // constraint and raising the rate alone changed nothing.
+  //
+  // 16 is that floor plus headroom. It bounds SOCKETS, not load: load is bounded
+  // by maxRequestsPerSecond, which is metered per request and is the real
+  // governor. Raising this without raising the rate cannot increase traffic —
+  // the limiter still holds the rate, and the extra slots only stop latency from
+  // throttling a run below the rate it is already allowed. 16 simultaneous
+  // connections is modest for a production origin (a browser opens 6 per host).
+  //
+  // maxRequestsPerSecond 50 — the real governor, enforced per target host and
+  // counted per HTTP REQUEST (see http/hostRateLimiter.ts and verifyProbe.ts).
+  //
+  // Raised from 25 on the evidence already in hand, not on feel. The broken
+  // unbounded run sustained ~35 requests/second against a live client origin
+  // for 80 minutes with no reported incident, which is a real observation of
+  // what that infrastructure tolerates; 50 is above it but still under a
+  // typical Googlebot crawl rate and a fraction of a percent of what a
+  // CDN-fronted origin serves.
+  //
+  // Read this number together with the metering fix: it used to be charged per
+  // CHECK, and a check is 1-2 requests, so the OLD "25" delivered up to 49
+  // requests/second in practice (measured). The new 50 is therefore closer to a
+  // formalisation of the load already being sent than a doubling of it — the
+  // difference is that it is now the number the origin actually experiences,
+  // whatever the pattern's status mix.
+  //
+  // Lower it for a small origin. VERIFY_MAX_REQUESTS_PER_SECOND.
   //
   // rateLimitBurst 10 — idle credit only. Lets a small triage draw against an
   // idle host go out immediately instead of being paced over 30s to prove a
@@ -122,12 +142,12 @@ export const config = {
   // infrastructure, which is not knowable here. Lower them for a small origin.
   verification: {
     maxConcurrency: readNumber("VERIFY_MAX_CONCURRENCY", {
-      fallback: 8,
+      fallback: 16,
       min: 1,
       max: 32
     }),
     maxRequestsPerSecond: readNumber("VERIFY_MAX_REQUESTS_PER_SECOND", {
-      fallback: 25,
+      fallback: 50,
       min: 1,
       max: 200
     }),

@@ -116,6 +116,38 @@ export type SampleLogContext = {
   sampleIndex: number;
 };
 
+// Called immediately before EVERY outbound HTTP request this module makes.
+//
+// One "check" is not one request: a 2xx costs a HEAD plus a soft-404 GET, a 3xx
+// costs a HEAD plus a follow-up HEAD, and only a hard 404 costs one. Metering a
+// rate limit per CHECK therefore lets the real request rate reach ~2x the
+// configured number — MEASURED at 49.17 req/s against a 25 req/s ceiling on a
+// fast origin (bench/verifyThroughput.ts, 25ms latency, redirect-heavy mix).
+// That was invisible at 300ms only because concurrency capped throughput first.
+//
+// The hook lets the caller charge its budget per REQUEST, which is the unit the
+// target server actually experiences. Optional so pattern sampling — 5-20 URLs
+// in one burst — keeps its existing unpaced behaviour.
+export type BeforeRequestHook = () => Promise<void>;
+
+export type SampleCheckOptions = {
+  beforeRequest?: BeforeRequestHook;
+  // Skip the follow-up HEAD on a 3xx destination (v1.52).
+  //
+  // WHAT IT ACTUALLY COSTS: nothing that is read. finalUrl is derived from the
+  // FIRST response's Location header (resolveRedirectUrl), not from the
+  // follow-up, and the follow-up's own status/location are discarded — its
+  // result feeds `responseMs` alone. verified_urls does not persist responseMs,
+  // and destination_not_found is a URL heuristic (looksLikeNotFoundUrl) applied
+  // to the Location-derived value. So on the verification path this request was
+  // pure waste, and dropping it halves the request cost of a redirect-heavy
+  // pattern at identical output.
+  //
+  // Left OFF for pattern sampling, which stores response_ms per sampled URL and
+  // whose 5-20 URLs per pattern make the saving irrelevant anyway.
+  skipRedirectFollow?: boolean;
+};
+
 function firstHeaderValue(value: string | string[] | undefined) {
   if (Array.isArray(value)) {
     return value[0] ?? null;
@@ -124,10 +156,16 @@ function firstHeaderValue(value: string | string[] | undefined) {
   return value ?? null;
 }
 
-async function headOnce(url: string, userAgent: string): Promise<HeadResult> {
+async function headOnce(
+  url: string,
+  userAgent: string,
+  beforeRequest?: BeforeRequestHook
+): Promise<HeadResult> {
   const started = performance.now();
 
   try {
+    await beforeRequest?.();
+
     const response = await request(url, {
       method: "HEAD",
       maxRedirections: 0,
@@ -206,11 +244,14 @@ async function readBodyPrefix(
 // new.
 async function getStatusOnce(
   url: string,
-  userAgent: string
+  userAgent: string,
+  beforeRequest?: BeforeRequestHook
 ): Promise<HeadResult> {
   const started = performance.now();
 
   try {
+    await beforeRequest?.();
+
     const response = await request(url, {
       method: "GET",
       maxRedirections: 0,
@@ -256,11 +297,14 @@ async function getStatusOnce(
 
 async function checkSoft404Signals(
   url: string,
-  userAgent: string
+  userAgent: string,
+  beforeRequest?: BeforeRequestHook
 ): Promise<Soft404CheckResult> {
   const started = performance.now();
 
   try {
+    await beforeRequest?.();
+
     const response = await request(url, {
       method: "GET",
       maxRedirections: 0,
@@ -335,8 +379,10 @@ export async function checkSampleUrl(
   sampleSourceUrl: string | null,
   userAgent: string,
   logger: FastifyBaseLogger,
-  context: SampleLogContext
+  context: SampleLogContext,
+  options: SampleCheckOptions = {}
 ): Promise<SampleCheckResult> {
+  const { beforeRequest, skipRedirectFollow = false } = options;
   const url = resolveSampleTarget(baseUrl, samplePath, sampleSourceUrl);
   const logContext = {
     session_id: context.sessionId,
@@ -348,7 +394,7 @@ export async function checkSampleUrl(
 
   logger.info(logContext, "sample url HEAD request started");
 
-  let firstResult = await headOnce(url, userAgent);
+  let firstResult = await headOnce(url, userAgent, beforeRequest);
   let methodFallbackFrom: number | null = null;
 
   // HEAD refused for being HEAD: re-probe with GET and classify on THAT, so the
@@ -361,7 +407,7 @@ export async function checkSampleUrl(
       "sample url HEAD method-rejected, re-probing with GET"
     );
 
-    const getResult = await getStatusOnce(url, userAgent);
+    const getResult = await getStatusOnce(url, userAgent, beforeRequest);
 
     firstResult = {
       ...getResult,
@@ -375,7 +421,11 @@ export async function checkSampleUrl(
   if (firstResult.statusCode && firstResult.statusCode >= 200 && firstResult.statusCode <= 299) {
     logger.info(logContext, "sample url soft-404 GET check started");
 
-    const soft404Result = await checkSoft404Signals(url, userAgent);
+    const soft404Result = await checkSoft404Signals(
+      url,
+      userAgent,
+      beforeRequest
+    );
 
     logger.info(
       {
@@ -407,8 +457,8 @@ export async function checkSampleUrl(
     const finalUrl = resolveRedirectUrl(firstResult.location, url);
     let responseMs = firstResult.responseMs;
 
-    if (finalUrl) {
-      const followResult = await headOnce(finalUrl, userAgent);
+    if (finalUrl && !skipRedirectFollow) {
+      const followResult = await headOnce(finalUrl, userAgent, beforeRequest);
 
       responseMs += followResult.responseMs;
     }

@@ -134,6 +134,7 @@ import {
   resolveStructureFilters,
   urlMatchesStructureFilters
 } from "@/lib/structure-filter";
+import { filterByStatus } from "@/lib/fix-status-filter";
 import { FixTrailingSlashesDialog } from "@/components/fix-trailing-slashes-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -909,6 +910,13 @@ export default function ResultsDashboardPage({
   // (v1.45.1), independent of how many rows are shown here. Selection is keyed by
   // candidate.key (sampled_url_id for verified rows, "inferred:<url>" for rest).
   const [fixCandidates, setFixCandidates] = useState<RedirectCandidate[]>([]);
+  // Status-chip selection for the Fix modal, owned HERE rather than inside
+  // PatternVerifyPanel (v1.52) because it has to drive two things that live in
+  // different components: the panel's delete target, and the URL list below it.
+  // While it was panel-local the chips filtered nothing. Empty = all statuses.
+  const [fixStatusFilter, setFixStatusFilter] = useState<Set<number>>(
+    new Set()
+  );
   // The pattern's real total occurrence count — the true scope of an accept.
   const [fixPatternTotal, setFixPatternTotal] = useState(0);
   const [fixLoading, setFixLoading] = useState(false);
@@ -2471,6 +2479,8 @@ export default function ResultsDashboardPage({
     setFixActions({});
     setFixInferredWithoutRule(false);
     setFixPage(0);
+    // Opening a different pattern must not inherit the previous one's chips.
+    setFixStatusFilter(new Set());
 
     void getRedirectCandidates(params.id, fixPatternId)
       .then((data) => {
@@ -2662,6 +2672,18 @@ export default function ResultsDashboardPage({
 
   const fixActionFor = (candidate: RedirectCandidate): FixAction =>
     fixActions[candidate.key] ?? defaultFixAction(candidate);
+
+  // The URL list, narrowed by the status chips above it (v1.52).
+  //
+  // Filtering by the candidate's OWN http_status, which the row already renders
+  // as a badge — so what the chip selects and what the row shows are the same
+  // number. Candidates with no status are the inferred rows: they were never
+  // HTTP-checked, so no status chip can honestly claim them and they drop out
+  // of a filtered view rather than being shown under a code they might not have.
+  const filteredFixCandidates = useMemo(
+    () => filterByStatus(fixCandidates, fixStatusFilter),
+    [fixCandidates, fixStatusFilter]
+  );
   const fixCount = fixCandidates.filter(
     (candidate) => fixActionFor(candidate) === "fix"
   ).length;
@@ -2671,11 +2693,11 @@ export default function ResultsDashboardPage({
   const skipCount = fixCandidates.length - fixCount - deleteCount;
   const fixPageCount = Math.max(
     1,
-    Math.ceil(fixCandidates.length / FIX_MODAL_PAGE_SIZE)
+    Math.ceil(filteredFixCandidates.length / FIX_MODAL_PAGE_SIZE)
   );
   const fixPageSafe = Math.min(fixPage, fixPageCount - 1);
   const fixPageStart = fixPageSafe * FIX_MODAL_PAGE_SIZE;
-  const pagedFixCandidates = fixCandidates.slice(
+  const pagedFixCandidates = filteredFixCandidates.slice(
     fixPageStart,
     fixPageStart + FIX_MODAL_PAGE_SIZE
   );
@@ -4654,6 +4676,13 @@ export default function ResultsDashboardPage({
                   patternId={fixRow.id}
                   template={fixRow.template}
                   onDeleted={handleVerifiedDeleted}
+                  selectedStatuses={fixStatusFilter}
+                  onSelectedStatusesChange={(next) => {
+                    setFixStatusFilter(next);
+                    // Back to page 1: the filtered list is shorter, and staying
+                    // on page 4 of a now-2-page list shows an empty table.
+                    setFixPage(0);
+                  }}
                 />
               ) : null}
               <div className="rounded-md border border-slate-200">
@@ -4667,13 +4696,19 @@ export default function ResultsDashboardPage({
                     Set all to Fix
                   </button>
                   <span className="text-xs text-slate-500">
-                    {fixPatternTotal > fixCandidates.length
-                      ? `${formatNumber(fixCandidates.length)} of ${formatNumber(
-                          fixPatternTotal
-                        )} shown`
-                      : `${fixCandidates.length} URL${
-                          fixCandidates.length === 1 ? "" : "s"
-                        }`}
+                    {fixStatusFilter.size > 0
+                      ? `${formatNumber(filteredFixCandidates.length)} of ${formatNumber(
+                          fixCandidates.length
+                        )} shown · ${Array.from(fixStatusFilter)
+                          .sort((a, b) => a - b)
+                          .join("/")} only`
+                      : fixPatternTotal > fixCandidates.length
+                        ? `${formatNumber(fixCandidates.length)} of ${formatNumber(
+                            fixPatternTotal
+                          )} shown`
+                        : `${fixCandidates.length} URL${
+                            fixCandidates.length === 1 ? "" : "s"
+                          }`}
                   </span>
                 </div>
                 <div className="max-h-[320px] overflow-y-auto">
@@ -4685,6 +4720,18 @@ export default function ResultsDashboardPage({
                   ) : fixCandidates.length === 0 ? (
                     <p className="px-3 py-3 text-sm text-slate-500">
                       No redirect URLs remain for this pattern.
+                    </p>
+                  ) : filteredFixCandidates.length === 0 ? (
+                    <p
+                      className="px-3 py-3 text-sm text-slate-500"
+                      data-testid="fix-list-empty-for-filter"
+                    >
+                      None of the {formatNumber(fixCandidates.length)} sampled
+                      URLs here returned{" "}
+                      {Array.from(fixStatusFilter)
+                        .sort((a, b) => a - b)
+                        .join(" or ")}.
+                      Clear the status filter to see them all.
                     </p>
                   ) : (
                     <ul>
