@@ -229,4 +229,100 @@ test("structures returns the URL pool, and source-files returns file ids", async
   // The id the download's ?exclude= addresses. Resolved server-side precisely
   // so the client never derives one from a display name.
   assert.equal(files[0].file_id, fileRow.rows[0].id);
+
+  // ---- source-files, SCOPED: counts must come from the real file, not the
+  // whole-pattern rollup -------------------------------------------------
+  //
+  // The bug this covers: the modal's file list ignored "Limit this edit to"
+  // entirely and always showed the whole pattern's rollup (120, the count
+  // recorded above) regardless of which structure was selected. A real sitemap
+  // file is written here with a KNOWN split across the two `A`-position
+  // families (niin-parts vs part-types) so the assertion is on an exact,
+  // independently-verifiable number rather than "some smaller number."
+  const NIIN_COUNT = 7;
+  const PART_TYPES_COUNT = 5;
+  const scopedStored = `${sessionId}-current-part-1.xml`;
+  const scopedLocs = [
+    ...Array.from(
+      { length: NIIN_COUNT },
+      (_, i) => `${BASE}/rfq/niin-parts-${i}/mid-${i}/brand${i}-parts-catalog`
+    ),
+    ...Array.from(
+      { length: PART_TYPES_COUNT },
+      (_, i) => `${BASE}/rfq/part-types-${i}/mid-${i}/brand${i}-price-list`
+    )
+  ];
+
+  writeFileSync(
+    path.join(uploadDir, scopedStored),
+    `<?xml version="1.0" encoding="UTF-8"?>\n<urlset>${scopedLocs
+      .map((loc) => `<url><loc>${loc}</loc></url>`)
+      .join("")}</urlset>\n`,
+    "utf8"
+  );
+
+  const scopedFileRow = await pool.query<{ id: string }>(
+    `
+      INSERT INTO sitemap_files (session_id, filename, total_urls, parsed_at, is_valid, is_index)
+      VALUES ($1, $2, $3, now(), true, false)
+      RETURNING id
+    `,
+    [sessionId, scopedStored, scopedLocs.length]
+  );
+  const scopedDisplay = displaySourceFilename(sessionId, scopedStored);
+
+  // Recorded rollup deliberately WRONG (the whole pattern's 120, not this
+  // file's real 12) — pattern_file_occurrences is a rollup built at extraction
+  // time and is exactly what the scoped path must NOT read from.
+  await pool.query(
+    "INSERT INTO pattern_file_occurrences (pattern_id, source_file, occurrence_count) VALUES ($1, $2, 120)",
+    [patternId, scopedDisplay]
+  );
+
+  const niinFilterParam = encodeURIComponent(
+    JSON.stringify([{ param_index: 0, anchor: "prefix", value: "niin-parts" }])
+  );
+
+  const scopedSourceFiles = await app.inject({
+    method: "GET",
+    url: `/api/sessions/${sessionId}/patterns/${patternId}/source-files?structure_filter=${niinFilterParam}`
+  });
+  const scopedBody = scopedSourceFiles.json();
+  const scopedFile = scopedBody.source_files.find(
+    (file: { source_file: string }) => file.source_file === scopedDisplay
+  );
+
+  assert.equal(scopedSourceFiles.statusCode, 200);
+  assert.ok(scopedFile, "scoped file must appear in the scoped breakdown");
+  assert.equal(scopedFile.occurrences, NIIN_COUNT);
+  assert.equal(scopedFile.file_id, scopedFileRow.rows[0].id);
+
+  // The unscoped display file (0 real "current" content, no niin-parts) must
+  // be excluded entirely rather than showing its stale rollup of 120.
+  assert.equal(
+    scopedBody.source_files.some(
+      (file: { source_file: string }) => file.source_file === display
+    ),
+    false
+  );
+
+  // A structure_filter naming a param_index the template doesn't have is
+  // rejected the same way the PATCH .../rename route rejects it — ALL OR
+  // NOTHING, never silently widened to unscoped.
+  const badFilterParam = encodeURIComponent(
+    JSON.stringify([{ param_index: 99, anchor: "prefix", value: "x" }])
+  );
+  const badFilterResponse = await app.inject({
+    method: "GET",
+    url: `/api/sessions/${sessionId}/patterns/${patternId}/source-files?structure_filter=${badFilterParam}`
+  });
+
+  assert.equal(badFilterResponse.statusCode, 400);
+
+  const malformedResponse = await app.inject({
+    method: "GET",
+    url: `/api/sessions/${sessionId}/patterns/${patternId}/source-files?structure_filter=not-json`
+  });
+
+  assert.equal(malformedResponse.statusCode, 400);
 });

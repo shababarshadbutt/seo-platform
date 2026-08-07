@@ -1428,12 +1428,24 @@ export type RenamePatternResult = {
   undo?: boolean;
 };
 
+// structureFilters, when non-empty, scopes both the file list and each file's
+// occurrence count to just that structure — see
+// scopedPatternSourceFileBreakdown on the backend for why the whole-pattern
+// rollup can't just be filtered client-side after the fact. Omitted/empty
+// keeps the old whole-pattern behaviour.
 export async function getPatternSourceFiles(
   sessionId: string,
-  patternId: string
+  patternId: string,
+  structureFilters?: StructureFilter[]
 ) {
+  const query =
+    structureFilters && structureFilters.length > 0
+      ? `?structure_filter=${encodeURIComponent(JSON.stringify(structureFilters))}`
+      : "";
   const response = await fetchWithTimeout(
-    backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/source-files`),
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/source-files${query}`
+    ),
     { cache: "no-store" }
   );
   const data = await readJsonResponse<{ source_files: PatternSourceFile[] }>(

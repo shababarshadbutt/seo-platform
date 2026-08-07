@@ -1,6 +1,6 @@
 import { createReadStream, createWriteStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
-import { Transform, type TransformCallback } from "node:stream";
+import { Transform, Writable, type TransformCallback } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { createGunzip, createGzip } from "node:zlib";
 
@@ -468,4 +468,42 @@ export async function rewriteSpecificLocs(options: {
     isGzip: options.isGzip,
     rewriteUrl: buildLocMapRewriter(options.replacements)
   });
+}
+
+// Count <loc> URLs in a sitemap file that satisfy `matchesUrl`, WITHOUT writing
+// anything anywhere — a read-only sibling of rewriteSitemapLocFile for
+// previewing how many URLs an edit would touch before it runs. Built on the
+// exact same LocRewriteTransform (CDATA-aware, chunk-boundary-safe <loc>
+// parsing) that the real rewrite uses, by giving it a rewriter that always
+// returns null (never rewrites) but tallies a match first — so a preview count
+// can never disagree with the real rewrite about what counts as a <loc>, or
+// about which URLs inside one are well-formed.
+export async function countSitemapLocMatches(options: {
+  inputPath: string;
+  isGzip: boolean;
+  matchesUrl: (url: string) => boolean;
+}): Promise<number> {
+  let matched = 0;
+  const countOnly: LocUrlRewriter = (url) => {
+    if (options.matchesUrl(url)) {
+      matched += 1;
+    }
+
+    return null;
+  };
+  const transform = new LocRewriteTransform(countOnly);
+  const readable = createReadStream(options.inputPath);
+  // Discards output — this call exists only for its side effect on `matched`.
+  const sink = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback();
+    }
+  });
+  const stages = options.isGzip
+    ? [readable, createGunzip(), transform, sink]
+    : [readable, transform, sink];
+
+  await pipeline(stages);
+
+  return matched;
 }

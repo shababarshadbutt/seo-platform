@@ -147,7 +147,9 @@ import {
 } from "../queue/maintenanceQueue.js";
 import {
   buildPatternTemplateRewriter,
+  countSitemapLocMatches,
   countTemplateParams,
+  pathMatchesTemplate,
   rewriteSitemapLocFile
 } from "../sitemaps/rewriteLocs.js";
 import {
@@ -171,6 +173,8 @@ import {
   detectPatternStructures,
   parseStructureFilters,
   resolveStructureFilters,
+  urlMatchesStructureFilters,
+  type ResolvedStructureFilter,
   type StructureFilter
 } from "../sitemaps/structureClusters.js";
 
@@ -979,6 +983,133 @@ async function patternSourceFileBreakdown(
   const per = Math.round(totalUrls / files.length);
 
   return files.map((file) => ({ source_file: file, occurrences: per }));
+}
+
+// How many files to stream-count in parallel. Read-only and lightweight next
+// to the actual rewrite (no output file, no worker-pool handoff), so this can
+// run inline on the request thread; capped so a pattern spanning hundreds of
+// files doesn't open them all at once.
+const SCOPED_BREAKDOWN_CONCURRENCY = 6;
+
+// Structure-scoped occurrence counts for the source-files list (v1.52), used
+// once the Update Pattern modal has a structure selected in "Limit this edit
+// to." patternSourceFileBreakdown's rollup is whole-pattern and, for a session
+// that used sampling/extrapolation, only approximate — neither is safe to
+// filter after the fact, because a structure filter can concentrate ALL of a
+// file's occurrences in the excluded share or the included one. So this scans
+// each candidate file's actual <loc> entries with the SAME test
+// (pathMatchesTemplate + urlMatchesStructureFilters) the real scoped rename /
+// transform applies, meaning the modal can never show a file the real edit
+// would skip, or an occurrence count the real edit wouldn't produce.
+//
+// The candidate file set is still pattern_file_occurrences' source_file list —
+// files already known to carry SOME of this pattern. Re-deriving "which files
+// touch this pattern at all" from nothing would mean scanning every file in
+// the session's role, which this scoped preview does not need to do: a file
+// with zero recorded occurrences of the pattern cannot contain a structure
+// inside it either.
+async function scopedPatternSourceFileBreakdown(
+  patternId: string,
+  sessionId: string,
+  sourceRole: string,
+  template: string,
+  resolvedFilters: ResolvedStructureFilter[]
+): Promise<Array<{ source_file: string; occurrences: number }>> {
+  const candidates = await pool.query<{ source_file: string }>(
+    "SELECT source_file FROM pattern_file_occurrences WHERE pattern_id = $1",
+    [patternId]
+  );
+
+  if (candidates.rows.length === 0) {
+    return [];
+  }
+
+  const filesResult = await pool.query<{ filename: string }>(
+    `
+      SELECT filename
+      FROM sitemap_files
+      WHERE session_id = $1 AND source_role = $2 AND is_deleted = false
+    `,
+    [sessionId, sourceRole]
+  );
+  const storedFilenameByDisplay = new Map<string, string>();
+
+  for (const file of filesResult.rows) {
+    if (isHttpUrl(file.filename)) {
+      continue;
+    }
+
+    storedFilenameByDisplay.set(
+      displaySourceFilename(sessionId, file.filename),
+      file.filename
+    );
+  }
+
+  const matchesUrl = (url: string): boolean => {
+    let pathname: string;
+
+    try {
+      pathname = new URL(url).pathname;
+    } catch {
+      return false;
+    }
+
+    return (
+      pathMatchesTemplate(pathname, template) &&
+      urlMatchesStructureFilters(url, resolvedFilters)
+    );
+  };
+
+  const displayNames = candidates.rows.map((row) => row.source_file);
+  const results: Array<{ source_file: string; occurrences: number }> = [];
+  let cursor = 0;
+
+  async function worker() {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+
+      if (index >= displayNames.length) {
+        return;
+      }
+
+      const displayName = displayNames[index];
+      const storedFilename = storedFilenameByDisplay.get(displayName);
+
+      if (!storedFilename) {
+        // Recorded at extraction time but the file row is gone/renamed since —
+        // the unscoped breakdown tolerates this too (file_id resolves to null).
+        continue;
+      }
+
+      try {
+        const occurrences = await countSitemapLocMatches({
+          inputPath: path.join(config.uploadDir, storedFilename),
+          isGzip: storedFilename.toLowerCase().endsWith(".gz"),
+          matchesUrl
+        });
+
+        if (occurrences > 0) {
+          results.push({ source_file: displayName, occurrences });
+        }
+      } catch {
+        // Missing/unreadable on disk — excluded rather than failing the whole
+        // preview.
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(SCOPED_BREAKDOWN_CONCURRENCY, displayNames.length) },
+      worker
+    )
+  );
+
+  return results.sort(
+    (a, b) =>
+      b.occurrences - a.occurrences || a.source_file.localeCompare(b.source_file)
+  );
 }
 
 const PATTERN_STRUCTURE_JOB_NAMES = {
@@ -2639,14 +2770,19 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     }
   );
 
-  app.get<{ Params: PatternParams }>(
+  app.get<{
+    Params: PatternParams;
+    Querystring: { structure_filter?: string };
+  }>(
     "/api/sessions/:id/patterns/:patternId/source-files",
     async (request, reply) => {
       const patternResult = await pool.query<{
         total_urls: string;
         source_file: string | null;
+        template: string;
+        source_role: string;
       }>(
-        "SELECT total_urls, source_file FROM patterns WHERE session_id = $1 AND id = $2",
+        "SELECT total_urls, source_file, template, source_role FROM patterns WHERE session_id = $1 AND id = $2",
         [request.params.id, request.params.patternId]
       );
 
@@ -2657,11 +2793,62 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         });
       }
 
-      const sourceFiles = await patternSourceFileBreakdown(
-        request.params.patternId,
-        Number(patternResult.rows[0].total_urls),
-        patternResult.rows[0].source_file
+      const { total_urls, source_file, template, source_role } =
+        patternResult.rows[0];
+
+      // Optional scope (v1.52): once the modal's "Limit this edit to" picks a
+      // structure, the file list must match — see
+      // scopedPatternSourceFileBreakdown for why a rollup can't just be
+      // filtered after the fact. A query param, not a body, because this is a
+      // GET; encoded the same shape as the PATCH .../rename body's
+      // structure_filter (an array of {param_index, anchor, value}).
+      const rawFilter = request.query?.structure_filter;
+      let requestedFilters: StructureFilter[] | null = [];
+
+      if (typeof rawFilter === "string" && rawFilter.length > 0) {
+        try {
+          requestedFilters = parseStructureFilters(JSON.parse(rawFilter));
+        } catch {
+          requestedFilters = null;
+        }
+      }
+
+      if (requestedFilters === null) {
+        return reply.code(400).send(badRequest(STRUCTURE_FILTER_SHAPE_ERROR));
+      }
+
+      const resolvedFilters = resolveStructureFilters(
+        requestedFilters,
+        template
       );
+
+      // ALL-OR-NOTHING, same reasoning as the rename/transform routes: a
+      // partially-resolved scope would silently widen the preview to include
+      // the position that failed to resolve.
+      if (resolvedFilters === null) {
+        return reply.code(400).send(
+          badRequest(
+            `structure_filter param_index ${requestedFilters
+              .map((filter) => filter.param_index)
+              .join(", ")} does not all exist in ${template}`
+          )
+        );
+      }
+
+      const sourceFiles =
+        resolvedFilters.length > 0
+          ? await scopedPatternSourceFileBreakdown(
+              request.params.patternId,
+              request.params.id,
+              source_role,
+              template,
+              resolvedFilters
+            )
+          : await patternSourceFileBreakdown(
+              request.params.patternId,
+              Number(total_urls),
+              source_file
+            );
       // file_id lets the Update Pattern modal download exactly the files the
       // user ticked (v1.51) — the download endpoint excludes by id, and the
       // client must not be the thing that derives one from a display name.

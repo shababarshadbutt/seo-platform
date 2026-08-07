@@ -135,6 +135,7 @@ import {
   urlMatchesStructureFilters
 } from "@/lib/structure-filter";
 import { filterByStatus } from "@/lib/fix-status-filter";
+import { buildSuspiciousStripSuggestion } from "@/lib/suspicious-segment";
 import { FixTrailingSlashesDialog } from "@/components/fix-trailing-slashes-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -456,57 +457,6 @@ function convertParamToABC(template: string): string {
 
     return `{${letter}}`;
   });
-}
-
-// Which {param} position (0 = A, 1 = B, …) holds the suspicious segment, found
-// by scanning sampled URLs' values at each param slot. Returns null when no
-// sampled value contains it (e.g. it's a static segment, not inside a param) —
-// the caller then falls back to the first placeholder. (v1.41 Feature 1)
-function findSuspiciousPosition(
-  template: string,
-  suspiciousSegment: string,
-  sampledUrls: string[]
-): number | null {
-  const templateSegments = template.split("/").filter(Boolean);
-  const paramPositions = templateSegments
-    .map((segment, index) => (segment === "{param}" ? index : -1))
-    .filter((index) => index !== -1);
-
-  for (const url of sampledUrls) {
-    let urlSegments: string[];
-
-    try {
-      urlSegments = new URL(url).pathname.split("/").filter(Boolean);
-    } catch {
-      continue;
-    }
-
-    for (let i = 0; i < paramPositions.length; i += 1) {
-      const value = urlSegments[paramPositions[i]] ?? "";
-
-      if (value.includes(suspiciousSegment)) {
-        return i;
-      }
-    }
-  }
-
-  return null;
-}
-
-// Place a strip expression on the placeholder at `suspiciousPosition`, e.g.
-// ("/manufacturer/{A}/{B}/", "parts-catalog", 0) -> "/manufacturer/{A|-parts-catalog|}/{B}/".
-// (v1.41 Feature 1)
-function buildNewUrlStructure(
-  convertedTemplate: string,
-  suspiciousSegment: string,
-  suspiciousPosition: number
-): string {
-  const letter = String.fromCharCode(65 + suspiciousPosition);
-
-  return convertedTemplate.replace(
-    `{${letter}}`,
-    `{${letter}|-${suspiciousSegment}|}`
-  );
 }
 
 // Infer a pattern template from a set of URLs: segments that are identical
@@ -1872,34 +1822,27 @@ export default function ResultsDashboardPage({
 
     setTransformCurrentStructure(convertedStructure);
 
-    // Feature 1 (v1.41): if the pattern has a suspicious segment, auto-place a
-    // strip expression on the placeholder whose sampled values contain it, so
-    // the New URL structure is a ready-to-apply transform rather than a copy of
-    // the current one. Falls back to the first placeholder when the position
-    // can't be pinpointed; both cases surface a "edit if incorrect" note.
+    // Feature 1 (v1.41): if the pattern has a suspicious segment AND it can be
+    // verified in this modal's own sampled URLs, auto-place a strip expression
+    // on that placeholder so the New URL structure is a ready-to-apply
+    // transform rather than a copy of the current one.
+    //
+    // No fallback guess when it can't be verified: the pattern's
+    // suspiciousSegmentValue is computed across the wider pattern group, so it
+    // is not guaranteed to appear in this pattern's own samples. Auto-filling a
+    // strip the tool cannot confirm — and saying so in the same breath — was
+    // worse than showing nothing.
     const suspicious = rowData.suspiciousSegmentValue;
-    let newStructure = convertedStructure;
-    let stripNote: string | null = null;
-
-    if (suspicious) {
-      const detectedPosition = findSuspiciousPosition(
-        rowData.template,
-        suspicious,
-        samples.map((sample) => sample.url)
-      );
-      const position = detectedPosition ?? 0;
-      const letter = String.fromCharCode(65 + position);
-
-      newStructure = buildNewUrlStructure(
-        convertedStructure,
-        suspicious,
-        position
-      );
-      stripNote =
-        detectedPosition === null
-          ? `Auto-added a strip for "-${suspicious}" on segment ${letter} — couldn't pinpoint the segment, so edit if this is incorrect.`
-          : `Auto-detected: "-${suspicious}" appears in segment ${letter}. Edit if this is incorrect.`;
-    }
+    const suggestion = suspicious
+      ? buildSuspiciousStripSuggestion(
+          convertedStructure,
+          rowData.template,
+          suspicious,
+          samples.map((sample) => sample.url)
+        )
+      : null;
+    const newStructure = suggestion?.newStructure ?? convertedStructure;
+    const stripNote = suggestion?.note ?? null;
 
     setTransformNewStructure(newStructure);
     setRenameStripNote(stripNote);
@@ -1934,20 +1877,11 @@ export default function ResultsDashboardPage({
     setRenameValue(nameValue);
     setRenameRedirectNote(redirectNote);
     setTransformStep("form");
-    setRenameSourceFiles([]);
-    setSelectedRenameFiles(new Set());
-    setIsLoadingRenameFiles(true);
-
-    try {
-      const files = await getPatternSourceFiles(params.id, rowData.id);
-
-      setRenameSourceFiles(files);
-      setSelectedRenameFiles(new Set(files.map((file) => file.source_file)));
-    } catch {
-      setRenameSourceFiles([]);
-    } finally {
-      setIsLoadingRenameFiles(false);
-    }
+    // The source-files fetch itself is NOT done here — it is driven by the
+    // effect below, keyed on renameRow + renameStructureFilters, so the same
+    // one fetch path handles both this initial load (including a scope seeded
+    // from options.structureScope, set above) and every subsequent dropdown
+    // change without duplicating the fetch/race-guard logic in two places.
   }
 
   function toggleRenameFile(sourceFile: string) {
@@ -2774,6 +2708,58 @@ export default function ResultsDashboardPage({
         .sort((a, b) => a.param_index - b.param_index),
     [renameStructureSelections]
   );
+
+  // The file list at the bottom of the modal, kept in lockstep with whatever
+  // is currently picked in "Limit this edit to" (v1.52). One effect drives
+  // BOTH the initial load when the modal opens (renameStructureFilters starts
+  // out either [] or seeded from options.structureScope — see
+  // openRenameModal) and every later dropdown change, so there is exactly one
+  // place that can race.
+  //
+  // The bug this fixes: the file list previously always showed the whole
+  // pattern's rollup (all files, whole-pattern occurrence counts) regardless
+  // of the structure scope selected — a user narrowing "Limit this edit to"
+  // still saw every file the UNSCOPED pattern touches, with counts that had
+  // nothing to do with the narrowed edit they were about to run.
+  //
+  // requestIdRef guards against an in-flight fetch from a since-abandoned
+  // selection resolving after a newer one — e.g. clicking two different
+  // dropdown values quickly must not let the FIRST response overwrite the
+  // list after the SECOND has already landed.
+  const sourceFilesRequestIdRef = useRef(0);
+
+  useEffect(() => {
+    if (!renameRow) {
+      return;
+    }
+
+    const requestId = sourceFilesRequestIdRef.current + 1;
+
+    sourceFilesRequestIdRef.current = requestId;
+    setRenameSourceFiles([]);
+    setSelectedRenameFiles(new Set());
+    setIsLoadingRenameFiles(true);
+
+    getPatternSourceFiles(params.id, renameRow.id, renameStructureFilters)
+      .then((files) => {
+        if (sourceFilesRequestIdRef.current !== requestId) {
+          return;
+        }
+
+        setRenameSourceFiles(files);
+        setSelectedRenameFiles(new Set(files.map((file) => file.source_file)));
+      })
+      .catch(() => {
+        if (sourceFilesRequestIdRef.current === requestId) {
+          setRenameSourceFiles([]);
+        }
+      })
+      .finally(() => {
+        if (sourceFilesRequestIdRef.current === requestId) {
+          setIsLoadingRenameFiles(false);
+        }
+      });
+  }, [renameRow, renameStructureFilters, params.id]);
 
   // Resolved against the pattern template so the client can apply the SAME
   // match test the server will. resolveStructureFilters is all-or-nothing for
