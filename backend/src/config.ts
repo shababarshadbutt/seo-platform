@@ -80,6 +80,63 @@ export const config = {
   }),
   defaultHttpUserAgent:
     process.env.DEFAULT_HTTP_USER_AGENT ?? DEFAULT_HTTP_USER_AGENT,
+
+  // ---- URL verification: load placed on the CLIENT's web server ----------
+  //
+  // These bound traffic we aim at someone else's production origin, which makes
+  // them different from every other limit in this file. The numbers below were
+  // chosen against two references, not picked for feel:
+  //
+  //   * SFTP_MAX_CONCURRENT_CONNECTIONS = 4 — our closest existing "don't
+  //     overwhelm a remote endpoint" cap. That is a floor to reason from, not a
+  //     target: an SFTP session holding a file transfer is far more expensive
+  //     for the far side than an HTTP HEAD that returns headers and closes.
+  //   * The MEASURED behaviour of the unbounded run this work fixes: ~35 URL
+  //     checks/second sustained for 80 minutes at sessions.concurrency = 10.
+  //     That number is the thing to come in under. Anything at or above it
+  //     would mean shipping a "protection" that protects nothing.
+  //
+  // maxConcurrency 8 — simultaneous in-flight URL CHECKS. One check is 1-3 HTTP
+  // requests (HEAD, plus a soft-404 GET when the answer is 2xx or a follow when
+  // it is 3xx), so 8 checks is 8-24 sockets: twice the SFTP cap, and bracketing
+  // the sessions.concurrency default of 10 rather than exceeding it. This is
+  // also an upper clamp on sessions.concurrency, which a user may set to 30 —
+  // a value that is defensible for a 20-URL sample burst and is not defensible
+  // for a 25,744-URL sweep.
+  //
+  // maxRequestsPerSecond 25 — the real governor, enforced per target host (see
+  // http/hostRateLimiter.ts). Below the ~35/s the broken run was already doing,
+  // so this strictly REDUCES load versus today. In absolute terms it is modest
+  // traffic for a production site — well under a typical Googlebot crawl rate,
+  // and a fraction of a percent of what a CDN-fronted origin serves — while
+  // still completing a 25,744-URL pattern in roughly 17 minutes rather than the
+  // hours a politeness-first 5/s would take. That trade is the whole reason the
+  // sample-triage layer exists: triage answers "is this worth 17 minutes?" in
+  // about ten seconds, so the expensive pass is only ever paid deliberately.
+  //
+  // rateLimitBurst 10 — idle credit only. Lets a small triage draw against an
+  // idle host go out immediately instead of being paced over 30s to prove a
+  // point. Credit does not accumulate past this, so it cannot become a flood.
+  //
+  // All three are env-tunable because the right answer depends on the client's
+  // infrastructure, which is not knowable here. Lower them for a small origin.
+  verification: {
+    maxConcurrency: readNumber("VERIFY_MAX_CONCURRENCY", {
+      fallback: 8,
+      min: 1,
+      max: 32
+    }),
+    maxRequestsPerSecond: readNumber("VERIFY_MAX_REQUESTS_PER_SECOND", {
+      fallback: 25,
+      min: 1,
+      max: 200
+    }),
+    rateLimitBurst: readNumber("VERIFY_RATE_LIMIT_BURST", {
+      fallback: 10,
+      min: 1,
+      max: 100
+    })
+  },
   // Secret used to encrypt sensitive per-session data at rest (GSC service
   // account JSON). Any non-empty string works; it is stretched to a 32-byte
   // AES-256 key via scrypt. Falls back to a dev-only default so local runs

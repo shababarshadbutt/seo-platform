@@ -78,6 +78,13 @@ import {
   type VerifyUrlsJobData
 } from "./queue/verificationQueue.js";
 import {
+  TRIAGE_QUEUE_NAME,
+  TRIAGE_SAMPLE_JOB,
+  closeTriageQueue,
+  type TriageJobName,
+  type TriageSampleJobData
+} from "./queue/triageQueue.js";
+import {
   CLEANUP_ZIPS_JOB,
   PRE_GENERATE_ZIP_JOB,
   PRE_GENERATE_ZIP_QUEUE_NAME,
@@ -111,6 +118,7 @@ import {
 import { destroyZipPool } from "./jobs/zipPool.js";
 import { destroyFileRewritePool } from "./jobs/fileRewritePool.js";
 import { processVerifyUrlsJob } from "./jobs/verifyUrlsJob.js";
+import { processTriageSampleJob } from "./jobs/triageJob.js";
 import { processCleanupUploadsJob } from "./jobs/cleanupUploadsJob.js";
 import { processExtractPatternsJob } from "./jobs/extractPatternsJob.js";
 import { processParseSitemapJob } from "./jobs/parseSitemapJob.js";
@@ -161,6 +169,11 @@ let verificationWorker: Worker<
   void,
   VerificationJobName
 > | null = null;
+// Sample triage on its own concurrency-1 queue so a ~15-second approximate read
+// is never stuck behind a multi-minute full verification. Running the two at
+// once does not double the load on the client's origin — pacing is per target
+// host and process-global (http/hostRateLimiter.ts), so they share one budget.
+let triageWorker: Worker<TriageSampleJobData, void, TriageJobName> | null = null;
 // Download-ZIP pre-generation + daily cleanup on its own concurrency-1 queue, so
 // a heavy 1000-file archive write never starves the other workers.
 let preGenerateZipWorker: Worker<
@@ -495,6 +508,37 @@ async function start() {
         "verification worker job failed"
       );
     });
+    triageWorker = new Worker<TriageSampleJobData, void, TriageJobName>(
+      TRIAGE_QUEUE_NAME,
+      async (job) => {
+        if (job.name === TRIAGE_SAMPLE_JOB) {
+          await processTriageSampleJob(job.data, app.log);
+          return;
+        }
+
+        throw new Error(`Unsupported job: ${job.name}`);
+      },
+      {
+        connection: redisConnectionOptions(),
+        concurrency: 1,
+        // A triage is bounded at ~1200 rate-limited probes (~48s), so the
+        // default 30s lock is not enough but nothing like the hour the full
+        // sweeps need. Ten minutes covers a slow origin with plenty of room.
+        lockDuration: 10 * 60 * 1000
+      }
+    );
+    triageWorker.on("failed", (job, error) => {
+      app.log.error(
+        {
+          job_id: job?.id,
+          job_name: job?.name,
+          session_id: (job?.data as { session_id?: string } | undefined)
+            ?.session_id,
+          error
+        },
+        "triage worker job failed"
+      );
+    });
     preGenerateZipWorker = new Worker<
       PreGenerateZipQueueData,
       void,
@@ -552,6 +596,7 @@ async function close() {
   await publishWorker?.close();
   await maintenanceWorker?.close();
   await verificationWorker?.close();
+  await triageWorker?.close();
   await preGenerateZipWorker?.close();
   await destroyZipPool();
   await destroyFileRewritePool();
@@ -561,6 +606,7 @@ async function close() {
   await closePublishLockClient();
   await closeMaintenanceQueue();
   await closeVerificationQueue();
+  await closeTriageQueue();
   await closePreGenerateZipQueue();
   await app.close();
   await closePool();

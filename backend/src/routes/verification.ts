@@ -3,6 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { pool } from "../db/pool.js";
 import { VERIFY_PROBLEM_STATUSES } from "../jobs/verifyUrlsJob.js";
 import { enqueueDeleteProblemUrlsJob } from "../queue/maintenanceQueue.js";
+import { enqueueTriageSampleJob } from "../queue/triageQueue.js";
 import { enqueueVerifyUrlsJob } from "../queue/verificationQueue.js";
 
 // Full-population verification routes (verify-then-act, migration 038).
@@ -45,10 +46,35 @@ async function sessionExists(sessionId: string): Promise<boolean> {
   return result.rowCount !== null && result.rowCount > 0;
 }
 
+// Parse and validate a target_statuses body field. Returns null for "not
+// specified" (meaning every problem status) or an Error to be turned into a 400.
+function parseTargetStatuses(raw: unknown): number[] | null | Error {
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return new Error("target_statuses must be a non-empty array of status codes");
+  }
+
+  const statuses = raw.map((value) => Number(value));
+
+  if (statuses.some((value) => !VERIFY_PROBLEM_STATUSES.includes(value))) {
+    return new Error(
+      `target_statuses must be a subset of ${VERIFY_PROBLEM_STATUSES.join(", ")}`
+    );
+  }
+
+  return statuses;
+}
+
 export async function verificationRoutes(app: FastifyInstance) {
   // Start (or attach to) a full-population verification. Body may carry
   // pattern_ids to verify a subset; absent → every current pattern.
-  app.post<{ Params: SessionParams; Body: { pattern_ids?: unknown } }>(
+  app.post<{
+    Params: SessionParams;
+    Body: { pattern_ids?: unknown; target_statuses?: unknown };
+  }>(
     "/api/sessions/:id/verify-urls",
     async (request, reply) => {
       const sessionId = request.params.id;
@@ -72,9 +98,22 @@ export async function verificationRoutes(app: FastifyInstance) {
           .send(badRequest("pattern_ids must be a non-empty array of ids"));
       }
 
-      // Attach semantics: a verification can run for hours, so a re-POST (page
-      // reload, second tab) joins the in-flight job instead of stacking a
-      // second full population check behind it.
+      const targetStatuses = parseTargetStatuses(request.body?.target_statuses);
+
+      if (targetStatuses instanceof Error) {
+        return reply.code(400).send(badRequest(targetStatuses.message));
+      }
+
+      // Attach semantics: a verification can run for a long time, so a re-POST
+      // (page reload, second tab) joins the in-flight job instead of stacking a
+      // second population check behind it.
+      //
+      // MATCHED ON SCOPE, not just on session. This query used to accept any
+      // in-flight 'verify-urls' row, so a request to verify one 25,744-URL
+      // pattern would attach to a running whole-session sweep and report ITS
+      // 1.3M-URL progress — indistinguishable, from the modal, from the scoping
+      // bug itself. Comparing sorted arrays makes the match independent of the
+      // order the ids arrived in; NULL (whole session) only ever matches NULL.
       const active = await pool.query<{ id: string }>(
         `
           SELECT id
@@ -82,10 +121,22 @@ export async function verificationRoutes(app: FastifyInstance) {
           WHERE session_id = $1
             AND kind = 'verify-urls'
             AND status IN ('PENDING', 'RUNNING')
+            AND (
+              ($2::uuid[] IS NULL AND pattern_ids IS NULL)
+              OR (
+                $2::uuid[] IS NOT NULL
+                AND pattern_ids IS NOT NULL
+                AND (
+                  SELECT array_agg(id ORDER BY id) FROM unnest(pattern_ids) AS id
+                ) = (
+                  SELECT array_agg(id ORDER BY id) FROM unnest($2::uuid[]) AS id
+                )
+              )
+            )
           ORDER BY started_at DESC
           LIMIT 1
         `,
-        [sessionId]
+        [sessionId, patternIds]
       );
 
       if (active.rows[0]) {
@@ -93,15 +144,20 @@ export async function verificationRoutes(app: FastifyInstance) {
       }
 
       const jobRow = await pool.query<{ id: string }>(
-        "INSERT INTO maintenance_jobs (session_id, kind) VALUES ($1, 'verify-urls') RETURNING id",
-        [sessionId]
+        `
+          INSERT INTO maintenance_jobs (session_id, kind, pattern_ids)
+          VALUES ($1, 'verify-urls', $2::uuid[])
+          RETURNING id
+        `,
+        [sessionId, patternIds]
       );
       const jobRowId = jobRow.rows[0].id;
 
       await enqueueVerifyUrlsJob({
         session_id: sessionId,
         job_row_id: jobRowId,
-        pattern_ids: patternIds
+        pattern_ids: patternIds,
+        target_statuses: targetStatuses
       });
 
       return reply.code(202).send({ job_row_id: jobRowId });
@@ -111,10 +167,19 @@ export async function verificationRoutes(app: FastifyInstance) {
   // Poll the latest verification: live progress ("Verifying 187 of 269 URLs…"),
   // per-status counts over the verified population, and a staleness flag for
   // "files changed since this was verified".
-  app.get<{ Params: SessionParams }>(
+  //
+  // ?pattern_id= scopes the WHOLE response to one pattern — the job reported is
+  // that pattern's job, the counts cover only its verified URLs, and freshness
+  // is judged on when IT was last checked. Without this the Fix modal, which is
+  // open on exactly one pattern, would poll whatever verification ran most
+  // recently in the session and show session-wide per-status counts next to a
+  // single pattern's name. Omitting it keeps the original session-wide
+  // behaviour, which is what the Delete Problem URLs dialog wants.
+  app.get<{ Params: SessionParams; Querystring: { pattern_id?: string } }>(
     "/api/sessions/:id/verify-urls/status",
     async (request) => {
       const sessionId = request.params.id;
+      const patternId = request.query.pattern_id ?? null;
 
       const jobResult = await pool.query<{
         id: string;
@@ -123,15 +188,30 @@ export async function verificationRoutes(app: FastifyInstance) {
         files_done: number;
         items_changed: string;
         error: string | null;
+        pattern_ids: string[] | null;
       }>(
+        // A session-wide run (pattern_ids IS NULL) COVERS every pattern, so it
+        // matches a pattern-scoped query too. Excluding it would tell a user
+        // "not verified yet" while a run that is about to verify their pattern
+        // is already going, and their Verify press would queue a second,
+        // redundant job behind it. The response carries pattern_ids so the
+        // client can say which kind of run it is looking at rather than
+        // presenting a 1.3M-URL session progress bar as if it were the
+        // pattern's — the confusion this release exists to remove.
         `
-          SELECT id, status, files_total, files_done, items_changed, error
+          SELECT id, status, files_total, files_done, items_changed, error, pattern_ids
           FROM maintenance_jobs
-          WHERE session_id = $1 AND kind = 'verify-urls'
+          WHERE session_id = $1
+            AND kind = 'verify-urls'
+            AND (
+              $2::uuid IS NULL
+              OR pattern_ids IS NULL
+              OR $2::uuid = ANY(pattern_ids)
+            )
           ORDER BY started_at DESC
           LIMIT 1
         `,
-        [sessionId]
+        [sessionId, patternId]
       );
       const jobRow = jobResult.rows[0] ?? null;
 
@@ -145,15 +225,21 @@ export async function verificationRoutes(app: FastifyInstance) {
         stale: boolean;
       }>(
         `
+          WITH scoped AS (
+            SELECT MAX(checked_at) AS verified_at
+            FROM verified_urls
+            WHERE session_id = $1
+              AND ($2::uuid IS NULL OR pattern_id = $2::uuid)
+          )
           SELECT
-            (SELECT MAX(checked_at) FROM verified_urls WHERE session_id = $1) AS verified_at,
+            scoped.verified_at,
             COALESCE(
-              (SELECT files_mutated_at FROM sessions WHERE id = $1) >
-                (SELECT MAX(checked_at) FROM verified_urls WHERE session_id = $1),
+              (SELECT files_mutated_at FROM sessions WHERE id = $1) > scoped.verified_at,
               false
             ) AS stale
+          FROM scoped
         `,
-        [sessionId]
+        [sessionId, patternId]
       );
 
       const countsResult = await pool.query<{
@@ -163,11 +249,13 @@ export async function verificationRoutes(app: FastifyInstance) {
         `
           SELECT http_status, COUNT(*)::text AS count
           FROM verified_urls
-          WHERE session_id = $1 AND is_deleted_from_sitemap = false
+          WHERE session_id = $1
+            AND is_deleted_from_sitemap = false
+            AND ($2::uuid IS NULL OR pattern_id = $2::uuid)
           GROUP BY http_status
           ORDER BY http_status ASC NULLS LAST
         `,
-        [sessionId]
+        [sessionId, patternId]
       );
 
       return {
@@ -180,9 +268,15 @@ export async function verificationRoutes(app: FastifyInstance) {
               urls_total: jobRow.files_total,
               urls_done: jobRow.files_done,
               items_changed: Number(jobRow.items_changed),
-              error: jobRow.error
+              error: jobRow.error,
+              // What this run actually covers, so the UI can state it rather
+              // than assume it. null = the whole session.
+              pattern_ids: jobRow.pattern_ids
             }
           : null,
+        // Echoes the request scope so a client can tell a pattern-scoped
+        // response from a session-wide one without tracking what it asked for.
+        scope: patternId ? "pattern" : "session",
         verified_at: freshnessResult.rows[0]?.verified_at ?? null,
         stale: freshnessResult.rows[0]?.stale ?? false,
         counts_by_status: countsResult.rows.map((row) => ({
@@ -329,6 +423,104 @@ export async function verificationRoutes(app: FastifyInstance) {
       });
 
       return reply.code(202).send({ job_row_id: jobRowId });
+    }
+  );
+
+  // Start a sample triage for one pattern: the fast, approximate read that
+  // tells a user whether a full verification is worth starting.
+  app.post<{ Params: PatternParams; Body: { target_statuses?: unknown } }>(
+    "/api/sessions/:id/patterns/:patternId/triage",
+    async (request, reply) => {
+      const sessionId = request.params.id;
+      const patternId = request.params.patternId;
+
+      const patternResult = await pool.query(
+        "SELECT 1 FROM patterns WHERE id = $1 AND session_id = $2",
+        [patternId, sessionId]
+      );
+
+      if (patternResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "Pattern not found" });
+      }
+
+      const targetStatuses = parseTargetStatuses(request.body?.target_statuses);
+
+      if (targetStatuses instanceof Error) {
+        return reply.code(400).send(badRequest(targetStatuses.message));
+      }
+
+      // Attach to an in-flight triage rather than starting a second one. The
+      // unique partial index in migration 040 is the real guard (two triages
+      // for one pattern would double the request rate at the client's origin
+      // for no extra information); this check just turns that into a clean 202
+      // instead of a constraint violation.
+      const active = await pool.query<{ id: string }>(
+        `
+          SELECT id
+          FROM verify_triage_runs
+          WHERE pattern_id = $1 AND status IN ('PENDING', 'RUNNING')
+          ORDER BY started_at DESC
+          LIMIT 1
+        `,
+        [patternId]
+      );
+
+      if (active.rows[0]) {
+        return reply.code(202).send({ run_id: active.rows[0].id });
+      }
+
+      const runRow = await pool.query<{ id: string }>(
+        `
+          INSERT INTO verify_triage_runs (session_id, pattern_id, target_statuses)
+          VALUES ($1, $2, $3::int[])
+          RETURNING id
+        `,
+        [sessionId, patternId, targetStatuses]
+      );
+      const runId = runRow.rows[0].id;
+
+      await enqueueTriageSampleJob({
+        session_id: sessionId,
+        pattern_id: patternId,
+        run_id: runId,
+        target_statuses: targetStatuses
+      });
+
+      return reply.code(202).send({ run_id: runId });
+    }
+  );
+
+  // Poll the latest triage for a pattern.
+  app.get<{ Params: PatternParams }>(
+    "/api/sessions/:id/patterns/:patternId/triage",
+    async (request) => {
+      const patternId = request.params.patternId;
+
+      const result = await pool.query<{
+        id: string;
+        status: string;
+        target_statuses: number[] | null;
+        population_total: number;
+        sampled_total: number;
+        expanded: boolean;
+        result: unknown;
+        error: string | null;
+        completed_at: string | null;
+      }>(
+        `
+          SELECT id, status, target_statuses, population_total, sampled_total,
+                 expanded, result, error, completed_at
+          FROM verify_triage_runs
+          WHERE pattern_id = $1
+          ORDER BY started_at DESC
+          LIMIT 1
+        `,
+        [patternId]
+      );
+
+      return { run: result.rows[0] ?? null };
     }
   );
 }

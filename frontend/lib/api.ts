@@ -1130,44 +1130,144 @@ export type VerificationJob = {
   urls_done: number;
   items_changed: number | null;
   error: string | null;
+  // Which patterns this run covers; null = the whole session. Lets the UI state
+  // its scope instead of assuming one.
+  pattern_ids: string[] | null;
 };
 
 export type VerificationStatus = {
   job: VerificationJob | null;
-  // Newest checked_at across the session's verified URLs; null = never ran.
+  // "pattern" when the caller scoped the request to one pattern, else
+  // "session". Everything below is scoped to match.
+  scope: "pattern" | "session";
+  // Newest checked_at within the scope; null = never verified.
   verified_at: string | null;
   // Files were edited after the last verification — counts may be outdated.
   stale: boolean;
   counts_by_status: Array<{ http_status: number; count: number }>;
 };
 
+// Start (or attach to) a verification.
+//
+// patternIds SCOPES THE RUN, and getting it wrong is expensive: omitting it
+// from the Fix modal is what turned a 25,744-URL pattern check into a
+// 1,324,310-URL session sweep that ran for 75-90 minutes. Pass the pattern
+// being worked on whenever there is one; omit it only for a deliberately
+// session-wide check (the Delete Problem URLs dialog).
 export async function startUrlVerification(
   sessionId: string,
-  patternIds?: string[]
+  patternIds?: string[],
+  targetStatuses?: number[]
 ): Promise<{ job_row_id: string }> {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/verify-urls`),
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(patternIds ? { pattern_ids: patternIds } : {})
+      body: JSON.stringify({
+        ...(patternIds ? { pattern_ids: patternIds } : {}),
+        ...(targetStatuses && targetStatuses.length > 0
+          ? { target_statuses: targetStatuses }
+          : {})
+      })
     }
   );
 
   return readJsonResponse<{ job_row_id: string }>(response);
 }
 
+// patternId scopes the whole response — the job reported, the per-status
+// counts, and the freshness check. Omit it for the session-wide view.
 export async function getVerificationStatus(
-  sessionId: string
+  sessionId: string,
+  patternId?: string
 ): Promise<VerificationStatus> {
+  const suffix = patternId
+    ? `?pattern_id=${encodeURIComponent(patternId)}`
+    : "";
   const response = await fetchWithTimeout(
-    backendUrl(`/api/sessions/${sessionId}/verify-urls/status`),
+    backendUrl(`/api/sessions/${sessionId}/verify-urls/status${suffix}`),
     {
       cache: "no-store"
     }
   );
 
   return readJsonResponse<VerificationStatus>(response);
+}
+
+// ---- Sample triage (fast approximate read, v1.50) --------------------------
+
+export type TriageEstimate = {
+  http_status: number;
+  // Raw count seen in the sample.
+  observed: number;
+  // Stratified extrapolation to the full population.
+  estimate: number;
+  ci_low: number;
+  ci_high: number;
+};
+
+export type TriageStratum = {
+  label: string;
+  population: number;
+  sampled: number;
+  hits_by_status: Record<string, number>;
+};
+
+export type TriageRun = {
+  id: string;
+  status: string;
+  target_statuses: number[] | null;
+  population_total: number;
+  sampled_total: number;
+  expanded: boolean;
+  error: string | null;
+  completed_at: string | null;
+  result: {
+    // The REAL fraction probed. Quote this, not the nominal 1% — the min/max
+    // clamps and any adaptive expansion move it.
+    sample_rate: number;
+    nominal_sample_rate: number;
+    duration_ms: number;
+    target_statuses: number[];
+    estimates: TriageEstimate[];
+    strata: TriageStratum[];
+  } | null;
+};
+
+export async function startPatternTriage(
+  sessionId: string,
+  patternId: string,
+  targetStatuses?: number[]
+): Promise<{ run_id: string }> {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/triage`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(
+        targetStatuses && targetStatuses.length > 0
+          ? { target_statuses: targetStatuses }
+          : {}
+      )
+    }
+  );
+
+  return readJsonResponse<{ run_id: string }>(response);
+}
+
+export async function getPatternTriage(
+  sessionId: string,
+  patternId: string
+): Promise<{ run: TriageRun | null }> {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/triage`),
+    {
+      cache: "no-store"
+    }
+  );
+
+  return readJsonResponse<{ run: TriageRun | null }>(response);
 }
 
 const VERIFICATION_POLL_INTERVAL_MS = 1500;

@@ -79,13 +79,8 @@ import {
   getPatternStructures,
   getPatterns,
   getProblemUrlCount,
-  getVerificationStatus,
-  getVerifiedUrls,
-  startUrlVerification,
-  deleteVerifiedUrls,
   type PatternStructuresResponse,
   type StructureFilter,
-  type VerificationStatus,
   getSession,
   getDeleteProblemUrlsStatus,
   getTrailingSlashStatus,
@@ -133,6 +128,7 @@ import {
 } from "@/components/bulk-replace-dialog";
 import { DeleteUrlDialog } from "@/components/delete-url-dialog";
 import { ProblemUrlsDialog } from "@/components/problem-urls-dialog";
+import { PatternVerifyPanel } from "@/components/pattern-verify-panel";
 import { FixTrailingSlashesDialog } from "@/components/fix-trailing-slashes-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -902,21 +898,10 @@ export default function ResultsDashboardPage({
   const [fixPatternTotal, setFixPatternTotal] = useState(0);
   const [fixLoading, setFixLoading] = useState(false);
   const [fixInferredWithoutRule, setFixInferredWithoutRule] = useState(false);
-  // Verify-then-act state for the Fix modal (v1.49): session-level verification
-  // status, THIS pattern's verified per-status counts, and the status-chip
-  // selection driving "delete every URL of that code in this pattern".
-  const [fixVerification, setFixVerification] =
-    useState<VerificationStatus | null>(null);
-  const [fixVerifiedCounts, setFixVerifiedCounts] = useState<Record<
-    number,
-    number
-  > | null>(null);
-  const [fixVerifyPolling, setFixVerifyPolling] = useState(false);
-  const [fixVerifyError, setFixVerifyError] = useState<string | null>(null);
-  const [fixDeleteStatuses, setFixDeleteStatuses] = useState<Set<number>>(
-    new Set()
-  );
-  const [fixVerifiedDeleting, setFixVerifiedDeleting] = useState(false);
+  // Verify-then-act for the Fix modal now lives in PatternVerifyPanel (v1.50),
+  // which owns its own pattern-scoped verification/triage state. It used to be
+  // eight pieces of state here driving a SESSION-wide verify from inside a
+  // single pattern's modal — the scoping bug this release fixes.
   // Per-row action (v1.42.1): "fix" (adopt the redirect destination), "delete"
   // (remove the source URL — for not-found destinations), or "skip" (leave it
   // untouched — the inferred-row default). Keyed by candidate.key.
@@ -2475,216 +2460,20 @@ export default function ResultsDashboardPage({
     };
   }, [params.id, fixPatternId]);
 
-  // The problem statuses the verified chips cover — mirrors the backend's
-  // PROBLEM_STATUSES and the Delete Problem URLs dialog.
-  const FIX_PROBLEM_STATUSES = useMemo(() => [301, 302, 307, 308, 404], []);
-
-  // This pattern's verified per-status totals (full population, not samples).
-  const loadFixVerifiedCounts = useCallback(
-    async (patternId: string) => {
-      const entries = await Promise.all(
-        FIX_PROBLEM_STATUSES.map(async (code) => {
-          const result = await getVerifiedUrls(params.id, patternId, {
-            statuses: [code],
-            limit: 1
-          });
-
-          return [code, result.total] as const;
-        })
-      );
-
-      return Object.fromEntries(entries) as Record<number, number>;
-    },
-    [params.id, FIX_PROBLEM_STATUSES]
-  );
-
-  // On Fix-modal open: pick up the verification state; with a fresh
-  // verification, load this pattern's verified counts so the chips show the
-  // real population sizes. Resumes the progress display for an in-flight run.
-  useEffect(() => {
-    if (!fixPatternId) {
-      return;
-    }
-
-    let cancelled = false;
-
-    setFixVerification(null);
-    setFixVerifiedCounts(null);
-    setFixVerifyError(null);
-    setFixDeleteStatuses(new Set());
-
-    void (async () => {
-      try {
-        const status = await getVerificationStatus(params.id);
-
-        if (cancelled) {
-          return;
-        }
-
-        setFixVerification(status);
-
-        if (
-          status.job &&
-          (status.job.status === "PENDING" || status.job.status === "RUNNING")
-        ) {
-          setFixVerifyPolling(true);
-        } else if (status.verified_at) {
-          const counts = await loadFixVerifiedCounts(fixPatternId);
-
-          if (!cancelled) {
-            setFixVerifiedCounts(counts);
-          }
-        }
-      } catch {
-        // Non-fatal: the modal still works rule-based.
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [params.id, fixPatternId, loadFixVerifiedCounts]);
-
-  // Poll a running verification while the Fix modal is open.
-  useEffect(() => {
-    if (!fixVerifyPolling || !fixPatternId) {
-      return;
-    }
-
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout>;
-
-    const tick = async () => {
-      try {
-        const status = await getVerificationStatus(params.id);
-
-        if (cancelled) {
-          return;
-        }
-
-        setFixVerification(status);
-
-        if (
-          status.job &&
-          (status.job.status === "PENDING" || status.job.status === "RUNNING")
-        ) {
-          timer = setTimeout(tick, 1500);
-        } else if (status.job?.status === "FAILED") {
-          setFixVerifyError(status.job.error ?? "Verification failed.");
-          setFixVerifyPolling(false);
-        } else {
-          // Load the counts BEFORE flipping the polling flag: the flip re-runs
-          // this effect, whose cleanup sets `cancelled` — any set-state gated on
-          // it after that point would be silently dropped.
-          const counts = await loadFixVerifiedCounts(fixPatternId);
-
-          if (cancelled) {
-            return;
-          }
-
-          setFixVerifiedCounts(counts);
-          setFixVerifyPolling(false);
-          await loadMaintenanceState();
-        }
-      } catch {
-        if (!cancelled) {
-          timer = setTimeout(tick, 1500);
-        }
-      }
-    };
-
-    void tick();
-
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [
-    fixVerifyPolling,
-    fixPatternId,
-    params.id,
-    loadFixVerifiedCounts,
-    loadMaintenanceState
-  ]);
-
-  async function handleFixVerify() {
-    setFixVerifyError(null);
-
-    try {
-      await startUrlVerification(params.id);
-      setFixVerifyPolling(true);
-    } catch (nextError) {
-      setFixVerifyError(
-        friendlyApiErrorMessage(nextError, "Unable to start verification.")
-      );
-    }
-  }
-
-  function toggleFixDeleteStatus(code: number) {
-    setFixDeleteStatuses((current) => {
-      const next = new Set(current);
-
-      if (next.has(code)) {
-        next.delete(code);
-      } else {
-        next.add(code);
-      }
-
-      return next;
-    });
-  }
-
-  // Delete EVERY verified URL of the selected status codes in this pattern —
-  // across all uploaded files, not the sampled preview. Verified counts make
-  // the button label the true population size.
-  async function handleDeleteVerifiedUrls() {
-    if (!fixRow || fixVerifiedDeleting) {
-      return;
-    }
-
-    const statuses =
-      fixDeleteStatuses.size > 0
-        ? FIX_PROBLEM_STATUSES.filter((code) => fixDeleteStatuses.has(code))
-        : FIX_PROBLEM_STATUSES;
-
-    setFixVerifiedDeleting(true);
-    setFixVerifyError(null);
-
-    try {
-      await deleteVerifiedUrls(params.id, fixRow.id, statuses);
-
-      // Wait for the maintenance job so the toast reports the real count.
-      for (;;) {
-        const { job } = await getDeleteProblemUrlsStatus(params.id);
-
-        if (!job || !["PENDING", "RUNNING", "UNDOING"].includes(job.status)) {
-          if (job?.status === "FAILED") {
-            throw new Error(job.error ?? "The deletion failed.");
-          }
-
-          setFindReplaceToast({
-            tone: "success",
-            message: `Deleted ${formatNumber(
-              Number(job?.items_changed ?? 0)
-            )} verified URLs (${statuses.join(", ")}) from this pattern's files.`
-          });
-          break;
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      }
-
+  // Verify-then-act moved into PatternVerifyPanel (v1.50). All this page still
+  // owns is what happens AFTER a delete: refresh the results and close the
+  // modal. The panel is scoped to fixRow.id, which is the fix — the old code
+  // here called startUrlVerification(sessionId) with no pattern, so opening one
+  // pattern verified the whole session.
+  const handleVerifiedDeleted = useCallback(
+    async (message: string) => {
+      setFindReplaceToast({ tone: "success", message });
       setFixRow(null);
       await loadResults({ silent: true });
       await loadMaintenanceState();
-    } catch (nextError) {
-      setFixVerifyError(
-        friendlyApiErrorMessage(nextError, "Unable to delete verified URLs.")
-      );
-    } finally {
-      setFixVerifiedDeleting(false);
-    }
-  }
+    },
+    [loadResults, loadMaintenanceState]
+  );
 
   function setFixAction(key: string, action: FixAction) {
     setFixActions((current) => ({ ...current, [key]: action }));
@@ -4654,134 +4443,16 @@ export default function ResultsDashboardPage({
                   too varied to infer a single rewrite rule for the rest.
                 </p>
               ) : null}
-              {/* Verify-then-act (v1.49): status-code groups over the VERIFIED
-                  full population of this pattern. Selecting codes + Delete
-                  removes every such URL from all uploaded files. */}
-              <div
-                className="space-y-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2"
-                data-testid="fix-verified-section"
-              >
-                <p className="text-sm font-semibold text-slate-700">
-                  Delete by status code (full population)
-                </p>
-                {fixVerifyPolling ? (
-                  <div className="space-y-2">
-                    <p className="flex items-center gap-2 text-sm text-indigo-900">
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      Verifying{" "}
-                      {formatNumber(fixVerification?.job?.urls_done ?? 0)} of{" "}
-                      {formatNumber(fixVerification?.job?.urls_total ?? 0)} URLs…
-                    </p>
-                    <Progress
-                      value={
-                        (fixVerification?.job?.urls_total ?? 0) > 0
-                          ? Math.round(
-                              ((fixVerification?.job?.urls_done ?? 0) /
-                                (fixVerification?.job?.urls_total ?? 1)) *
-                                100
-                            )
-                          : 0
-                      }
-                    />
-                  </div>
-                ) : fixVerifiedCounts &&
-                  fixVerification?.verified_at &&
-                  !fixVerification.stale ? (
-                  <>
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => setFixDeleteStatuses(new Set())}
-                        className={`rounded-full px-3 py-1 text-xs font-medium ${
-                          fixDeleteStatuses.size === 0
-                            ? "bg-slate-800 text-white"
-                            : "bg-white text-slate-600 ring-1 ring-slate-200"
-                        }`}
-                      >
-                        All ·{" "}
-                        {formatNumber(
-                          Object.values(fixVerifiedCounts).reduce(
-                            (sum, count) => sum + count,
-                            0
-                          )
-                        )}
-                      </button>
-                      {FIX_PROBLEM_STATUSES.map((code) => (
-                        <button
-                          key={code}
-                          type="button"
-                          onClick={() => toggleFixDeleteStatus(code)}
-                          className={`rounded-full px-3 py-1 text-xs font-medium ${
-                            fixDeleteStatuses.has(code)
-                              ? "bg-slate-800 text-white"
-                              : "bg-white text-slate-600 ring-1 ring-slate-200"
-                          }`}
-                        >
-                          {code} · {formatNumber(fixVerifiedCounts[code] ?? 0)}
-                        </button>
-                      ))}
-                    </div>
-                    {(() => {
-                      const selected =
-                        fixDeleteStatuses.size > 0
-                          ? FIX_PROBLEM_STATUSES.filter((code) =>
-                              fixDeleteStatuses.has(code)
-                            )
-                          : FIX_PROBLEM_STATUSES;
-                      const targetCount = selected.reduce(
-                        (sum, code) => sum + (fixVerifiedCounts[code] ?? 0),
-                        0
-                      );
-
-                      return (
-                        <Button
-                          type="button"
-                          variant="destructive"
-                          size="sm"
-                          className="gap-1"
-                          disabled={targetCount === 0 || fixVerifiedDeleting}
-                          onClick={() => void handleDeleteVerifiedUrls()}
-                        >
-                          {fixVerifiedDeleting ? (
-                            <>
-                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                              Deleting…
-                            </>
-                          ) : (
-                            <>
-                              <Trash2 className="h-3.5 w-3.5" />
-                              Delete all {formatNumber(targetCount)} matching URL
-                              {targetCount === 1 ? "" : "s"} from every file
-                            </>
-                          )}
-                        </Button>
-                      );
-                    })()}
-                  </>
-                ) : (
-                  <div className="flex flex-wrap items-center gap-2">
-                    <p className="min-w-0 flex-1 text-xs text-slate-600">
-                      {fixVerification?.verified_at && fixVerification.stale
-                        ? "Files changed since the last verification — re-verify to act on exact per-status counts."
-                        : "HTTP-check every URL in this session's files to select and delete by exact status code."}
-                    </p>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      className="shrink-0"
-                      onClick={() => void handleFixVerify()}
-                    >
-                      {fixVerification?.verified_at
-                        ? "Re-verify all URLs"
-                        : "Verify all URLs"}
-                    </Button>
-                  </div>
-                )}
-                {fixVerifyError ? (
-                  <p className="text-xs text-red-500">{fixVerifyError}</p>
-                ) : null}
-              </div>
+              {/* Verify-then-act, scoped to THIS pattern (v1.50). Owns its own
+                  triage/verification state; see components/pattern-verify-panel. */}
+              {fixRow ? (
+                <PatternVerifyPanel
+                  sessionId={params.id}
+                  patternId={fixRow.id}
+                  template={fixRow.template}
+                  onDeleted={handleVerifiedDeleted}
+                />
+              ) : null}
               <div className="rounded-md border border-slate-200">
                 <div className="flex items-center justify-between border-b border-slate-200 px-3 py-2">
                   <button

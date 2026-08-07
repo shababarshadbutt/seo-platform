@@ -290,7 +290,12 @@ test("verify-then-delete acts on the full population and spares the healthy 91",
   );
 
   await processVerifyUrlsJob(
-    { session_id: sessionId, job_row_id: verifyJobRow.rows[0].id, pattern_ids: null },
+    {
+      session_id: sessionId,
+      job_row_id: verifyJobRow.rows[0].id,
+      pattern_ids: null,
+      target_statuses: null
+    },
     silentLogger
   );
 

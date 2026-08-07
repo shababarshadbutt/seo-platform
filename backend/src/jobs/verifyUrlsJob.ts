@@ -2,10 +2,13 @@ import type { FastifyBaseLogger } from "fastify";
 
 import { pool } from "../db/pool.js";
 import { runWithBoundedConcurrency } from "../sitemaps/boundedConcurrency.js";
-import { displaySourceFilename, isHttpUrl } from "../sitemaps/filenames.js";
-import { streamSitemapUrlLocs } from "../sitemaps/parser.js";
-import { pathMatchesTemplate } from "../sitemaps/rewriteLocs.js";
-import { checkSampleUrl, type SampleCheckResult } from "./sampleUrlCheck.js";
+import {
+  enumeratePopulation,
+  type EnumeratedUrl,
+  type PatternRow
+} from "./patternPopulation.js";
+import type { SampleCheckResult } from "./sampleUrlCheck.js";
+import { probeUrl, verifyConcurrency } from "./verifyProbe.js";
 import type { VerifyUrlsJobData } from "../queue/verificationQueue.js";
 
 // Full-population URL verification (verify-then-act, step 1).
@@ -17,6 +20,14 @@ import type { VerifyUrlsJobData } from "../queue/verificationQueue.js";
 // (checkSampleUrl: HEAD -> GET fallback -> soft-404 sniff), and upserts one
 // verified_urls row per (session, url). Deletion then acts on the full verified
 // set — see processDeleteProblemUrlsJob's use_verified path.
+//
+// SCOPE IS THE EXPENSIVE DECISION (v1.50). data.pattern_ids restricts the
+// population to the patterns the user is actually working on. It was always
+// plumbed through here, but the Fix modal never sent it, so every verification
+// swept the whole session: a 25,744-URL pattern triggered a 1,324,310-URL run.
+// Nothing about this job was slow — it was doing 51x the necessary work. The
+// call site is fixed in the Fix modal, and the route now records the scope on
+// the job row so a scoped run can never be confused with a session-wide one.
 //
 // Progress rides the maintenance_jobs row the route created, kind 'verify-urls'.
 // FOR THIS KIND ONLY files_total / files_done carry URL counts, not file counts
@@ -38,100 +49,11 @@ type SessionRow = {
   user_agent: string;
 };
 
-type PatternRow = {
-  id: string;
-  template: string;
-};
-
-type EnumeratedUrl = {
-  url: string;
-  patternId: string;
-  template: string;
-  sourceFiles: Set<string>;
-};
-
 async function markFailed(jobRowId: string, message: string) {
   await pool.query(
     "UPDATE maintenance_jobs SET status = 'FAILED', error = $2 WHERE id = $1",
     [jobRowId, message]
   );
-}
-
-// Enumerate the verification population: stream every <loc> of every current,
-// non-deleted, valid, local sitemap file and keep the ones whose pathname
-// matches a selected pattern template (first match wins — same one-URL-one-
-// pattern rule extraction uses). Deduped by the exact <loc> string, because
-// that string is what the deletion engine matches byte-for-byte; the set of
-// display files that contained it is recorded for the delete job's file scope.
-async function enumeratePopulation(
-  sessionId: string,
-  patterns: PatternRow[],
-  logger: FastifyBaseLogger
-): Promise<Map<string, EnumeratedUrl>> {
-  const filesResult = await pool.query<{ id: string; filename: string }>(
-    `
-      SELECT id, filename
-      FROM sitemap_files
-      WHERE session_id = $1
-        AND source_role = 'current'
-        AND is_deleted = false
-        AND is_valid = true
-      ORDER BY filename ASC
-    `,
-    [sessionId]
-  );
-  const files = filesResult.rows.filter((row) => !isHttpUrl(row.filename));
-  const population = new Map<string, EnumeratedUrl>();
-
-  for (const file of files) {
-    const display = displaySourceFilename(sessionId, file.filename);
-
-    try {
-      await streamSitemapUrlLocs(file.filename, (loc) => {
-        const existing = population.get(loc);
-
-        if (existing) {
-          existing.sourceFiles.add(display);
-          return;
-        }
-
-        let pathname: string;
-
-        try {
-          pathname = new URL(loc).pathname;
-        } catch {
-          // Not a parseable absolute URL — it can't be probed or matched.
-          return;
-        }
-
-        // First matching selected template wins; a loc matching none is not
-        // part of the population.
-        const matched = patterns.find((pattern) =>
-          pathMatchesTemplate(pathname, pattern.template)
-        );
-
-        if (!matched) {
-          return;
-        }
-
-        population.set(loc, {
-          url: loc,
-          patternId: matched.id,
-          template: matched.template,
-          sourceFiles: new Set([display])
-        });
-      });
-    } catch (error) {
-      // Missing on disk (cleaned up) or unreadable — skip like the deletion
-      // rebuild does, but say so: a silently skipped file shrinks the population.
-      logger.warn(
-        { session_id: sessionId, filename: file.filename, error },
-        "verify urls: could not stream file, skipping"
-      );
-    }
-  }
-
-  return population;
 }
 
 // Batch-upsert check results. ON CONFLICT resets the verification columns but
@@ -200,13 +122,22 @@ export async function processVerifyUrlsJob(
   const {
     session_id: sessionId,
     job_row_id: jobRowId,
-    pattern_ids: patternIds
+    pattern_ids: patternIds,
+    target_statuses: targetStatuses
   } = data;
 
   logger.info(
-    { session_id: sessionId, job_row_id: jobRowId, pattern_ids: patternIds },
+    {
+      session_id: sessionId,
+      job_row_id: jobRowId,
+      pattern_ids: patternIds,
+      scope: patternIds ? "patterns" : "session",
+      target_statuses: targetStatuses
+    },
     "verify urls job started"
   );
+
+  const startedAtMs = Date.now();
 
   try {
     const sessionResult = await pool.query<SessionRow>(
@@ -242,7 +173,19 @@ export async function processVerifyUrlsJob(
     const runStartedResult = await pool.query<{ now: string }>("SELECT now()");
     const runStarted = runStartedResult.rows[0].now;
 
+    // RUNNING with an unknown total, before enumeration. Enumeration streams
+    // every <loc> of every file (tens of seconds on a 1.3M-URL session), and
+    // without this the row sits at PENDING throughout, so the modal shows
+    // "Verifying 0 of 0" and looks hung. The client reads total = 0 while
+    // RUNNING as the enumerating phase.
+    await pool.query(
+      "UPDATE maintenance_jobs SET status = 'RUNNING', files_total = 0, files_done = 0 WHERE id = $1",
+      [jobRowId]
+    );
+
+    const enumerateStartedMs = Date.now();
     const population = await enumeratePopulation(sessionId, patterns, logger);
+    const enumerateMs = Date.now() - enumerateStartedMs;
 
     // URLs already deleted from the sitemap keep their rows (restore needs
     // them) but are not re-probed: their live status is irrelevant while they
@@ -271,8 +214,14 @@ export async function processVerifyUrlsJob(
         session_id: sessionId,
         job_row_id: jobRowId,
         patterns: patterns.length,
+        scope: patternIds ? "patterns" : "session",
         urls_total: entries.length,
-        skipped_deleted: skippedDeleted
+        skipped_deleted: skippedDeleted,
+        // Separated from the HTTP phase so the two costs stay distinguishable
+        // in the logs — the whole scoping fix was diagnosed from the fact that
+        // urls_total, not enumeration, was the number out of proportion.
+        enumerate_ms: enumerateMs,
+        concurrency: verifyConcurrency(session.concurrency)
       },
       "verify urls: population enumerated, checking started"
     );
@@ -285,26 +234,17 @@ export async function processVerifyUrlsJob(
 
     await runWithBoundedConcurrency(
       toCheck,
-      Math.max(1, session.concurrency),
+      // Clamped to config.verification.maxConcurrency. sessions.concurrency can
+      // be set as high as 30, which is a defensible burst for a 20-URL sample
+      // and is not defensible for a sustained sweep of someone else's
+      // production origin. Rate is bounded separately, inside probeUrl.
+      verifyConcurrency(session.concurrency),
       async (entry, index) => {
-        // checkSampleUrl never throws — failures come back classified
-        // (timeout/ssl_cert/no_response), which is what we want persisted.
-        let path: string;
-
-        try {
-          const url = new URL(entry.url);
-
-          path = `${url.pathname}${url.search}`;
-        } catch {
-          path = entry.url;
-        }
-
         // The loc itself is passed as source_url, so resolveSampleTarget applies
         // the same www-equivalence rule sampling uses when base_url and the
         // sitemap disagree about the host label.
-        const result = await checkSampleUrl(
+        const result = await probeUrl(
           session.base_url,
-          path,
           entry.url,
           session.user_agent,
           logger,
@@ -363,8 +303,19 @@ export async function processVerifyUrlsJob(
       }
     }
 
-    // items_changed = URLs with a problem status among what this run verified —
-    // the number the delete flow can act on.
+    // items_changed = URLs the delete flow can act on. Normally every problem
+    // status; for a status-scoped run ("Verify 404s") only the statuses asked
+    // for, so the completion number is the EXACT count of the thing the user
+    // asked about rather than a total they then have to re-filter.
+    //
+    // A status-scoped run still probes the whole scoped population — it has to,
+    // since a URL's status is not knowable without asking for it. The filter
+    // narrows what is REPORTED, not what is checked. Triage is the layer that
+    // avoids the work.
+    const countedStatuses =
+      targetStatuses && targetStatuses.length > 0
+        ? targetStatuses
+        : VERIFY_PROBLEM_STATUSES;
     const problemResult = await pool.query<{ count: string }>(
       `
         SELECT COUNT(*)::text AS count
@@ -374,7 +325,7 @@ export async function processVerifyUrlsJob(
           AND is_deleted_from_sitemap = false
           AND http_status = ANY($3::int[])
       `,
-      [sessionId, sweepPatternIds, VERIFY_PROBLEM_STATUSES]
+      [sessionId, sweepPatternIds, countedStatuses]
     );
     const problemCount = Number(problemResult.rows[0]?.count ?? 0);
 
@@ -387,12 +338,27 @@ export async function processVerifyUrlsJob(
       [jobRowId, problemCount]
     );
 
+    const durationMs = Date.now() - startedAtMs;
+
     logger.info(
       {
         session_id: sessionId,
         job_row_id: jobRowId,
+        scope: patternIds ? "patterns" : "session",
+        patterns: patterns.length,
         urls_total: entries.length,
-        problem_urls: problemCount
+        urls_checked: toCheck.length,
+        counted_statuses: countedStatuses,
+        problem_urls: problemCount,
+        enumerate_ms: enumerateMs,
+        duration_ms: durationMs,
+        // The measurement that made the original bug diagnosable, kept as a
+        // first-class field: divide it into a future slow report before
+        // assuming the checker got slower.
+        checks_per_second:
+          durationMs > 0
+            ? Math.round((toCheck.length / (durationMs / 1000)) * 100) / 100
+            : 0
       },
       "verify urls job complete"
     );

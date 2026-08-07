@@ -21,8 +21,13 @@ export type VerifyUrlsJobData = {
   // 'verify-urls', files_total/files_done carry URL counts (see 038 migration).
   job_row_id: string;
   // Patterns (source_role 'current') whose URLs to verify; null → every current
-  // pattern of the session.
+  // pattern of the session. The Fix modal ALWAYS sends exactly one id — sending
+  // null from there is the bug this release fixes.
   pattern_ids: string[] | null;
+  // Statuses the caller asked about, for a status-scoped run ("Verify 404s").
+  // Narrows what the completion count REPORTS, not what gets probed: a URL's
+  // status cannot be known without checking it. null → every problem status.
+  target_statuses: number[] | null;
 };
 
 export type VerificationJobName = typeof VERIFY_URLS_JOB;
@@ -56,9 +61,29 @@ async function reusableSingletonJob(jobId: string) {
   return existingJob;
 }
 
+// Stable id for a verification's SCOPE.
+//
+// This used to be the session id alone, which meant a whole-session run and a
+// pattern-scoped run were the same BullMQ job: whichever arrived second was
+// silently dropped as a duplicate, and its caller polled a job that was
+// verifying something else entirely. Sorting makes the id independent of the
+// order the caller listed its patterns in, so the same scope always dedupes.
+export function verifyScopeJobId(
+  sessionId: string,
+  patternIds: string[] | null
+): string {
+  if (!patternIds || patternIds.length === 0) {
+    return `${VERIFY_URLS_JOB}-${sessionId}`;
+  }
+
+  return `${VERIFY_URLS_JOB}-${sessionId}-${[...patternIds].sort().join("_")}`;
+}
+
 export async function enqueueVerifyUrlsJob(data: VerifyUrlsJobData) {
-  // One in-flight verification per session.
-  const jobId = `${VERIFY_URLS_JOB}-${data.session_id}`;
+  // One in-flight verification per (session, scope). Still at most one RUNNING
+  // at a time overall — the queue is concurrency 1 — this only controls what
+  // counts as a duplicate request.
+  const jobId = verifyScopeJobId(data.session_id, data.pattern_ids);
   const existingJob = await reusableSingletonJob(jobId);
 
   if (existingJob) {
