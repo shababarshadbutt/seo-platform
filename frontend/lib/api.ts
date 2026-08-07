@@ -1105,6 +1105,11 @@ export type PatternStructuresResponse = {
     paramIndex: number;
     clusters: StructureCluster[];
   }>;
+  // The SAME real-URL pool the clusters above were detected from (v1.51). The
+  // Update Pattern modal filters it client-side to show a real sample URL and a
+  // real match count for the combination of structures the user picked, one per
+  // {param} position. Bounded at ~1,000 rows server-side.
+  urls: string[];
 };
 
 export async function getPatternStructures(
@@ -1409,6 +1414,10 @@ export async function undoFindReplace(sessionId: string) {
 export type PatternSourceFile = {
   source_file: string;
   occurrences: number;
+  // sitemap_files.id for this display name, so the Update Pattern modal can
+  // download exactly the ticked files (the download endpoint excludes by id).
+  // null when the occurrence has no live file row.
+  file_id: string | null;
 };
 
 export type RenamePatternResult = {
@@ -1573,7 +1582,7 @@ export async function renamePatternTemplate(
     newTemplate: string;
     sourceFiles: string[];
     // Scope the rename to one detected structure (v1.49) — see StructureFilter.
-    structureFilter?: StructureFilter | null;
+    structureFilters?: StructureFilter[] | null;
   },
   onProgress?: (progress: PatternStructureProgress) => void
 ) {
@@ -1585,7 +1594,7 @@ export async function renamePatternTemplate(
       body: JSON.stringify({
         new_template: input.newTemplate,
         source_files: input.sourceFiles,
-        structure_filter: input.structureFilter ?? null
+        structure_filter: input.structureFilters ?? null
       })
     }
   );
@@ -1617,7 +1626,7 @@ export async function transformPatternStructure(
     currentStructure: string;
     newStructure: string;
     sourceFiles: string[];
-    structureFilter?: StructureFilter | null;
+    structureFilters?: StructureFilter[] | null;
   },
   onProgress?: (progress: PatternStructureProgress) => void
 ) {
@@ -1631,7 +1640,7 @@ export async function transformPatternStructure(
         current_structure: input.currentStructure,
         new_structure: input.newStructure,
         source_files: input.sourceFiles,
-        structure_filter: input.structureFilter ?? null
+        structure_filter: input.structureFilters ?? null
       })
     }
   );

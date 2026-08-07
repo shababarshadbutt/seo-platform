@@ -33,15 +33,17 @@ import {
 
 export type FileRewriteSpec =
   | { kind: "trailingSlash" }
-  // structureFilter (v1.49) scopes the rewrite to ONE detected URL structure
-  // inside the pattern — locs outside it pass through byte-for-byte. It crosses
-  // the thread edge FULLY RESOLVED (a path-segment index, not a param ordinal)
-  // so the worker applies it without any template parsing.
+  // structureFilters (v1.49, list since v1.51) scopes the rewrite to the
+  // detected URL structures inside the pattern — locs outside them pass through
+  // byte-for-byte. A pattern with several {param} slots can be scoped at more
+  // than one position at once and the list is ANDed. They cross the thread edge
+  // FULLY RESOLVED (path-segment indexes, not param ordinals) so the worker
+  // applies them without any template parsing.
   | {
       kind: "patternTemplate";
       from: string;
       to: string;
-      structureFilter?: ResolvedStructureFilter | null;
+      structureFilters?: ResolvedStructureFilter[] | null;
     }
   // Exact whole-URL replacements (apply-redirects, v1.42). Passed as [old, new]
   // pairs because a Map isn't structured-clone friendly across the thread edge.
@@ -62,7 +64,7 @@ export type FileRewriteSpec =
       kind: "structureTransform";
       currentStructure: string;
       newStructure: string;
-      structureFilter?: ResolvedStructureFilter | null;
+      structureFilters?: ResolvedStructureFilter[] | null;
     };
 
 export type FileRewriteInput = {
@@ -78,7 +80,7 @@ function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
   if (spec.kind === "patternTemplate") {
     return applyStructureFilterToRewriter(
       buildPatternTemplateRewriter(spec.from, spec.to),
-      spec.structureFilter ?? null
+      spec.structureFilters ?? null
     );
   }
 
@@ -96,7 +98,7 @@ function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
 
     return applyStructureFilterToRewriter(
       (url) => transformUrl(url, current, next),
-      spec.structureFilter ?? null
+      spec.structureFilters ?? null
     );
   }
 

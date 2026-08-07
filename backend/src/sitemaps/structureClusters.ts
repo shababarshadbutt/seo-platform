@@ -421,6 +421,29 @@ export function urlMatchesStructureFilter(
   rawUrl: string,
   filter: ResolvedStructureFilter
 ): boolean {
+  return urlMatchesStructureFilters(rawUrl, [filter]);
+}
+
+// Does this URL fall inside EVERY scoped structure? (v1.51)
+//
+// A pattern with several {param} slots has independently detected structures at
+// each one — /rfq/{param}/{param}/{param} can be scoped to niin-parts-{var} at
+// segment A AND {var}-catalog at segment C — so the guard takes a LIST and ANDs
+// it. One filter is just the one-element case; an EMPTY list means unscoped and
+// matches everything, which keeps "no scope" and "scope to nothing" from being
+// the same value.
+//
+// The URL is parsed ONCE for the whole list rather than per filter. At three
+// filters over a multi-million-loc pattern that is millions of avoided URL
+// constructions, and this runs inside the per-loc hot path of every rewrite.
+export function urlMatchesStructureFilters(
+  rawUrl: string,
+  filters: ResolvedStructureFilter[]
+): boolean {
+  if (filters.length === 0) {
+    return true;
+  }
+
   let url: URL;
 
   try {
@@ -429,26 +452,98 @@ export function urlMatchesStructureFilter(
     return false;
   }
 
-  const segment = url.pathname.split("/").filter(Boolean)[filter.segmentIndex];
+  const segments = url.pathname.split("/").filter(Boolean);
 
-  if (segment === undefined) {
-    return false;
-  }
+  return filters.every((filter) => {
+    const segment = segments[filter.segmentIndex];
 
-  return segmentMatchesAnchor(segment, filter.anchor, filter.value);
+    if (segment === undefined) {
+      return false;
+    }
+
+    return segmentMatchesAnchor(segment, filter.anchor, filter.value);
+  });
 }
 
 // AND the structure guard into an existing rewriter: URLs outside the scoped
 // structure pass through byte-for-byte (null), exactly like template
 // non-matches do today.
+//
+// Accepts a single filter or a list so every existing call site keeps working
+// while multi-position scoping is added around it.
 export function applyStructureFilterToRewriter(
   rewriter: LocUrlRewriter,
-  filter: ResolvedStructureFilter | null
+  filter: ResolvedStructureFilter | ResolvedStructureFilter[] | null
 ): LocUrlRewriter {
-  if (!filter) {
+  const filters = filter === null ? [] : Array.isArray(filter) ? filter : [filter];
+
+  if (filters.length === 0) {
     return rewriter;
   }
 
   return (url: string) =>
-    urlMatchesStructureFilter(url, filter) ? rewriter(url) : null;
+    urlMatchesStructureFilters(url, filters) ? rewriter(url) : null;
+}
+
+// Resolve a whole list against a template. Returns null if ANY filter fails to
+// resolve — a partially-applied scope would silently widen the edit to include
+// the position that dropped out, which is the one failure mode a scoped edit
+// must never have.
+export function resolveStructureFilters(
+  filters: StructureFilter[],
+  fromTemplate: string
+): ResolvedStructureFilter[] | null {
+  const resolved: ResolvedStructureFilter[] = [];
+
+  for (const filter of filters) {
+    const one = resolveStructureFilter(filter, fromTemplate);
+
+    if (!one) {
+      return null;
+    }
+
+    resolved.push(one);
+  }
+
+  return resolved;
+}
+
+// Upper bound on filters in one request. A pattern has one filter per {param}
+// slot at most; this is a guard against a hand-crafted body, not a real limit.
+export const MAX_STRUCTURE_FILTERS = 16;
+
+// Read the persisted / request form into a list.
+//
+// BACK-COMPATIBLE BY NECESSITY, not by preference: pattern_renames rows written
+// before v1.51 hold a single filter OBJECT in structure_filter, and undo
+// replays a rename by reading that column back. If this only understood arrays,
+// every scoped rename performed before this release would silently undo as an
+// UNSCOPED rename and rewrite URLs it never touched. So a bare object is
+// accepted and read as a one-element list, forever.
+//
+// null / undefined / [] all mean unscoped.
+export function parseStructureFilters(raw: unknown): StructureFilter[] | null {
+  if (raw === undefined || raw === null) {
+    return [];
+  }
+
+  if (Array.isArray(raw)) {
+    if (raw.length > MAX_STRUCTURE_FILTERS) {
+      return null;
+    }
+
+    const filters: StructureFilter[] = [];
+
+    for (const entry of raw) {
+      if (!isValidStructureFilter(entry)) {
+        return null;
+      }
+
+      filters.push(entry);
+    }
+
+    return filters;
+  }
+
+  return isValidStructureFilter(raw) ? [raw] : null;
 }

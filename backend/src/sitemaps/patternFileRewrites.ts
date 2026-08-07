@@ -235,10 +235,11 @@ export async function rewritePatternSourceFilesOnDisk(
     oldTemplate: string;
     newTemplate: string;
     selectedDisplayFiles: string[];
-    // Scope the rewrite to ONE detected structure inside the pattern (v1.49):
-    // locs whose {param} value falls outside the anchor pass through unchanged.
-    // Resolved against oldTemplate by the caller.
-    structureFilter?: ResolvedStructureFilter | null;
+    // Scope the rewrite to the detected structures inside the pattern (v1.49;
+    // a LIST since v1.51, ANDed). Locs whose {param} value falls outside any
+    // anchor pass through unchanged. Resolved against oldTemplate by the
+    // caller. Empty / omitted = unscoped, the whole pattern.
+    structureFilters?: ResolvedStructureFilter[] | null;
     onFileDone?: (filesDone: number) => void | Promise<void>;
     onFilesTotal?: (filesTotal: number) => void | Promise<void>;
   }
@@ -254,7 +255,7 @@ export async function rewritePatternSourceFilesOnDisk(
     rewrittenLocCount: 0
   };
 
-  const structureFilter = options.structureFilter ?? null;
+  const structureFilters = options.structureFilters ?? [];
 
   await rewriteTargets(targets, {
     sessionId: options.sessionId,
@@ -262,7 +263,7 @@ export async function rewritePatternSourceFilesOnDisk(
       kind: "patternTemplate",
       from: options.oldTemplate,
       to: options.newTemplate,
-      structureFilter
+      structureFilters
     },
     // Order-based param mapping: carries each {param} value across even when the
     // new template changes segment count (e.g. inserting /aviation/). The old
@@ -270,7 +271,7 @@ export async function rewritePatternSourceFilesOnDisk(
     // that case — the "extra content in downloaded URLs" bug.
     inlineRewriter: applyStructureFilterToRewriter(
       buildPatternTemplateRewriter(options.oldTemplate, options.newTemplate),
-      structureFilter
+      structureFilters
     ),
     buildStoredName: (sessionId, displayName) =>
       buildRenamedStoredFilename(sessionId, displayName, randomUUID()),
@@ -306,11 +307,12 @@ export async function transformPatternSourceFilesOnDisk(
     currentStructure: string;
     newStructure: string;
     rewriteUrl: LocUrlRewriter;
-    // Scope the transform to ONE detected structure (v1.49) — resolved against
-    // the current structure's segments by the caller. The inline rewriteUrl is
-    // expected to ALREADY be wrapped by the caller; this field only rides along
-    // for the parallel pool's spec so the worker threads apply the same guard.
-    structureFilter?: ResolvedStructureFilter | null;
+    // Scope the transform to the detected structures (v1.49; a LIST since
+    // v1.51, ANDed) — resolved against the current structure's segments by the
+    // caller. The inline rewriteUrl is expected to ALREADY be wrapped by the
+    // caller; this field only rides along for the parallel pool's spec so the
+    // worker threads apply the same guard.
+    structureFilters?: ResolvedStructureFilter[] | null;
     onFileDone?: (filesDone: number) => void | Promise<void>;
     onFilesTotal?: (filesTotal: number) => void | Promise<void>;
   }
@@ -332,7 +334,7 @@ export async function transformPatternSourceFilesOnDisk(
       kind: "structureTransform",
       currentStructure: options.currentStructure,
       newStructure: options.newStructure,
-      structureFilter: options.structureFilter ?? null
+      structureFilters: options.structureFilters ?? []
     },
     inlineRewriter: options.rewriteUrl,
     buildStoredName: (sessionId, displayName) =>

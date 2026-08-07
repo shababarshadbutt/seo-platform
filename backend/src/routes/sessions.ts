@@ -169,8 +169,8 @@ import {
 } from "../sitemaps/transformStructure.js";
 import {
   detectPatternStructures,
-  isValidStructureFilter,
-  resolveStructureFilter,
+  parseStructureFilters,
+  resolveStructureFilters,
   type StructureFilter
 } from "../sitemaps/structureClusters.js";
 
@@ -240,6 +240,8 @@ type RenameBody = {
   new_template?: string;
   source_files?: unknown[];
   // Scope the rename to one detected structure inside the pattern (v1.49).
+  // One filter object (pre-v1.51) or an ARRAY of them, ANDed across {param}
+  // positions. null / [] / absent = whole-pattern.
   structure_filter?: unknown;
 };
 
@@ -248,6 +250,8 @@ type TransformBody = {
   current_structure?: string;
   new_structure?: string;
   source_files?: unknown[];
+  // One filter object (pre-v1.51) or an ARRAY of them, ANDed across {param}
+  // positions. null / [] / absent = whole-pattern.
   structure_filter?: unknown;
 };
 
@@ -386,6 +390,23 @@ function parseUserAgent(body: CreateSessionBody) {
   }
 
   return trimmed;
+}
+
+const STRUCTURE_FILTER_SHAPE_ERROR =
+  "structure_filter must be { param_index, anchor: prefix|suffix, value } " +
+  "or an array of them";
+
+// What goes INTO the request fingerprint for a filter list.
+//
+// Empty normalises back to `null`, which is what an unscoped request hashed as
+// before v1.51. Without this, the same unscoped rename would hash differently
+// after the deploy, and any retry-after-timeout in flight across it would look
+// like a NEW operation and re-apply an edit that had already committed —
+// exactly the double-apply that pattern_structure_jobs' fingerprint exists to
+// prevent. A single-element list is NOT collapsed to a bare object: nothing
+// pre-v1.51 could have sent a list, so there is no older hash to preserve.
+function fingerprintFilters(filters: StructureFilter[]): unknown {
+  return filters.length === 0 ? null : filters;
 }
 
 function badRequest(message: string) {
@@ -890,6 +911,37 @@ function urlContainsFind(value: string, find: string, matchCase: boolean) {
 // contributing file; the counts sum to patterns.total_urls). For patterns
 // extracted before that table existed we fall back to splitting the pattern's
 // source_file column and distributing the total evenly.
+// Map each of a session's files from its DISPLAY name to its row id.
+//
+// pattern_file_occurrences records display names, while everything that acts on
+// a file (the download endpoint's ?exclude=, deletion) addresses it by id. The
+// mapping is computed here rather than on the client because deriving a display
+// name from a stored one is filename-mangling logic that has drifted before —
+// displaySourceFilename is the single definition and it lives server-side.
+//
+// It is also why the DISPLAY name is the stable key: a rename or transform
+// repoints sitemap_files.filename at a fresh copy, so the stored name changes
+// under an edit while the display name does not.
+async function sessionFileIdsByDisplayName(
+  sessionId: string
+): Promise<Map<string, string>> {
+  const files = await pool.query<{ id: string; filename: string }>(
+    "SELECT id, filename FROM sitemap_files WHERE session_id = $1 AND is_deleted = false",
+    [sessionId]
+  );
+  const byDisplay = new Map<string, string>();
+
+  for (const file of files.rows) {
+    if (isHttpUrl(file.filename)) {
+      continue;
+    }
+
+    byDisplay.set(displaySourceFilename(sessionId, file.filename), file.id);
+  }
+
+  return byDisplay;
+}
+
 async function patternSourceFileBreakdown(
   patternId: string,
   totalUrls: number,
@@ -2610,8 +2662,18 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         Number(patternResult.rows[0].total_urls),
         patternResult.rows[0].source_file
       );
+      // file_id lets the Update Pattern modal download exactly the files the
+      // user ticked (v1.51) — the download endpoint excludes by id, and the
+      // client must not be the thing that derives one from a display name.
+      // null when a recorded occurrence no longer has a live file row.
+      const fileIds = await sessionFileIdsByDisplayName(request.params.id);
 
-      return { source_files: sourceFiles };
+      return {
+        source_files: sourceFiles.map((file) => ({
+          ...file,
+          file_id: fileIds.get(file.source_file) ?? null
+        }))
+      };
     }
   );
 
@@ -2655,34 +2717,33 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       const currentTemplate = patternResult.rows[0].template;
       const sourceRole = patternResult.rows[0].source_role;
 
-      // Scope the rename to one detected structure (v1.49). Validated against
-      // the CURRENT template — the {param} ordinal it names must exist there.
-      const rawStructureFilter = request.body?.structure_filter;
-      let structureFilter: StructureFilter | null = null;
+      // Scope the rename to the detected structures (v1.49; a LIST since
+      // v1.51). Validated against the CURRENT template — every {param} ordinal
+      // named must exist there.
+      const parsedFilters = parseStructureFilters(
+        request.body?.structure_filter
+      );
 
-      if (rawStructureFilter !== undefined && rawStructureFilter !== null) {
-        if (!isValidStructureFilter(rawStructureFilter)) {
-          return reply
-            .code(400)
-            .send(
-              badRequest(
-                "structure_filter must be { param_index, anchor: prefix|suffix, value }"
-              )
-            );
-        }
-
-        if (!resolveStructureFilter(rawStructureFilter, currentTemplate)) {
-          return reply
-            .code(400)
-            .send(
-              badRequest(
-                `structure_filter param_index ${rawStructureFilter.param_index} does not exist in ${currentTemplate}`
-              )
-            );
-        }
-
-        structureFilter = rawStructureFilter;
+      if (parsedFilters === null) {
+        return reply
+          .code(400)
+          .send(badRequest(STRUCTURE_FILTER_SHAPE_ERROR));
       }
+
+      if (!resolveStructureFilters(parsedFilters, currentTemplate)) {
+        return reply
+          .code(400)
+          .send(
+            badRequest(
+              `structure_filter param_index ${parsedFilters
+                .map((filter) => filter.param_index)
+                .join(", ")} does not all exist in ${currentTemplate}`
+            )
+          );
+      }
+
+      const structureFilters = parsedFilters;
+      const filterFingerprint = fingerprintFilters(structureFilters);
 
       // Reverting to the most recent rename's old_template is an undo: pop that
       // history row instead of recording a new rename (one level of undo).
@@ -2713,7 +2774,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           patternStructureFingerprint("RENAME", {
             new_template: newTemplate,
             source_files: sourceFiles,
-            structure_filter: structureFilter
+            structure_filter: filterFingerprint
           })
         );
 
@@ -2773,14 +2834,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         fingerprint: patternStructureFingerprint("RENAME", {
           new_template: newTemplate,
           source_files: sourceFiles,
-          structure_filter: structureFilter
+          structure_filter: filterFingerprint
         }),
         params: {
           new_template: newTemplate,
           source_files: selectedFiles,
           occurrence_count: occurrenceCount,
           is_undo: isUndo,
-          structure_filter: structureFilter
+          structure_filter: structureFilters
         },
         filesTotal: selectedFiles.length
       });
@@ -2869,32 +2930,32 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // Scope the transform to one detected structure (v1.49). The ordinal is
       // resolved against the current structure string — the same segments the
       // transform itself matches URLs with.
-      const rawStructureFilter = request.body?.structure_filter;
-      let structureFilter: StructureFilter | null = null;
+      const parsedFilters = parseStructureFilters(
+        request.body?.structure_filter
+      );
 
-      if (rawStructureFilter !== undefined && rawStructureFilter !== null) {
-        if (!isValidStructureFilter(rawStructureFilter)) {
-          return reply
-            .code(400)
-            .send(
-              badRequest(
-                "structure_filter must be { param_index, anchor: prefix|suffix, value }"
-              )
-            );
-        }
-
-        if (!resolveStructureFilter(rawStructureFilter, currentStructureRaw)) {
-          return reply
-            .code(400)
-            .send(
-              badRequest(
-                `structure_filter param_index ${rawStructureFilter.param_index} does not exist in ${currentStructureRaw}`
-              )
-            );
-        }
-
-        structureFilter = rawStructureFilter;
+      if (parsedFilters === null) {
+        return reply
+          .code(400)
+          .send(badRequest(STRUCTURE_FILTER_SHAPE_ERROR));
       }
+
+      // Resolved against the CURRENT STRUCTURE string, not the pattern
+      // template: a transform addresses named {A}/{B} slots, and the route has
+      // already validated that its param count matches the pattern's.
+      if (!resolveStructureFilters(parsedFilters, currentStructureRaw)) {
+        return reply
+          .code(400)
+          .send(
+            badRequest(
+              `structure_filter param_index ${parsedFilters
+                .map((filter) => filter.param_index)
+                .join(", ")} does not all exist in ${currentStructureRaw}`
+            )
+          );
+      }
+
+      const structureFilters = parsedFilters;
 
       // The label rename is optional; default to the existing template so a
       // structure-only transform leaves the pattern name untouched. A SCOPED
@@ -2902,7 +2963,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // pattern's other structures (the job enforces this too).
       const newTemplateRaw = request.body?.new_template;
       const newTemplate =
-        !structureFilter &&
+        structureFilters.length === 0 &&
         typeof newTemplateRaw === "string" &&
         newTemplateRaw.trim().length > 0
           ? newTemplateRaw
@@ -2957,14 +3018,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           new_structure: newStructureRaw,
           new_template: newTemplateRaw ?? null,
           source_files: sourceFiles,
-          structure_filter: structureFilter
+          structure_filter: fingerprintFilters(structureFilters)
         }),
         params: {
           current_structure: currentStructureRaw,
           new_structure: newStructureRaw,
           new_template: newTemplate,
           source_files: selectedFiles,
-          structure_filter: structureFilter
+          structure_filter: structureFilters
         },
         filesTotal: selectedFiles.length
       });
@@ -2992,8 +3053,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       }
 
       const template = patternResult.rows[0].template;
-      const urls = await pool.query<{ path: string }>(
-        "SELECT path FROM pattern_urls WHERE pattern_id = $1",
+      const urls = await pool.query<{ path: string; source_url: string }>(
+        "SELECT path, source_url FROM pattern_urls WHERE pattern_id = $1 ORDER BY path ASC",
         [request.params.patternId]
       );
       // pattern_urls.path keeps the query string; clustering is over path
@@ -3006,7 +3067,20 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // may be fewer than patterns.total_urls — the UI labels counts as
         // "of the sampled pool" beyond this size.
         url_pool_size: paths.length,
-        positions: detectPatternStructures(template, paths)
+        positions: detectPatternStructures(template, paths),
+        // THE SAME POOL the clusters above were detected from (v1.51), so the
+        // Update Pattern modal can filter it client-side as the user picks a
+        // structure per {param} position and show a real matching URL plus a
+        // real match count for the COMBINATION.
+        //
+        // Deliberately this pool and not sampled_urls: sampled_urls holds at
+        // most ~20 HTTP-verified rows per pattern, and a scope narrowed at two
+        // positions at once would match none of them, leaving the modal with an
+        // empty preview and no sample URL to show. Any structure offered in a
+        // dropdown is by construction present here, because this is where it
+        // was found. Capped upstream at ~1,000 rows (patternUrlPoolMinSize), so
+        // the payload is bounded.
+        urls: urls.rows.map((row) => row.source_url)
       };
     }
   );

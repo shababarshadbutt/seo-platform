@@ -63,6 +63,7 @@ import {
   chooseDownloadFolder,
   downloadCorrectedSitemap,
   downloadSessionExport,
+  downloadSitemapsZip,
   fetchSitemapsZipBlob,
   formatDownloadProgress,
   getDownloadFolderName,
@@ -129,6 +130,10 @@ import {
 import { DeleteUrlDialog } from "@/components/delete-url-dialog";
 import { ProblemUrlsDialog } from "@/components/problem-urls-dialog";
 import { PatternVerifyPanel } from "@/components/pattern-verify-panel";
+import {
+  resolveStructureFilters,
+  urlMatchesStructureFilters
+} from "@/lib/structure-filter";
 import { FixTrailingSlashesDialog } from "@/components/fix-trailing-slashes-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -843,16 +848,26 @@ export default function ResultsDashboardPage({
   );
   const [isLoadingRenameFiles, setIsLoadingRenameFiles] = useState(false);
   const [isRenaming, setIsRenaming] = useState(false);
-  // Scope for the Update Pattern modal (v1.49): when set, the rename/transform
-  // applies ONLY to URLs of this detected structure — the backend ANDs the
-  // filter into its matchers, other structures under the same pattern are
-  // untouched. Set by the per-structure Edit buttons in the expander row;
-  // openRenameModal resets it on every open.
-  const [renameStructureScope, setRenameStructureScope] = useState<{
-    filter: StructureFilter;
-    label: string;
-    urlCount: number;
-  } | null>(null);
+  // Scope for the Update Pattern modal (v1.49; per-POSITION since v1.51).
+  //
+  // One selection per {param} ordinal, so /rfq/{param}/{param}/{param} gets
+  // three independent dropdowns and the backend ANDs whatever the user picked.
+  // Positions left unselected are unconstrained — "any structure here" — which
+  // is why absence is modelled by a missing key rather than a null entry.
+  // openRenameModal resets this on every open.
+  const [renameStructureSelections, setRenameStructureSelections] = useState<
+    Record<number, { anchor: "prefix" | "suffix"; value: string; label: string }>
+  >({});
+  // The detected structures + real URL pool for the pattern the modal is open
+  // on. Loaded once per open; the dropdowns, the sample URL and the scoped
+  // preview all read it, so changing a dropdown costs nothing.
+  const [renameStructures, setRenameStructures] =
+    useState<PatternStructuresResponse | null>(null);
+  // Set once a Fix (rename/transform) has completed for the open modal, which
+  // is what enables Download — the updated files only exist after that.
+  const [renameFixCompleted, setRenameFixCompleted] = useState(false);
+  const [isDownloadingRenameFiles, setIsDownloadingRenameFiles] =
+    useState(false);
   // Structures expander (v1.49): which pattern row is expanded, plus a
   // per-pattern cache of detected structures so re-expanding is instant.
   const [expandedStructuresId, setExpandedStructuresId] = useState<
@@ -1803,7 +1818,42 @@ export default function ResultsDashboardPage({
     setRenameRow(rowData);
     // Reset on EVERY open: an unscoped Edit right after a scoped one must not
     // inherit the previous scope.
-    setRenameStructureScope(options.structureScope ?? null);
+    //
+    // A structureScope passed in comes from the expander's per-structure Edit
+    // button, which addresses ONE position — it seeds that position's dropdown
+    // and leaves the others unconstrained.
+    setRenameStructureSelections(
+      options.structureScope
+        ? {
+            [options.structureScope.filter.param_index]: {
+              anchor: options.structureScope.filter.anchor,
+              value: options.structureScope.filter.value,
+              label: options.structureScope.label
+            }
+          }
+        : {}
+    );
+    setRenameFixCompleted(false);
+    setRenameStructures(structuresByPattern[rowData.id] ?? null);
+
+    // The dropdowns and the scoped preview both need the detected structures
+    // and the real URL pool. Cached per pattern by the expander, so re-opening
+    // is instant; fetched here when the user came straight to Update Pattern
+    // without expanding the row first.
+    if (!structuresByPattern[rowData.id]) {
+      void getPatternStructures(params.id, rowData.id)
+        .then((structures) => {
+          setStructuresByPattern((current) => ({
+            ...current,
+            [rowData.id]: structures
+          }));
+          setRenameStructures(structures);
+        })
+        .catch(() => {
+          // Non-fatal: the modal still works unscoped, and the preview falls
+          // back to the HTTP-sampled URLs.
+        });
+    }
 
     // Pre-populate the URL-structure fields from the pattern that's already on
     // screen, with {param} → {A}, {B}, {C}… so the user edits from a starting
@@ -1929,7 +1979,7 @@ export default function ResultsDashboardPage({
         {
           newTemplate: renameValue,
           sourceFiles: Array.from(selectedRenameFiles),
-          structureFilter: renameStructureScope?.filter ?? null
+          structureFilters: renameStructureFilters
         },
         setStructureProgress
       );
@@ -1937,7 +1987,7 @@ export default function ResultsDashboardPage({
       await loadResults({ silent: true });
       // A scoped edit changes the structure makeup — drop the cache so the
       // expander refetches fresh clusters next open.
-      if (renameStructureScope) {
+      if (hasStructureScope) {
         setStructuresByPattern((current) => {
           const next = { ...current };
 
@@ -1947,13 +1997,17 @@ export default function ResultsDashboardPage({
         });
       }
 
-      setRenameRow(null);
+      // The modal STAYS OPEN on success (v1.51) so Download can offer the
+      // updated files. Downloading the post-fix state is only meaningful once
+      // the fix has actually landed, and closing the modal would leave nowhere
+      // to offer it from.
+      setRenameFixCompleted(true);
       setFindReplaceToast({
         tone: "success",
         message: result.already_completed
           ? "This rename had already finished — showing the result of that run."
-          : renameStructureScope
-            ? `Renamed the ${renameStructureScope.label} URLs — other structures under this pattern were left untouched.`
+          : hasStructureScope
+            ? `Renamed the ${scopeSummaryLabel} URLs — other structures under this pattern were left untouched.`
             : `Pattern renamed — ${formatNumber(
                 result.occurrence_count
               )} occurrences across ${result.source_files_count} file${
@@ -2025,13 +2079,13 @@ export default function ResultsDashboardPage({
           currentStructure: transformCurrentStructure,
           newStructure: transformNewStructure,
           sourceFiles: Array.from(selectedRenameFiles),
-          structureFilter: renameStructureScope?.filter ?? null
+          structureFilters: renameStructureFilters
         },
         setStructureProgress
       );
 
       await loadResults({ silent: true });
-      if (renameStructureScope) {
+      if (hasStructureScope) {
         setStructuresByPattern((current) => {
           const next = { ...current };
 
@@ -2041,7 +2095,7 @@ export default function ResultsDashboardPage({
         });
       }
 
-      setRenameRow(null);
+      setRenameFixCompleted(true);
       setFindReplaceToast({
         tone: "success",
         message: result.already_completed
@@ -2685,18 +2739,82 @@ export default function ResultsDashboardPage({
     !renameEmpty &&
     selectedRenameFiles.size > 0;
 
-  // Build before/after samples from real sampled URLs for the Preview panel.
+  // ---- Scoped structure selection (v1.51) ---------------------------------
+  // The user's dropdown picks, as the wire filters the backend will AND.
+  const renameStructureFilters = useMemo<StructureFilter[]>(
+    () =>
+      Object.entries(renameStructureSelections)
+        .map(([paramIndex, selection]) => ({
+          param_index: Number(paramIndex),
+          anchor: selection.anchor,
+          value: selection.value
+        }))
+        .sort((a, b) => a.param_index - b.param_index),
+    [renameStructureSelections]
+  );
+
+  // Resolved against the pattern template so the client can apply the SAME
+  // match test the server will. resolveStructureFilters is all-or-nothing for
+  // the same reason it is server-side: previewing a partially-applied scope
+  // would show a narrower edit than the one that actually runs.
+  const resolvedRenameFilters = useMemo(
+    () =>
+      resolveStructureFilters(
+        renameStructureFilters,
+        renameRow?.template ?? ""
+      ) ?? [],
+    [renameStructureFilters, renameRow]
+  );
+
+  // The pattern's real URL pool narrowed to the chosen COMBINATION. This is the
+  // one number that tells the user whether their combination is real: clusters
+  // at each position are detected independently over all URLs, so nothing
+  // guarantees the intersection of two of them is non-empty.
+  const scopedPoolUrls = useMemo(() => {
+    const urls = renameStructures?.urls ?? [];
+
+    return renameStructureFilters.length === 0
+      ? urls
+      : urls.filter((url) =>
+          urlMatchesStructureFilters(url, resolvedRenameFilters)
+        );
+  }, [renameStructures, renameStructureFilters, resolvedRenameFilters]);
+
+  const hasStructureScope = renameStructureFilters.length > 0;
+  // Empty combination = nothing to edit. Surfaced in the UI and used to block
+  // the Fix button, so the user finds out here rather than from a job that
+  // rewrites zero URLs.
+  const scopeMatchesNothing =
+    hasStructureScope &&
+    (renameStructures?.urls.length ?? 0) > 0 &&
+    scopedPoolUrls.length === 0;
+
+  // Build before/after samples for the Preview panel.
+  //
+  // Source is the pattern's real URL POOL (~1,000 rows, the same set the
+  // dropdowns' structures were detected from), narrowed to the selected
+  // combination — NOT sampled_urls. sampled_urls holds at most ~20 HTTP-checked
+  // rows, so a scope narrowed at two positions would match none of them and the
+  // preview would sit empty for a perfectly valid edit. Falls back to the
+  // samples only when the pool could not be loaded.
+  const transformPreviewSource =
+    scopedPoolUrls.length > 0 || (renameStructures?.urls.length ?? 0) > 0
+      ? scopedPoolUrls
+      : (samplesByPattern[renameRow?.id ?? ""] ?? []).map(
+          (sample) => sample.url
+        );
+
   const transformPreviewSamples =
     transformParsed && renameRow
-      ? (samplesByPattern[renameRow.id] ?? [])
-          .map((sample) => {
+      ? transformPreviewSource
+          .map((url) => {
             const after = transformUrl(
-              sample.url,
+              url,
               transformParsed!.current,
               transformParsed!.next
             );
 
-            return after ? { before: sample.url, after } : null;
+            return after ? { before: url, after } : null;
           })
           .filter(
             (entry): entry is { before: string; after: string } =>
@@ -2704,6 +2822,91 @@ export default function ResultsDashboardPage({
           )
           .slice(0, 3)
       : [];
+
+  // How many of the scoped URLs the transform would actually rewrite — the
+  // preview's own denominator, so "3 of N" is honest about what N counts.
+  const transformPreviewMatchCount = useMemo(() => {
+    if (!transformParsed) {
+      return 0;
+    }
+
+    return transformPreviewSource.reduce(
+      (total, url) =>
+        transformUrl(url, transformParsed.current, transformParsed.next)
+          ? total + 1
+          : total,
+      0
+    );
+  }, [transformPreviewSource, transformParsed]);
+
+  // Download ONLY the files the user ticked, in their POST-FIX state (v1.51).
+  //
+  // Enabled only after a Fix has completed, matching how every other download
+  // here works — the Cleaner's ZIP appears after cleaning, not before. There is
+  // deliberately NO pre-fix backup download: Undo already restores byte-
+  // identically, and a second, weaker safety net that only helps if the user
+  // remembers to click it beforehand is worse than the one that always works.
+  //
+  // The endpoint excludes by id, so the ticked set is inverted into the
+  // untickedones. type "all" (not "edited"): the point is the files the user
+  // chose, whether or not this particular fix happened to rewrite each one.
+  const downloadFixedFiles = useCallback(async () => {
+    if (!renameRow || isDownloadingRenameFiles) {
+      return;
+    }
+
+    setIsDownloadingRenameFiles(true);
+
+    try {
+      const excludeFileIds = renameSourceFiles
+        .filter(
+          (file) => !selectedRenameFiles.has(file.source_file) && file.file_id
+        )
+        .map((file) => file.file_id as string);
+
+      const saved = await downloadSitemapsZip(params.id, "all", {
+        excludeFileIds
+      });
+
+      if (saved !== null) {
+        setFindReplaceToast({
+          tone: "success",
+          message: `Downloaded ${formatNumber(selectedRenameFiles.size)} updated file${
+            selectedRenameFiles.size === 1 ? "" : "s"
+          }.`
+        });
+      }
+    } catch (error) {
+      setFindReplaceToast({
+        tone: "error",
+        message: friendlyApiErrorMessage(
+          error,
+          "Unable to download the updated files."
+        )
+      });
+    } finally {
+      setIsDownloadingRenameFiles(false);
+    }
+  }, [
+    renameRow,
+    isDownloadingRenameFiles,
+    renameSourceFiles,
+    selectedRenameFiles,
+    params.id
+  ]);
+
+  // A real URL from the chosen combination, shown under "Current URL structure"
+  // so the user edits against something concrete rather than a placeholder.
+  const scopedExampleUrl = scopedPoolUrls[0] ?? null;
+
+  // "niin-parts-{var} + {var}-parts-catalog" — reads the same order as the
+  // dropdowns above it.
+  const scopeSummaryLabel = renameStructureFilters
+    .map(
+      (filter) =>
+        renameStructureSelections[filter.param_index]?.label ?? filter.value
+    )
+    .join(" + ");
 
   const session = sessionData?.session;
   const zipReady = session?.zip_ready ?? false;
@@ -4712,21 +4915,182 @@ export default function ResultsDashboardPage({
                 across selected source files.
               </DialogDescription>
             </DialogHeader>
-            {renameStructureScope ? (
+            {/* Per-position structure scope (v1.51). One dropdown per {param}
+                slot, each listing that position's detected sub-structures.
+                Picks are ANDed, so choosing at two positions edits only their
+                intersection. Replaces the single generic scope badge. */}
+            {(renameStructures?.positions.length ?? 0) > 0 ? (
               <div
-                className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm text-indigo-900"
+                className="space-y-2 rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2"
                 data-testid="structure-scope-badge"
               >
-                Scoped to{" "}
-                <code className="font-mono font-semibold">
-                  {renameStructureScope.label}
-                </code>{" "}
-                ({formatNumber(renameStructureScope.urlCount)} URL
-                {renameStructureScope.urlCount === 1 ? "" : "s"}) — other
-                structures under this pattern will not be touched.
+                <p className="text-xs font-semibold uppercase tracking-wide text-indigo-900">
+                  Limit this edit to
+                </p>
+                <div className="space-y-1.5">
+                  {(renameStructures?.positions ?? []).map((position) => {
+                    // Only anchored clusters can become a filter. A residual
+                    // bucket has no shared literal to scope by — the same
+                    // limitation the structures expander already states.
+                    const selectable = position.clusters.filter(
+                      (cluster) => cluster.anchor !== null
+                    );
+
+                    if (selectable.length === 0) {
+                      return null;
+                    }
+
+                    const selected =
+                      renameStructureSelections[position.paramIndex];
+                    const value = selected
+                      ? `${selected.anchor}:${selected.value}`
+                      : "";
+
+                    return (
+                      <label
+                        key={position.paramIndex}
+                        className="flex flex-wrap items-center gap-2 text-sm text-indigo-900"
+                      >
+                        <span className="w-24 shrink-0 font-medium">
+                          Segment{" "}
+                          {String.fromCharCode(65 + position.paramIndex)}
+                        </span>
+                        <select
+                          className="min-w-0 flex-1 rounded-md border border-indigo-200 bg-white px-2 py-1 font-mono text-xs text-slate-800"
+                          value={value}
+                          data-testid={`structure-select-${position.paramIndex}`}
+                          onChange={(event) => {
+                            const next = event.target.value;
+
+                            setRenameStructureSelections((current) => {
+                              const updated = { ...current };
+
+                              if (next === "") {
+                                delete updated[position.paramIndex];
+
+                                return updated;
+                              }
+
+                              const cluster = selectable.find(
+                                (entry) =>
+                                  `${entry.anchor!.direction}:${entry.anchor!.value}` ===
+                                  next
+                              );
+
+                              if (cluster?.anchor) {
+                                updated[position.paramIndex] = {
+                                  anchor: cluster.anchor.direction,
+                                  value: cluster.anchor.value,
+                                  label: cluster.label
+                                };
+                              }
+
+                              return updated;
+                            });
+                          }}
+                        >
+                          <option value="">Any structure</option>
+                          {selectable.map((cluster) => (
+                            <option
+                              key={cluster.label}
+                              value={`${cluster.anchor!.direction}:${cluster.anchor!.value}`}
+                            >
+                              {cluster.label} ({formatNumber(cluster.urlCount)})
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    );
+                  })}
+                </div>
+                {hasStructureScope ? (
+                  <p
+                    className={`text-xs ${
+                      scopeMatchesNothing ? "text-red-600" : "text-indigo-800"
+                    }`}
+                    data-testid="structure-scope-count"
+                  >
+                    {scopeMatchesNothing ? (
+                      <>
+                        No URLs match{" "}
+                        <code className="font-mono">{scopeSummaryLabel}</code>{" "}
+                        together. Each structure exists on its own, but not in
+                        this combination — pick different ones.
+                      </>
+                    ) : (
+                      <>
+                        <code className="font-mono font-semibold">
+                          {scopeSummaryLabel}
+                        </code>{" "}
+                        — {formatNumber(scopedPoolUrls.length)} of{" "}
+                        {formatNumber(renameStructures?.url_pool_size ?? 0)}{" "}
+                        pooled URLs match. Other structures under this pattern
+                        will not be touched.
+                      </>
+                    )}
+                  </p>
+                ) : (
+                  <p className="text-xs text-indigo-800">
+                    Leave every dropdown on &ldquo;Any structure&rdquo; to edit
+                    the whole pattern.
+                  </p>
+                )}
               </div>
             ) : null}
-            {transformStep === "form" ? (
+            {/* Post-fix state (v1.51). The modal stays open after a successful
+                Fix so the updated files can be downloaded from here; before the
+                Fix there is nothing updated to download, which is why the
+                button only exists in this branch. */}
+            {renameFixCompleted ? (
+              <div className="space-y-4" data-testid="rename-fix-complete">
+                <p className="flex items-start gap-2 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+                  <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>
+                    Applied to {formatNumber(selectedRenameFiles.size)} file
+                    {selectedRenameFiles.size === 1 ? "" : "s"}
+                    {hasStructureScope ? (
+                      <>
+                        , scoped to{" "}
+                        <code className="font-mono">{scopeSummaryLabel}</code>
+                      </>
+                    ) : null}
+                    . The originals are kept — use Undo on the pattern row to
+                    restore them byte-for-byte.
+                  </span>
+                </p>
+                <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => setRenameRow(null)}
+                    disabled={isDownloadingRenameFiles}
+                  >
+                    Close
+                  </Button>
+                  <Button
+                    type="button"
+                    className="gap-1"
+                    onClick={() => void downloadFixedFiles()}
+                    disabled={
+                      isDownloadingRenameFiles || selectedRenameFiles.size === 0
+                    }
+                  >
+                    {isDownloadingRenameFiles ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Preparing download…
+                      </>
+                    ) : (
+                      <>
+                        <Download className="h-4 w-4" />
+                        Download {formatNumber(selectedRenameFiles.size)} updated
+                        file{selectedRenameFiles.size === 1 ? "" : "s"}
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </div>
+            ) : transformStep === "form" ? (
               <div className="space-y-4">
                 <div className="space-y-1">
                   <p className="text-sm font-semibold text-slate-700">
@@ -4789,6 +5153,18 @@ export default function ResultsDashboardPage({
                       autoComplete="off"
                       className="font-mono text-sm"
                     />
+                    {/* A REAL URL from the selected combination (v1.51), so the
+                        structure above is edited against something concrete
+                        rather than a generic placeholder. */}
+                    {scopedExampleUrl ? (
+                      <p
+                        className="break-all text-xs text-slate-500"
+                        data-testid="scoped-example-url"
+                      >
+                        <span className="text-slate-400">Matching URL: </span>
+                        <span className="font-mono">{scopedExampleUrl}</span>
+                      </p>
+                    ) : null}
                   </div>
                   <div className="space-y-1">
                     <label
@@ -4955,15 +5331,31 @@ export default function ResultsDashboardPage({
                 </div>
                 <div className="space-y-2">
                   <p className="text-sm font-semibold text-slate-700">
-                    Sample transformations (from sampled URLs)
+                    Sample transformations
+                    {hasStructureScope ? (
+                      <>
+                        {" "}
+                        <span className="font-normal text-slate-500">
+                          (scoped to{" "}
+                          <code className="font-mono">{scopeSummaryLabel}</code>
+                          )
+                        </span>
+                      </>
+                    ) : null}
                   </p>
                   {transformPreviewSamples.length === 0 ? (
                     <p className="text-sm text-slate-500">
-                      No sampled URLs matched this structure — double-check the
-                      current structure matches the pattern before applying.
+                      {scopeMatchesNothing
+                        ? "No URLs match the selected combination of structures — change the dropdowns above."
+                        : "No URLs matched this structure — double-check the current structure matches the pattern before applying."}
                     </p>
                   ) : (
-                    <ul className="space-y-2">
+                    <ul className="space-y-2" data-testid="transform-preview">
+                      <li className="text-xs text-slate-500">
+                        Showing {transformPreviewSamples.length} of{" "}
+                        {formatNumber(transformPreviewMatchCount)} matching URLs
+                        {hasStructureScope ? " in this combination" : ""}.
+                      </li>
                       {transformPreviewSamples.map((sample, index) => (
                         <li
                           key={index}

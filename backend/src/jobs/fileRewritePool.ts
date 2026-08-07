@@ -19,11 +19,32 @@ import type {
 // Sessions with at least this many target files use the parallel pool; smaller
 // ones stay on the simpler inline sequential loop (thread overhead isn't worth
 // it, and most sessions are small).
-export const FILE_REWRITE_PARALLEL_THRESHOLD = 200;
+//
+// Env-tunable so the two paths can be measured against each OTHER on identical
+// input — setting it above the file count forces the sequential path, which is
+// how the parallel speedup on this code path is benchmarked rather than
+// asserted (bench/patternRewriteScale.ts). It also lets a deployment on a
+// bigger or smaller box move the crossover without a rebuild.
+export const FILE_REWRITE_PARALLEL_THRESHOLD = readPositiveInt(
+  "FILE_REWRITE_PARALLEL_THRESHOLD",
+  200
+);
 
 // Parallel file processors. Kept at 4 — a safe default for typical machines
 // that still cuts a ~37-minute 900-file run to roughly a quarter of that.
-const MAX_WORKERS = 4;
+const MAX_WORKERS = readPositiveInt("FILE_REWRITE_MAX_WORKERS", 4);
+
+function readPositiveInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+
+  if (!raw) {
+    return fallback;
+  }
+
+  const value = Number.parseInt(raw, 10);
+
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
 
 let pool: Piscina | null = null;
 
