@@ -141,6 +141,19 @@ export function validateStructures(
   const nextNames = structureParamNames(next);
 
   if (currentNames.length !== patternParamCount) {
+    // The zero-param case is overwhelmingly "typed a literal example URL
+    // instead of the {A} template syntax" (e.g. /nsn/niin-parts-567/ for a
+    // /nsn/{param} pattern). The bare count mismatch is accurate but offers no
+    // way out, and Preview stays disabled — so this case gets the instruction.
+    // A literal can never be valid here: it matches only the one URL it names.
+    if (currentNames.length === 0 && patternParamCount > 0) {
+      return (
+        `current structure defines 0 params but the pattern has ${patternParamCount} — ` +
+        `put {A}${patternParamCount > 1 ? ", {B}…" : ""} where the URL varies ` +
+        `instead of a literal value`
+      );
+    }
+
     return `current structure defines ${currentNames.length} param${
       currentNames.length === 1 ? "" : "s"
     } but the pattern has ${patternParamCount}`;
@@ -222,6 +235,28 @@ export function transformUrl(
   const result = url.toString();
 
   return result === rawUrl ? null : result;
+}
+
+// Convert a pattern template's {param} placeholders to positional {A}, {B},
+// {C}… names for the Update Pattern modal's structure fields, so the SEO team
+// doesn't have to retype a structure that's already on screen. Every static
+// segment and the trailing slash are preserved untouched. (v1.40)
+//   /manufacturer/{param}/{param}/        -> /manufacturer/{A}/{B}/
+//   /rfq/{param}/{param}/{param}/{param}/ -> /rfq/{A}/{B}/{C}/{D}/
+//
+// Lives here rather than in the page so the modal's "Use this structure"
+// recovery affordance and the v1.40 pre-fill share one implementation, and so
+// the result is guaranteed to satisfy validateStructures for its own template.
+export function convertParamToABC(template: string): string {
+  let index = 0;
+
+  return template.replace(/\{param\}/g, () => {
+    const letter = String.fromCharCode(65 + index);
+
+    index += 1;
+
+    return `{${letter}}`;
+  });
 }
 
 // Count "{param}" placeholders in a pattern template (mirror of the backend

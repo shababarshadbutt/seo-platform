@@ -168,6 +168,19 @@ export function validateStructures(
   const nextNames = structureParamNames(next);
 
   if (currentNames.length !== patternParamCount) {
+    // The zero-param case is overwhelmingly "typed a literal example URL
+    // instead of the {A} template syntax" (e.g. /nsn/niin-parts-567/ for a
+    // /nsn/{param} pattern). The bare count mismatch is accurate but offers no
+    // way out, and Preview stays disabled — so this case gets the instruction.
+    // A literal can never be valid here: it matches only the one URL it names.
+    if (currentNames.length === 0 && patternParamCount > 0) {
+      return (
+        `current structure defines 0 params but the pattern has ${patternParamCount} — ` +
+        `put {A}${patternParamCount > 1 ? ", {B}…" : ""} where the URL varies ` +
+        `instead of a literal value`
+      );
+    }
+
     return `current structure defines ${currentNames.length} param${
       currentNames.length === 1 ? "" : "s"
     } but the pattern has ${patternParamCount}`;

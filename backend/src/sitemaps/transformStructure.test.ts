@@ -178,6 +178,37 @@ test("validateStructures rejects a param-count mismatch with the pattern", () =>
   );
 });
 
+// The nsnstocks screenshot: a /nsn/{param} pattern with a literal example URL
+// typed into "Current URL structure" instead of the {A} syntax. Rejecting it is
+// correct — a literal matches only the one URL it names — but the bare count
+// mismatch left Preview disabled with no way out, so this case carries the
+// instruction. (v1.52)
+test("validateStructures tells a 0-param current structure what to do instead", () => {
+  const typedLiteral = parseStructure("/nsn/niin-parts-567/");
+  const message = validateStructures(typedLiteral, parseStructure("/nsn/{A}"), 1) ?? "";
+
+  assert.match(message, /0 params but the pattern has 1/);
+  assert.match(message, /put \{A\} where the URL varies/);
+  assert.doesNotMatch(message, /\{B\}/);
+});
+
+test("validateStructures pluralises the placeholder hint past one param", () => {
+  const message =
+    validateStructures(parseStructure("/rfq/a/b"), parseStructure("/rfq/{A}/{B}"), 2) ?? "";
+
+  assert.match(message, /0 params but the pattern has 2/);
+  assert.match(message, /put \{A\}, \{B\}… where the URL varies/);
+});
+
+// A 0-param structure against a 0-param pattern is not this error — it is a
+// legitimate static-only rewrite, and must keep validating.
+test("validateStructures accepts a 0-param pair when the pattern has none", () => {
+  assert.equal(
+    validateStructures(parseStructure("/about-us/"), parseStructure("/about/"), 0),
+    null
+  );
+});
+
 test("validateStructures rejects dropping a param", () => {
   assert.match(
     validateStructures(CURRENT, parseStructure("/manufacturer/{A}"), 2) ?? "",

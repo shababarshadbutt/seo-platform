@@ -116,9 +116,11 @@ import {
   type PublishProgressEvent
 } from "@/lib/api";
 import {
+  convertParamToABC,
   countTemplateParams,
   parseStructure,
   StructureSyntaxError,
+  structureParamNames,
   transformUrl,
   validateStructures,
   type ParsedStructure
@@ -439,24 +441,6 @@ function sampleTone(sample: SampledUrl) {
     badgeVariant: "secondary" as const,
     icon: "⚠"
   };
-}
-
-// Convert a pattern template's {param} placeholders to positional {A}, {B},
-// {C}… names for the Update Pattern modal's structure fields, so the SEO team
-// doesn't have to retype a structure that's already on screen. Every static
-// segment and the trailing slash are preserved untouched. (v1.40)
-//   /manufacturer/{param}/{param}/       -> /manufacturer/{A}/{B}/
-//   /rfq/{param}/{param}/{param}/{param}/ -> /rfq/{A}/{B}/{C}/{D}/
-function convertParamToABC(template: string): string {
-  let index = 0;
-
-  return template.replace(/\{param\}/g, () => {
-    const letter = String.fromCharCode(65 + index);
-
-    index += 1;
-
-    return `{${letter}}`;
-  });
 }
 
 // Infer a pattern template from a set of URLs: segments that are identical
@@ -2657,6 +2641,11 @@ export default function ResultsDashboardPage({
   // Empty "current structure" => label-only rename (backward compatible).
   const wantsTransform = transformCurrentStructure.trim().length > 0;
   let transformError: string | null = null;
+  // True when the current structure has no {A} placeholders at all while the
+  // pattern does have changing segments — i.e. a literal example URL was typed
+  // over the pre-filled template. The message alone can't show the way out, so
+  // the UI pairs this with the pattern's real corrected structure. (v1.52)
+  let transformNeedsPlaceholders = false;
   let transformParsed: { current: ParsedStructure; next: ParsedStructure } | null =
     null;
 
@@ -2667,14 +2656,17 @@ export default function ResultsDashboardPage({
       try {
         const current = parseStructure(transformCurrentStructure);
         const next = parseStructure(transformNewStructure);
+        const patternParamCount = countTemplateParams(renameRow?.template ?? "");
         const validation = validateStructures(
           current,
           next,
-          countTemplateParams(renameRow?.template ?? "")
+          patternParamCount
         );
 
         if (validation) {
           transformError = validation;
+          transformNeedsPlaceholders =
+            structureParamNames(current).length === 0 && patternParamCount > 0;
         } else {
           transformParsed = { current, next };
         }
@@ -2915,6 +2907,18 @@ export default function ResultsDashboardPage({
         renameStructureSelections[filter.param_index]?.label ?? filter.value
     )
     .join(" + ");
+
+  // The valid starting structure for THIS pattern — "/nsn/{param}" -> "/nsn/{A}".
+  // Same value the modal pre-fills on open, kept available the whole time so
+  // typing over the field is always recoverable in one click. Scope-independent
+  // on purpose: the structure describes the pattern's SHAPE, while the scope
+  // narrows WHICH URLs are edited. (v1.52)
+  const structureStarter = renameRow
+    ? convertParamToABC(renameRow.template)
+    : "";
+  const structureStarterUsable =
+    structureStarter.length > 0 &&
+    structureStarter !== transformCurrentStructure;
 
   const session = sessionData?.session;
   const zipReady = session?.zip_ready ?? false;
@@ -4940,8 +4944,16 @@ export default function ResultsDashboardPage({
             }
           }}
         >
-          <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
-            <DialogHeader>
+          {/* min-w-0 on the dialog, header and every direct content wrapper
+              below: DialogContent is a CSS grid, and a grid item's default
+              min-width:auto lets one long unbreakable string (a scope label, a
+              sampled URL, a file name) force the column wider than sm:max-w-lg
+              — which is what produced the HORIZONTAL scrollbar here. Same fix
+              the Fix Redirect URLs dialog above already carries. Only the
+              intentional vertical scroll (max-h-[85vh] overflow-y-auto)
+              remains. (v1.52) */}
+          <DialogContent className="max-h-[85vh] min-w-0 overflow-y-auto sm:max-w-lg">
+            <DialogHeader className="min-w-0">
               <DialogTitle>Update Pattern</DialogTitle>
               <DialogDescription>
                 Rename the pattern label and/or transform its URL structure
@@ -4954,7 +4966,7 @@ export default function ResultsDashboardPage({
                 intersection. Replaces the single generic scope badge. */}
             {(renameStructures?.positions.length ?? 0) > 0 ? (
               <div
-                className="space-y-2 rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2"
+                className="min-w-0 space-y-2 rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2"
                 data-testid="structure-scope-badge"
               >
                 <p className="text-xs font-semibold uppercase tracking-wide text-indigo-900">
@@ -5046,13 +5058,13 @@ export default function ResultsDashboardPage({
                     {scopeMatchesNothing ? (
                       <>
                         No URLs match{" "}
-                        <code className="font-mono">{scopeSummaryLabel}</code>{" "}
+                        <code className="break-all font-mono">{scopeSummaryLabel}</code>{" "}
                         together. Each structure exists on its own, but not in
                         this combination — pick different ones.
                       </>
                     ) : (
                       <>
-                        <code className="font-mono font-semibold">
+                        <code className="break-all font-mono font-semibold">
                           {scopeSummaryLabel}
                         </code>{" "}
                         — {formatNumber(scopedPoolUrls.length)} of{" "}
@@ -5075,7 +5087,7 @@ export default function ResultsDashboardPage({
                 Fix there is nothing updated to download, which is why the
                 button only exists in this branch. */}
             {renameFixCompleted ? (
-              <div className="space-y-4" data-testid="rename-fix-complete">
+              <div className="min-w-0 space-y-4" data-testid="rename-fix-complete">
                 <p className="flex items-start gap-2 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
                   <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
                   <span>
@@ -5084,7 +5096,7 @@ export default function ResultsDashboardPage({
                     {hasStructureScope ? (
                       <>
                         , scoped to{" "}
-                        <code className="font-mono">{scopeSummaryLabel}</code>
+                        <code className="break-all font-mono">{scopeSummaryLabel}</code>
                       </>
                     ) : null}
                     . The originals are kept — use Undo on the pattern row to
@@ -5124,7 +5136,7 @@ export default function ResultsDashboardPage({
                 </div>
               </div>
             ) : transformStep === "form" ? (
-              <div className="space-y-4">
+              <div className="min-w-0 space-y-4">
                 <div className="space-y-1">
                   <p className="text-sm font-semibold text-slate-700">
                     Current pattern
@@ -5170,12 +5182,33 @@ export default function ResultsDashboardPage({
                     URL Structure Transformation (optional)
                   </p>
                   <div className="space-y-1">
-                    <label
-                      htmlFor="transform-current"
-                      className="text-sm font-semibold text-slate-700"
-                    >
-                      Current URL structure
-                    </label>
+                    <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+                      <label
+                        htmlFor="transform-current"
+                        className="text-sm font-semibold text-slate-700"
+                      >
+                        Current URL structure
+                      </label>
+                      {/* Always-available recovery, not just an error-state
+                          affordance: the field is pre-filled on open, so the
+                          only way to reach the 0-param dead end is to type over
+                          it — and then there was no way back without knowing
+                          the {A} syntax. One click restores a structure that is
+                          valid for this pattern BY CONSTRUCTION. (v1.52) */}
+                      {structureStarterUsable ? (
+                        <button
+                          type="button"
+                          data-testid="use-pattern-structure"
+                          className="min-w-0 max-w-full truncate rounded border border-indigo-200 bg-indigo-50 px-2 py-0.5 font-mono text-xs text-indigo-800 hover:bg-indigo-100"
+                          title={`Use ${structureStarter}`}
+                          onClick={() =>
+                            setTransformCurrentStructure(structureStarter)
+                          }
+                        >
+                          Use {structureStarter}
+                        </button>
+                      ) : null}
+                    </div>
                     <Input
                       id="transform-current"
                       value={transformCurrentStructure}
@@ -5185,6 +5218,7 @@ export default function ResultsDashboardPage({
                       placeholder="/manufacturer/{A}/{B}"
                       autoComplete="off"
                       className="font-mono text-sm"
+                      aria-invalid={transformNeedsPlaceholders}
                     />
                     {/* A REAL URL from the selected combination (v1.51), so the
                         structure above is edited against something concrete
@@ -5234,9 +5268,35 @@ export default function ResultsDashboardPage({
                     added or removed.
                   </p>
                   {transformError ? (
-                    <p className="text-sm text-red-500" role="alert">
-                      {transformError}
-                    </p>
+                    <div className="min-w-0 space-y-1" role="alert">
+                      <p className="break-words text-sm text-red-500">
+                        {transformError}
+                      </p>
+                      {/* The shared validateStructures message can only talk
+                          about counts — it has no access to the template. The
+                          concrete correction lives here, where the pattern and
+                          the scoped example URL are both in hand. (v1.52) */}
+                      {transformNeedsPlaceholders ? (
+                        <p
+                          className="text-xs text-slate-600"
+                          data-testid="structure-recovery-hint"
+                        >
+                          For this pattern that is{" "}
+                          <code className="break-all font-mono text-slate-800">
+                            {structureStarter}
+                          </code>
+                          {scopedExampleUrl ? (
+                            <>
+                              , which matches{" "}
+                              <span className="break-all font-mono">
+                                {scopedExampleUrl}
+                              </span>
+                            </>
+                          ) : null}
+                          .
+                        </p>
+                      ) : null}
+                    </div>
                   ) : null}
                 </div>
 
@@ -5344,12 +5404,12 @@ export default function ResultsDashboardPage({
                 </div>
               </div>
             ) : (
-              <div className="space-y-4">
+              <div className="min-w-0 space-y-4">
                 <p className="text-sm font-semibold text-slate-700">
                   Preview: URL Structure Transformation
                 </p>
                 <div className="space-y-1 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm">
-                  <p>
+                  <p className="break-all">
                     <span className="text-slate-500">Pattern:</span>{" "}
                     <span className="font-mono">{renameRow?.template}</span>
                   </p>
@@ -5370,7 +5430,7 @@ export default function ResultsDashboardPage({
                         {" "}
                         <span className="font-normal text-slate-500">
                           (scoped to{" "}
-                          <code className="font-mono">{scopeSummaryLabel}</code>
+                          <code className="break-all font-mono">{scopeSummaryLabel}</code>
                           )
                         </span>
                       </>
