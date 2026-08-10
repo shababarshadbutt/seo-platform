@@ -179,6 +179,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 
+import { fixAcceptCount } from "@/lib/fix-accept-count";
 import { showFixButton, type PatternStatus } from "@/lib/fix-visibility";
 type StatusFilter = "ALL" | "GOOD" | "WARNING" | "BAD";
 
@@ -2605,6 +2606,15 @@ export default function ResultsDashboardPage({
   const fixCount = fixCandidates.filter(
     (candidate) => fixActionFor(candidate) === "fix"
   ).length;
+  // What "Accept Selected Changes" will actually change, which is not the same as
+  // how many rows are selected — the banner above the button already said so and
+  // the button disagreed with it. See lib/fix-accept-count.ts. (v1.53)
+  const fixAcceptLabelCount = fixAcceptCount({
+    fixCount,
+    fixPatternTotal,
+    fixCandidateCount: fixCandidates.length,
+    inferredWithoutRule: fixInferredWithoutRule
+  });
   const deleteCount = fixCandidates.filter(
     (candidate) => fixActionFor(candidate) === "delete"
   ).length;
@@ -4928,7 +4938,7 @@ export default function ResultsDashboardPage({
                       Applying
                     </>
                   ) : (
-                    `Accept Selected Changes (${formatNumber(fixCount)})`
+                    `Accept Selected Changes (${formatNumber(fixAcceptLabelCount)})`
                   )}
                 </Button>
               </div>
