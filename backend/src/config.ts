@@ -115,24 +115,47 @@ export const config = {
   // throttling a run below the rate it is already allowed. 16 simultaneous
   // connections is modest for a production origin (a browser opens 6 per host).
   //
-  // maxRequestsPerSecond 50 — the real governor, enforced per target host and
+  // NOTE after the rate drop to 5/s below: 5 req/s against a 300ms origin needs
+  // only ~1.5 in flight, so 16 is now well above what throughput requires. Left
+  // unchanged deliberately — it bounds sockets while the rate limiter bounds
+  // load, and lowering it would not reduce the traffic a target experiences.
+  //
+  // maxRequestsPerSecond 5 — the real governor, enforced per target host and
   // counted per HTTP REQUEST (see http/hostRateLimiter.ts and verifyProbe.ts).
   //
-  // Raised from 25 on the evidence already in hand, not on feel. The broken
-  // unbounded run sustained ~35 requests/second against a live client origin
-  // for 80 minutes with no reported incident, which is a real observation of
-  // what that infrastructure tolerates; 50 is above it but still under a
-  // typical Googlebot crawl rate and a fraction of a percent of what a
-  // CDN-fronted origin serves.
+  // LOWERED FROM 50 on a confirmed incident, reversing the reasoning below.
+  // Verify-urls job 0779ff01 ran continuously 11:18:28 -> past 11:45:32 (27+
+  // minutes) against a single domain, and a sampled URL on that same domain
+  // came back 405 with `x-amzn-waf-action: captcha` at 11:45:32. AWS WAF Bot
+  // Control rate-limited the box's egress IP under sustained volume to one
+  // host. This is NOT the UA problem from migration 032 — the honest crawler
+  // UA is confirmed correct and gets a clean 308 outside burst conditions.
   //
-  // Read this number together with the metering fix: it used to be charged per
-  // CHECK, and a check is 1-2 requests, so the OLD "25" delivered up to 49
-  // requests/second in practice (measured). The new 50 is therefore closer to a
-  // formalisation of the load already being sent than a doubling of it — the
-  // difference is that it is now the number the origin actually experiences,
-  // whatever the pattern's status mix.
+  // The arithmetic that matters: 50 req/s sustained is ~15,000 requests per
+  // 5-minute window from one IP to one host. AWS WAF rate-based rules are
+  // commonly configured at 2,000 per 5 minutes, so 50/s ran ~7.5x over a
+  // typical threshold and 27 minutes was simply how long it took to trip.
+  // 5 req/s is ~1,500 per 5 minutes, which leaves headroom under that rule
+  // instead of relying on the target not having one.
   //
-  // Lower it for a small origin. VERIFY_MAX_REQUESTS_PER_SECOND.
+  // The previous justification for 50 was "~35 req/s for 80 minutes with no
+  // reported incident". That observation is now superseded: there IS a reported
+  // incident, and an absence of complaints was never evidence of tolerance —
+  // WAF actions are silent until they are not.
+  //
+  // THROUGHPUT COST, stated plainly rather than discovered later: at 5 req/s a
+  // 10,000-URL pattern takes ~33 minutes, 100,000 takes ~5.5 hours, and a
+  // multi-million-URL pattern is not viable in one run at all. That is a real
+  // trade, and the knob exists precisely so a client whose origin is known to
+  // tolerate more can be raised deliberately — per client, with their
+  // agreement, rather than globally by default.
+  //
+  // Metering context, unchanged: this is charged per REQUEST, not per check (a
+  // check is 1-2 requests), so the number is what the origin actually
+  // experiences whatever the pattern's status mix.
+  //
+  // Raise it only for an origin known to tolerate more.
+  // VERIFY_MAX_REQUESTS_PER_SECOND.
   //
   // rateLimitBurst 10 — idle credit only. Lets a small triage draw against an
   // idle host go out immediately instead of being paced over 30s to prove a
@@ -147,7 +170,7 @@ export const config = {
       max: 32
     }),
     maxRequestsPerSecond: readNumber("VERIFY_MAX_REQUESTS_PER_SECOND", {
-      fallback: 50,
+      fallback: 5,
       min: 1,
       max: 200
     }),

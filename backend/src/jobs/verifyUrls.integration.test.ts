@@ -33,6 +33,20 @@ process.env.DATABASE_URL =
   "postgresql://sitemap:sitemap@localhost:5434/sitemap_health";
 process.env.REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
 
+// The rate limiter is raised for this file so the measurement is of
+// VERIFY-THEN-DELETE and not of pacing — same reasoning and same value as
+// verifyScoping.integration.test.ts. Pacing is proven exactly in
+// http/hostRateLimiter.test.ts (unit, virtual clock) and end-to-end in
+// verifyRateLimit.integration.test.ts.
+//
+// Pinned rather than inherited on purpose. This file previously took the
+// production default, so lowering that default to 5 req/s (the AWS WAF fix)
+// turned a fast test into an 89.8s one and it blew the 60s suite timeout —
+// while still passing in isolation. A test that asserts deletion correctness
+// must not silently depend on a production tuning knob; 360 URLs paced at the
+// shipped rate measures the limiter, which is already covered elsewhere.
+process.env.VERIFY_MAX_REQUESTS_PER_SECOND = "5000";
+
 const uploadDir = mkdtempSync(path.join(os.tmpdir(), "verify-urls-itest-"));
 
 process.env.UPLOAD_DIR = uploadDir;

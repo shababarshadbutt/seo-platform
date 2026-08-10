@@ -5,6 +5,7 @@ import {
   acquireHostSlot,
   rateLimitHostKey,
   resetHostRateLimiter,
+  verificationRateLimit,
   type RateLimiterClock
 } from "./hostRateLimiter.js";
 
@@ -170,4 +171,57 @@ test("host key normalises case and ignores path", () => {
   assert.equal(rateLimitHostKey("http://example.com:8080/x"), "example.com:8080");
   // An unparseable URL still gets paced rather than escaping the limiter.
   assert.equal(rateLimitHostKey("not a url"), "unparseable");
+});
+
+// The MECHANISM was already covered above (exact pacing, shared per-host
+// budget, independent hosts). What actually caused the WAF block was the
+// shipped NUMBER, so the default itself is pinned here.
+//
+// Job 0779ff01 ran 27+ minutes against one host at the old default of 50 req/s
+// — ~15,000 requests per 5-minute window from one IP, roughly 7.5x a typical
+// AWS WAF rate-based rule (2,000 / 5 min) — and earned a 405 +
+// x-amzn-waf-action: captcha. The guard is the per-5-minute figure, not the
+// per-second one, because that is the window WAF rules are written against.
+test("the shipped per-host default stays under a typical WAF rate rule", () => {
+  const { requestsPerSecond, burst } = verificationRateLimit();
+  const perFiveMinutes = requestsPerSecond * 300;
+
+  assert.ok(
+    perFiveMinutes <= 2000,
+    `default ${requestsPerSecond} req/s = ${perFiveMinutes} per 5 min, over the 2000 a WAF rate rule commonly allows`
+  );
+
+  // Burst is idle credit, not sustained rate, but it still sets the momentary
+  // ceiling the limiter will release (ceil(rps) + burst inside one window) —
+  // and a WAF reacts to the spike, not the average.
+  assert.ok(
+    Math.ceil(requestsPerSecond) + burst <= 20,
+    `momentary ceiling ${Math.ceil(requestsPerSecond) + burst} is too spiky for one origin`
+  );
+});
+
+// Lowering the per-host rate must NOT serialise unrelated clients: N hosts each
+// get their own budget, so aggregate throughput across hosts still scales.
+// ("hosts have independent budgets" proves independence for 2 requests; this
+// proves the aggregate at the shipped default over a sustained run.)
+test("the per-host cap does not throttle the aggregate across many hosts", async () => {
+  resetHostRateLimiter();
+
+  const { clock, waits } = virtualClock();
+  const { requestsPerSecond } = verificationRateLimit();
+  const options = { requestsPerSecond, burst: 1 };
+  const hosts = Array.from({ length: 12 }, (_, i) => `client-${i}.example.com`);
+
+  // One request to each of 12 different hosts: none should wait, because each
+  // host's schedule starts idle. Aggregate = 12 requests with zero pacing.
+  for (const host of hosts) {
+    await acquireHostSlot(host, options, clock);
+  }
+
+  assert.deepEqual(waits, [], "different hosts must not pace each other");
+
+  // A SECOND request to one of them does wait — the per-host cap still binds.
+  await acquireHostSlot(hosts[0], options, clock);
+
+  assert.deepEqual(waits, [1000 / requestsPerSecond]);
 });
