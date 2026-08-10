@@ -180,6 +180,7 @@ import {
 import { cn } from "@/lib/utils";
 
 import { fixAcceptCount } from "@/lib/fix-accept-count";
+import { findSegmentDuplication } from "@/lib/segment-duplication";
 import { showFixButton, type PatternStatus } from "@/lib/fix-visibility";
 type StatusFilter = "ALL" | "GOOD" | "WARNING" | "BAD";
 
@@ -2849,6 +2850,26 @@ export default function ResultsDashboardPage({
     );
   }, [transformPreviewSource, transformParsed]);
 
+  // Does the new structure add a static segment that is ALREADY the prefix or
+  // suffix of an adjacent param's real value? ("/nsn/niin-parts/{A}/" where {A}
+  // is "niin-parts-503" produces ".../niin-parts/niin-parts-503/".) Checked
+  // against the same real URLs the preview samples from, so the warning quotes an
+  // actual value rather than a hypothetical one.
+  //
+  // Non-blocking by design — see lib/segment-duplication.ts. Preview and Fix stay
+  // enabled; this only tells the user what is about to happen. (v1.53)
+  const transformDuplication = useMemo(() => {
+    if (!transformParsed) {
+      return null;
+    }
+
+    return findSegmentDuplication(
+      transformPreviewSource,
+      transformParsed.current,
+      transformParsed.next
+    );
+  }, [transformPreviewSource, transformParsed]);
+
   // Download ONLY the files the user ticked, in their POST-FIX state (v1.51).
   //
   // Enabled only after a Fix has completed, matching how every other download
@@ -5307,6 +5328,36 @@ export default function ResultsDashboardPage({
                         </p>
                       ) : null}
                     </div>
+                  ) : null}
+                  {/* Duplicate-segment heads-up (v1.53). Amber, matching the
+                      fixInferredWithoutRule banner: informational, NOT an error —
+                      Preview and Fix stay enabled. It quotes a real captured
+                      value from this pattern's own URLs and offers the strip
+                      expression that would remove the repetition, rather than
+                      silently rewriting the value or blocking the edit. */}
+                  {transformDuplication ? (
+                    <p
+                      className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800"
+                      data-testid="segment-duplication-warning"
+                    >
+                      The new segment{" "}
+                      <code className="break-all font-mono font-semibold">
+                        {transformDuplication.segmentValue}
+                      </code>{" "}
+                      duplicates text already in{" "}
+                      <code className="font-mono">
+                        {`{${transformDuplication.paramName}}`}
+                      </code>{" "}
+                      (
+                      <code className="break-all font-mono">
+                        {transformDuplication.capturedValue}
+                      </code>
+                      ). Did you mean{" "}
+                      <code className="break-all font-mono font-semibold">
+                        {transformDuplication.suggestedParamToken}
+                      </code>{" "}
+                      instead of adding it as a separate segment?
+                    </p>
                   ) : null}
                 </div>
 

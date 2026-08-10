@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  captureStructureValues,
   StructureSyntaxError,
   parseStructure,
   structureParamNames,
@@ -243,4 +244,36 @@ test("structureParamNames lists params in order", () => {
     "A",
     "B"
   ]);
+});
+
+// --- captureStructureValues -------------------------------------------------
+// Mirror of the frontend helper. Only validateStructures is byte-compared
+// between the two files, so these assert equivalent BEHAVIOUR rather than
+// identical text.
+
+test("captureStructureValues returns each param's real value", () => {
+  const values = captureStructureValues(
+    "https://nsnstocks.com/nsn/niin-parts-503/",
+    parseStructure("/nsn/{A}")
+  );
+
+  assert.deepEqual(Array.from(values ?? new Map()), [["A", "niin-parts-503"]]);
+});
+
+test("captureStructureValues is null on the same conditions transformUrl is", () => {
+  const current = parseStructure("/nsn/{A}");
+
+  assert.equal(captureStructureValues("https://e.com/nsn/a/b", current), null);
+  assert.equal(captureStructureValues("https://e.com/other/a", current), null);
+  assert.equal(captureStructureValues("not a url", current), null);
+});
+
+test("captureStructureValues captures multiple params in order", () => {
+  const values = captureStructureValues(
+    "https://e.com/manufacturer/square-d/page-18",
+    parseStructure("/manufacturer/{A}/{B}")
+  );
+
+  assert.equal(values?.get("A"), "square-d");
+  assert.equal(values?.get("B"), "page-18");
 });

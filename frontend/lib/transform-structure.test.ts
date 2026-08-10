@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 import {
+  captureStructureValues,
   convertParamToABC,
   countTemplateParams,
   parseStructure,
@@ -158,4 +159,37 @@ test("validateStructures is byte-identical to the backend copy", () => {
     "validateStructures drifted between the frontend and backend copies — " +
       "the modal would tell the user something the API does not"
   );
+});
+
+// --- captureStructureValues -------------------------------------------------
+// Exposes the values transformUrl already derives internally, so the
+// duplicate-segment warning does not re-implement the segment walk.
+
+test("captureStructureValues returns each param's real value", () => {
+  const values = captureStructureValues(
+    "https://nsnstocks.com/nsn/niin-parts-503/",
+    parseStructure("/nsn/{A}")
+  );
+
+  assert.deepEqual(Array.from(values ?? new Map()), [["A", "niin-parts-503"]]);
+});
+
+test("captureStructureValues is null on the same conditions transformUrl is", () => {
+  const current = parseStructure("/nsn/{A}");
+
+  // Wrong segment count, differing static segment, and an unparseable URL — the
+  // three ways transformUrl declines to rewrite.
+  assert.equal(captureStructureValues("https://e.com/nsn/a/b", current), null);
+  assert.equal(captureStructureValues("https://e.com/other/a", current), null);
+  assert.equal(captureStructureValues("not a url", current), null);
+});
+
+test("captureStructureValues captures multiple params in order", () => {
+  const values = captureStructureValues(
+    "https://e.com/manufacturer/square-d/page-18",
+    parseStructure("/manufacturer/{A}/{B}")
+  );
+
+  assert.equal(values?.get("A"), "square-d");
+  assert.equal(values?.get("B"), "page-18");
 });

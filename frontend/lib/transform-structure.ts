@@ -182,6 +182,50 @@ export function validateStructures(
   return null;
 }
 
+// The per-param values a URL yields when matched against `current`.
+//
+// transformUrl builds exactly this map internally and then throws it away,
+// returning only the rewritten string. Callers that need to reason about the
+// captured VALUES — e.g. warning that a new static segment duplicates text
+// already inside {A} — would otherwise have to re-implement the segment walk and
+// the static-equality check, and drift from it. Returns null when the URL does
+// not match, on the same conditions transformUrl returns null for.
+export function captureStructureValues(
+  rawUrl: string,
+  current: ParsedStructure
+): Map<string, string> | null {
+  let url: URL;
+
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+
+  const urlSegments = url.pathname.split("/").filter(Boolean);
+
+  if (urlSegments.length !== current.segments.length) {
+    return null;
+  }
+
+  const values = new Map<string, string>();
+
+  for (let index = 0; index < current.segments.length; index += 1) {
+    const rule = current.segments[index];
+    const segment = urlSegments[index];
+
+    if (rule.type === "static") {
+      if (rule.value !== segment) {
+        return null;
+      }
+    } else {
+      values.set(rule.name, segment);
+    }
+  }
+
+  return values;
+}
+
 export function transformUrl(
   rawUrl: string,
   current: ParsedStructure,

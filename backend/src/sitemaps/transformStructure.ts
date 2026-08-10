@@ -209,6 +209,53 @@ export function validateStructures(
   return null;
 }
 
+// The per-param values a URL yields when matched against `current`.
+//
+// transformUrl builds this map internally and discards it, returning only the
+// rewritten string. Exposed so callers that need the captured VALUES (the Update
+// Pattern modal's duplicate-segment warning) share one segment walk instead of
+// re-deriving the static-equality and segment-count rules and drifting from them.
+// Returns null on exactly the conditions transformUrl returns null for.
+//
+// Mirrored in frontend/lib/transform-structure.ts. Only validateStructures is
+// byte-compared between the two files (see the sync-guard test), so the comments
+// here differ; the logic must stay equivalent.
+export function captureStructureValues(
+  rawUrl: string,
+  current: ParsedStructure
+): Map<string, string> | null {
+  let url: URL;
+
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+
+  const urlSegments = url.pathname.split("/").filter(Boolean);
+
+  if (urlSegments.length !== current.segments.length) {
+    return null;
+  }
+
+  const values = new Map<string, string>();
+
+  for (let index = 0; index < current.segments.length; index += 1) {
+    const rule = current.segments[index];
+    const segment = urlSegments[index];
+
+    if (rule.type === "static") {
+      if (rule.value !== segment) {
+        return null;
+      }
+    } else {
+      values.set(rule.name, segment);
+    }
+  }
+
+  return values;
+}
+
 // Transform one absolute URL from the `current` layout to the `next` layout.
 // Returns the rewritten URL, or null when the URL does not match `current`
 // (segment count or a static segment differs) so callers leave it byte-for-byte.
