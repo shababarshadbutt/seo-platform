@@ -295,6 +295,52 @@ test("verification routes scope by pattern", async (t) => {
   // …while the COUNTS stay scoped to the pattern regardless.
   assert.deepEqual(duringBody.counts_by_status, [{ http_status: 404, count: 7 }]);
 
+  // ---- enumeration-phase progress is surfaced by the status endpoint (v1.53)
+  // The panel could only draw an indeterminate spinner during enumeration
+  // because urls_total is 0 throughout it and nothing else was exposed. These
+  // two columns are that missing signal, and they must survive the round trip
+  // through the endpoint or the UI still has nothing to render.
+  await pool.query(
+    `UPDATE maintenance_jobs
+       SET status = 'RUNNING', files_total = 0, files_done = 0,
+           enum_files_total = 823, enum_files_done = 137
+     WHERE id = $1`,
+    [wholeSession.json().job_row_id]
+  );
+
+  const duringEnum = await app.inject({
+    method: "GET",
+    url: `/api/sessions/${sessionId}/verify-urls/status?pattern_id=${alphaId}`
+  });
+  const enumBody = duringEnum.json();
+
+  assert.equal(enumBody.job.enum_files_total, 823);
+  assert.equal(enumBody.job.enum_files_done, 137);
+  // urls_total stays 0 — that is what identifies the phase, and the file counts
+  // are deliberately NOT written into it (see migration 041).
+  assert.equal(enumBody.job.urls_total, 0);
+
+  // Once the URL phase starts, enum_* read as null so the client switches phases
+  // on a single poll rather than inferring it from two counters.
+  await pool.query(
+    `UPDATE maintenance_jobs
+       SET files_total = 25744, files_done = 12,
+           enum_files_total = NULL, enum_files_done = NULL
+     WHERE id = $1`,
+    [wholeSession.json().job_row_id]
+  );
+
+  const afterEnum = await app.inject({
+    method: "GET",
+    url: `/api/sessions/${sessionId}/verify-urls/status?pattern_id=${alphaId}`
+  });
+  const afterBody = afterEnum.json();
+
+  assert.equal(afterBody.job.enum_files_total, null);
+  assert.equal(afterBody.job.enum_files_done, null);
+  assert.equal(afterBody.job.urls_total, 25744);
+  assert.equal(afterBody.job.urls_done, 12);
+
   // ---- target_statuses validation -----------------------------------------
   enqueuedScopes.push([alphaId]);
   const badStatus = await app.inject({

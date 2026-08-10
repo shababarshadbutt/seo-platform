@@ -35,10 +35,21 @@ export type EnumeratedUrl = {
   sourceFiles: Set<string>;
 };
 
+// Reports enumeration progress in FILES, which is the only unit available
+// during this phase — the URL total is what enumeration exists to discover, so
+// it cannot also be the thing it reports against. Called once with
+// (0, files.length) as soon as the file list is known, then once per file.
+//
+// Synchronous by contract: this runs inside the per-file loop, so a caller that
+// awaited a DB write here would serialise enumeration behind its own progress
+// reporting. Callers throttle and fire-and-forget — see verifyUrlsJob.
+export type EnumerateProgressFn = (filesDone: number, filesTotal: number) => void;
+
 export async function enumeratePopulation(
   sessionId: string,
   patterns: PatternRow[],
-  logger: FastifyBaseLogger
+  logger: FastifyBaseLogger,
+  onProgress?: EnumerateProgressFn
 ): Promise<Map<string, EnumeratedUrl>> {
   const population = new Map<string, EnumeratedUrl>();
 
@@ -59,6 +70,13 @@ export async function enumeratePopulation(
     [sessionId]
   );
   const files = filesResult.rows.filter((row) => !isHttpUrl(row.filename));
+
+  // The denominator, published before any streaming so the client can switch
+  // from an indeterminate spinner to a real bar immediately rather than after
+  // the first (possibly large) file.
+  onProgress?.(0, files.length);
+
+  let filesDone = 0;
 
   for (const file of files) {
     const display = displaySourceFilename(sessionId, file.filename);
@@ -106,6 +124,14 @@ export async function enumeratePopulation(
         "pattern population: could not stream file, skipping"
       );
     }
+
+    // Counted OUTSIDE the try/catch on purpose: a file that could not be
+    // streamed is still a file the scan is done with. Advancing only on success
+    // would leave the bar stalled below 100% for the rest of the run on any
+    // session with a missing or unreadable file, which reads as a hang — the
+    // very symptom this reporting exists to remove.
+    filesDone += 1;
+    onProgress?.(filesDone, files.length);
   }
 
   return population;

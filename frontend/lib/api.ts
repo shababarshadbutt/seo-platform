@@ -1138,6 +1138,16 @@ export type VerificationJob = {
   // Which patterns this run covers; null = the whole session. Lets the UI state
   // its scope instead of assuming one.
   pattern_ids: string[] | null;
+  // Enumeration-phase progress, in FILES (v1.53). Non-null only while the job is
+  // scanning sitemap files to discover the URL population — the phase that used
+  // to be an indeterminate spinner because urls_total is 0 throughout it and
+  // there was no other signal. Both null = not enumerating.
+  //
+  // Deliberately NOT folded into urls_total/urls_done: those carry URL counts
+  // for this job kind, and a file count against a URL denominator is how the
+  // "Verifying 0 of 0" confusion gets rebuilt. See migration 041.
+  enum_files_total: number | null;
+  enum_files_done: number | null;
 };
 
 export type VerificationStatus = {

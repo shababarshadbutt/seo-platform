@@ -297,6 +297,49 @@ test("verify-then-delete acts on the full population and spares the healthy 91",
     );
   }
 
+  // ---- act 0: enumeration publishes real per-file progress (v1.53) ----------
+  // The reported bug was a 10+ minute indeterminate spinner: the panel shows
+  // "Finding this pattern's URLs…" whenever urls_total === 0, and that is the
+  // whole enumeration phase, during which nothing was published. Assert the
+  // signal exists, starts with the denominator, and is monotonic — those are the
+  // three properties a progress bar needs to not lie.
+  const { enumeratePopulation } = await import("./patternPopulation.js");
+  const patternRows = await pool.query<{ id: string; template: string }>(
+    "SELECT id, template FROM patterns WHERE session_id = $1 AND source_role = 'current' ORDER BY template ASC",
+    [sessionId]
+  );
+  const enumProgress: Array<[number, number]> = [];
+  const enumeratedPopulation = await enumeratePopulation(
+    sessionId,
+    patternRows.rows,
+    silentLogger,
+    (filesDone, filesTotal) => {
+      enumProgress.push([filesDone, filesTotal]);
+    }
+  );
+
+  // It actually did the work — otherwise a progress assertion over an empty
+  // file list would pass while proving nothing.
+  assert.ok(
+    enumeratedPopulation.size > 0,
+    "enumeration must find URLs for the fixture patterns"
+  );
+  // The denominator arrives BEFORE any file is streamed, so the client can leave
+  // the indeterminate spinner immediately rather than after the first file.
+  assert.deepEqual(enumProgress[0], [0, FILE_COUNT]);
+  // One call per file after that, and no more.
+  assert.equal(enumProgress.length, FILE_COUNT + 1);
+  assert.deepEqual(enumProgress.at(-1), [FILE_COUNT, FILE_COUNT]);
+  // Monotonic non-decreasing, constant denominator. A bar that can go backwards
+  // is worse than no bar.
+  for (let index = 1; index < enumProgress.length; index += 1) {
+    assert.ok(
+      enumProgress[index][0] >= enumProgress[index - 1][0],
+      `enum progress went backwards at ${index}: ${JSON.stringify(enumProgress)}`
+    );
+    assert.equal(enumProgress[index][1], FILE_COUNT);
+  }
+
   // ---- act 1: verify the full population -----------------------------------
   const verifyJobRow = await pool.query<{ id: string }>(
     "INSERT INTO maintenance_jobs (session_id, kind) VALUES ($1, 'verify-urls') RETURNING id",
@@ -318,8 +361,10 @@ test("verify-then-delete acts on the full population and spares the healthy 91",
     files_total: number;
     files_done: number;
     items_changed: string;
+    enum_files_total: number | null;
+    enum_files_done: number | null;
   }>(
-    "SELECT status, files_total, files_done, items_changed FROM maintenance_jobs WHERE id = $1",
+    "SELECT status, files_total, files_done, items_changed, enum_files_total, enum_files_done FROM maintenance_jobs WHERE id = $1",
     [verifyJobRow.rows[0].id]
   );
 
@@ -327,6 +372,16 @@ test("verify-then-delete acts on the full population and spares the healthy 91",
   assert.equal(verifyJob.rows[0].files_total, TOTAL_COUNT, "urls_total = deduped population");
   assert.equal(verifyJob.rows[0].files_done, TOTAL_COUNT);
   assert.equal(Number(verifyJob.rows[0].items_changed), PROBLEM_COUNT, "items_changed = problem URLs");
+  // PHASE-2 NON-REGRESSION (v1.53): the URL counters above are untouched by the
+  // new enumeration reporting, and the enum_* columns are cleared once the URL
+  // phase starts — so a poll can never see both phases active and render file
+  // progress for the rest of the run.
+  assert.equal(
+    verifyJob.rows[0].enum_files_total,
+    null,
+    "enum_files_total must be cleared when enumeration completes"
+  );
+  assert.equal(verifyJob.rows[0].enum_files_done, null);
 
   const verifiedCount = await pool.query<{ count: string }>(
     "SELECT COUNT(*)::text AS count FROM verified_urls WHERE session_id = $1",

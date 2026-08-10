@@ -189,6 +189,8 @@ export async function verificationRoutes(app: FastifyInstance) {
         items_changed: string;
         error: string | null;
         pattern_ids: string[] | null;
+        enum_files_total: number | null;
+        enum_files_done: number | null;
       }>(
         // A session-wide run (pattern_ids IS NULL) COVERS every pattern, so it
         // matches a pattern-scoped query too. Excluding it would tell a user
@@ -199,7 +201,8 @@ export async function verificationRoutes(app: FastifyInstance) {
         // presenting a 1.3M-URL session progress bar as if it were the
         // pattern's — the confusion this release exists to remove.
         `
-          SELECT id, status, files_total, files_done, items_changed, error, pattern_ids
+          SELECT id, status, files_total, files_done, items_changed, error, pattern_ids,
+                 enum_files_total, enum_files_done
           FROM maintenance_jobs
           WHERE session_id = $1
             AND kind = 'verify-urls'
@@ -271,7 +274,12 @@ export async function verificationRoutes(app: FastifyInstance) {
               error: jobRow.error,
               // What this run actually covers, so the UI can state it rather
               // than assume it. null = the whole session.
-              pattern_ids: jobRow.pattern_ids
+              pattern_ids: jobRow.pattern_ids,
+              // Enumeration-phase progress (v1.53). NULL on both = not
+              // enumerating; see migration 041 for why these are separate from
+              // files_total/files_done rather than reusing them.
+              enum_files_total: jobRow.enum_files_total,
+              enum_files_done: jobRow.enum_files_done
             }
           : null,
         // Echoes the request scope so a client can tell a pattern-scoped

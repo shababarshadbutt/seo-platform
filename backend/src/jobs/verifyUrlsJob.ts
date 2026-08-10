@@ -42,6 +42,14 @@ export const VERIFY_PROBLEM_STATUSES = [301, 302, 307, 308, 404];
 // something live without a DB write per URL.
 const PROGRESS_FLUSH_EVERY = 25;
 
+// Same intent as PROGRESS_FLUSH_EVERY, but TIME-based rather than count-based,
+// because the enumeration phase's unit cost is nothing like a URL check's. One
+// file can be 50 locs or 500,000, so "every 25 files" is somewhere between a
+// write storm and a bar that never moves depending on the session. A wall-clock
+// interval bounds the writes to ~1/sec regardless of file size or file count —
+// on a 10,000-file session that is seconds' worth of writes, not 10,000 of them.
+const ENUM_PROGRESS_FLUSH_MS = 1000;
+
 type SessionRow = {
   id: string;
   base_url: string;
@@ -173,19 +181,88 @@ export async function processVerifyUrlsJob(
     const runStartedResult = await pool.query<{ now: string }>("SELECT now()");
     const runStarted = runStartedResult.rows[0].now;
 
-    // RUNNING with an unknown total, before enumeration. Enumeration streams
-    // every <loc> of every file (tens of seconds on a 1.3M-URL session), and
-    // without this the row sits at PENDING throughout, so the modal shows
-    // "Verifying 0 of 0" and looks hung. The client reads total = 0 while
-    // RUNNING as the enumerating phase.
+    // RUNNING with an unknown URL total, before enumeration. The zeroing is a
+    // RESET, not a placeholder — this row may be a re-run, and stale counters
+    // from the previous attempt would render as a live "Verifying X of Y". The
+    // client still reads files_total = 0 while RUNNING as "not in the URL phase
+    // yet"; what changed in v1.53 is that the phase is no longer SILENT, because
+    // enum_files_* below carry real per-file progress through it.
+    //
+    // enum_* start NULL rather than 0 so the brief window before the file list
+    // is known renders as the plain spinner instead of a bogus "0 of 0".
     await pool.query(
-      "UPDATE maintenance_jobs SET status = 'RUNNING', files_total = 0, files_done = 0 WHERE id = $1",
+      `UPDATE maintenance_jobs
+         SET status = 'RUNNING', files_total = 0, files_done = 0,
+             enum_files_total = NULL, enum_files_done = NULL
+       WHERE id = $1`,
       [jobRowId]
     );
 
+    // Throttled, fire-and-forget enumeration progress.
+    //
+    // NOT awaited inside the loop: enumeratePopulation's callback is synchronous
+    // by contract, and awaiting a DB round trip per file would put the write
+    // latency directly into enumeration's critical path. inFlight collapses
+    // overlapping writes instead of queueing them, so a slow DB degrades to
+    // fewer progress updates rather than to a growing backlog of them.
+    //
+    // Failures are swallowed deliberately: this is a progress cosmetic, and a
+    // transient write error must not fail a verification run that is otherwise
+    // proceeding correctly.
+    let enumLastFlushMs = 0;
+    let enumWriteInFlight = false;
+    // The most recent write, kept so it can be settled before the columns are
+    // cleared below. Without this, a write issued for the final file could land
+    // AFTER the clearing statement and resurrect enum_files_* on a row that has
+    // already moved to the URL phase — leaving the client rendering enumeration
+    // progress for the rest of the run.
+    let enumLastWrite: Promise<unknown> = Promise.resolve();
+
+    const flushEnumProgress = (filesDone: number, filesTotal: number) => {
+      enumWriteInFlight = true;
+
+      enumLastWrite = pool
+        .query(
+          "UPDATE maintenance_jobs SET enum_files_total = $2, enum_files_done = $3 WHERE id = $1",
+          [jobRowId, filesTotal, filesDone]
+        )
+        .catch(() => {})
+        .finally(() => {
+          enumWriteInFlight = false;
+        });
+    };
+
+    const onEnumProgress = (filesDone: number, filesTotal: number) => {
+      const nowMs = Date.now();
+      // Always publish the first call (it carries the denominator) and the last
+      // (so the bar reaches 100% rather than stopping mid-way); throttle between.
+      const isFirst = filesDone === 0;
+      const isLast = filesTotal > 0 && filesDone === filesTotal;
+
+      if (
+        !isFirst &&
+        !isLast &&
+        (enumWriteInFlight || nowMs - enumLastFlushMs < ENUM_PROGRESS_FLUSH_MS)
+      ) {
+        return;
+      }
+
+      enumLastFlushMs = nowMs;
+      flushEnumProgress(filesDone, filesTotal);
+    };
+
     const enumerateStartedMs = Date.now();
-    const population = await enumeratePopulation(sessionId, patterns, logger);
+    const population = await enumeratePopulation(
+      sessionId,
+      patterns,
+      logger,
+      onEnumProgress
+    );
     const enumerateMs = Date.now() - enumerateStartedMs;
+
+    // Settle the last progress write before anything clears enum_files_*, so
+    // the clear cannot be overwritten by a write that was already in flight.
+    await enumLastWrite;
 
     // URLs already deleted from the sitemap keep their rows (restore needs
     // them) but are not re-probed: their live status is irrelevant while they
@@ -204,8 +281,16 @@ export async function processVerifyUrlsJob(
 
     // urls_total is the FULL deduped population (files_total column — URL
     // semantics for this kind); already-deleted URLs count as done up front.
+    //
+    // enum_* are cleared in the SAME statement that publishes the URL total, so
+    // no poll can ever observe both phases as active. Safe against a late
+    // fire-and-forget write because enumLastWrite was awaited above — no
+    // progress write can still be outstanding at this point.
     await pool.query(
-      "UPDATE maintenance_jobs SET status = 'RUNNING', files_total = $2, files_done = $3 WHERE id = $1",
+      `UPDATE maintenance_jobs
+         SET status = 'RUNNING', files_total = $2, files_done = $3,
+             enum_files_total = NULL, enum_files_done = NULL
+       WHERE id = $1`,
       [jobRowId, entries.length, skippedDeleted]
     );
 

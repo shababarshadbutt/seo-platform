@@ -161,6 +161,23 @@ export function PatternVerifyPanel({
 
   const verifyJob = verification?.job ?? null;
   const verifyRunning = Boolean(verifyJob && IN_FLIGHT.includes(verifyJob.status));
+
+  // ---- phase 1: enumerating the population (v1.53) --------------------------
+  // urls_total is 0 for the whole enumeration phase because discovering the URL
+  // total IS that phase's job. It used to be the only signal, so the panel could
+  // draw nothing but an indeterminate spinner — for 10+ minutes on a 10.8M-URL
+  // pattern. enum_files_* carry real per-file progress through it.
+  //
+  // Both conditions are required: urls_total === 0 identifies the phase, and a
+  // non-null enum_files_total means the backend has published the denominator.
+  // In the brief window before it does, this stays false and the plain spinner
+  // shows — better than a bogus "0 of 0".
+  const enumFilesTotal = verifyJob?.enum_files_total ?? null;
+  const enumFilesDone = verifyJob?.enum_files_done ?? 0;
+  const isEnumerating =
+    (verifyJob?.urls_total ?? 0) === 0 &&
+    enumFilesTotal !== null &&
+    enumFilesTotal > 0;
   const triageRunning = Boolean(triage && IN_FLIGHT.includes(triage.status));
 
   const refresh = useCallback(async () => {
@@ -445,7 +462,12 @@ export function PatternVerifyPanel({
         >
           <p className="flex items-center gap-2 text-sm text-indigo-900">
             <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
-            {(verifyJob?.urls_total ?? 0) === 0 ? (
+            {isEnumerating ? (
+              <span data-testid="verify-enum-progress">
+                Scanning sitemap files: {formatNumber(enumFilesDone)} of{" "}
+                {formatNumber(enumFilesTotal ?? 0)}…
+              </span>
+            ) : (verifyJob?.urls_total ?? 0) === 0 ? (
               <>Finding this pattern&rsquo;s URLs in the sitemap files…</>
             ) : verifyJob?.pattern_ids === null ? (
               // A whole-session run covers this pattern, so it is reported —
@@ -466,14 +488,21 @@ export function PatternVerifyPanel({
               </>
             )}
           </p>
+          {/* One bar, two phases. It used to sit at 0 for the entire enumeration
+              because its only input was the URL counter, which is 0 until
+              enumeration finishes. Now phase 1 drives it off files and phase 2
+              off URLs, so the bar always reflects work actually completed. */}
           <Progress
             value={
-              (verifyJob?.urls_total ?? 0) > 0
-                ? Math.round(
-                    ((verifyJob?.urls_done ?? 0) / (verifyJob?.urls_total ?? 1)) *
-                      100
-                  )
-                : 0
+              isEnumerating
+                ? Math.round((enumFilesDone / (enumFilesTotal ?? 1)) * 100)
+                : (verifyJob?.urls_total ?? 0) > 0
+                  ? Math.round(
+                      ((verifyJob?.urls_done ?? 0) /
+                        (verifyJob?.urls_total ?? 1)) *
+                        100
+                    )
+                  : 0
             }
           />
           <p className="text-xs text-indigo-800/80">
