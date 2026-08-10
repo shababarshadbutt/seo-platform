@@ -8,7 +8,13 @@ export type ParamTransform =
   | { kind: "none" }
   | { kind: "replace"; find: string; replace: string }
   | { kind: "upper" }
-  | { kind: "lower" };
+  | { kind: "lower" }
+  // Insert `separator` at `position` characters into the value: "24" with
+  // position 1 and separator "-" gives "2-4". Positional rather than
+  // content-matched, which is the whole point — `replace` acts on every
+  // occurrence of a needle, so it cannot target ONE of several identical
+  // characters ("niin-parts-24" with find "-" hits both hyphens).
+  | { kind: "insertAt"; position: number; separator: string };
 
 export type SegmentRule =
   | { type: "static"; value: string }
@@ -80,8 +86,34 @@ function parseParamToken(inner: string): SegmentRule {
     };
   }
 
+  // {A|split|N|sep|} — insert sep after N characters.
+  if (parts.length === 5 && parts[4] === "" && parts[1] === "split") {
+    const rawPosition = parts[2];
+
+    // Digits only. Number.parseInt alone would silently accept "1.5" and "1abc"
+    // as 1, so the structure would apply a transform the user did not write.
+    if (!/^\d+$/.test(rawPosition)) {
+      throw new StructureSyntaxError(
+        `{${inner}} has an invalid split position "${rawPosition}" — write a whole number of characters, e.g. {${name}|split|1|-|}`
+      );
+    }
+
+    return {
+      type: "param",
+      name,
+      // Empty separator is allowed and is a documented no-op, rather than an
+      // error: it is unambiguous about what it does, and rejecting it would
+      // mean a half-typed expression errors mid-keystroke.
+      transform: {
+        kind: "insertAt",
+        position: Number.parseInt(rawPosition, 10),
+        separator: parts[3]
+      }
+    };
+  }
+
   throw new StructureSyntaxError(
-    `{${inner}} is not a valid transform — use {A}, {A|text|}, {A|old|new|}, {A|upper|} or {A|lower|}`
+    `{${inner}} is not a valid transform — use {A}, {A|text|}, {A|old|new|}, {A|upper|}, {A|lower|} or {A|split|N|sep|}`
   );
 }
 
@@ -120,6 +152,14 @@ function applyTransform(value: string, transform: ParamTransform): string {
       return value.toLowerCase();
     case "replace":
       return value.split(transform.find).join(transform.replace);
+    case "insertAt": {
+      // Clamped rather than rejected: a position past the end appends, which is a
+      // sensible reading of "insert here" and keeps a transform that is correct
+      // for most values from failing the whole run on one short outlier.
+      const at = Math.max(0, Math.min(transform.position, value.length));
+
+      return `${value.slice(0, at)}${transform.separator}${value.slice(at)}`;
+    }
   }
 }
 

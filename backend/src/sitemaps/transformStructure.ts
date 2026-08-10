@@ -15,7 +15,12 @@ export type ParamTransform =
   | { kind: "none" }
   | { kind: "replace"; find: string; replace: string }
   | { kind: "upper" }
-  | { kind: "lower" };
+  | { kind: "lower" }
+  // Insert `separator` at `position` characters into the value: "24" with
+  // position 1 and separator "-" gives "2-4". POSITIONAL, unlike `replace`,
+  // which acts on every occurrence of its needle and therefore cannot target one
+  // of several identical characters ("niin-parts-24" with find "-" hits both).
+  | { kind: "insertAt"; position: number; separator: string };
 
 export type SegmentRule =
   | { type: "static"; value: string }
@@ -44,6 +49,16 @@ const PARAM_NAME = /^[A-Za-z][A-Za-z0-9]*$/;
 //   {A|old|new|} → replace "old" with "new"
 //   {A|upper|}   → uppercase
 //   {A|lower|}   → lowercase
+//   {A|split|N|sep|} → insert "sep" after N characters ("24" → "2-4")
+//
+// NOTE on separators, verified rather than assumed: a "/" cannot appear in ANY
+// token, because parseStructure splits the structure on "/" before tokens are
+// parsed, so "{A|-|/|}" arrives here as the fragment "{A|-|" and is rejected as
+// brace-mixed. A literal backslash parses, but transformUrl assigns the rebuilt
+// path to url.pathname and the WHATWG URL parser normalises "\" to "/" for
+// special schemes — so a backslash silently becomes a slash and splits the
+// segment. Neither operator can put a real slash INSIDE one path segment; that
+// is a property of URLs, not of this grammar.
 function parseParamToken(inner: string): SegmentRule {
   const parts = inner.split("|");
   const name = parts[0];
@@ -99,8 +114,32 @@ function parseParamToken(inner: string): SegmentRule {
     };
   }
 
+  // {A|split|N|sep|} — insert sep after N characters.
+  if (parts.length === 5 && parts[4] === "" && parts[1] === "split") {
+    const rawPosition = parts[2];
+
+    // Digits only: Number.parseInt alone accepts "1.5" and "1abc" as 1, which
+    // would apply a transform the user did not write.
+    if (!/^\d+$/.test(rawPosition)) {
+      throw new StructureSyntaxError(
+        `{${inner}} has an invalid split position "${rawPosition}" — write a whole number of characters, e.g. {${name}|split|1|-|}`
+      );
+    }
+
+    return {
+      type: "param",
+      name,
+      // Empty separator is a documented no-op rather than an error.
+      transform: {
+        kind: "insertAt",
+        position: Number.parseInt(rawPosition, 10),
+        separator: parts[3]
+      }
+    };
+  }
+
   throw new StructureSyntaxError(
-    `{${inner}} is not a valid transform — use {A}, {A|text|}, {A|old|new|}, {A|upper|} or {A|lower|}`
+    `{${inner}} is not a valid transform — use {A}, {A|text|}, {A|old|new|}, {A|upper|}, {A|lower|} or {A|split|N|sep|}`
   );
 }
 
@@ -143,6 +182,13 @@ function applyTransform(value: string, transform: ParamTransform): string {
     case "replace":
       // Replace every occurrence (split/join avoids regex-escaping the needle).
       return value.split(transform.find).join(transform.replace);
+    case "insertAt": {
+      // Clamped, not rejected: past-the-end appends, so one short outlier value
+      // does not fail a transform that is correct for the rest of the pattern.
+      const at = Math.max(0, Math.min(transform.position, value.length));
+
+      return `${value.slice(0, at)}${transform.separator}${value.slice(at)}`;
+    }
   }
 }
 

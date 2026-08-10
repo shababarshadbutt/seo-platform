@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   captureStructureValues,
   convertParamToABC,
+  StructureSyntaxError,
   countTemplateParams,
   parseStructure,
   structureParamNames,
@@ -192,4 +193,142 @@ test("captureStructureValues captures multiple params in order", () => {
 
   assert.equal(values?.get("A"), "square-d");
   assert.equal(values?.get("B"), "page-18");
+});
+
+// --- {A|split|N|sep|} : insert a separator at a position -------------------
+
+test("split inserts the separator at the given position (24 -> 2-4)", () => {
+  assert.equal(
+    transformUrl(
+      "https://e.com/nsn/24",
+      parseStructure("/nsn/{A}"),
+      parseStructure("/nsn/{A|split|1|-|}")
+    ),
+    "https://e.com/nsn/2-4"
+  );
+});
+
+test("split position past the value length clamps to the end, no throw", () => {
+  assert.equal(
+    transformUrl(
+      "https://e.com/nsn/24",
+      parseStructure("/nsn/{A}"),
+      parseStructure("/nsn/{A|split|99|-|}")
+    ),
+    "https://e.com/nsn/24-"
+  );
+});
+
+test("split position 0 prepends", () => {
+  assert.equal(
+    transformUrl(
+      "https://e.com/nsn/24",
+      parseStructure("/nsn/{A}"),
+      parseStructure("/nsn/{A|split|0|x|}")
+    ),
+    "https://e.com/nsn/x24"
+  );
+});
+
+test("split rejects a non-numeric or negative position", () => {
+  // Digits only. Number.parseInt alone would accept these as 1 and silently
+  // apply a transform nobody wrote.
+  assert.throws(() => parseStructure("/nsn/{A|split|abc|-|}"), StructureSyntaxError);
+  assert.throws(() => parseStructure("/nsn/{A|split|-1|-|}"), StructureSyntaxError);
+  assert.throws(() => parseStructure("/nsn/{A|split|1.5|-|}"), StructureSyntaxError);
+  assert.throws(() => parseStructure("/nsn/{A|split||-|}"), StructureSyntaxError);
+  assert.match(
+    (() => {
+      try {
+        parseStructure("/nsn/{A|split|abc|-|}");
+        return "";
+      } catch (error) {
+        return (error as Error).message;
+      }
+    })(),
+    /invalid split position "abc"/
+  );
+});
+
+test("split with an EMPTY separator is a documented no-op, not an error", () => {
+  const parsed = parseStructure("/nsn/{A|split|1||}");
+
+  assert.deepEqual(parsed.segments[1], {
+    type: "param",
+    name: "A",
+    transform: { kind: "insertAt", position: 1, separator: "" }
+  });
+  // Inserting nothing leaves the value identical, and transformUrl returns null
+  // for an unchanged result — so it is a no-op end to end, not a crash.
+  assert.equal(
+    transformUrl(
+      "https://e.com/nsn/24",
+      parseStructure("/nsn/{A}"),
+      parsed
+    ),
+    null
+  );
+});
+
+test("a 5-part token that is not 'split' is still rejected", () => {
+  assert.throws(() => parseStructure("/nsn/{A|a|b|c|}"), StructureSyntaxError);
+});
+
+test("the not-a-valid-transform message lists the split form", () => {
+  try {
+    parseStructure("/nsn/{A|a|b|c|}");
+    assert.fail("should have thrown");
+  } catch (error) {
+    assert.match((error as Error).message, /\{A\|split\|N\|sep\|\}/);
+  }
+});
+
+// --- the existing replace operator already covers single-character swaps ----
+// Confirming rather than assuming, because it is easy to reach for split here.
+
+test("replace still swaps a lone hyphen for another character", () => {
+  assert.equal(
+    transformUrl(
+      "https://e.com/nsn/page-4/",
+      parseStructure("/nsn/{A}"),
+      parseStructure("/nsn/{A|-|_|}/")
+    ),
+    "https://e.com/nsn/page_4/"
+  );
+});
+
+test("replace hits EVERY occurrence — which is why split exists", () => {
+  // Both hyphens go, so replace cannot target one of several identical chars.
+  assert.equal(
+    transformUrl(
+      "https://e.com/nsn/niin-parts-24/",
+      parseStructure("/nsn/{A}"),
+      parseStructure("/nsn/{A|-|_|}/")
+    ),
+    "https://e.com/nsn/niin_parts_24/"
+  );
+});
+
+test("a slash cannot be a separator in ANY token — verified limitation", () => {
+  // parseStructure splits on "/" before tokens are parsed, so the token arrives
+  // as the fragment "{A|-|" and is rejected as brace-mixed. Applies equally to
+  // {A|split|1|/|}: a real slash inside one path segment is not expressible.
+  assert.throws(() => parseStructure("/nsn/{A|-|/|}/"), StructureSyntaxError);
+  assert.throws(() => parseStructure("/nsn/{A|split|1|/|}/"), StructureSyntaxError);
+});
+
+test("a backslash separator silently becomes a slash — verified limitation", () => {
+  // It parses, but transformUrl assigns to url.pathname and the WHATWG parser
+  // normalises "\" to "/" for special schemes, so it splits the segment instead
+  // of staying inside it. Documented so nobody offers it as a workaround.
+  const BACKSLASH = String.fromCharCode(92);
+
+  assert.equal(
+    transformUrl(
+      "https://e.com/nsn/24",
+      parseStructure("/nsn/{A}"),
+      parseStructure(`/nsn/{A|split|1|${BACKSLASH}|}`)
+    ),
+    "https://e.com/nsn/2/4"
+  );
 });
