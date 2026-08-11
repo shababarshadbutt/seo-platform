@@ -275,7 +275,26 @@ const silentLogger: any = {
   }
 };
 
-test("scoping the verify to the open pattern: before/after on one fixture", async (t) => {
+// Own deadline, above the suite-wide --test-timeout=60000. MEASURED, not guessed:
+//
+//   in isolation                    41.0s
+//   with --test-concurrency=4      100.1s   <- what the suite actually runs
+//   default concurrency (11 of 12)  timed out at 60s, twice, reproducibly
+//
+// This is the suite's heaviest test by a wide margin — 5,140 URLs across 8 files
+// through a live Postgres and a latency-injecting HTTP fixture, plus the triage
+// pass — and it is almost all DB write volume, so it inflates ~2.4x under even
+// modest parallel load while remaining perfectly healthy.
+//
+// The suite-wide 60s exists to make a HUNG test fail visibly (0ab9a0eb), not to
+// bound a test whose cost is known and legitimate. Raising it for this one file
+// keeps that hang-detector at 60s for the other ~290 tests rather than weakening
+// it globally, and hides nothing: a real hang here still fails, just later.
+//
+// Paired with --test-concurrency=4 in package.json — that cap is what stops this
+// test from starving the others, and this deadline is what stops the cap's
+// slower wall-clock from failing this one. Both are needed; see the commit.
+test("scoping the verify to the open pattern: before/after on one fixture", { timeout: 180_000 }, async (t) => {
   if (!(await postgresReachable())) {
     rmSync(uploadDir, { recursive: true, force: true });
     t.skip(`postgres not reachable at ${process.env.DATABASE_URL} — skipping`);

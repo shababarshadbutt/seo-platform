@@ -10,7 +10,7 @@
     "start": "node dist/server.js",
     "start:worker": "node dist/worker.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test --test-timeout=60000 \"src/**/*.test.ts\""
+    "test": "node --import tsx --test --test-concurrency=4 --test-timeout=60000 \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@aws-sdk/client-cloudfront": "^3.1095.0",
