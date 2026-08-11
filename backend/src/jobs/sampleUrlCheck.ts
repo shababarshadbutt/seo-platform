@@ -611,19 +611,67 @@ async function runCheckWithProfile(
   };
 }
 
+// WHICH RESULTS EARN A SECOND ATTEMPT: any outcome that is not a clean answer.
+//
+// WHEN WE RETRY IS DECOUPLED FROM HOW WE LABEL. The retry used to fire only on a
+// result already classified "blocked", which needs one of two narrow signals: an
+// explicit WAF header, or a 405/501 that survived the GET re-probe
+// (isMethodRejectedStatus is 405/501 only, deliberately). Production then produced
+// the case neither signal covers — devops measured this site family answering the
+// honest crawler UA with a plain 403, no x-amzn-waf-action header, and 403 is not
+// method-rejection so it never even reached the GET re-probe. It classified as
+// "failure" (status BAD, "Broken") and the browser-profile escalation was
+// UNREACHABLE for the exact status the WAF actually returns. On any origin that
+// blocks with 403 rather than 405, the whole feature was dead code.
+//
+// The fix is NOT to widen what counts as "blocked". A 403 can be a genuinely,
+// correctly forbidden page, and relabelling unexplained 403s as "no measurement"
+// would hide real access-control failures in the bucket built for WAF noise —
+// exactly the overreach avoided when that classification was designed (no
+// "403 + small body" heuristic, on purpose). So the classification below is
+// untouched: it still keys on the same two signals, and a 403 that is refused
+// twice is still reported as a failure.
+//
+// What widens is only the SAFETY NET: try harder before calling a page broken.
+// Anything that is not success / redirect / soft_404 gets one more attempt with a
+// different profile, whether the first attempt was "blocked" or "failure".
+//
+// COST: one extra request per URL that was ALREADY going to be reported as broken,
+// paced by the same per-host limiter — a 404 costs one HEAD, so it becomes two.
+// That is a real doubling on 404-heavy full verifications, and it is the price of
+// not calling a live page broken because a bot filter answered for it.
+function isEscalationEligible(result: SampleCheckResult): boolean {
+  return (
+    result.httpStatusCategory === "failure" ||
+    result.httpStatusCategory === "blocked"
+  );
+}
+
+// Is the second attempt's answer worth BELIEVING over the first one?
+//
+// Only when it is a clean answer — success, redirect or soft_404. Anything else
+// and the PRIMARY observation stands, which is what keeps this a safety net rather
+// than a reclassification: a confirmed block stays "blocked", a real 403 stays
+// "failure", and a fallback that merely TIMED OUT cannot overwrite either with a
+// transport error (the false "Broken" the blocked category exists to prevent).
+function isRealMeasurement(result: SampleCheckResult): boolean {
+  return !isEscalationEligible(result);
+}
+
 // The public checker. Callers still pass a bare session user_agent — nothing about
 // how samplePatternsJob or verifyProbe call this changed.
 //
 // TWO ATTEMPTS, MAXIMUM. The primary profile is the caller's UA with no extra
-// headers, i.e. exactly today's behaviour, so a site that is not blocking pays
-// nothing and cannot regress. Only a CONFIRMED block escalates to
-// BROWSER_FALLBACK_PROFILE, and the second attempt is the full check again (its own
-// HEAD, GET re-probe and soft-404 sniff) rather than a half-check.
+// headers, i.e. exactly today's behaviour, so a URL that answers cleanly pays
+// nothing and cannot regress. Any non-clean outcome escalates to
+// BROWSER_FALLBACK_PROFILE once (see isEscalationEligible), and the second attempt
+// is the full check again (its own HEAD, GET re-probe and soft-404 sniff) rather
+// than a half-check.
 //
-// COST. Unblocked sites: unchanged. A consistently-blocking site: at worst 4
-// requests per check instead of 2 — and every one still goes through the same
-// beforeRequest hook, so the per-host rate limiter paces the retry identically. No
-// volume is reintroduced.
+// COST. Clean URLs: unchanged. A URL that would be reported broken: one extra
+// request (or two, if HEAD is method-rejected on the retry as well) — and every one
+// still goes through the same beforeRequest hook, so the per-host rate limiter paces
+// the retry identically.
 export async function checkSampleUrl(
   baseUrl: string,
   samplePath: string,
@@ -651,13 +699,17 @@ export async function checkSampleUrl(
     options
   );
 
-  if (primaryResult.httpStatusCategory !== "blocked") {
+  if (!isEscalationEligible(primaryResult)) {
     return primaryResult;
   }
 
   logger.info(
-    { ...logContext, blocked_status: primaryResult.httpStatus },
-    "sample url blocked on the primary profile, retrying with the browser profile"
+    {
+      ...logContext,
+      blocked_status: primaryResult.httpStatus,
+      blocked_category: primaryResult.httpStatusCategory
+    },
+    "sample url refused on the primary profile, retrying with the browser profile"
   );
 
   const fallbackResult = await runCheckWithProfile(
@@ -668,21 +720,23 @@ export async function checkSampleUrl(
     options
   );
 
-  // Still blocked on both: report blocked, exactly as before. Two attempts is the
-  // ceiling — there is no third profile and no loop.
-  if (fallbackResult.httpStatusCategory === "blocked") {
+  // The fallback measured the page, so THAT is the truth about this URL.
+  if (isRealMeasurement(fallbackResult)) {
+    logger.info(
+      {
+        ...logContext,
+        recovered_status: fallbackResult.httpStatus,
+        recovered_category: fallbackResult.httpStatusCategory
+      },
+      "sample url recovered with the browser fallback profile"
+    );
+
     return { ...fallbackResult, usedFallbackProfile: true };
   }
 
-  // The fallback got a real answer, so THAT is the truth about this URL.
-  logger.info(
-    {
-      ...logContext,
-      recovered_status: fallbackResult.httpStatus,
-      recovered_category: fallbackResult.httpStatusCategory
-    },
-    "sample url recovered with the browser fallback profile"
-  );
-
-  return { ...fallbackResult, usedFallbackProfile: true };
+  // Refused on both profiles: the PRIMARY observation stands (a confirmed block
+  // stays "blocked"; a real 403 stays "failure"), flagged so the data records that
+  // the escalation was attempted. Two attempts is the ceiling — there is no third
+  // profile and no loop.
+  return { ...primaryResult, usedFallbackProfile: true };
 }

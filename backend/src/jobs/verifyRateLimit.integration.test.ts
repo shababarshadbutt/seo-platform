@@ -41,9 +41,16 @@ const BURST = 10;
 // limiter can guarantee. The SUSTAINED rate assertion below is the tight one
 // and is not affected by bunching.
 const WINDOW_JITTER_ALLOWANCE = 8;
-// Every fixture URL answers 404, so one URL check is exactly one HTTP request
-// and "checks" and "requests" are the same number. A 2xx would add the
-// soft-404 GET and blur the comparison.
+// Every fixture URL answers 404 — no soft-404 GET, no HEAD->GET method-rejection
+// re-probe — so a check costs the HEAD plus ONE escalation attempt.
+//
+// It used to be one request per check. The browser-profile retry now fires on any
+// non-clean outcome (not only a confirmed WAF block), because a bot filter can
+// answer with any status and a single 404 is not enough to call a page dead. The
+// price is exactly this: 404s cost two requests instead of one. Pinned as a named
+// constant so a future change to the escalation rule fails these tests loudly
+// instead of silently altering what the rate maths is measuring.
+const REQUESTS_PER_404_CHECK = 2;
 const URL_COUNT = 60;
 // The SECOND fixture deliberately does the opposite: every URL answers 200, so
 // each check costs TWO requests — the HEAD plus the soft-404 GET. That is the
@@ -234,13 +241,26 @@ test("a real verification run is paced at the configured requests/second", async
     silentLogger
   );
 
-  assert.equal(arrivals.length, URL_COUNT);
+  // PREMISE: every 404 costs TWO requests now — the primary attempt plus the
+  // browser-profile escalation, which fires on any non-clean outcome rather than
+  // only on a confirmed block. That widening is deliberate (a bot filter can answer
+  // with any status, so a 404 is not trustworthy on one attempt), and this is where
+  // its cost is measured rather than assumed: a 404-heavy verification now issues
+  // twice the requests, at the SAME paced rate, so it takes twice as long.
+  assert.equal(
+    arrivals.length,
+    URL_COUNT * REQUESTS_PER_404_CHECK,
+    "expected two requests per 404 check — the escalation attempt included"
+  );
 
   const spanMs = arrivals[arrivals.length - 1] - arrivals[0];
   const observedRate = (arrivals.length - 1) / (spanMs / 1000);
-  // The burst is spent up front, so the paced portion is what must take time:
-  // (60 - 10) requests at 25/s = 2000ms minimum.
-  const expectedMinMs = ((URL_COUNT - BURST) / REQUESTS_PER_SECOND) * 1000;
+  // The burst is spent up front, so the paced portion is what must take time.
+  // Derived from the REQUEST count, not the check count, because requests are what
+  // the limiter meters — which also makes this floor rise with the escalation
+  // instead of quietly going slack.
+  const expectedMinMs =
+    ((arrivals.length - BURST) / REQUESTS_PER_SECOND) * 1000;
 
   console.log(
     `[rate limit] ${arrivals.length} requests over ${spanMs}ms = ` +
@@ -248,8 +268,8 @@ test("a real verification run is paced at the configured requests/second", async
       `floor for the paced portion ${expectedMinMs}ms`
   );
 
-  // Loopback with no rate limiter finishes 60 requests in well under 100ms, so
-  // this margin is enormous relative to what an unpaced run would produce.
+  // Loopback with no rate limiter finishes these in well under 100ms, so this
+  // margin is enormous relative to what an unpaced run would produce.
   assert.ok(
     spanMs >= expectedMinMs * 0.9,
     `run finished in ${spanMs}ms, faster than the ${expectedMinMs}ms the rate cap requires`
@@ -649,8 +669,8 @@ test("sampling is paced through the same per-host limiter as verification", asyn
   const arrivals: number[] = [];
   const server = createServer((_req, res) => {
     arrivals.push(Date.now());
-    // 404 keeps it at exactly one HTTP request per check: no soft-404 GET, and
-    // no HEAD->GET method-rejection re-probe.
+    // 404: no soft-404 GET and no HEAD->GET method-rejection re-probe, so a check
+    // is the HEAD plus the browser-profile escalation — REQUESTS_PER_404_CHECK.
     res.writeHead(404);
     res.end();
   });
@@ -774,19 +794,21 @@ test("sampling is paced through the same per-host limiter as verification", asyn
 
   const elapsedMs = Date.now() - startedMs;
 
-  // PREMISE: one request per check. If this drifts the rate maths below is
-  // measuring something else, so it fails loudly rather than passing quietly.
+  // PREMISE: REQUESTS_PER_404_CHECK requests per check (the HEAD plus the
+  // browser-profile escalation). If this drifts the rate maths below is measuring
+  // something else, so it fails loudly rather than passing quietly.
   assert.equal(
     arrivals.length,
-    SAMPLING_URL_COUNT,
-    "expected exactly one HTTP request per sampled URL"
+    SAMPLING_URL_COUNT * REQUESTS_PER_404_CHECK,
+    "expected two HTTP requests per sampled 404 URL — the escalation included"
   );
 
   const spanMs = arrivals[arrivals.length - 1] - arrivals[0];
   const observedRate = (arrivals.length - 1) / (spanMs / 1000);
-  // Burst credit is a fixed head start, so only the remainder is paced.
+  // Burst credit is a fixed head start, so only the remainder is paced. Off the
+  // REQUEST count, which is the unit the limiter meters.
   const expectedMinMs =
-    ((SAMPLING_URL_COUNT - BURST) / REQUESTS_PER_SECOND) * 1000;
+    ((arrivals.length - BURST) / REQUESTS_PER_SECOND) * 1000;
 
   console.log(
     `[sampling rate limit] ${arrivals.length} requests over ${spanMs}ms = ` +

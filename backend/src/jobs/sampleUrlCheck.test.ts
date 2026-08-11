@@ -141,24 +141,17 @@ test("a genuine 403 with no WAF header stays FAILURE", async () => {
       res.writeHead(403);
       res.end();
     },
-    (baseUrl) => check(baseUrl)
+    (baseUrl, counts) =>
+      check(baseUrl).then((r) => ({ r, requests: [...counts.requests] }))
   );
 
-  assert.equal(result.httpStatusCategory, "failure");
-  assert.equal(result.httpStatus, 403);
-});
-
-test("a genuine 404 stays FAILURE", async () => {
-  const result = await withServer(
-    (_method, _url, res) => {
-      res.writeHead(404);
-      res.end();
-    },
-    (baseUrl) => check(baseUrl)
-  );
-
-  assert.equal(result.httpStatusCategory, "failure");
-  assert.equal(result.httpStatus, 404);
+  // A 403 is escalation-ELIGIBLE, not reclassified: it earns a second attempt with
+  // the browser profile, and when that is refused too the honest verdict is still
+  // "failure". Reclassifying it as "blocked" would hide genuinely forbidden pages.
+  assert.equal(result.r.httpStatusCategory, "failure");
+  assert.equal(result.r.httpStatus, 403);
+  assert.equal(result.r.usedFallbackProfile, true);
+  assert.deepEqual(result.requests, ["HEAD /thing/one", "HEAD /thing/one"]);
 });
 
 test("a 500 stays FAILURE — server errors are real failures", async () => {
@@ -295,12 +288,13 @@ test("primary succeeds -> NO fallback attempt is made at all", async () => {
   assert.deepEqual(result.requests, ["HEAD /thing/one", "GET /thing/one"]);
 });
 
-test("a genuine 404 does NOT trigger the fallback", async () => {
-  // Escalation is gated on "blocked", not on "not 2xx". A real 404 must stay one
-  // attempt, or every broken URL on every site doubles in cost.
+test("a 404 DOES get a second attempt, and stays a failure when refused again", async () => {
+  // The safety net is deliberately wide: anything not success/redirect/soft_404
+  // earns one retry with a different profile, because a bot filter can answer with
+  // any status. The label is what stays narrow — a 404 twice is still a failure,
+  // never "blocked".
   const result = await withServer(
-    (_method, _url, res, headers) => {
-      assert.equal(isBrowserProfile(headers!), false);
+    (_method, _url, res) => {
       res.writeHead(404);
       res.end();
     },
@@ -309,8 +303,160 @@ test("a genuine 404 does NOT trigger the fallback", async () => {
   );
 
   assert.equal(result.r.httpStatusCategory, "failure");
-  assert.equal(result.r.usedFallbackProfile, false);
-  assert.deepEqual(result.requests, ["HEAD /thing/one"]);
+  assert.equal(result.r.httpStatus, 404);
+  assert.equal(result.r.usedFallbackProfile, true);
+  // The documented cost: one extra request for a URL already headed for "broken".
+  assert.deepEqual(result.requests, ["HEAD /thing/one", "HEAD /thing/one"]);
+});
+
+test("a 404 that the browser profile serves is recovered, not reported broken", async () => {
+  // The reason the net is this wide: a bot filter that answers 404 to crawlers is
+  // indistinguishable from a dead page on the first attempt.
+  const result = await withServer(
+    (_method, _url, res, headers) => {
+      if (isBrowserProfile(headers!)) {
+        res.writeHead(200, { "content-type": "text/html" });
+        res.end("healthy fixture product page content. ".repeat(60));
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    },
+    (baseUrl) => check(baseUrl)
+  );
+
+  assert.equal(result.httpStatusCategory, "success");
+  assert.equal(result.httpStatus, 200);
+  assert.equal(result.usedFallbackProfile, true);
+});
+
+// --- the 403 escalation ------------------------------------------------------
+// The production gap: this site family's WAF answers the honest crawler UA with a
+// bare 403 — no x-amzn-waf-action header, and 403 is not method-rejection, so
+// NEITHER "blocked" signal fires. Before this, the browser-profile retry could
+// never run on the exact status the site actually returns.
+
+test("a bare 403 escalates and the fallback's real status wins", async () => {
+  const result = await withServer(
+    (_method, _url, res, headers) => {
+      if (isBrowserProfile(headers!)) {
+        res.writeHead(200, { "content-type": "text/html" });
+        res.end("healthy fixture product page content. ".repeat(60));
+        return;
+      }
+
+      // No WAF header, no 405 — the measured signature of this site's block.
+      res.writeHead(403);
+      res.end();
+    },
+    (baseUrl, counts) =>
+      check(baseUrl).then((r) => ({ r, requests: [...counts.requests] }))
+  );
+
+  assert.equal(result.r.httpStatusCategory, "success");
+  assert.equal(result.r.httpStatus, 200);
+  assert.equal(result.r.usedFallbackProfile, true);
+  // HEAD(403) on the primary, then the fallback's full check: HEAD + soft-404 GET.
+  assert.deepEqual(result.requests, [
+    "HEAD /thing/one",
+    "HEAD /thing/one",
+    "GET /thing/one"
+  ]);
+});
+
+test("a 403 that the fallback answers with a redirect adopts the redirect", async () => {
+  const result = await withServer(
+    (_method, url, res, headers) => {
+      if (!isBrowserProfile(headers!)) {
+        res.writeHead(403);
+        res.end();
+        return;
+      }
+
+      if (url === "/thing/one") {
+        res.writeHead(301, { location: "/thing/two" });
+        res.end();
+        return;
+      }
+
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("ok");
+    },
+    (baseUrl) => check(baseUrl)
+  );
+
+  assert.equal(result.httpStatusCategory, "redirect");
+  assert.equal(result.httpStatus, 301);
+  assert.equal(result.usedFallbackProfile, true);
+});
+
+test("a confirmed block is NOT erased by a fallback that fails to connect", async () => {
+  // THE GUARD ON isRealMeasurement. If the second attempt gets no answer at all, it
+  // measured nothing — adopting its "failure" would turn a confirmed block back
+  // into the false "Broken" that the blocked classification exists to prevent.
+  const result = await withServer(
+    (_method, _url, res, headers) => {
+      if (isBrowserProfile(headers!)) {
+        // No response at all: undici throws, so the fallback's httpStatus is null.
+        res.socket?.destroy();
+        return;
+      }
+
+      res.writeHead(403, { "x-amzn-waf-action": "captcha" });
+      res.end();
+    },
+    (baseUrl, counts) =>
+      check(baseUrl).then((r) => ({ r, requests: [...counts.requests] }))
+  );
+
+  assert.equal(result.r.httpStatusCategory, "blocked");
+  assert.equal(result.r.httpStatus, 403);
+  assert.equal(result.r.usedFallbackProfile, true);
+  assert.equal(result.requests.length, 2, JSON.stringify(result.requests));
+});
+
+test("401, 429 and 503 escalate ONCE and keep their real classification", async () => {
+  // THE LABEL-OVERREACH GUARD. Every one of these gets the extra attempt, and not
+  // one of them may come back "blocked": authentication, our own pacing and
+  // availability are real answers about the URL. Two attempts is still the ceiling.
+  for (const status of [401, 429, 503]) {
+    const result = await withServer(
+      (_method, _url, res) => {
+        res.writeHead(status);
+        res.end();
+      },
+      (baseUrl, counts) =>
+        check(baseUrl).then((r) => ({ r, requests: [...counts.requests] }))
+    );
+
+    assert.equal(result.r.httpStatusCategory, "failure", `status ${status}`);
+    assert.equal(result.r.httpStatus, status, `status ${status}`);
+    assert.equal(result.r.usedFallbackProfile, true, `status ${status}`);
+    assert.deepEqual(
+      result.requests,
+      ["HEAD /thing/one", "HEAD /thing/one"],
+      `status ${status}`
+    );
+  }
+});
+
+test("a transport failure escalates but cannot be relabelled as blocked", async () => {
+  // No response at all on either profile: still a failure with a null status, and
+  // exactly two attempts — a connection that never completes must not become
+  // "blocked" (nothing observed a WAF) nor loop.
+  const result = await withServer(
+    (_method, _url, res) => {
+      res.socket?.destroy();
+    },
+    (baseUrl, counts) =>
+      check(baseUrl).then((r) => ({ r, requests: [...counts.requests] }))
+  );
+
+  assert.equal(result.r.httpStatusCategory, "failure");
+  assert.equal(result.r.httpStatus, null);
+  assert.equal(result.r.usedFallbackProfile, true);
+  assert.equal(result.requests.length, 2, JSON.stringify(result.requests));
 });
 
 test("the fallback profile sends all four Sec-Fetch headers and the Chrome UA", async () => {
