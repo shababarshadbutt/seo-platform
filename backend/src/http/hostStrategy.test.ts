@@ -1,0 +1,538 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import {
+  HOST_STRATEGY_TTL_SECONDS,
+  ladderForRung,
+  noteHostCheckOutcome,
+  REFUSAL_STREAK_BEFORE_RENEGOTIATION,
+  resetHostStrategyMemory,
+  resolveHostStrategy,
+  type HostStrategyStore,
+  type RungProbe,
+  type StoredHostStrategy
+} from "./hostStrategy.js";
+import { DEFAULT_HTTP_USER_AGENT } from "../config.js";
+import type { SampleCheckResult } from "../jobs/sampleUrlCheck.js";
+
+// The engine's ladder, circuit breaker, memory and race guard — with an in-memory
+// store and a fake probe, so no Redis, no Postgres and no sockets are involved.
+// Exactly the discipline patternScore.ts and sampleHttpStatus.ts follow: the
+// decisions are pure, so they get real coverage.
+
+const silentLogger: any = {
+  info() {},
+  warn() {},
+  error() {},
+  debug() {},
+  trace() {},
+  fatal() {},
+  child() {
+    return silentLogger;
+  }
+};
+
+const HOST = "www.example.com";
+const PROBE_URL = "https://www.example.com/product/deep/thing";
+
+function outcome(
+  overrides: Partial<SampleCheckResult> & Pick<SampleCheckResult, "httpStatusCategory">
+): SampleCheckResult {
+  return {
+    url: PROBE_URL,
+    httpStatus: 200,
+    responseMs: 5,
+    isHit: true,
+    isSoft404: false,
+    finalUrl: null,
+    redirectCount: 0,
+    scoreWeight: 1,
+    timedOut: false,
+    errorReason: null,
+    usedFallbackProfile: false,
+    edgeServer: null,
+    ...overrides
+  };
+}
+
+const clean = () => outcome({ httpStatusCategory: "success" });
+const redirect = () =>
+  outcome({ httpStatusCategory: "redirect", httpStatus: 301, redirectCount: 1 });
+const softNotFound = () =>
+  outcome({ httpStatusCategory: "soft_404", scoreWeight: 0.25 });
+const blocked = (edgeServer: string | null = "awselb/2.0") =>
+  outcome({
+    httpStatusCategory: "blocked",
+    httpStatus: 405,
+    isHit: false,
+    scoreWeight: 0,
+    edgeServer
+  });
+const transportFailure = () =>
+  outcome({
+    httpStatusCategory: "failure",
+    httpStatus: null,
+    isHit: false,
+    scoreWeight: 0,
+    timedOut: true,
+    errorReason: "timeout"
+  });
+
+function memoryStore(seed?: StoredHostStrategy) {
+  const rows = new Map<string, StoredHostStrategy>();
+  const held = new Set<string>();
+  const calls = { reads: 0, writes: 0, locks: 0 };
+
+  if (seed) {
+    rows.set(seed.host, seed);
+  }
+
+  const store: HostStrategyStore = {
+    async read(host) {
+      calls.reads += 1;
+      return rows.get(host) ?? null;
+    },
+    async write(value) {
+      calls.writes += 1;
+      rows.set(value.host, value);
+    },
+    async lock(host) {
+      calls.locks += 1;
+
+      if (held.has(host)) {
+        return null;
+      }
+
+      held.add(host);
+
+      return {
+        release: async () => {
+          held.delete(host);
+        }
+      };
+    }
+  };
+
+  return { store, rows, held, calls };
+}
+
+// A probe that returns a scripted result per rung, counting attempts.
+function scriptedProbe(script: Array<() => SampleCheckResult>) {
+  const attempts: string[] = [];
+  const probe: RungProbe = async (_url, profile) => {
+    const label = profile.allowH2
+      ? "R2"
+      : profile.userAgent.includes("Chrome/")
+        ? "R1"
+        : "R0";
+
+    attempts.push(label);
+
+    const next = script[Math.min(attempts.length - 1, script.length - 1)];
+
+    return next();
+  };
+
+  return { probe, attempts };
+}
+
+// --- the ladder --------------------------------------------------------------
+
+test("R0 wins: one probe, and the honest UA is what gets learned", async () => {
+  resetHostStrategyMemory();
+
+  const { store, rows } = memoryStore();
+  const { probe, attempts } = scriptedProbe([clean]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  assert.deepEqual(attempts, ["R0"]);
+  assert.equal(resolved.verdict, "OK");
+  assert.equal(resolved.rung, "R0");
+  assert.equal(resolved.skip, false);
+  assert.equal(rows.get(HOST)?.rung, "R0");
+  // R0 learned still carries R1 as the per-URL safety net.
+  assert.equal(resolved.ladder.length, 2);
+  assert.equal(resolved.ladder[0].userAgent, DEFAULT_HTTP_USER_AGENT);
+});
+
+test("R0 refused, R1 wins: two probes, and R1 becomes the primary", async () => {
+  resetHostStrategyMemory();
+
+  const { store } = memoryStore();
+  const { probe, attempts } = scriptedProbe([blocked, clean]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  assert.deepEqual(attempts, ["R0", "R1"]);
+  assert.equal(resolved.rung, "R1");
+  assert.match(resolved.ladder[0].userAgent, /Chrome\//);
+  // R1 learned -> R2 is the safety net above it.
+  assert.equal(resolved.ladder.length, 2);
+  assert.equal(resolved.ladder[1].allowH2, true);
+});
+
+test("only R2 answers: the ladder is a SINGLE rung, so no per-URL escalation", async () => {
+  resetHostStrategyMemory();
+
+  const { store } = memoryStore();
+  const { probe, attempts } = scriptedProbe([blocked, blocked, clean]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  assert.deepEqual(attempts, ["R0", "R1", "R2"]);
+  assert.equal(resolved.rung, "R2");
+  // Top rung: nothing above it, so a URL that still refuses costs one request, not
+  // two. Asserted because a stray second entry here would silently double the cost
+  // of every check on such a host.
+  assert.equal(resolved.ladder.length, 1);
+});
+
+test("a REDIRECT wins a rung — do not climb past a usable answer", async () => {
+  resetHostStrategyMemory();
+
+  const { store } = memoryStore();
+  const { probe, attempts } = scriptedProbe([redirect]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  // A host whose pages redirect is perfectly measurable. Climbing to a browser
+  // profile because a page 301s would spend requests to learn nothing.
+  assert.deepEqual(attempts, ["R0"]);
+  assert.equal(resolved.rung, "R0");
+});
+
+test("a SOFT-404 wins a rung — it is an unhealthy measurement, still a measurement", async () => {
+  resetHostStrategyMemory();
+
+  const { store } = memoryStore();
+  const { probe, attempts } = scriptedProbe([softNotFound]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  assert.deepEqual(attempts, ["R0"]);
+  assert.equal(resolved.verdict, "OK");
+});
+
+// --- the circuit breaker -----------------------------------------------------
+
+test("every rung refused -> REFUSED, skip = true, empty ladder, edge server recorded", async () => {
+  resetHostStrategyMemory();
+
+  const { store, rows } = memoryStore();
+  const { probe, attempts } = scriptedProbe([blocked, blocked, blocked]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  assert.deepEqual(attempts, ["R0", "R1", "R2"]);
+  assert.equal(resolved.verdict, "REFUSED");
+  assert.equal(resolved.skip, true);
+  assert.deepEqual(resolved.ladder, []);
+  // The one fact that turns this into an actionable devops request rather than a
+  // mystery: WHICH edge refused us.
+  assert.equal(resolved.edgeServer, "awselb/2.0");
+  assert.equal(rows.get(HOST)?.verdict, "REFUSED");
+  assert.equal(rows.get(HOST)?.rung, null);
+  assert.equal(rows.get(HOST)?.lastStatus, 405);
+});
+
+test("a REFUSED host resolves from the store with ZERO probes on the next run", async () => {
+  resetHostStrategyMemory();
+
+  const { store } = memoryStore({
+    host: HOST,
+    verdict: "REFUSED",
+    rung: null,
+    edgeServer: "awselb/2.0",
+    lastStatus: 403,
+    decidedAt: new Date().toISOString()
+  });
+  const { probe, attempts } = scriptedProbe([clean]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  // THE COST ASSERTION. This is the difference between a blocked site's session
+  // finishing in seconds and it spending days re-learning the same refusal.
+  assert.deepEqual(attempts, []);
+  assert.equal(resolved.skip, true);
+});
+
+// --- inconclusive is NOT refused --------------------------------------------
+
+test("all rungs time out -> UNKNOWN, nothing persisted, default ladder, still checked", async () => {
+  resetHostStrategyMemory();
+
+  const { store, rows, calls } = memoryStore();
+  const { probe, attempts } = scriptedProbe([transportFailure]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  // An unreachable host is a normal failure the per-URL checker must report
+  // honestly — NOT a refusal to skip and definitely not "needs an allowlist".
+  assert.equal(resolved.verdict, "UNKNOWN");
+  assert.equal(resolved.skip, false);
+  assert.equal(resolved.ladder.length, 2);
+  assert.equal(rows.size, 0);
+  assert.equal(calls.writes, 0);
+  // Each rung is retried once on a transport failure (nothing answered, so the rung
+  // was never really tested): 3 rungs x 2 attempts.
+  assert.equal(attempts.length, 6, attempts.join(","));
+});
+
+test("a rung that times out once then answers still wins that rung", async () => {
+  resetHostStrategyMemory();
+
+  const { store } = memoryStore();
+  const { probe, attempts } = scriptedProbe([transportFailure, clean]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  assert.deepEqual(attempts, ["R0", "R0"]);
+  assert.equal(resolved.rung, "R0");
+});
+
+// --- memory ------------------------------------------------------------------
+
+test("a stored fresh strategy is reused without probing", async () => {
+  resetHostStrategyMemory();
+
+  const { store } = memoryStore({
+    host: HOST,
+    verdict: "OK",
+    rung: "R1",
+    edgeServer: "nginx/1.28.3",
+    lastStatus: 200,
+    decidedAt: new Date().toISOString()
+  });
+  const { probe, attempts } = scriptedProbe([clean]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  assert.deepEqual(attempts, []);
+  assert.equal(resolved.rung, "R1");
+});
+
+test("a strategy older than the TTL is re-negotiated", async () => {
+  resetHostStrategyMemory();
+
+  const nowMs = Date.UTC(2026, 7, 11, 12, 0, 0);
+  const { store } = memoryStore({
+    host: HOST,
+    verdict: "OK",
+    rung: "R1",
+    edgeServer: null,
+    lastStatus: 200,
+    decidedAt: new Date(nowMs - (HOST_STRATEGY_TTL_SECONDS * 1000 + 1000)).toISOString()
+  });
+  const { probe, attempts } = scriptedProbe([clean]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger,
+    now: () => nowMs
+  });
+
+  // An allowlist landing on the target's side is picked up without anyone
+  // remembering to clear a cache.
+  assert.deepEqual(attempts, ["R0"]);
+  assert.equal(resolved.rung, "R0");
+});
+
+test("re-negotiation fires after a STREAK of refusals, not after one", async () => {
+  resetHostStrategyMemory();
+
+  const stored: StoredHostStrategy = {
+    host: HOST,
+    verdict: "OK",
+    rung: "R0",
+    edgeServer: null,
+    lastStatus: 200,
+    decidedAt: new Date().toISOString()
+  };
+  const { store } = memoryStore(stored);
+  const first = scriptedProbe([clean]);
+
+  noteHostCheckOutcome(HOST, false);
+  await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe: first.probe,
+    logger: silentLogger
+  });
+
+  // ONE refusal is ordinary — a 404 in a sitemap is a finding, not evidence the
+  // recipe broke. Re-negotiating here would reintroduce the per-URL cost.
+  assert.deepEqual(first.attempts, []);
+
+  for (let i = 0; i < REFUSAL_STREAK_BEFORE_RENEGOTIATION; i += 1) {
+    noteHostCheckOutcome(HOST, false);
+  }
+
+  const second = scriptedProbe([blocked, clean]);
+
+  await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe: second.probe,
+    logger: silentLogger
+  });
+
+  assert.deepEqual(second.attempts, ["R0", "R1"]);
+});
+
+test("a clean result clears the streak", async () => {
+  resetHostStrategyMemory();
+
+  const { store } = memoryStore({
+    host: HOST,
+    verdict: "OK",
+    rung: "R0",
+    edgeServer: null,
+    lastStatus: 200,
+    decidedAt: new Date().toISOString()
+  });
+
+  noteHostCheckOutcome(HOST, false);
+  noteHostCheckOutcome(HOST, false);
+  noteHostCheckOutcome(HOST, true);
+  noteHostCheckOutcome(HOST, false);
+
+  const { probe, attempts } = scriptedProbe([clean]);
+
+  await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  assert.deepEqual(attempts, []);
+});
+
+// --- the race guard ----------------------------------------------------------
+
+test("a loser of the negotiation race WAITS for the winner instead of probing", async () => {
+  resetHostStrategyMemory();
+
+  const { store, rows, held } = memoryStore();
+
+  // Simulate the winner holding the lock, then publishing its answer.
+  held.add(HOST);
+
+  const { probe, attempts } = scriptedProbe([clean]);
+  const pending = resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger,
+    sleep: async () => {
+      // On the loser's first poll the winner's answer lands.
+      rows.set(HOST, {
+        host: HOST,
+        verdict: "OK",
+        rung: "R2",
+        edgeServer: "nginx/1.28.3",
+        lastStatus: 200,
+        decidedAt: new Date().toISOString()
+      });
+    }
+  });
+  const resolved = await pending;
+
+  // THE ASSERTION THAT MATTERS: the loser issued no probes of its own and adopted
+  // the winner's recipe. Two processes probing one origin to learn the same thing is
+  // precisely the duplicated cost this engine exists to remove.
+  assert.deepEqual(attempts, []);
+  assert.equal(resolved.rung, "R2");
+});
+
+test("a negotiation wait that never resolves falls back to the default ladder", async () => {
+  resetHostStrategyMemory();
+
+  const { store, held } = memoryStore();
+
+  held.add(HOST);
+
+  let clockMs = 1_000_000;
+  const { probe, attempts } = scriptedProbe([clean]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger,
+    now: () => clockMs,
+    sleep: async () => {
+      clockMs += 10_000;
+    }
+  });
+
+  // Bounded: a wait that outlives the negotiation it waits for would stall a whole
+  // session on one host. It gives up and runs today's ladder.
+  assert.equal(resolved.verdict, "UNKNOWN");
+  assert.equal(resolved.ladder.length, 2);
+  assert.deepEqual(attempts, []);
+});
+
+// --- an explicit user override -----------------------------------------------
+
+test("a session with a custom user_agent is never negotiated for", async () => {
+  resetHostStrategyMemory();
+
+  const { store, calls } = memoryStore();
+  const { probe, attempts } = scriptedProbe([clean]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, "AcmeCrawler/9.9", {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  // A non-default UA is a deliberate instruction. The engine must not learn, on the
+  // operator's behalf, that this host prefers Chrome and then silently send that.
+  assert.deepEqual(attempts, []);
+  assert.equal(calls.reads, 0);
+  assert.equal(resolved.verdict, "UNKNOWN");
+  assert.equal(resolved.ladder[0].userAgent, "AcmeCrawler/9.9");
+  // The v1.60 per-URL safety net is still there for them.
+  assert.equal(resolved.ladder.length, 2);
+});
+
+// --- ladder shape ------------------------------------------------------------
+
+test("ladderForRung never exceeds two entries and always leads with the learned rung", () => {
+  for (const rung of ["R0", "R1", "R2"] as const) {
+    const ladder = ladderForRung(rung, DEFAULT_HTTP_USER_AGENT);
+
+    assert.ok(ladder.length >= 1 && ladder.length <= 2, `${rung} -> ${ladder.length}`);
+
+    if (rung === "R0") {
+      assert.equal(ladder[0].userAgent, DEFAULT_HTTP_USER_AGENT);
+    } else {
+      assert.match(ladder[0].userAgent, /Chrome\//);
+    }
+  }
+});
