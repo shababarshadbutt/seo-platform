@@ -5,7 +5,7 @@ import { request } from "undici";
 
 import { tlsAwareDispatcher } from "../http/tlsDispatcher.js";
 import { SOFT_404_TEXT_SIGNALS } from "../sitemaps/softNotFound.js";
-import { isMethodRejectedStatus } from "./sampleHttpStatus.js";
+import { hasWafBlockHeader, isMethodRejectedStatus } from "./sampleHttpStatus.js";
 import { resolveSampleTarget } from "./sampleTarget.js";
 
 // The per-URL HTTP checker (HEAD, GET fallback on method rejection, soft-404
@@ -70,7 +70,16 @@ const METHOD_FALLBACK_BODY_SAMPLE_BYTES = 8 * 1024;
 // SOFT_404_TEXT_SIGNALS lives in sitemaps/softNotFound.js so the Fix Redirect
 // URLs modal's destination check reuses the exact same vocabulary.
 
-export type HttpStatusCategory = "success" | "redirect" | "failure" | "soft_404";
+// "blocked" is NOT a kind of failure — it is the absence of a measurement. A
+// blocked row means the site's security answered instead of the page, so its
+// status code tells us nothing about whether the URL works. patternScore filters
+// these out before scoring rather than averaging them in as zeros.
+export type HttpStatusCategory =
+  | "success"
+  | "redirect"
+  | "failure"
+  | "soft_404"
+  | "blocked";
 
 type HeadResult = {
   statusCode: number | null;
@@ -78,6 +87,10 @@ type HeadResult = {
   location: string | null;
   timedOut: boolean;
   errorReason: SampleErrorReason | null;
+  // True when the response carried a header proving a WAF produced it. Both
+  // probes discard headers apart from Location; this one is threaded through the
+  // same way because it changes the VERDICT, not just the diagnostics.
+  wafBlockHeaderDetected: boolean;
 };
 
 export type SampleCheckResult = {
@@ -188,7 +201,8 @@ async function headOnce(
       responseMs: Math.round(performance.now() - started),
       location: firstHeaderValue(response.headers.location),
       timedOut: false,
-      errorReason: null
+      errorReason: null,
+      wafBlockHeaderDetected: hasWafBlockHeader(response.headers)
     };
   } catch (error) {
     return {
@@ -196,7 +210,10 @@ async function headOnce(
       responseMs: Math.round(performance.now() - started),
       location: null,
       timedOut: true,
-      errorReason: classifyRequestError(error)
+      errorReason: classifyRequestError(error),
+      // No response at all, so no header to read — a transport failure is a
+      // genuine failure, not a block.
+      wafBlockHeaderDetected: false
     };
   }
 }
@@ -282,7 +299,8 @@ async function getStatusOnce(
       responseMs: Math.round(performance.now() - started),
       location: firstHeaderValue(response.headers.location),
       timedOut: false,
-      errorReason: null
+      errorReason: null,
+      wafBlockHeaderDetected: hasWafBlockHeader(response.headers)
     };
   } catch (error) {
     return {
@@ -290,7 +308,10 @@ async function getStatusOnce(
       responseMs: Math.round(performance.now() - started),
       location: null,
       timedOut: true,
-      errorReason: classifyRequestError(error)
+      errorReason: classifyRequestError(error),
+      // No response at all, so no header to read — a transport failure is a
+      // genuine failure, not a block.
+      wafBlockHeaderDetected: false
     };
   }
 }
@@ -477,6 +498,25 @@ export async function checkSampleUrl(
       errorReason: null
     };
   } else {
+    // BLOCKED vs FAILURE. Two high-confidence signals only — no vendor guessing,
+    // and deliberately no "403 with a small body" heuristic, which would hide
+    // genuinely forbidden pages behind "blocked".
+    //
+    // Signal 1: the response carried an explicit WAF header, so a WAF produced it
+    // rather than the origin.
+    //
+    // Signal 2: HEAD was method-rejected AND the GET re-probe came back
+    // method-rejected too. The re-probe exists because "WAFs and inspection
+    // proxies refuse HEAD while serving GET perfectly well"; that code path then
+    // treated a rejected GET as a genuine failure. It is not — a real page
+    // refusing GET is essentially unheard of, and this is exactly what was
+    // measured across 8/8 patterns on a live, working site.
+    const stillRejectedAfterFallback =
+      methodFallbackFrom !== null &&
+      isMethodRejectedStatus(firstResult.statusCode);
+    const blocked =
+      firstResult.wafBlockHeaderDetected || stillRejectedAfterFallback;
+
     result = {
       url,
       httpStatus: firstResult.statusCode,
@@ -485,9 +525,14 @@ export async function checkSampleUrl(
       isSoft404: false,
       finalUrl: null,
       redirectCount: 0,
-      httpStatusCategory: "failure",
+      httpStatusCategory: blocked ? "blocked" : "failure",
+      // Irrelevant for a blocked row — patternScore filters those out before any
+      // averaging — but 0 keeps it from ever counting if that filter is bypassed.
       scoreWeight: 0,
       timedOut: firstResult.timedOut,
+      // httpStatus and errorReason stay exactly as observed: an operator looking
+      // at sampled_urls must still see the raw 403/405. Only the pattern-level
+      // verdict changes.
       errorReason: firstResult.errorReason
     };
   }

@@ -9,6 +9,15 @@ import type { SampleCheckResult } from "./sampleUrlCheck.js";
 
 // Minimal stand-in: calculatePatternScore reads only scoreWeight and
 // redirectCount.
+function blocked(): SampleCheckResult {
+  return {
+    ...result(0),
+    httpStatus: 405,
+    isHit: false,
+    httpStatusCategory: "blocked"
+  };
+}
+
 function result(scoreWeight: number, redirectCount = 0): SampleCheckResult {
   return {
     url: "https://e.com/x",
@@ -104,4 +113,63 @@ test("this module loads without standing up Redis", () => {
   // this assertion at all proves the import chain stayed clean (the SampleCheckResult
   // import above is type-only and erased at compile time).
   assert.equal(typeof calculatePatternScore, "function");
+});
+
+// --- blocked samples are excluded from scoring ------------------------------
+// A blocked row is the site's security answering, not the page. Averaging it in
+// as a zero is what reported a working site as Broken.
+
+test("all-blocked scores PENDING, not BAD", () => {
+  const score = calculatePatternScore([blocked(), blocked(), blocked()]);
+
+  assert.equal(score.status, "PENDING");
+  assert.equal(score.confidencePct, 0);
+  assert.equal(score.redirectPct, 0);
+});
+
+test("all-blocked is reached through the FILTER, not the empty-results check", () => {
+  // Distinguishes the two PENDING paths: this input is non-empty, so if the
+  // filter were missing it would divide by 3 and score 0% -> BAD. Passing here
+  // proves the filter ran rather than the zero-length branch coincidentally
+  // catching it.
+  const input = [blocked(), blocked(), blocked()];
+
+  assert.equal(input.length, 3, "premise: the input is NOT empty");
+  assert.equal(calculatePatternScore(input).status, "PENDING");
+  // And the zero-sample path still behaves identically.
+  assert.equal(calculatePatternScore([]).status, "PENDING");
+});
+
+test("a MIX scores only off the measurable results", () => {
+  // Two healthy + two blocked must read 100% confident, not 50%. Under the old
+  // maths the blocked pair dragged this to 50% -> WARNING.
+  const score = calculatePatternScore([
+    result(1),
+    result(1),
+    blocked(),
+    blocked()
+  ]);
+
+  assert.equal(score.confidencePct, 100);
+  assert.equal(score.status, "GOOD");
+});
+
+test("a mix of blocked and genuinely failing still reports BAD off the real ones", () => {
+  // The filter must not rescue a pattern that really is broken.
+  const score = calculatePatternScore([result(0), result(0), blocked()]);
+
+  assert.equal(score.confidencePct, 0);
+  assert.equal(score.status, "BAD");
+});
+
+test("redirect share is computed against measurable rows only", () => {
+  // One redirect out of two measurable = 50%, not 1-in-4 = 25%.
+  const score = calculatePatternScore([
+    result(0.5, 1),
+    result(1, 0),
+    blocked(),
+    blocked()
+  ]);
+
+  assert.equal(score.redirectPct, 50);
 });

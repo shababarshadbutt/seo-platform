@@ -42,7 +42,20 @@ export function calculatePatternScore(results: SampleCheckResult[]) {
   //
   // Confidence and redirect stay 0 because there is genuinely nothing to average;
   // the status just no longer asserts a verdict the data does not support.
-  if (results.length === 0) {
+  // A BLOCKED sample is not a data point. The site's security answered instead of
+  // the page, so its status says nothing about whether the URL works — averaging
+  // it in as a zero would report a working site as broken, which is exactly the
+  // lie the "blocked" category exists to stop. Filtered out BEFORE any maths.
+  const measurable = results.filter(
+    (result) => result.httpStatusCategory !== "blocked"
+  );
+
+  // Nothing measurable — either no samples at all, or every one was blocked. Both
+  // mean the same thing at the status level: we have no measurement. Falls through
+  // to the SAME PENDING branch rather than duplicating it, so "never checked" and
+  // "checked but fully blocked" agree on the status and are distinguished by the
+  // sampled_urls rows instead (which is what the dialog copy reads).
+  if (measurable.length === 0) {
     return {
       confidencePct: 0,
       redirectPct: 0,
@@ -50,14 +63,18 @@ export function calculatePatternScore(results: SampleCheckResult[]) {
     };
   }
 
-  const scoreTotal = results.reduce(
+  const scoreTotal = measurable.reduce(
     (total, result) => total + result.scoreWeight,
     0
   );
-  const redirectTotal = results.filter((result) => result.redirectCount > 0)
+  const redirectTotal = measurable.filter((result) => result.redirectCount > 0)
     .length;
-  const confidencePct = Number(((scoreTotal / results.length) * 100).toFixed(2));
-  const redirectPct = Number(((redirectTotal / results.length) * 100).toFixed(2));
+  const confidencePct = Number(
+    ((scoreTotal / measurable.length) * 100).toFixed(2)
+  );
+  const redirectPct = Number(
+    ((redirectTotal / measurable.length) * 100).toFixed(2)
+  );
 
   return {
     confidencePct,

@@ -1,0 +1,29 @@
+-- "The site's security blocked our check" is not "the page is broken" (v1.59).
+--
+-- WHY. Confirmed on stackedindustrials.com (ASAP Semiconductor site family, same
+-- family as the earlier aerospaceengineeringsolutions.com case): a bare curl from
+-- the AWS box gets HTTP/2 403 from `server: awselb/2.0`, while the identical URL
+-- fetched from outside the box returns a normal 200. checkSampleUrl's final else
+-- branch put a genuine 404 and a WAF block in the SAME bucket — "failure",
+-- scoreWeight 0 — so a working site read as broken and there was no way to tell
+-- the two apart after the fact.
+--
+-- This project checks 650+ sites, most not ours. Asking each one to allowlist our
+-- egress IP does not scale. Classifying honestly does: we cannot promise to get
+-- past an arbitrary third party's WAF, but we can stop reporting a block as a
+-- broken page.
+--
+-- Deliberately NOT a heuristic. Only two high-confidence signals feed 'blocked'
+-- (see sampleHttpStatus.hasWafBlockHeader and the persistent-405 case in
+-- sampleUrlCheck): an explicit WAF header, or a 405/501 that survives the
+-- existing HEAD->GET re-probe. A "403 with a small body" rule was considered and
+-- rejected — it would hide genuinely forbidden pages behind 'blocked', which is
+-- the same class of lie in the other direction.
+--
+-- verified_urls.http_status_category (migration 038) is plain TEXT, not this
+-- enum, so it already accepts the new value with no change.
+--
+-- ADD VALUE IF NOT EXISTS mirrors migration 007, which added 'soft_404' the same
+-- way. Enum values cannot be removed, which is the usual argument for caution —
+-- here the vocabulary genuinely needs a fourth word.
+ALTER TYPE http_status_category ADD VALUE IF NOT EXISTS 'blocked';
