@@ -17,6 +17,29 @@
 // rows, so the pattern-wide number would overstate what the click actually does
 // — the opposite error, and a worse one, since it would promise changes that
 // never happen.
+// Does accepting apply a single inferred rule to the WHOLE pattern, beyond the
+// rows on screen?
+//
+// ONE SOURCE OF TRUTH, deliberately. This condition drives two things that sit
+// inches apart in the modal: the indigo "accepting applies the confirmed rule to
+// all N matching URLs" banner, and the count on the Accept button. They were
+// written out separately and drifted — the banner claimed pattern-wide scope
+// while the button counted only reviewed rows. Fixing the button alone then left
+// the banner overclaiming in the no-rule case, i.e. the same bug moved one
+// element up. Anything that needs to know "is this pattern-wide?" calls this.
+export function appliesPatternWide(input: {
+  // Real pattern-wide occurrence count on disk.
+  fixPatternTotal: number;
+  // How many rows are in the reviewed sample.
+  fixCandidateCount: number;
+  // True when the confirmed redirects were too varied to infer one rule.
+  inferredWithoutRule: boolean;
+}): boolean {
+  return (
+    input.fixPatternTotal > input.fixCandidateCount && !input.inferredWithoutRule
+  );
+}
+
 export function fixAcceptCount(input: {
   // Reviewed sample rows currently toggled to "Fix".
   fixCount: number;
@@ -27,8 +50,5 @@ export function fixAcceptCount(input: {
   // True when the confirmed redirects were too varied to infer one rule.
   inferredWithoutRule: boolean;
 }): number {
-  const appliesPatternWide =
-    input.fixPatternTotal > input.fixCandidateCount && !input.inferredWithoutRule;
-
-  return appliesPatternWide ? input.fixPatternTotal : input.fixCount;
+  return appliesPatternWide(input) ? input.fixPatternTotal : input.fixCount;
 }

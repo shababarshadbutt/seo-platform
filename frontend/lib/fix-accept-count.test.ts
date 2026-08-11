@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 
-import { fixAcceptCount } from "./fix-accept-count";
+import { appliesPatternWide, fixAcceptCount } from "./fix-accept-count";
 
 // The regression this guards: the banner above the button said "applies the
 // confirmed rule to all 92,643 matching URLs" while the button said 1,000. Same
@@ -75,5 +75,66 @@ test("still reports the pattern-wide total when nothing is selected yet", () => 
       inferredWithoutRule: false
     }),
     92643
+  );
+});
+
+// --- the two banners are mutually exclusive (follow-up to ba286d5f) ---------
+// results/page.tsx has no component test harness, so these assert the PREDICATE
+// that gates the indigo banner rather than the rendered DOM. The banner is
+// `{fixAppliesPatternWide ? <indigo/> : null}` and the amber one is
+// `{fixInferredWithoutRule ? <amber/> : null}`, so predicate false + flag true is
+// exactly "indigo absent, amber present".
+
+test("no single rule inferred: indigo banner gated OFF while amber is ON", () => {
+  const inferredWithoutRule = true;
+  const gate = appliesPatternWide({
+    fixPatternTotal: 92643,
+    fixCandidateCount: 1000,
+    inferredWithoutRule
+  });
+
+  // Indigo banner does not render, even though the pattern total exceeds the
+  // reviewed rows — which is the condition that used to be enough on its own.
+  assert.equal(gate, false);
+  // Amber banner does render: it keys off the flag directly.
+  assert.equal(inferredWithoutRule, true);
+  // …and the button agrees, falling back to the reviewed count.
+  assert.equal(
+    fixAcceptCount({
+      fixCount: 1000,
+      fixPatternTotal: 92643,
+      fixCandidateCount: 1000,
+      inferredWithoutRule
+    }),
+    1000
+  );
+});
+
+test("the two banners can never both render, for any input", () => {
+  // The invariant rather than one example: whenever amber is on, indigo is off.
+  for (const fixPatternTotal of [0, 12, 1000, 92643]) {
+    for (const fixCandidateCount of [0, 12, 1000]) {
+      assert.equal(
+        appliesPatternWide({
+          fixPatternTotal,
+          fixCandidateCount,
+          inferredWithoutRule: true
+        }),
+        false,
+        `indigo must stay off at total=${fixPatternTotal} candidates=${fixCandidateCount}`
+      );
+    }
+  }
+});
+
+test("a real pattern-wide rule still turns the indigo banner ON", () => {
+  // The guard must not have silenced the banner in the case it exists for.
+  assert.equal(
+    appliesPatternWide({
+      fixPatternTotal: 92643,
+      fixCandidateCount: 1000,
+      inferredWithoutRule: false
+    }),
+    true
   );
 });

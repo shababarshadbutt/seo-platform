@@ -179,7 +179,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 
-import { fixAcceptCount } from "@/lib/fix-accept-count";
+import { appliesPatternWide, fixAcceptCount } from "@/lib/fix-accept-count";
 import { findSegmentDuplication } from "@/lib/segment-duplication";
 import { showFixButton, type PatternStatus } from "@/lib/fix-visibility";
 type StatusFilter = "ALL" | "GOOD" | "WARNING" | "BAD";
@@ -2607,6 +2607,15 @@ export default function ResultsDashboardPage({
   const fixCount = fixCandidates.filter(
     (candidate) => fixActionFor(candidate) === "fix"
   ).length;
+  // Does accepting reach beyond the rows on screen? Drives BOTH the indigo
+  // scope banner and the Accept button's count, from one predicate — writing the
+  // condition out separately per call site is what let them disagree in the
+  // first place. See lib/fix-accept-count.ts. (v1.53)
+  const fixAppliesPatternWide = appliesPatternWide({
+    fixPatternTotal,
+    fixCandidateCount: fixCandidates.length,
+    inferredWithoutRule: fixInferredWithoutRule
+  });
   // What "Accept Selected Changes" will actually change, which is not the same as
   // how many rows are selected — the banner above the button already said so and
   // the button disagreed with it. See lib/fix-accept-count.ts. (v1.53)
@@ -4675,7 +4684,14 @@ export default function ResultsDashboardPage({
                 rest match this pattern and get the same confirmed rewrite
                 applied by inference (not individually verified).
               </p>
-              {fixPatternTotal > fixCandidates.length ? (
+              {/* Gated on the same predicate as the Accept button (v1.53). It used
+                  to key off the row-count comparison alone, so on a pattern whose
+                  redirects were too varied to infer one rule it claimed a
+                  pattern-wide rule applies while the amber banner directly below
+                  said the opposite — the scope-overclaiming bug this release fixed
+                  on the button, one element higher up. The two banners are now
+                  mutually exclusive by construction. */}
+              {fixAppliesPatternWide ? (
                 <p className="rounded-md bg-indigo-50 px-3 py-2 text-xs text-indigo-800">
                   Showing {formatNumber(fixCandidates.length)} for review —
                   accepting applies the confirmed rule to all{" "}
