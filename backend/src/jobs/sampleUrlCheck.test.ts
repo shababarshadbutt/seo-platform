@@ -484,6 +484,127 @@ test("the fallback profile sends all four Sec-Fetch headers and the Chrome UA", 
   assert.equal(fallback["accept-language"], "en-US,en;q=0.9");
 });
 
+// --- the caller-supplied ladder (per-host strategy engine) -------------------
+// The engine owns rung ordering; this module just executes a list in order and
+// stops at the first real measurement. These cases pin that contract.
+
+test("a caller-supplied ladder replaces the default pair", async () => {
+  const seen: string[] = [];
+  const result = await withServer(
+    (_method, _url, res, headers) => {
+      seen.push(String(headers!["user-agent"]));
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("healthy fixture product page content. ".repeat(60));
+    },
+    (baseUrl) =>
+      checkSampleUrl(baseUrl, "/thing/one", null, UA, silentLogger, CONTEXT, {
+        profileLadder: [BROWSER_FALLBACK_PROFILE]
+      })
+  );
+
+  assert.equal(result.httpStatusCategory, "success");
+  // The learned rung went out FIRST — the honest UA was never sent.
+  assert.match(seen[0], /Chrome\//);
+  assert.equal(
+    seen.some((ua) => ua.includes("SitemapHealthChecker")),
+    false
+  );
+});
+
+test("a SINGLE-rung ladder does not escalate — a request saved, not a check weakened", async () => {
+  // A host whose learned strategy is already the top rung has nothing to escalate
+  // to. It must report the refusal after ONE attempt rather than repeating itself.
+  const result = await withServer(
+    (_method, _url, res) => {
+      res.writeHead(403, { "x-amzn-waf-action": "block" });
+      res.end();
+    },
+    (baseUrl, counts) =>
+      checkSampleUrl(baseUrl, "/thing/one", null, UA, silentLogger, CONTEXT, {
+        profileLadder: [BROWSER_FALLBACK_PROFILE]
+      }).then((r) => ({ r, requests: [...counts.requests] }))
+  );
+
+  assert.equal(result.r.httpStatusCategory, "blocked");
+  assert.equal(result.r.usedFallbackProfile, false);
+  assert.deepEqual(result.requests, ["HEAD /thing/one"]);
+});
+
+test("a ladder whose second rung is identical to the first does not repeat it", async () => {
+  // The guard against the original "reuse the primary UA as the fallback" mistake,
+  // now that callers can supply the list.
+  const result = await withServer(
+    (_method, _url, res) => {
+      res.writeHead(403);
+      res.end();
+    },
+    (baseUrl, counts) =>
+      checkSampleUrl(baseUrl, "/thing/one", null, UA, silentLogger, CONTEXT, {
+        profileLadder: [
+          { userAgent: UA, extraHeaders: {} },
+          { userAgent: UA, extraHeaders: {} }
+        ]
+      }).then((r) => ({ r, requests: [...counts.requests] }))
+  );
+
+  assert.equal(result.r.httpStatusCategory, "failure");
+  assert.deepEqual(result.requests, ["HEAD /thing/one"]);
+});
+
+test("a ladder is truncated to two attempts however long the caller's list is", async () => {
+  const result = await withServer(
+    (_method, _url, res) => {
+      res.writeHead(403);
+      res.end();
+    },
+    (baseUrl, counts) =>
+      checkSampleUrl(baseUrl, "/thing/one", null, UA, silentLogger, CONTEXT, {
+        profileLadder: [
+          { userAgent: "one", extraHeaders: {} },
+          { userAgent: "two", extraHeaders: {} },
+          { userAgent: "three", extraHeaders: {} },
+          { userAgent: "four", extraHeaders: {} }
+        ]
+      }).then((r) => ({ r, requests: [...counts.requests] }))
+  );
+
+  // The two-attempt ceiling belongs to the checker, not to the caller's list.
+  assert.equal(result.requests.length, 2, JSON.stringify(result.requests));
+});
+
+test("the Server header is captured for the strategy engine", async () => {
+  const result = await withServer(
+    (_method, _url, res) => {
+      res.writeHead(403, { server: "awselb/2.0" });
+      res.end();
+    },
+    (baseUrl) => check(baseUrl)
+  );
+
+  // The one response header worth keeping: it separates "a load balancer refused
+  // our IP" from "the origin itself said no", which need opposite responses.
+  assert.equal(result.edgeServer, "awselb/2.0");
+});
+
+test("an allowH2 profile still works against an HTTP/1.1 origin", async () => {
+  // The h2-enabled Agent must remain usable for ordinary h1 traffic — ALPN just
+  // does not select h2. If this ever throws, the second transport variant is
+  // unusable and every host that negotiates it would report a transport failure.
+  const result = await withServer(
+    (_method, _url, res) => {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("healthy fixture product page content. ".repeat(60));
+    },
+    (baseUrl) =>
+      checkSampleUrl(baseUrl, "/thing/one", null, UA, silentLogger, CONTEXT, {
+        profileLadder: [{ ...BROWSER_FALLBACK_PROFILE, allowH2: true }]
+      })
+  );
+
+  assert.equal(result.httpStatusCategory, "success");
+  assert.equal(result.httpStatus, 200);
+});
+
 test("the fallback UA is genuinely DIFFERENT from the primary one", () => {
   // THE GUARD FOR A REAL MISTAKE. The spec for this change said to reuse
   // config.ts's DEFAULT_HTTP_USER_AGENT as the fallback — but that constant is the

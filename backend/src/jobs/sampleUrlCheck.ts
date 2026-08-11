@@ -4,7 +4,7 @@ import type { FastifyBaseLogger } from "fastify";
 import { request } from "undici";
 
 import { BROWSER_PROFILE_USER_AGENT } from "../config.js";
-import { tlsAwareDispatcher } from "../http/tlsDispatcher.js";
+import { dispatcherFor } from "../http/tlsDispatcher.js";
 import { SOFT_404_TEXT_SIGNALS } from "../sitemaps/softNotFound.js";
 import { hasWafBlockHeader, isMethodRejectedStatus } from "./sampleHttpStatus.js";
 import { resolveSampleTarget } from "./sampleTarget.js";
@@ -83,11 +83,23 @@ export type HttpStatusCategory =
   | "blocked";
 
 // How a request identifies itself. A profile rather than a bare UA string because
-// the two strategies below differ by HEADERS as well as user-agent, and passing
-// them separately through four call sites is how they drift apart.
+// the strategies below differ by HEADERS and TRANSPORT as well as user-agent, and
+// passing those separately through four call sites is how they drift apart.
 export type RequestProfile = {
   userAgent: string;
   extraHeaders?: Record<string, string>;
+  // Advertise HTTP/2 in the TLS ALPN extension (undici's allowH2, default false).
+  //
+  // Part of the PROFILE rather than a global setting because it is part of how the
+  // request presents itself, exactly like the headers: undici advertises only
+  // http/1.1 by default and lowercases header names on HTTP/1.1, whereas a real
+  // browser advertises h2 and capitalises on 1.1. A Chrome user-agent arriving
+  // over HTTP/1.1 with lowercase headers is visibly not Chrome, no matter how
+  // right the headers are.
+  //
+  // It selects one of two cached dispatchers (see http/tlsDispatcher.ts) — never a
+  // freshly-built Agent, which would discard the connection pool.
+  allowH2?: boolean;
 };
 
 // The escalation profile, tried ONLY after the primary one is confirmed blocked.
@@ -147,6 +159,14 @@ type HeadResult = {
   // probes discard headers apart from Location; this one is threaded through the
   // same way because it changes the VERDICT, not just the diagnostics.
   wafBlockHeaderDetected: boolean;
+  // The `Server:` header verbatim, when the response carried one.
+  //
+  // The only response header this checker keeps for diagnostics, and it earns it:
+  // an entire week of investigation could not tell, from the database, whether a
+  // refusal came from `awselb/2.0` (a load balancer refusing our egress IP — an
+  // allowlist problem) or from `nginx/1.28.3` (the origin itself). Those two need
+  // opposite responses. The strategy engine persists this per host.
+  serverHeader: string | null;
 };
 
 export type SampleCheckResult = {
@@ -166,7 +186,18 @@ export type SampleCheckResult = {
   // so a pattern that NEEDED the fallback is distinguishable in the data from one
   // that never did: across 650+ sites, knowing which consistently require the
   // browser profile is useful, and nobody should re-derive it from logs.
+  //
+  // Its meaning stays strict: the SECOND attempt produced this verdict. A host
+  // whose learned strategy makes the browser profile the FIRST attempt is recorded
+  // by the strategy engine (host_probe_profiles.winning_rung), not here — the two
+  // answer different questions and conflating them would make this column
+  // unreadable.
   usedFallbackProfile: boolean;
+  // The `Server:` header of the response this verdict came from, when there was
+  // one. Not persisted per sampled URL; read by the strategy engine to record
+  // WHICH edge answered for a host (awselb/2.0 vs nginx/... — an allowlist problem
+  // vs an origin problem).
+  edgeServer: string | null;
 };
 
 type BodyPrefixResult = {
@@ -221,7 +252,34 @@ export type SampleCheckOptions = {
   // Left OFF for pattern sampling, which stores response_ms per sampled URL and
   // whose 5-20 URLs per pattern make the saving irrelevant anyway.
   skipRedirectFollow?: boolean;
+  // The profiles to try, in order. Absent = today's exact behaviour:
+  // [caller's UA, BROWSER_FALLBACK_PROFILE].
+  //
+  // The LADDER LIVES WITH THE CALLER, not here. The per-host strategy engine knows
+  // which rung a host answered on and what the next rung up is; this module stays a
+  // dumb executor that tries what it is given, in order, and stops at the first
+  // real measurement. Putting rung ordering in here would give two modules an
+  // opinion about escalation, which is how they drift.
+  //
+  // Truncated to MAX_ATTEMPTS — the two-attempt ceiling is a property of the
+  // checker, not of the caller's list, so a caller cannot widen it by accident.
+  profileLadder?: RequestProfile[];
 };
+
+// TWO ATTEMPTS, MAXIMUM — enforced here rather than trusted to callers. Worst case
+// per check stays HEAD + GET re-probe, twice.
+const MAX_ATTEMPTS = 2;
+
+// Are two profiles the same request? A ladder whose second rung is byte-identical
+// to its first would spend a request to get the same answer, which is exactly what
+// the original "reuse DEFAULT_HTTP_USER_AGENT as the fallback" mistake did.
+function sameProfile(a: RequestProfile, b: RequestProfile): boolean {
+  return (
+    a.userAgent === b.userAgent &&
+    Boolean(a.allowH2) === Boolean(b.allowH2) &&
+    JSON.stringify(a.extraHeaders ?? {}) === JSON.stringify(b.extraHeaders ?? {})
+  );
+}
 
 function firstHeaderValue(value: string | string[] | undefined) {
   if (Array.isArray(value)) {
@@ -244,7 +302,7 @@ async function headOnce(
     const response = await request(url, {
       method: "HEAD",
       maxRedirections: 0,
-      dispatcher: tlsAwareDispatcher,
+      dispatcher: dispatcherFor(profile.allowH2),
       headers: profileHeaders(profile),
       headersTimeout: HTTP_TIMEOUT_MS,
       bodyTimeout: HTTP_TIMEOUT_MS,
@@ -259,7 +317,8 @@ async function headOnce(
       location: firstHeaderValue(response.headers.location),
       timedOut: false,
       errorReason: null,
-      wafBlockHeaderDetected: hasWafBlockHeader(response.headers)
+      wafBlockHeaderDetected: hasWafBlockHeader(response.headers),
+      serverHeader: firstHeaderValue(response.headers.server)
     };
   } catch (error) {
     return {
@@ -270,7 +329,8 @@ async function headOnce(
       errorReason: classifyRequestError(error),
       // No response at all, so no header to read — a transport failure is a
       // genuine failure, not a block.
-      wafBlockHeaderDetected: false
+      wafBlockHeaderDetected: false,
+      serverHeader: null
     };
   }
 }
@@ -329,7 +389,7 @@ async function getStatusOnce(
     const response = await request(url, {
       method: "GET",
       maxRedirections: 0,
-      dispatcher: tlsAwareDispatcher,
+      dispatcher: dispatcherFor(profile.allowH2),
       headers: profileHeaders(profile, { "accept-encoding": "identity" }),
       headersTimeout: HTTP_TIMEOUT_MS,
       bodyTimeout: HTTP_TIMEOUT_MS,
@@ -351,7 +411,8 @@ async function getStatusOnce(
       location: firstHeaderValue(response.headers.location),
       timedOut: false,
       errorReason: null,
-      wafBlockHeaderDetected: hasWafBlockHeader(response.headers)
+      wafBlockHeaderDetected: hasWafBlockHeader(response.headers),
+      serverHeader: firstHeaderValue(response.headers.server)
     };
   } catch (error) {
     return {
@@ -362,7 +423,8 @@ async function getStatusOnce(
       errorReason: classifyRequestError(error),
       // No response at all, so no header to read — a transport failure is a
       // genuine failure, not a block.
-      wafBlockHeaderDetected: false
+      wafBlockHeaderDetected: false,
+      serverHeader: null
     };
   }
 }
@@ -380,7 +442,7 @@ async function checkSoft404Signals(
     const response = await request(url, {
       method: "GET",
       maxRedirections: 0,
-      dispatcher: tlsAwareDispatcher,
+      dispatcher: dispatcherFor(profile.allowH2),
       headers: profileHeaders(profile, {
         "accept-encoding": "identity",
         range: `bytes=0-${SOFT_404_BODY_SAMPLE_BYTES - 1}`
@@ -448,7 +510,14 @@ function resolveRedirectUrl(location: string | null, sourceUrl: string) {
 // structural rather than a flag: checkSampleUrl below is the only place that can
 // start a second attempt, and it never calls itself. There is no code path from
 // here back into a retry.
-async function runCheckWithProfile(
+//
+// EXPORTED for the per-host strategy engine, which has to try ONE rung at a time
+// and judge it. It needs the complete check path — a truncated HEAD-only probe
+// would call a host refused when its GET works, which is the exact false negative
+// the method-rejection re-probe exists to prevent — but it must NOT get
+// checkSampleUrl's built-in escalation, or the ladder would climb two rungs per
+// attempt and the engine could not tell which one answered.
+export async function runCheckWithProfile(
   url: string,
   profile: RequestProfile,
   logger: FastifyBaseLogger,
@@ -519,7 +588,8 @@ async function runCheckWithProfile(
       errorReason: null,
       // The runner does not know about escalation; checkSampleUrl overrides this
       // when a verdict came from the fallback attempt.
-      usedFallbackProfile: false
+      usedFallbackProfile: false,
+      edgeServer: firstResult.serverHeader
     };
   } else if (isRedirectStatus(firstResult.statusCode)) {
     const finalUrl = resolveRedirectUrl(firstResult.location, url);
@@ -543,7 +613,8 @@ async function runCheckWithProfile(
       scoreWeight: 0.5,
       timedOut: firstResult.timedOut,
       errorReason: null,
-      usedFallbackProfile: false
+      usedFallbackProfile: false,
+      edgeServer: firstResult.serverHeader
     };
   } else {
     // BLOCKED vs FAILURE. Two high-confidence signals only — no vendor guessing,
@@ -582,7 +653,8 @@ async function runCheckWithProfile(
       // at sampled_urls must still see the raw 403/405. Only the pattern-level
       // verdict changes.
       errorReason: firstResult.errorReason,
-      usedFallbackProfile: false
+      usedFallbackProfile: false,
+      edgeServer: firstResult.serverHeader
     };
   }
 
@@ -654,19 +726,25 @@ function isEscalationEligible(result: SampleCheckResult): boolean {
 // than a reclassification: a confirmed block stays "blocked", a real 403 stays
 // "failure", and a fallback that merely TIMED OUT cannot overwrite either with a
 // transport error (the false "Broken" the blocked category exists to prevent).
-function isRealMeasurement(result: SampleCheckResult): boolean {
+export function isRealMeasurement(result: SampleCheckResult): boolean {
   return !isEscalationEligible(result);
 }
 
 // The public checker. Callers still pass a bare session user_agent — nothing about
 // how samplePatternsJob or verifyProbe call this changed.
 //
-// TWO ATTEMPTS, MAXIMUM. The primary profile is the caller's UA with no extra
+// TWO ATTEMPTS, MAXIMUM. The first profile is the caller's UA with no extra
 // headers, i.e. exactly today's behaviour, so a URL that answers cleanly pays
 // nothing and cannot regress. Any non-clean outcome escalates to
 // BROWSER_FALLBACK_PROFILE once (see isEscalationEligible), and the second attempt
 // is the full check again (its own HEAD, GET re-probe and soft-404 sniff) rather
 // than a half-check.
+//
+// A caller that has LEARNED which profile this host answers (the per-host strategy
+// engine) supplies its own ladder via options.profileLadder: the learned rung
+// first, the next rung up as the safety net. The common case then succeeds on
+// attempt #1 instead of climbing from scratch on every URL. The ceiling, the
+// classification and the escalation predicate are identical either way.
 //
 // COST. Clean URLs: unchanged. A URL that would be reported broken: one extra
 // request (or two, if HEAD is method-rejected on the retry as well) — and every one
@@ -690,16 +768,30 @@ export async function checkSampleUrl(
     url
   };
 
-  const primary: RequestProfile = { userAgent, extraHeaders: {} };
+  const ladder = (
+    options.profileLadder && options.profileLadder.length > 0
+      ? options.profileLadder
+      : [{ userAgent, extraHeaders: {} }, BROWSER_FALLBACK_PROFILE]
+  ).slice(0, MAX_ATTEMPTS);
   const primaryResult = await runCheckWithProfile(
     url,
-    primary,
+    ladder[0],
     logger,
     logContext,
     options
   );
 
   if (!isEscalationEligible(primaryResult)) {
+    return primaryResult;
+  }
+
+  const fallbackProfile = ladder[1];
+
+  // Nothing left to escalate to: a single-rung ladder (a host whose learned
+  // strategy is already the top rung) reports the primary observation and stops,
+  // which is a request SAVED rather than a check weakened. Same for a second rung
+  // that would send a byte-identical request.
+  if (!fallbackProfile || sameProfile(ladder[0], fallbackProfile)) {
     return primaryResult;
   }
 
@@ -714,7 +806,7 @@ export async function checkSampleUrl(
 
   const fallbackResult = await runCheckWithProfile(
     url,
-    BROWSER_FALLBACK_PROFILE,
+    fallbackProfile,
     logger,
     { ...logContext, profile: "browser-fallback" },
     options

@@ -31,7 +31,8 @@ function result(scoreWeight: number, redirectCount = 0): SampleCheckResult {
     scoreWeight,
     timedOut: false,
     errorReason: null,
-    usedFallbackProfile: false
+    usedFallbackProfile: false,
+    edgeServer: null
   };
 }
 

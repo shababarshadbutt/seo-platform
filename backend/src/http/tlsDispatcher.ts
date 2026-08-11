@@ -16,12 +16,47 @@ import { Agent, setGlobalDispatcher } from "undici";
 export const rejectUnauthorized =
   process.env.NODE_TLS_REJECT_UNAUTHORIZED !== "0";
 
-// A single dispatcher every undici `request()` call can share. Also installed
-// as the global dispatcher so call sites that don't pass it explicitly (e.g.
-// the sitemap-fetch path in parser.ts, the cleaner) inherit the same TLS
-// policy without having to thread it through.
-export const tlsAwareDispatcher = new Agent({
-  connect: { rejectUnauthorized }
-});
+// TWO dispatchers, ONE OF EACH, created at module load and reused forever.
+//
+// WHY CACHED, not per-request. An undici Agent owns the connection pool: keep
+// alive, TLS session reuse, h2 session reuse. Constructing one per request throws
+// all of that away and forces a fresh TCP + TLS handshake every time, which on a
+// 1.3M-URL sweep is strictly slower than the single-Agent code it replaced. So
+// the transport variants are enumerated here, once, and callers SELECT one.
+//
+// WHY TWO. allowH2 is a property of the Agent's TLS connector, not of a request:
+// it decides what goes in the ALPN extension of the handshake
+// (['http/1.1'] vs ['http/1.1','h2']). It therefore cannot be chosen per request
+// on a shared Agent — a second variant is the only way to offer both.
+//
+// WHY IT MATTERS. undici defaults allowH2 to false, so every request this tool
+// has ever made advertised HTTP/1.1 only, and over HTTP/1.1 undici writes header
+// names in lowercase. A real Chrome advertises h2 and capitalises on 1.1, so the
+// browser-profile requests were claiming to be a browser from a client that
+// visibly could not be one. The h2 variant exists to close that gap for hosts
+// that need it — selected per host by the strategy engine, never guessed.
+function buildDispatcher(allowH2: boolean) {
+  return new Agent({
+    allowH2,
+    connect: { rejectUnauthorized }
+  });
+}
 
-setGlobalDispatcher(tlsAwareDispatcher);
+const http1Dispatcher = buildDispatcher(false);
+const http2Dispatcher = buildDispatcher(true);
+
+// The default for every caller that does not care (sitemap fetches, the cleaner)
+// and the global dispatcher: HTTP/1.1 only, i.e. exactly the behaviour that
+// shipped before the h2 variant existed. Nothing changes for anyone who does not
+// explicitly ask for h2.
+export const tlsAwareDispatcher = http1Dispatcher;
+
+// Pick the cached dispatcher for a transport. Returns the SAME instance every
+// time for a given argument — asserted in tlsDispatcher.test.ts, because an
+// accidental per-call `new Agent()` would look correct and quietly halve
+// throughput.
+export function dispatcherFor(allowH2: boolean | undefined) {
+  return allowH2 ? http2Dispatcher : http1Dispatcher;
+}
+
+setGlobalDispatcher(http1Dispatcher);
