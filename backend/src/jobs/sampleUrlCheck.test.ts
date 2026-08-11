@@ -353,3 +353,65 @@ test("the fallback UA is genuinely DIFFERENT from the primary one", () => {
   assert.match(BROWSER_FALLBACK_PROFILE.userAgent, /Chrome\//);
   assert.match(DEFAULT_HTTP_USER_AGENT, /SitemapHealthChecker/);
 });
+
+// --- the reported production case: bare root "/" ----------------------------
+// Session da912958, pattern "/" (total_urls 1) persisted http_status 405 /
+// category 'blocked' AFTER the retry shipped, while the same site's
+// /product/{param} scored GOOD. Devops then proved from the same box that the
+// honest UA gets 403 and the full browser profile gets 200 on that exact URL.
+//
+// This reproduces the site's measured behaviour exactly — 405 to the honest UA on
+// BOTH HEAD and GET (so the pre-existing method-rejection re-probe fires first and
+// still fails, which is what makes it "blocked"), 200 to the browser profile — at
+// path "/" specifically, because a bare root is the one path shape a parameterised
+// product URL never exercises.
+
+test("bare root '/' recovers via the fallback exactly as a deep path does", async () => {
+  const result = await withServer(
+    (_method, url, res, headers) => {
+      assert.equal(url, "/", `expected the bare root, got ${url}`);
+
+      if (isBrowserProfile(headers!)) {
+        res.writeHead(200, { "content-type": "text/html" });
+        res.end("healthy fixture home page content. ".repeat(60));
+        return;
+      }
+
+      // Honest UA: 405 on HEAD *and* GET, the measured signature.
+      res.writeHead(405);
+      res.end();
+    },
+    (baseUrl, counts) =>
+      checkSampleUrl(baseUrl, "/", null, UA, silentLogger, CONTEXT).then((r) => ({
+        r,
+        requests: [...counts.requests]
+      }))
+  );
+
+  // If the retry does NOT fire for the root, this is 'blocked' and the production
+  // symptom is reproduced locally — a code bug, not an environment difference.
+  assert.equal(
+    result.r.httpStatusCategory,
+    "success",
+    `root did not recover; requests were ${JSON.stringify(result.requests)}`
+  );
+  assert.equal(result.r.httpStatus, 200);
+  assert.equal(result.r.usedFallbackProfile, true);
+  // HEAD(405) + GET(405) on the primary, then HEAD + soft-404 GET on the fallback.
+  assert.equal(result.requests.length, 4, JSON.stringify(result.requests));
+});
+
+test("bare root '/' with a trailing-slash base URL still probes exactly '/'", async () => {
+  // Guards the URL-construction edge case: no double slash, no empty path.
+  const result = await withServer(
+    (_method, url, res) => {
+      assert.equal(url, "/");
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("healthy fixture home page content. ".repeat(60));
+    },
+    (baseUrl) =>
+      checkSampleUrl(`${baseUrl}/`, "/", null, UA, silentLogger, CONTEXT)
+  );
+
+  assert.equal(result.httpStatusCategory, "success");
+});
