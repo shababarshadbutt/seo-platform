@@ -74,14 +74,25 @@ test("every non-healthy status offers exactly one action", () => {
   }
 });
 
-// --- the dialog's empty-state copy -----------------------------------------
-// The dialog branches on this same predicate: showCheckButton(fixRow) picks
-// "hasn't been checked yet", otherwise "No redirect URLs remain". Asserting the
-// selector here rather than the DOM, since results/page.tsx has no component
-// test harness.
+// --- the dialog's empty-state copy AND its auto-start ------------------------
+// This one predicate drives three things that must agree: the Check button's
+// visibility, the empty-state copy ("being re-checked" vs "No redirect URLs
+// remain"), and autoStartRecheck — which is what makes Check actually check
+// instead of just opening a panel. Asserting the selector here rather than the
+// DOM, since results/page.tsx has no component test harness.
 
-test("empty dialog for an unscored pattern selects the not-checked copy", () => {
+test("empty dialog for an unscored pattern selects the re-checking copy", () => {
   assert.equal(showCheckButton({ status: "UNKNOWN" }), true);
+});
+
+test("only an unscored row auto-starts a re-check on open", () => {
+  // A scored row must not fire network requests just because its Fix modal was
+  // opened — re-probing a measured pattern stays an explicit press.
+  assert.equal(showCheckButton({ status: "UNKNOWN" }), true);
+
+  for (const status of ["GOOD", "WARNING", "BAD"] as const) {
+    assert.equal(showCheckButton({ status }), false, status);
+  }
 });
 
 test("empty dialog for a scored pattern keeps the clean-result copy", () => {

@@ -92,6 +92,7 @@ test("verification routes scope by pattern", async (t) => {
   const { closeMaintenanceQueue } = await import(
     "../queue/maintenanceQueue.js"
   );
+  const { closeSitemapQueue } = await import("../queue/sitemapQueue.js");
 
   const { verificationQueue, verifyScopeJobId } = await import(
     "../queue/verificationQueue.js"
@@ -129,6 +130,12 @@ test("verification routes scope by pattern", async (t) => {
     await closeVerificationQueue().catch(() => {});
     await closeTriageQueue().catch(() => {});
     await closeMaintenanceQueue().catch(() => {});
+    // verification.ts also owns the per-pattern re-check routes, which enqueue on
+    // (and read job state from) the sitemap queue — a FOURTH open Redis connection
+    // from registering this plugin. Every one of them has to be closed or the test
+    // worker never exits, and a worker that never exits never flushes its output:
+    // the failure looks like a hung test rather than a leaked handle.
+    await closeSitemapQueue().catch(() => {});
     await closePool().catch(() => {});
   });
 

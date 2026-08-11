@@ -1285,6 +1285,59 @@ export async function getPatternTriage(
   return readJsonResponse<{ run: TriageRun | null }>(response);
 }
 
+// Re-measure ONE pattern's sample and rescore its row.
+//
+// The Status / Confidence / Redirect cells are written only by the sampling job,
+// which used to run once per session, so those cells were frozen at whatever the
+// checker concluded on the first pass — no amount of triage or verification could
+// move them (they write their own tables). This is the path that re-probes the
+// pattern's sample pool and rewrites the row.
+export type PatternRecheckStatus = {
+  running: boolean;
+  job_state: string | null;
+  status: string;
+  confidence_pct: string | null;
+  redirect_pct: string | null;
+  sample_total: number;
+  // How many of those samples were WAF-blocked. The one number that separates
+  // "never checked" from "checked, and the site refused to answer" — both of which
+  // render as "Not scored".
+  blocked_count: number;
+  used_fallback_count: number;
+  pool_total: number;
+  last_checked_at: string | null;
+};
+
+export async function startPatternRecheck(
+  sessionId: string,
+  patternId: string
+): Promise<{ job_id: string | null }> {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/recheck`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    }
+  );
+
+  return readJsonResponse<{ job_id: string | null }>(response);
+}
+
+export async function getPatternRecheck(
+  sessionId: string,
+  patternId: string
+): Promise<PatternRecheckStatus> {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/recheck`),
+    {
+      cache: "no-store"
+    }
+  );
+
+  return readJsonResponse<PatternRecheckStatus>(response);
+}
+
 const VERIFICATION_POLL_INTERVAL_MS = 1500;
 // Full-population checks on huge sessions can genuinely run for hours; the
 // backstop only exists so an orphaned poll loop cannot spin forever.

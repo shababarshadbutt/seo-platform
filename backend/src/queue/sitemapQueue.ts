@@ -33,6 +33,21 @@ export type SamplePatternsJobData = {
   // Set by the resume endpoint: skip patterns that already have sampled_urls so
   // a resumed sample job re-fetches only patterns that never completed.
   resume?: boolean;
+  // Set by the per-pattern re-check endpoint: sample EXACTLY this one pattern and
+  // touch nothing about the session's lifecycle.
+  //
+  // WHY THIS EXISTS. Sampling was reachable only twice — at the end of extraction,
+  // and from resume while sampling was still unfinished — so a completed session's
+  // Status / Confidence / Redirect cells were frozen at whatever the checker
+  // concluded on the first pass. Every later improvement to the checker (the WAF
+  // "blocked" classification, the browser-profile retry) was invisible on existing
+  // sessions, and the Check button on an unscored row could not change it: triage
+  // and full verification write verify_triage_runs / verified_urls and never
+  // patterns.status. This is the missing path that lets one row be re-measured.
+  //
+  // `resume` is IGNORED when this is set — re-checking a pattern that already has
+  // rows is the entire point, so the already-sampled skip must not apply.
+  pattern_id?: string;
 };
 
 export type CleanupUploadsJobData = {
@@ -154,9 +169,20 @@ export async function enqueueExtractPatternsJob(data: ExtractPatternsJobData) {
   });
 }
 
+// The singleton job id for a pattern re-check, exported so the status endpoint can
+// look the job up by id instead of scanning the queue.
+export function samplePatternJobId(sessionId: string, patternId: string) {
+  return `${SAMPLE_PATTERNS_JOB}-${sessionId}-pattern-${patternId}`;
+}
+
 export async function enqueueSamplePatternsJob(data: SamplePatternsJobData) {
   const sourceId = data.sitemap_file_id ?? "session";
-  const jobId = `${SAMPLE_PATTERNS_JOB}-${data.session_id}-${sourceId}`;
+  // A pattern re-check gets its OWN singleton id. Sharing the session-wide id
+  // would make a re-check collide with (and be silently swallowed by) the
+  // session's own sample job — and vice versa.
+  const jobId = data.pattern_id
+    ? samplePatternJobId(data.session_id, data.pattern_id)
+    : `${SAMPLE_PATTERNS_JOB}-${data.session_id}-${sourceId}`;
   const existingJob = await reusableSingletonJob(jobId);
 
   if (existingJob) {

@@ -199,9 +199,21 @@ async function markSampledFilesDone(sessionId: string) {
 }
 
 export async function processSamplePatternsJob(
-  data: { session_id: string; sitemap_file_id?: string; resume?: boolean },
+  data: {
+    session_id: string;
+    sitemap_file_id?: string;
+    resume?: boolean;
+    // Re-check exactly ONE pattern (see SamplePatternsJobData). Scoped runs are
+    // deliberately inert with respect to the session's lifecycle: they do not flip
+    // it to SAMPLING, do not mark files sample-complete, do not re-finalise it and
+    // do not mark it FAILED. A completed session must not appear to reopen — and
+    // must not sprout a Resume banner — because one row was re-measured.
+    pattern_id?: string;
+  },
   logger: FastifyBaseLogger
 ) {
+  const scopedPatternId = data.pattern_id ?? null;
+
   if (await isSessionCancelled(data.session_id)) {
     logger.info(
       { session_id: data.session_id },
@@ -227,14 +239,17 @@ export async function processSamplePatternsJob(
   logger.info(
     {
       session_id: data.session_id,
-      sitemap_file_id: data.sitemap_file_id
+      sitemap_file_id: data.sitemap_file_id,
+      pattern_id: scopedPatternId
     },
     "sample patterns job started"
   );
 
-  await pool.query("UPDATE sessions SET status = 'SAMPLING' WHERE id = $1", [
-    data.session_id
-  ]);
+  if (!scopedPatternId) {
+    await pool.query("UPDATE sessions SET status = 'SAMPLING' WHERE id = $1", [
+      data.session_id
+    ]);
+  }
 
   try {
     const patternsResult = await pool.query<PatternRow>(
@@ -243,17 +258,24 @@ export async function processSamplePatternsJob(
         FROM patterns
         WHERE session_id = $1
           AND source_role = 'current'
+          AND ($2::uuid IS NULL OR id = $2::uuid)
         ORDER BY total_urls DESC, template ASC
       `,
-      [data.session_id]
+      [data.session_id, scopedPatternId]
     );
     let sampledUrlCount = 0;
     let skippedPatternCount = 0;
 
     for (const pattern of patternsResult.rows) {
       // On a resumed run, patterns that already have sampled URLs completed on a
-      // previous pass — skip their (expensive, network-bound) re-sampling.
-      if (data.resume && (await patternAlreadySampled(pattern.id))) {
+      // previous pass — skip their (expensive, network-bound) re-sampling. Never
+      // applies to a scoped re-check, whose whole purpose is to overwrite rows that
+      // already exist.
+      if (
+        !scopedPatternId &&
+        data.resume &&
+        (await patternAlreadySampled(pattern.id))
+      ) {
         skippedPatternCount += 1;
         continue;
       }
@@ -351,13 +373,16 @@ export async function processSamplePatternsJob(
       );
     }
 
-    await markSampledFilesDone(data.session_id);
-    await markSessionComplete(data.session_id);
+    if (!scopedPatternId) {
+      await markSampledFilesDone(data.session_id);
+      await markSessionComplete(data.session_id);
+    }
 
     logger.info(
       {
         session_id: data.session_id,
         sitemap_file_id: data.sitemap_file_id,
+        pattern_id: scopedPatternId,
         resume: Boolean(data.resume),
         pattern_count: patternsResult.rowCount,
         skipped_pattern_count: skippedPatternCount,
@@ -368,10 +393,18 @@ export async function processSamplePatternsJob(
   } catch (error) {
     // Record the failure so the UI can offer a Resume that re-samples only the
     // patterns that never completed. (v1.36 Fix 2)
-    await pool.query(
-      "UPDATE sessions SET status = 'FAILED', last_failed_at = now() WHERE id = $1",
-      [data.session_id]
-    );
+    //
+    // NOT for a scoped re-check: marking a long-completed session FAILED because
+    // one re-measured row hit a network error would offer a Resume that re-samples
+    // nothing (every pattern already has rows) and would misreport the session.
+    // The job still throws, so BullMQ retries and the failure is in the logs.
+    if (!scopedPatternId) {
+      await pool.query(
+        "UPDATE sessions SET status = 'FAILED', last_failed_at = now() WHERE id = $1",
+        [data.session_id]
+      );
+    }
+
     throw error;
   }
 }

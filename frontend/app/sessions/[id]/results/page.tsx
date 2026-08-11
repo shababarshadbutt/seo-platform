@@ -2486,6 +2486,13 @@ export default function ResultsDashboardPage({
     [loadResults, loadMaintenanceState]
   );
 
+  // A pattern re-check landed: reload the results so the row's Status /
+  // Confidence / Redirect show the new measurement. Silent, and the modal stays
+  // open — the user is still working inside it.
+  const handlePatternRescored = useCallback(() => {
+    void loadResults({ silent: true });
+  }, [loadResults]);
+
   function setFixAction(key: string, action: FixAction) {
     setFixActions((current) => ({ ...current, [key]: action }));
   }
@@ -4752,6 +4759,15 @@ export default function ResultsDashboardPage({
                   patternId={fixRow.id}
                   template={fixRow.template}
                   onDeleted={handleVerifiedDeleted}
+                  // A re-check rewrites this pattern's Status / Confidence /
+                  // Redirect, so the table underneath is stale the moment it
+                  // lands. Silent + modal stays open: the user is still working
+                  // in it.
+                  onRescored={handlePatternRescored}
+                  // Opened via "Check" (never-scored rows only) → check it, don't
+                  // just show a panel. Opened via the amber "Fix" → leave it to an
+                  // explicit press; that row already has a measurement.
+                  autoStartRecheck={showCheckButton(fixRow)}
                   selectedStatuses={fixStatusFilter}
                   onSelectedStatusesChange={(next) => {
                     setFixStatusFilter(next);
@@ -4797,8 +4813,10 @@ export default function ResultsDashboardPage({
                     // "No redirect URLs remain" asserts a clean result, which is
                     // wrong for a pattern that was never checked — the same
                     // never-measured-vs-measured-clean confusion 54e08a3e fixed on
-                    // the status itself. An unscored pattern gets told what to do
-                    // instead.
+                    // the status itself. An unscored pattern gets told what is
+                    // happening instead: opening this dialog from Check now starts
+                    // a real re-check (autoStartRecheck), so the copy no longer has
+                    // to send the user off to a different action.
                     // Same predicate as the Check button, not a re-derived
                     // condition: the button and this copy must agree about what
                     // "unscored" means. PatternRow.status is already normalised
@@ -4808,8 +4826,9 @@ export default function ResultsDashboardPage({
                         className="px-3 py-3 text-sm text-slate-500"
                         data-testid="fix-empty-unscored"
                       >
-                        This pattern hasn&rsquo;t been checked yet — run a Quick
-                        check or Full verification above to sample its URLs.
+                        This pattern is being re-checked above — its sampled URLs
+                        are being probed again and the row rescored. Any redirects
+                        found will appear here.
                       </p>
                     ) : (
                       <p

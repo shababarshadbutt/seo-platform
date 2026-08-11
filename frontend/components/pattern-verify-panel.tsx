@@ -8,16 +8,21 @@ import {
   ChevronRight,
   Gauge,
   Loader2,
+  RefreshCw,
+  ShieldAlert,
   Trash2
 } from "lucide-react";
 
 import {
   deleteVerifiedUrls,
   getDeleteProblemUrlsStatus,
+  getPatternRecheck,
   getPatternTriage,
   getVerificationStatus,
+  startPatternRecheck,
   startPatternTriage,
   startUrlVerification,
+  type PatternRecheckStatus,
   type TriageRun,
   type VerificationStatus
 } from "@/lib/api";
@@ -69,6 +74,19 @@ type Props = {
   // Empty = all problem statuses.
   selectedStatuses: Set<number>;
   onSelectedStatusesChange: (next: Set<number>) => void;
+  // Called when a pattern re-check finishes, so the parent can refresh the
+  // results table underneath — the row's Status / Confidence / Redirect cells are
+  // exactly what a re-check rewrites. Must be stable (useCallback): it is a
+  // dependency of the poll loop.
+  onRescored?: () => void;
+  // Start the re-check immediately on open, without a second click.
+  //
+  // Set when the dialog was opened from the table's "Check" button, which appears
+  // only on never-scored rows: pressing something labelled Check and having it
+  // merely open a panel is what made that button a dead end. The amber "Fix" path
+  // leaves this false — that row already has a measurement, so re-probing it stays
+  // an explicit choice.
+  autoStartRecheck?: boolean;
 };
 
 function formatNumber(value: number) {
@@ -124,18 +142,31 @@ export function PatternVerifyPanel({
   template,
   onDeleted,
   selectedStatuses,
-  onSelectedStatusesChange
+  onSelectedStatusesChange,
+  onRescored,
+  autoStartRecheck = false
 }: Props) {
   const [verification, setVerification] = useState<VerificationStatus | null>(
     null
   );
   const [triage, setTriage] = useState<TriageRun | null>(null);
+  const [recheck, setRecheck] = useState<PatternRecheckStatus | null>(null);
   const [error, setError] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [showStrata, setShowStrata] = useState(false);
+  // True between the POST and the first poll that sees the job — without it the
+  // button appears to do nothing for up to POLL_MS.
+  const [recheckStarting, setRecheckStarting] = useState(false);
+  // Was the re-check running on the previous poll? The falling edge is what tells
+  // the parent to reload the results table, since the row's cells only change when
+  // the job commits.
+  const recheckWasRunning = useRef(false);
   // Guards the initial load so a slow first fetch cannot overwrite state from a
   // Verify the user started in the meantime.
   const loadedForPattern = useRef<string | null>(null);
+  // One auto-start per pattern, ever. Without this the effect below would re-fire
+  // on every poll result and hammer the endpoint.
+  const autoStartedForPattern = useRef<string | null>(null);
   // First (time, urls_done) seen for the CURRENT job, which is what turns
   // progress into a time estimate. Anchored per job id so re-opening the modal
   // on a run already in flight starts a fresh measurement instead of dividing
@@ -179,17 +210,49 @@ export function PatternVerifyPanel({
     enumFilesTotal !== null &&
     enumFilesTotal > 0;
   const triageRunning = Boolean(triage && IN_FLIGHT.includes(triage.status));
+  // "Pending" covers the queue gap: the POST has returned but the job has not yet
+  // shown up as waiting/active, and the poll loop must not stop in that window.
+  const recheckPending = Boolean(recheck?.running) || recheckStarting;
+  // Never scored, and not because nobody looked: every stored sample was refused
+  // by the site's WAF. patternScore treats a blocked sample as the ABSENCE of a
+  // measurement, so this renders as "Not scored" — identical to never-checked —
+  // and this is the only place the difference can be stated.
+  const allSamplesBlocked = Boolean(
+    recheck &&
+      recheck.sample_total > 0 &&
+      recheck.blocked_count === recheck.sample_total
+  );
+  const neverSampled = Boolean(recheck && recheck.sample_total === 0);
 
   const refresh = useCallback(async () => {
-    // Both scoped to this pattern: the status call carries pattern_id, and the
-    // triage endpoint is per-pattern by construction.
-    const [nextVerification, nextTriage] = await Promise.all([
+    // All three scoped to this pattern: the status call carries pattern_id, and
+    // the triage and re-check endpoints are per-pattern by construction.
+    const [nextVerification, nextTriage, nextRecheck] = await Promise.all([
       getVerificationStatus(sessionId, patternId),
-      getPatternTriage(sessionId, patternId)
+      getPatternTriage(sessionId, patternId),
+      getPatternRecheck(sessionId, patternId)
     ]);
 
     setVerification(nextVerification);
     setTriage(nextTriage.run);
+    setRecheck(nextRecheck);
+
+    // The job we were waiting on is done: the row's Status / Confidence /
+    // Redirect have been rewritten, so the table underneath is now stale.
+    //
+    // The flag is armed by handleRecheck rather than by the first poll that sees
+    // `running`, because a single-URL pattern can finish inside one poll interval
+    // — waiting to observe the running state would miss exactly the rows this
+    // feature exists for.
+    if (nextRecheck.running) {
+      // Armed by observation too, so a re-check started in another tab (or before
+      // this modal was opened) still refreshes the table when it lands.
+      recheckWasRunning.current = true;
+    } else if (recheckWasRunning.current) {
+      recheckWasRunning.current = false;
+      setRecheckStarting(false);
+      onRescored?.();
+    }
 
     // Time remaining, from the rate this run is ACTUALLY achieving rather than
     // from the configured ceiling. The two differ: one URL check costs one or
@@ -224,8 +287,12 @@ export function PatternVerifyPanel({
       setEtaSeconds(null);
     }
 
-    return { verification: nextVerification, triage: nextTriage.run };
-  }, [sessionId, patternId]);
+    return {
+      verification: nextVerification,
+      triage: nextTriage.run,
+      recheck: nextRecheck
+    };
+  }, [sessionId, patternId, onRescored]);
 
   useEffect(() => {
     if (loadedForPattern.current === patternId) {
@@ -235,6 +302,9 @@ export function PatternVerifyPanel({
     loadedForPattern.current = patternId;
     setVerification(null);
     setTriage(null);
+    setRecheck(null);
+    setRecheckStarting(false);
+    recheckWasRunning.current = false;
     setError("");
     setShowStrata(false);
 
@@ -243,11 +313,35 @@ export function PatternVerifyPanel({
     });
   }, [patternId, refresh]);
 
-  // One poll loop for both jobs — they can legitimately run at the same time
-  // (different queues), and polling them together keeps the two displays from
+  // Opened from the table's Check button: do the check.
+  //
+  // Deliberately AFTER the first status load rather than on mount, so a pattern with
+  // no stored sample pool never fires a request that can only 400 — the panel says
+  // so instead. Also skipped when a run is already in flight (a reopened modal, a
+  // second tab), which the endpoint would attach to anyway.
+  useEffect(() => {
+    if (
+      !autoStartRecheck ||
+      !recheck ||
+      recheck.running ||
+      recheck.pool_total === 0 ||
+      autoStartedForPattern.current === patternId
+    ) {
+      return;
+    }
+
+    autoStartedForPattern.current = patternId;
+    void handleRecheck();
+    // handleRecheck is re-created every render and is not a meaningful dependency;
+    // the ref above is what makes this fire exactly once per pattern.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoStartRecheck, recheck, patternId]);
+
+  // One poll loop for all three jobs — they can legitimately run at the same time
+  // (different queues), and polling them together keeps the displays from
   // disagreeing about which phase the pattern is in.
   useEffect(() => {
-    if (!verifyRunning && !triageRunning) {
+    if (!verifyRunning && !triageRunning && !recheckPending) {
       return;
     }
 
@@ -265,7 +359,11 @@ export function PatternVerifyPanel({
         const stillRunning =
           (next.verification.job &&
             IN_FLIGHT.includes(next.verification.job.status)) ||
-          (next.triage && IN_FLIGHT.includes(next.triage.status));
+          (next.triage && IN_FLIGHT.includes(next.triage.status)) ||
+          next.recheck.running ||
+          // Keep polling across the gap between the POST and the job becoming
+          // visible in the queue, or the loop would stop before it ever started.
+          recheckStarting;
 
         if (stillRunning) {
           timer = setTimeout(tick, POLL_MS);
@@ -283,7 +381,7 @@ export function PatternVerifyPanel({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [verifyRunning, triageRunning, refresh]);
+  }, [verifyRunning, triageRunning, recheckPending, recheckStarting, refresh]);
 
   // Exact per-status counts from the full verification, keyed by status.
   const confirmedCounts = useMemo(() => {
@@ -342,6 +440,31 @@ export function PatternVerifyPanel({
         nextError instanceof Error
           ? nextError.message
           : "Unable to start the quick check."
+      );
+    }
+  }
+
+  // Re-measure the pattern's sample and rescore the row. This is the ONLY action
+  // in this panel that can change the table's Status / Confidence / Redirect cells
+  // — triage and verification write their own tables and always left an unscored
+  // row unscored, however many times it was pressed.
+  async function handleRecheck() {
+    setError("");
+    setRecheckStarting(true);
+    // Armed before the request so a re-check that finishes inside one poll
+    // interval still triggers the parent's refresh.
+    recheckWasRunning.current = true;
+
+    try {
+      await startPatternRecheck(sessionId, patternId);
+      await refresh();
+    } catch (nextError) {
+      setRecheckStarting(false);
+      recheckWasRunning.current = false;
+      setError(
+        nextError instanceof Error
+          ? nextError.message
+          : "Unable to start the re-check."
       );
     }
   }
@@ -453,6 +576,49 @@ export function PatternVerifyPanel({
             because nothing on screen claimed a scope. */}
         <span className="shrink-0 text-xs text-slate-500">{scopeNote}</span>
       </div>
+
+      {/* ---- the SAMPLED layer -------------------------------------------
+          Speaks for the pattern ROW itself (Status / Confidence / Redirect),
+          which nothing else in this panel can change: triage and verification
+          write their own tables. It is also the only place "we checked and the
+          site refused to answer" can be told apart from "nobody has checked" —
+          a blocked sample is the absence of a measurement, so both render as
+          "Not scored" in the table. */}
+      {recheckPending ? (
+        <div className="flex items-center gap-2 rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm text-indigo-900">
+          <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+          Re-checking this pattern&rsquo;s sampled URLs and rescoring the row…
+        </div>
+      ) : allSamplesBlocked ? (
+        <p
+          className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900"
+          data-testid="sample-blocked-note"
+        >
+          <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            The site refused all {formatNumber(recheck?.sample_total ?? 0)}{" "}
+            sampled URL
+            {(recheck?.sample_total ?? 0) === 1 ? "" : "s"} — bot protection
+            answered instead of the page
+            {(recheck?.used_fallback_count ?? 0) > 0
+              ? ", on a browser profile as well as the crawler one"
+              : ""}
+            . This row reads &ldquo;Not scored&rdquo; because a blocked response
+            measures nothing, not because the URLs are broken.
+          </span>
+        </p>
+      ) : neverSampled ? (
+        <p
+          className="flex items-start gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-600"
+          data-testid="sample-missing-note"
+        >
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            None of this pattern&rsquo;s URLs were sampled during analysis, so it
+            has no score. Re-check to sample and score it now.
+          </span>
+        </p>
+      ) : null}
 
       {/* ---- banner: what is sampled vs estimated vs verified ------------- */}
       {verifyRunning ? (
@@ -699,6 +865,33 @@ export function PatternVerifyPanel({
       <div className="flex flex-wrap items-center gap-2">
         {!verifyRunning && !triageRunning ? (
           <>
+            {/* The action that rewrites the ROW. Listed first for an unscored
+                pattern, because for that row it is the only one that changes what
+                the table says. */}
+            <Button
+              type="button"
+              size="sm"
+              variant={allSamplesBlocked || neverSampled ? "default" : "outline"}
+              className="gap-1"
+              disabled={recheckPending || recheck?.pool_total === 0}
+              onClick={() => void handleRecheck()}
+              data-testid="pattern-recheck"
+            >
+              {recheckPending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="h-3.5 w-3.5" />
+              )}
+              {recheckPending
+                ? "Re-checking…"
+                : `Re-check ${
+                    recheck && recheck.sample_total > 0
+                      ? `${formatNumber(recheck.sample_total)} sampled URL${
+                          recheck.sample_total === 1 ? "" : "s"
+                        }`
+                      : "this pattern’s sample"
+                  }`}
+            </Button>
             <Button
               type="button"
               size="sm"
@@ -715,7 +908,11 @@ export function PatternVerifyPanel({
             <Button
               type="button"
               size="sm"
-              variant={isConfirmed ? "outline" : "default"}
+              variant={
+                isConfirmed || allSamplesBlocked || neverSampled
+                  ? "outline"
+                  : "default"
+              }
               onClick={() => void handleVerify()}
             >
               {isConfirmed || isStale ? "Re-verify" : "Verify"}
@@ -761,6 +958,18 @@ export function PatternVerifyPanel({
           deleted from.
         </p>
       ) : null}
+      {/* Says which action affects which surface. Re-check is the only one that
+          rewrites the row in the table; the other two answer questions about the
+          population and store their answers separately. */}
+      <p className="text-xs text-slate-500">
+        Re-check re-probes the handful of URLs this pattern was scored on and
+        updates its Status, Confidence and Redirect columns
+        {recheck?.last_checked_at
+          ? ` (last checked ${new Date(recheck.last_checked_at).toLocaleString()})`
+          : ""}
+        . Quick check and Verify answer questions about the whole population and
+        do not change those columns.
+      </p>
 
       {error ? <p className="text-xs text-red-500">{error}</p> : null}
       <p className="sr-only">Pattern {template}</p>

@@ -3,6 +3,11 @@ import type { FastifyInstance } from "fastify";
 import { pool } from "../db/pool.js";
 import { VERIFY_PROBLEM_STATUSES } from "../jobs/verifyUrlsJob.js";
 import { enqueueDeleteProblemUrlsJob } from "../queue/maintenanceQueue.js";
+import {
+  enqueueSamplePatternsJob,
+  samplePatternJobId,
+  sitemapQueue
+} from "../queue/sitemapQueue.js";
 import { enqueueTriageSampleJob } from "../queue/triageQueue.js";
 import { enqueueVerifyUrlsJob } from "../queue/verificationQueue.js";
 
@@ -497,6 +502,163 @@ export async function verificationRoutes(app: FastifyInstance) {
       });
 
       return reply.code(202).send({ run_id: runId });
+    }
+  );
+
+  // RE-MEASURE ONE PATTERN'S SAMPLE AND RESCORE IT.
+  //
+  // The gap this closes: patterns.status / confidence_pct / redirect_pct are
+  // written by exactly one thing — the sampling job's persistPatternSamples — and
+  // sampling only ran at the end of extraction, or from resume while it was still
+  // unfinished. So a completed session's pattern table was frozen at whatever the
+  // checker concluded on its first pass, and every later checker fix (the WAF
+  // "blocked" classification, the browser-profile retry, the 403 escalation) was
+  // invisible on it. The Check button on an unscored row could not help: triage and
+  // full verification write verify_triage_runs / verified_urls and never touch
+  // patterns.status, so a "Not scored" row stayed "Not scored" no matter what the
+  // site answered. Re-running the whole analysis was the only remedy.
+  //
+  // This re-probes just this pattern's sample pool through the SAME job, checker
+  // and per-host rate limiter as the original pass, then rescores the row.
+  app.post<{ Params: PatternParams }>(
+    "/api/sessions/:id/patterns/:patternId/recheck",
+    async (request, reply) => {
+      const sessionId = request.params.id;
+      const patternId = request.params.patternId;
+
+      const patternResult = await pool.query<{
+        source_role: string;
+        pool_total: string;
+      }>(
+        `
+          SELECT
+            source_role,
+            (SELECT count(*) FROM pattern_urls WHERE pattern_id = patterns.id)::text
+              AS pool_total
+          FROM patterns
+          WHERE id = $1 AND session_id = $2
+        `,
+        [patternId, sessionId]
+      );
+      const pattern = patternResult.rows[0];
+
+      if (!pattern) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "Pattern not found" });
+      }
+
+      // The sampling job only ever walks source_role = 'current' patterns, so a
+      // proposed-side pattern would enqueue a job that silently sampled nothing.
+      if (pattern.source_role !== "current") {
+        return reply
+          .code(400)
+          .send(badRequest("only current-sitemap patterns can be re-checked"));
+      }
+
+      // No stored sample pool means there is nothing to probe — the honest answer
+      // is "re-run the analysis", not a job that writes zero rows and leaves the
+      // row unscored for a second, more confusing reason.
+      if (Number(pattern.pool_total) === 0) {
+        return reply
+          .code(400)
+          .send(
+            badRequest(
+              "this pattern has no stored sample URLs — re-run the analysis for this session"
+            )
+          );
+      }
+
+      // enqueueSamplePatternsJob is itself a singleton on this job id, so a second
+      // press (or a second tab) attaches to the in-flight run instead of doubling
+      // the request rate at the client's origin.
+      //
+      // That is also the whole concurrency guard, and it is enough: two re-checks of
+      // one pattern cannot coexist, and a re-check racing the session's ORIGINAL
+      // sample job (different job id, only possible on a resumed session) cannot
+      // corrupt anything either — persistPatternSamples deletes and re-inserts the
+      // pattern's rows inside ONE transaction, so the two serialise and the later
+      // commit simply wins. The cost of that race is duplicate requests, not mixed
+      // data.
+      const job = await enqueueSamplePatternsJob({
+        session_id: sessionId,
+        pattern_id: patternId
+      });
+
+      return reply.code(202).send({ job_id: job.id ?? null });
+    }
+  );
+
+  // Poll a pattern re-check: is it still running, and what does the row say now.
+  //
+  // Also the only place the UI can tell "never checked" apart from "checked and
+  // BLOCKED" — both render as "Not scored", because patternScore treats a blocked
+  // sample as the absence of a measurement rather than a data point. blocked_count
+  // and used_fallback_count come straight off sampled_urls so the panel can say
+  // which one it is instead of implying nobody has looked.
+  app.get<{ Params: PatternParams }>(
+    "/api/sessions/:id/patterns/:patternId/recheck",
+    async (request, reply) => {
+      const sessionId = request.params.id;
+      const patternId = request.params.patternId;
+
+      const patternResult = await pool.query<{
+        status: string;
+        confidence_pct: string | null;
+        redirect_pct: string | null;
+        sample_total: string;
+        blocked_count: string;
+        used_fallback_count: string;
+        last_checked_at: string | null;
+        pool_total: string;
+      }>(
+        `
+          SELECT
+            p.status,
+            p.confidence_pct,
+            p.redirect_pct,
+            count(su.id)::text AS sample_total,
+            count(su.id) FILTER (
+              WHERE su.http_status_category = 'blocked'
+            )::text AS blocked_count,
+            count(su.id) FILTER (
+              WHERE su.used_fallback_profile
+            )::text AS used_fallback_count,
+            max(su.checked_at)::text AS last_checked_at,
+            (SELECT count(*) FROM pattern_urls WHERE pattern_id = p.id)::text
+              AS pool_total
+          FROM patterns p
+          LEFT JOIN sampled_urls su ON su.pattern_id = p.id
+          WHERE p.id = $1 AND p.session_id = $2
+          GROUP BY p.id, p.status, p.confidence_pct, p.redirect_pct
+        `,
+        [patternId, sessionId]
+      );
+      const row = patternResult.rows[0];
+
+      if (!row) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "Pattern not found" });
+      }
+
+      const job = await sitemapQueue.getJob(
+        samplePatternJobId(sessionId, patternId)
+      );
+      const jobState = job ? await job.getState() : null;
+
+      return {
+        running: jobState === "waiting" || jobState === "active" || jobState === "delayed",
+        job_state: jobState,
+        status: row.status,
+        confidence_pct: row.confidence_pct,
+        redirect_pct: row.redirect_pct,
+        sample_total: Number(row.sample_total),
+        blocked_count: Number(row.blocked_count),
+        used_fallback_count: Number(row.used_fallback_count),
+        pool_total: Number(row.pool_total),
+        last_checked_at: row.last_checked_at
+      };
     }
   );
 
