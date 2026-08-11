@@ -1,12 +1,18 @@
 import type { FastifyBaseLogger } from "fastify";
 
 import { pool } from "../db/pool.js";
-import { checkSampleUrl, type SampleCheckResult } from "./sampleUrlCheck.js";
+import {
+  checkSampleUrl,
+  isRealMeasurement,
+  type SampleCheckResult
+} from "./sampleUrlCheck.js";
 import {
   acquireHostSlot,
   rateLimitHostKey,
   verificationRateLimit
 } from "../http/hostRateLimiter.js";
+import { noteHostCheckOutcome } from "../http/hostStrategy.js";
+import { createHostStrategyRun } from "../http/hostStrategyRun.js";
 import { resolveSampleTarget } from "./sampleTarget.js";
 // Pure scoring lives in its own module so it is unit-testable without loading
 // this job (and with it a BullMQ/Redis connection). See patternScore.ts.
@@ -76,6 +82,61 @@ async function mapWithConcurrency<T, R>(
   );
 
   return results;
+}
+
+// A URL to negotiate this host's request strategy with.
+//
+// DEEP, never the bare root. Measured evidence: on weareelectromechanicals.com "/"
+// was refused while /product/{param} scored GOOD in the same run — entry-point paths
+// routinely get stricter treatment than deep content paths, so negotiating on "/"
+// would pick a pessimistic recipe (or a false REFUSED) for the whole host.
+//
+// SAFETY FILTER: skip URLs already known from this pattern's prior samples to be a
+// redirect or a soft-404. Those still WIN a rung — a host whose pages 301 is
+// perfectly measurable — but a clean 200 is the least ambiguous evidence, and if the
+// probe URL happens to be a permanent redirect off-host the negotiation would be
+// judging the wrong origin.
+//
+// Depth is counted from slashes: "/a/b" has two, "/" has one, so >= 2 excludes the
+// root and any single-segment path.
+async function loadNegotiationProbeUrl(patternId: string) {
+  const preferred = await pool.query<PatternUrlRow>(
+    `
+      SELECT pu.id, pu.path, pu.source_url
+      FROM pattern_urls pu
+      WHERE pu.pattern_id = $1
+        AND (length(pu.path) - length(replace(pu.path, '/', ''))) >= 2
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sampled_urls su
+          WHERE su.pattern_id = pu.pattern_id
+            AND su.http_status_category IN ('redirect', 'soft_404')
+            AND su.url LIKE '%' || pu.path
+        )
+      ORDER BY random()
+      LIMIT 1
+    `,
+    [patternId]
+  );
+
+  if (preferred.rows[0]) {
+    return preferred.rows[0];
+  }
+
+  // Relaxed: any deep URL, even a known redirect. Still better than the root.
+  const anyDeep = await pool.query<PatternUrlRow>(
+    `
+      SELECT id, path, source_url
+      FROM pattern_urls
+      WHERE pattern_id = $1
+        AND (length(path) - length(replace(path, '/', ''))) >= 2
+      ORDER BY random()
+      LIMIT 1
+    `,
+    [patternId]
+  );
+
+  return anyDeep.rows[0] ?? null;
 }
 
 async function loadSamplePool(patternId: string, sampleLimit: number) {
@@ -265,6 +326,32 @@ export async function processSamplePatternsJob(
     );
     let sampledUrlCount = 0;
     let skippedPatternCount = 0;
+    let refusedPatternCount = 0;
+    const strategyRun = createHostStrategyRun(session.user_agent, logger);
+
+    // PRE-FLIGHT: negotiate the host ONCE, before any per-URL work, using a deep URL
+    // from the largest pattern (patterns arrive ordered by total_urls DESC) and the
+    // second-largest as a fallback when the first has no usable candidate.
+    //
+    // Doing it here rather than lazily inside the loop is what makes the cost bounded
+    // and legible: at most three probes decide the host, and a REFUSED host is known
+    // before a single pattern is touched.
+    for (const candidate of patternsResult.rows.slice(0, 2)) {
+      const probe = await loadNegotiationProbeUrl(candidate.id);
+
+      if (!probe) {
+        continue;
+      }
+
+      const probeTarget = resolveSampleTarget(
+        session.base_url,
+        probe.path,
+        probe.source_url
+      );
+
+      await strategyRun.forTarget(probeTarget, probeTarget);
+      break;
+    }
 
     for (const pattern of patternsResult.rows) {
       // On a resumed run, patterns that already have sampled URLs completed on a
@@ -283,6 +370,45 @@ export async function processSamplePatternsJob(
       const totalUrls = Number(pattern.total_urls);
       const sampleLimit = Math.min(session.sample_size, totalUrls);
       const samplePool = await loadSamplePool(pattern.id, sampleLimit);
+
+      // THE CIRCUIT BREAKER. Every rung was refused for this host, so there is
+      // nothing left to learn from probing its URLs one at a time: skip the pattern
+      // outright, issuing ZERO requests.
+      //
+      // persistPatternSamples is deliberately NOT called. It DELETEs then re-inserts,
+      // so calling it with an empty result set would wipe real measurements from an
+      // earlier run whenever a host became temporarily refused. A never-sampled
+      // pattern instead keeps status NULL (migration 002 dropped the NOT NULL and the
+      // 'PENDING' default), which the frontend's normalizeStatus renders as
+      // "Not scored" — the same honest cell PENDING produces — and an older pattern
+      // keeps the data it legitimately has.
+      const firstSample = samplePool[0];
+      const patternStrategy = firstSample
+        ? await strategyRun.forTarget(
+            resolveSampleTarget(
+              session.base_url,
+              firstSample.path,
+              firstSample.source_url
+            )
+          )
+        : null;
+
+      if (patternStrategy?.skip) {
+        refusedPatternCount += 1;
+        logger.warn(
+          {
+            session_id: data.session_id,
+            pattern_id: pattern.id,
+            template: pattern.template,
+            host: patternStrategy.host,
+            edge_server: patternStrategy.edgeServer,
+            last_status: patternStrategy.lastStatus
+          },
+          "pattern skipped — the host refused every request profile"
+        );
+        continue;
+      }
+
       const results = await mapWithConcurrency(
         samplePool,
         session.concurrency,
@@ -334,8 +460,24 @@ export async function processSamplePatternsJob(
               template: pattern.template,
               sampleIndex: index
             },
-            { beforeRequest: () => acquireHostSlot(host, verificationRateLimit()) }
-          );
+            {
+              beforeRequest: () => acquireHostSlot(host, verificationRateLimit()),
+              // The learned rung goes FIRST, with the rung above it as the per-URL
+              // safety net (ladderForRung). On a host that answers the browser
+              // profile this is the whole saving: attempt #1 succeeds instead of
+              // climbing from R0 on every single URL. Empty/absent ladder = today's
+              // default pair, so an unknown host behaves exactly as before.
+              profileLadder: patternStrategy?.ladder.length
+                ? patternStrategy.ladder
+                : undefined
+            }
+          ).then((result) => {
+            // Feeds the staleness heuristic: enough consecutive refusals on a
+            // previously-OK host and the next resolve re-negotiates once.
+            noteHostCheckOutcome(host, isRealMeasurement(result));
+
+            return result;
+          });
         }
       );
       const score = await persistPatternSamples(
@@ -386,6 +528,16 @@ export async function processSamplePatternsJob(
         resume: Boolean(data.resume),
         pattern_count: patternsResult.rowCount,
         skipped_pattern_count: skippedPatternCount,
+        // Patterns that issued ZERO requests because their host refused every
+        // profile. On a fully-refused site this is every pattern, and the run costs
+        // three probes instead of a full sample pass per pattern.
+        refused_pattern_count: refusedPatternCount,
+        host_strategies: strategyRun.resolved().map((strategy) => ({
+          host: strategy.host,
+          verdict: strategy.verdict,
+          rung: strategy.rung,
+          edge_server: strategy.edgeServer
+        })),
         sampled_url_count: sampledUrlCount
       },
       "sample patterns job completed"

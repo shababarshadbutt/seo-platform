@@ -68,6 +68,21 @@ const blocked = (edgeServer: string | null = "awselb/2.0") =>
     scoreWeight: 0,
     edgeServer
   });
+const notFound = () =>
+  outcome({
+    httpStatusCategory: "failure",
+    httpStatus: 404,
+    isHit: false,
+    scoreWeight: 0
+  });
+const forbidden = () =>
+  outcome({
+    httpStatusCategory: "failure",
+    httpStatus: 403,
+    isHit: false,
+    scoreWeight: 0,
+    edgeServer: "awselb/2.0"
+  });
 const transportFailure = () =>
   outcome({
     httpStatusCategory: "failure",
@@ -227,6 +242,97 @@ test("a SOFT-404 wins a rung — it is an unhealthy measurement, still a measure
 
   assert.deepEqual(attempts, ["R0"]);
   assert.equal(resolved.verdict, "OK");
+});
+
+test("A 404 PROBE URL WINS R0 — one dead URL must not condemn a whole host", async () => {
+  resetHostStrategyMemory();
+
+  // THE BUG THIS GUARDS. The checker's isRealMeasurement calls a 404 "not a
+  // measurement", which is right for the per-URL escalation (a bot filter can answer
+  // 404, so try harder before declaring a page broken) and catastrophic here: the probe
+  // URL is one random entry from a sitemap, and sitemaps are FULL of genuinely dead
+  // URLs — finding them is the product. Judging rungs by page health would fail all
+  // three on an unlucky pick and skip an entire site that answers fine.
+  const { store, rows } = memoryStore();
+  const { probe, attempts } = scriptedProbe([notFound]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  assert.deepEqual(attempts, ["R0"]);
+  assert.equal(resolved.verdict, "OK");
+  assert.equal(resolved.skip, false);
+  assert.equal(rows.get(HOST)?.lastStatus, 404);
+  // And the per-URL safety net is still there, so that 404 is still escalated once
+  // per URL exactly as v1.60 does.
+  assert.equal(resolved.ladder.length, 2);
+});
+
+test("500, 401, 429 and 503 also count as the origin ANSWERING", async () => {
+  for (const httpStatus of [500, 401, 429, 503]) {
+    resetHostStrategyMemory();
+
+    const { store } = memoryStore();
+    const { probe, attempts } = scriptedProbe([
+      () =>
+        outcome({
+          httpStatusCategory: "failure",
+          httpStatus,
+          isHit: false,
+          scoreWeight: 0
+        })
+    ]);
+    const resolved = await resolveHostStrategy(
+      HOST,
+      PROBE_URL,
+      DEFAULT_HTTP_USER_AGENT,
+      { store, probe, logger: silentLogger }
+    );
+
+    // A host having a bad day, or a page needing auth, is not a host refusing our
+    // client. Skipping it would report "needs an allowlist" about a site that is
+    // simply broken — and stop measuring the very breakage we exist to report.
+    assert.equal(resolved.verdict, "OK", `status ${httpStatus}`);
+    assert.deepEqual(attempts, ["R0"], `status ${httpStatus}`);
+  }
+});
+
+test("a bare 403 on every rung IS a refusal — the measured awselb signature", async () => {
+  resetHostStrategyMemory();
+
+  const { store, rows } = memoryStore();
+  const { probe, attempts } = scriptedProbe([forbidden]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  // 403 is the one status that means "ask again differently" rather than "here is
+  // your answer" — the same reason the per-URL escalation treats it as eligible.
+  assert.deepEqual(attempts, ["R0", "R1", "R2"]);
+  assert.equal(resolved.verdict, "REFUSED");
+  assert.equal(rows.get(HOST)?.lastStatus, 403);
+});
+
+test("a 403 that the browser profile turns into a 404 still learns R1", async () => {
+  resetHostStrategyMemory();
+
+  const { store } = memoryStore();
+  const { probe, attempts } = scriptedProbe([forbidden, notFound]);
+  const resolved = await resolveHostStrategy(HOST, PROBE_URL, DEFAULT_HTTP_USER_AGENT, {
+    store,
+    probe,
+    logger: silentLogger
+  });
+
+  // The origin started talking to us on R1 — that is what the rung is for. Whether
+  // this particular URL is alive is the per-URL checker's business, not the host's.
+  assert.deepEqual(attempts, ["R0", "R1"]);
+  assert.equal(resolved.verdict, "OK");
+  assert.equal(resolved.rung, "R1");
 });
 
 // --- the circuit breaker -----------------------------------------------------

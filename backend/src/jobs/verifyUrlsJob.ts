@@ -7,8 +7,16 @@ import {
   type EnumeratedUrl,
   type PatternRow
 } from "./patternPopulation.js";
-import type { SampleCheckResult } from "./sampleUrlCheck.js";
+import {
+  isRealMeasurement,
+  type RequestProfile,
+  type SampleCheckResult
+} from "./sampleUrlCheck.js";
+import { resolveSampleTarget } from "./sampleTarget.js";
 import { probeUrl, verifyConcurrency } from "./verifyProbe.js";
+import { rateLimitHostKey } from "../http/hostRateLimiter.js";
+import { noteHostCheckOutcome } from "../http/hostStrategy.js";
+import { createHostStrategyRun } from "../http/hostStrategyRun.js";
 import type { VerifyUrlsJobData } from "../queue/verificationQueue.js";
 
 // Full-population URL verification (verify-then-act, step 1).
@@ -276,7 +284,39 @@ export async function processVerifyUrlsJob(
     const deletedUrls = new Set(deletedResult.rows.map((row) => row.url));
 
     const entries = Array.from(population.values());
-    const toCheck = entries.filter((entry) => !deletedUrls.has(entry.url));
+    const notDeleted = entries.filter((entry) => !deletedUrls.has(entry.url));
+
+    // THE CIRCUIT BREAKER, on the path where it saves the most.
+    //
+    // Resolve the host's request strategy ONCE (at most three probes, using a URL
+    // from the population itself), then drop every URL whose host refused all of
+    // them. On a fully-refused 1.3M-URL site that turns ~2.6M requests over several
+    // days into three — and the reason is reported once instead of being spread
+    // across 1.3M individually unremarkable rows.
+    //
+    // Sampling usually resolved this host already; the run-level memo and Redis both
+    // return that answer, so this normally costs no requests at all.
+    const strategyRun = createHostStrategyRun(session.user_agent, logger);
+    const ladderByHost = new Map<string, RequestProfile[] | undefined>();
+    const toCheck: EnumeratedUrl[] = [];
+    let refusedByHost = 0;
+
+    for (const entry of notDeleted) {
+      const target = resolveSampleTarget(session.base_url, entry.url, entry.url);
+      const strategy = await strategyRun.forTarget(target);
+
+      if (strategy.skip) {
+        refusedByHost += 1;
+        continue;
+      }
+
+      ladderByHost.set(
+        rateLimitHostKey(target),
+        strategy.ladder.length ? strategy.ladder : undefined
+      );
+      toCheck.push(entry);
+    }
+
     const skippedDeleted = entries.length - toCheck.length;
 
     // urls_total is the FULL deduped population (files_total column — URL
@@ -302,6 +342,16 @@ export async function processVerifyUrlsJob(
         scope: patternIds ? "patterns" : "session",
         urls_total: entries.length,
         skipped_deleted: skippedDeleted,
+        // Broken out from skipped_deleted because they mean different things: one is
+        // "we deliberately do not check deleted URLs", the other is "this origin
+        // refuses us and needs an allowlist".
+        skipped_host_refused: refusedByHost,
+        host_strategies: strategyRun.resolved().map((strategy) => ({
+          host: strategy.host,
+          verdict: strategy.verdict,
+          rung: strategy.rung,
+          edge_server: strategy.edgeServer
+        })),
         // Separated from the HTTP phase so the two costs stay distinguishable
         // in the logs — the whole scoping fix was diagnosed from the fact that
         // urls_total, not enumeration, was the number out of proportion.
@@ -338,7 +388,23 @@ export async function processVerifyUrlsJob(
             patternId: entry.patternId,
             template: entry.template,
             sampleIndex: index
+          },
+          {
+            // The learned rung leads, so on a host that needs the browser profile
+            // every URL succeeds on attempt #1 instead of climbing from R0.
+            profileLadder: ladderByHost.get(
+              rateLimitHostKey(
+                resolveSampleTarget(session.base_url, entry.url, entry.url)
+              )
+            )
           }
+        );
+
+        noteHostCheckOutcome(
+          rateLimitHostKey(
+            resolveSampleTarget(session.base_url, entry.url, entry.url)
+          ),
+          isRealMeasurement(result)
         );
 
         return { entry, result };

@@ -312,6 +312,7 @@ test("scoping the verify to the open pattern: before/after on one fixture", { ti
 
   const { pool, closePool } = await import("../db/pool.js");
   const { runMigrations } = await import("../db/migrate.js");
+  const { closeRedisLockClient } = await import("../queue/redisLock.js");
   const { processVerifyUrlsJob } = await import("./verifyUrlsJob.js");
   const { processTriageSampleJob } = await import("./triageJob.js");
   const { resetHostRateLimiter } = await import("../http/hostRateLimiter.js");
@@ -331,6 +332,11 @@ test("scoping the verify to the open pattern: before/after on one fixture", { ti
     }
 
     await closePreGenerateZipQueue().catch(() => {});
+    // The per-host strategy engine opens its own Redis connection (queue/redisLock.ts,
+    // shared with the publish lock). Every code path here reaches it now, and a leaked
+    // ioredis handle keeps the test worker alive after the last assertion — which looks
+    // exactly like a hung test, because a worker that never exits never flushes output.
+    await closeRedisLockClient().catch(() => {});
     await closePool().catch(() => {});
     rmSync(uploadDir, { recursive: true, force: true });
   });

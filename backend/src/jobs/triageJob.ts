@@ -11,8 +11,11 @@ import {
   type StratumObservation,
   type TriagePlan
 } from "./triageSampling.js";
+import type { RequestProfile } from "./sampleUrlCheck.js";
+import { resolveSampleTarget } from "./sampleTarget.js";
 import { probeUrl, verifyConcurrency } from "./verifyProbe.js";
 import { VERIFY_PROBLEM_STATUSES } from "./verifyUrlsJob.js";
+import { createHostStrategyRun } from "../http/hostStrategyRun.js";
 import type { TriageSampleJobData } from "../queue/triageQueue.js";
 
 // Sample triage: the fast, approximate read on ONE pattern.
@@ -54,7 +57,12 @@ async function probePlan(
   session: SessionRow,
   pattern: PatternRow,
   logger: FastifyBaseLogger,
-  tallies: Map<string, StratumObservation>
+  tallies: Map<string, StratumObservation>,
+  // The host's learned request ladder, resolved once by the caller. Triage shares
+  // probeUrl with full verification, so it shares the strategy too — otherwise a
+  // "quick check" on a refused host would still spend ~1% of a 1.3M population
+  // learning what negotiation already knows.
+  profileLadder?: RequestProfile[]
 ) {
   const items: Array<{ label: string; url: string }> = [];
 
@@ -90,7 +98,8 @@ async function probePlan(
           patternId: pattern.id,
           template: pattern.template,
           sampleIndex: index
-        }
+        },
+        { profileLadder }
       );
 
       return { label: item.label, status: result.httpStatus };
@@ -196,9 +205,47 @@ export async function processTriageSampleJob(
       "triage sample: plan built, probing"
     );
 
+    // Resolve the host's strategy before probing anything. Usually free: sampling
+    // negotiated this host already and the answer is in Redis.
+    //
+    // A REFUSED host FAILS the run with the reason rather than quietly returning an
+    // estimate of zero — an estimate built from refusals is not an estimate, and
+    // "0 problem URLs" would be the single most misleading thing this panel could
+    // say about a site nobody can see.
+    const strategyRun = createHostStrategyRun(session.user_agent, logger);
+    const firstUrl = plan.strata[0]?.urls[0] ?? allUrls[0];
+    const strategy = firstUrl
+      ? await strategyRun.forTarget(
+          resolveSampleTarget(session.base_url, firstUrl, firstUrl)
+        )
+      : null;
+
+    if (strategy?.skip) {
+      await markFailed(
+        runId,
+        `This site's edge refused every request profile${
+          strategy.edgeServer ? ` (${strategy.edgeServer})` : ""
+        }. The checker needs to be allowlisted before this pattern can be checked.`
+      );
+      logger.warn(
+        {
+          session_id: sessionId,
+          pattern_id: patternId,
+          run_id: runId,
+          host: strategy.host,
+          edge_server: strategy.edgeServer,
+          last_status: strategy.lastStatus
+        },
+        "triage sample abandoned — the host refused every request profile"
+      );
+
+      return;
+    }
+
+    const profileLadder = strategy?.ladder.length ? strategy.ladder : undefined;
     const tallies = new Map<string, StratumObservation>();
 
-    await probePlan(plan, session, pattern, logger, tallies);
+    await probePlan(plan, session, pattern, logger, tallies, profileLadder);
 
     // Adaptive expansion: look harder ONLY where the first round found
     // something and the estimate is too thin to quote.
@@ -225,7 +272,7 @@ export async function processTriageSampleJob(
         "triage sample: anomaly detected, expanding sample"
       );
 
-      await probePlan(expansion, session, pattern, logger, tallies);
+      await probePlan(expansion, session, pattern, logger, tallies, profileLadder);
     }
 
     const observations = Array.from(tallies.values());

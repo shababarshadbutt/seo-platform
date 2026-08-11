@@ -22,6 +22,20 @@ import {
 
 const KEY_PREFIX = "host-strategy:";
 const LOCK_PREFIX = "host-strategy-lock:";
+// REDIS IS A CACHE HERE, NEVER A DEPENDENCY.
+//
+// ioredis queues commands while disconnected and retries indefinitely by default, so
+// a plain `await redis.get()` against a Redis that is down does not reject — it hangs
+// forever, and a .catch() never fires. Wired into sampling, that turns "Redis is
+// unavailable" into "the whole job stops with no error", which is exactly how the
+// suite hung when this first landed.
+//
+// So every Redis call is raced against a short timeout and degrades: reads fall
+// through to Postgres (the durable tier), writes lose only the cache entry, and the
+// negotiation lock degrades to no lock at all — with Redis down the worst case is two
+// processes each spending three probes on one host, which is a bounded cost, whereas
+// stalling a run is not.
+const REDIS_OP_TIMEOUT_MS = 1000;
 // The lock only has to outlive one negotiation: at most three rungs, each a full
 // check (HEAD plus a possible GET re-probe) with a 5s timeout, paced by the per-host
 // limiter. 60s is generous; the happy path releases in a finally.
@@ -36,6 +50,29 @@ type ProfileRow = {
   decided_at: string;
 };
 
+// Run a Redis operation, or give up quickly with `fallback`. See REDIS_OP_TIMEOUT_MS.
+async function withRedisTimeout<T>(
+  operation: () => Promise<T>,
+  fallback: T
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), REDIS_OP_TIMEOUT_MS);
+      })
+    ]);
+  } catch {
+    return fallback;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 function rowToStored(row: ProfileRow): StoredHostStrategy {
   return {
     host: row.host,
@@ -49,9 +86,10 @@ function rowToStored(row: ProfileRow): StoredHostStrategy {
 
 export const hostStrategyStore: HostStrategyStore = {
   async read(host) {
-    const cached = await lockRedis()
-      .get(`${KEY_PREFIX}${host}`)
-      .catch(() => null);
+    const cached = await withRedisTimeout(
+      () => lockRedis().get(`${KEY_PREFIX}${host}`),
+      null
+    );
 
     if (cached) {
       try {
@@ -110,31 +148,38 @@ export const hostStrategyStore: HostStrategyStore = {
   },
 
   async lock(host) {
-    const lock = await tryAcquireRedisLock(
-      `${LOCK_PREFIX}${host}`,
-      LOCK_TTL_SECONDS
-    );
+    // `undefined` means Redis did not answer in time — distinct from `null`, which
+    // means someone else genuinely holds the lock and we should wait for their answer.
+    // With no Redis there is nobody to wait for, so negotiation proceeds unlocked
+    // rather than stalling; the verdict still lands in Postgres.
+    const lock = await withRedisTimeout<
+      Awaited<ReturnType<typeof tryAcquireRedisLock>> | undefined
+    >(() => tryAcquireRedisLock(`${LOCK_PREFIX}${host}`, LOCK_TTL_SECONDS), undefined);
+
+    if (lock === undefined) {
+      return { release: async () => undefined };
+    }
 
     return lock ? { release: lock.release } : null;
   }
 };
 
 async function cacheStrategy(value: StoredHostStrategy): Promise<void> {
-  await lockRedis()
-    .set(
-      `${KEY_PREFIX}${value.host}`,
-      JSON.stringify(value),
-      "EX",
-      HOST_STRATEGY_TTL_SECONDS
-    )
-    .catch(() => undefined);
+  await withRedisTimeout(
+    () =>
+      lockRedis().set(
+        `${KEY_PREFIX}${value.host}`,
+        JSON.stringify(value),
+        "EX",
+        HOST_STRATEGY_TTL_SECONDS
+      ),
+    null
+  );
 }
 
 // Drop a host's hot entry, e.g. after an allowlist lands and someone wants the next
 // run to re-negotiate rather than waiting out the TTL. The durable row stays, so the
 // fleet report keeps its history until a fresh negotiation overwrites it.
 export async function invalidateHostStrategyCache(host: string): Promise<void> {
-  await lockRedis()
-    .del(`${KEY_PREFIX}${host}`)
-    .catch(() => undefined);
+  await withRedisTimeout(() => lockRedis().del(`${KEY_PREFIX}${host}`), 0);
 }

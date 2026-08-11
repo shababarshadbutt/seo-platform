@@ -51,6 +51,17 @@ const WINDOW_JITTER_ALLOWANCE = 8;
 // constant so a future change to the escalation rule fails these tests loudly
 // instead of silently altering what the rate maths is measuring.
 const REQUESTS_PER_404_CHECK = 2;
+// The per-host strategy engine's PRE-FLIGHT: one probe URL decides which request
+// profile this host answers, before any per-URL work. On these fixtures the honest UA
+// gets a real answer immediately (a 404 or a 301 both mean "the origin is talking to
+// us"), so the first rung wins and negotiation costs exactly ONE request — and it is
+// charged to the same per-host budget as everything else, which is why it shows up in
+// these arrival counts at all.
+//
+// Named rather than folded into the totals so the pre-flight stays visible: if it ever
+// costs more than one request on a host that answers immediately, these tests should
+// fail and say so.
+const NEGOTIATION_REQUESTS = 1;
 const URL_COUNT = 60;
 // The SECOND fixture deliberately does the opposite: every URL answers 200, so
 // each check costs TWO requests — the HEAD plus the soft-404 GET. That is the
@@ -249,8 +260,8 @@ test("a real verification run is paced at the configured requests/second", async
   // twice the requests, at the SAME paced rate, so it takes twice as long.
   assert.equal(
     arrivals.length,
-    URL_COUNT * REQUESTS_PER_404_CHECK,
-    "expected two requests per 404 check — the escalation attempt included"
+    URL_COUNT * REQUESTS_PER_404_CHECK + NEGOTIATION_REQUESTS,
+    "expected two requests per 404 check plus one host-strategy pre-flight"
   );
 
   const spanMs = arrivals[arrivals.length - 1] - arrivals[0];
@@ -594,8 +605,11 @@ test("verification skips the redirect follow-up; final_url survives", async (t) 
     silentLogger
   );
 
-  // ONE request per redirect check: the destination was never fetched.
-  assert.equal(arrivals.length, REDIRECTS);
+  // ONE request per redirect check, plus the one host-strategy pre-flight: the
+  // destination was never fetched by either. Negotiation passes skipRedirectFollow for
+  // the same reason verification does — a redirect destination's responseMs is the only
+  // thing that follow-up produces, and neither of them reads it.
+  assert.equal(arrivals.length, REDIRECTS + NEGOTIATION_REQUESTS);
   assert.equal(
     arrivals.filter((url) => url.startsWith("/moved/")).length,
     0,
@@ -697,6 +711,7 @@ test("sampling is paced through the same per-host limiter as verification", asyn
   // with nothing wrong in it. The verification-only tests above never reached
   // that code path, which is why this file exited cleanly before.
   const { closeSitemapQueue } = await import("../queue/sitemapQueue.js");
+  const { closeRedisLockClient } = await import("../queue/redisLock.js");
 
   let sessionId: string | null = null;
 
@@ -715,6 +730,11 @@ test("sampling is paced through the same per-host limiter as verification", asyn
     // the first time. If another test is ever added below, move these two lines.
     await closePreGenerateZipQueue().catch(() => {});
     await closeSitemapQueue().catch(() => {});
+    // The per-host strategy engine opens its own Redis connection (queue/redisLock.ts,
+    // shared with the publish lock). Every code path here reaches it now, and a leaked
+    // ioredis handle keeps the test worker alive after the last assertion — which looks
+    // exactly like a hung test, because a worker that never exits never flushes output.
+    await closeRedisLockClient().catch(() => {});
     await closePool().catch(() => {});
     rmSync(uploadDir, { recursive: true, force: true });
   });
@@ -799,8 +819,8 @@ test("sampling is paced through the same per-host limiter as verification", asyn
   // something else, so it fails loudly rather than passing quietly.
   assert.equal(
     arrivals.length,
-    SAMPLING_URL_COUNT * REQUESTS_PER_404_CHECK,
-    "expected two HTTP requests per sampled 404 URL — the escalation included"
+    SAMPLING_URL_COUNT * REQUESTS_PER_404_CHECK + NEGOTIATION_REQUESTS,
+    "expected two HTTP requests per sampled 404 URL plus one host-strategy pre-flight"
   );
 
   const spanMs = arrivals[arrivals.length - 1] - arrivals[0];

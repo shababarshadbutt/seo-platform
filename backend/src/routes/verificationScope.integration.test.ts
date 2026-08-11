@@ -93,6 +93,7 @@ test("verification routes scope by pattern", async (t) => {
     "../queue/maintenanceQueue.js"
   );
   const { closeSitemapQueue } = await import("../queue/sitemapQueue.js");
+  const { closeRedisLockClient } = await import("../queue/redisLock.js");
 
   const { verificationQueue, verifyScopeJobId } = await import(
     "../queue/verificationQueue.js"
@@ -136,6 +137,11 @@ test("verification routes scope by pattern", async (t) => {
     // worker never exits, and a worker that never exits never flushes its output:
     // the failure looks like a hung test rather than a leaked handle.
     await closeSitemapQueue().catch(() => {});
+    // The per-host strategy engine opens its own Redis connection (queue/redisLock.ts,
+    // shared with the publish lock). Every code path here reaches it now, and a leaked
+    // ioredis handle keeps the test worker alive after the last assertion — which looks
+    // exactly like a hung test, because a worker that never exits never flushes output.
+    await closeRedisLockClient().catch(() => {});
     await closePool().catch(() => {});
   });
 

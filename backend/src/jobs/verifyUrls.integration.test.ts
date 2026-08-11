@@ -224,6 +224,7 @@ test("verify-then-delete acts on the full population and spares the healthy 91",
   const { closePreGenerateZipQueue } = await import(
     "../queue/preGenerateZipQueue.js"
   );
+  const { closeRedisLockClient } = await import("../queue/redisLock.js");
 
   let sessionId: string | null = null;
 
@@ -239,6 +240,11 @@ test("verify-then-delete acts on the full population and spares the healthy 91",
     // The Queue import above opened a Redis connection at module load; without
     // these closes the test process never exits.
     await closePreGenerateZipQueue().catch(() => {});
+    // The per-host strategy engine opens its own Redis connection (queue/redisLock.ts,
+    // shared with the publish lock). Every code path here reaches it now, and a leaked
+    // ioredis handle keeps the test worker alive after the last assertion — which looks
+    // exactly like a hung test, because a worker that never exits never flushes output.
+    await closeRedisLockClient().catch(() => {});
     await closePool().catch(() => {});
     rmSync(uploadDir, { recursive: true, force: true });
   });

@@ -6,7 +6,11 @@ import {
   rateLimitHostKey,
   verificationRateLimit
 } from "../http/hostRateLimiter.js";
-import { checkSampleUrl, type SampleCheckResult } from "./sampleUrlCheck.js";
+import {
+  checkSampleUrl,
+  type RequestProfile,
+  type SampleCheckResult
+} from "./sampleUrlCheck.js";
 import { resolveSampleTarget } from "./sampleTarget.js";
 
 // The one probe both verification paths (full sweep and sample triage) call.
@@ -67,7 +71,12 @@ export async function probeUrl(
     patternId: string;
     template: string;
     sampleIndex: number;
-  }
+  },
+  // The host's learned request ladder, resolved ONCE per run by the caller (see
+  // http/hostStrategyRun.ts). Passed in rather than looked up here so this module
+  // stays free of Redis and the DB — and so the caller, which owns the bookkeeping,
+  // is the one that decides what to do about a REFUSED host.
+  options: { profileLadder?: RequestProfile[] } = {}
 ): Promise<SampleCheckResult> {
   let path: string;
 
@@ -91,6 +100,9 @@ export async function probeUrl(
   // wherever it actually went.
   return checkSampleUrl(baseUrl, path, sourceUrl, userAgent, logger, context, {
     beforeRequest: () => acquireHostSlot(host, verificationRateLimit()),
+    // The learned rung first, the rung above it as the per-URL safety net. Absent =
+    // today's default pair.
+    profileLadder: options.profileLadder,
     // Verification exists to establish each URL's OWN status so delete-by-status
     // can act on it. The follow-up HEAD on a redirect destination contributes
     // only responseMs, which verified_urls does not store — finalUrl comes from

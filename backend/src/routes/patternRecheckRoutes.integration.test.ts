@@ -89,6 +89,7 @@ test("pattern re-check routes scope, attach and explain", async (t) => {
   const Fastify = (await import("fastify")).default;
   const { pool, closePool } = await import("../db/pool.js");
   const { runMigrations } = await import("../db/migrate.js");
+  const { closeRedisLockClient } = await import("../queue/redisLock.js");
   const { verificationRoutes } = await import("./verification.js");
   const { closeVerificationQueue } = await import(
     "../queue/verificationQueue.js"
@@ -132,6 +133,11 @@ test("pattern re-check routes scope, attach and explain", async (t) => {
     await closeTriageQueue().catch(() => {});
     await closeMaintenanceQueue().catch(() => {});
     await closeSitemapQueue().catch(() => {});
+    // The per-host strategy engine opens its own Redis connection (queue/redisLock.ts,
+    // shared with the publish lock). Every code path here reaches it now, and a leaked
+    // ioredis handle keeps the test worker alive after the last assertion — which looks
+    // exactly like a hung test, because a worker that never exits never flushes output.
+    await closeRedisLockClient().catch(() => {});
     await closePool().catch(() => {});
   });
 

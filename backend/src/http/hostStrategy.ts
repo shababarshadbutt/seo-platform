@@ -3,7 +3,6 @@ import type { FastifyBaseLogger } from "fastify";
 import { DEFAULT_HTTP_USER_AGENT } from "../config.js";
 import {
   BROWSER_FALLBACK_PROFILE,
-  isRealMeasurement,
   type RequestProfile,
   type SampleCheckResult
 } from "../jobs/sampleUrlCheck.js";
@@ -183,6 +182,32 @@ function isTransportFailure(result: SampleCheckResult): boolean {
   return result.httpStatus === null;
 }
 
+// DID THE ORIGIN ANSWER US? — the rung-success predicate, and deliberately NOT the
+// checker's isRealMeasurement.
+//
+// isRealMeasurement asks "is this page healthy" (success / redirect / soft_404), which
+// is the right question for the PER-URL escalation: a 404 might be a bot filter, so
+// try harder before calling the page broken. It is the WRONG question here, and
+// dangerously so. A negotiation probe is one randomly-chosen URL out of a sitemap, and
+// sitemaps are full of genuinely dead URLs — that is what this tool exists to find. If
+// a 404 failed a rung, an unlucky probe URL would fail all three and condemn the whole
+// host to REFUSED, skipping a site that answers perfectly well.
+//
+// So a rung WINS when the origin gave us a real answer of any kind. Only two outcomes
+// count as being refused:
+//   * "blocked" — a WAF header, or a 405/501 that survived the GET re-probe;
+//   * a bare 403 — the status this site family's load balancer actually returns, and
+//     the one the per-URL escalation already treats as "ask again differently".
+// A 404, 500, 401, 429 or 503 all mean the host is talking to us; the per-URL safety
+// net still escalates those individually, exactly as it does today.
+export function hostAnsweredRung(result: SampleCheckResult): boolean {
+  if (result.httpStatus === null) {
+    return false;
+  }
+
+  return result.httpStatusCategory !== "blocked" && result.httpStatus !== 403;
+}
+
 function unknownStrategy(
   host: string,
   sessionUserAgent: string
@@ -262,7 +287,7 @@ export async function negotiateHostStrategy(
       lastStatus = result.httpStatus;
     }
 
-    if (isRealMeasurement(result)) {
+    if (hostAnsweredRung(result)) {
       const stored: StoredHostStrategy = {
         host,
         verdict: "OK",

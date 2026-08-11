@@ -23,8 +23,9 @@ import pg from "pg";
 //      SAMPLING, must not be re-finalised, and must not be marked FAILED because
 //      one re-measured row hit a network error. Otherwise re-checking one row
 //      would sprout a Resume banner on a finished session.
-//   4. The re-check goes through the SAME checker, so the browser-profile
-//      escalation applies to it — which is the entire point on a WAF'd site.
+//   4. The re-check goes through the SAME checker AND the per-host strategy engine,
+//      so it leads with the profile this host is known to answer — which is the
+//      entire point on a WAF-fronted site.
 //
 // Skips (does not fail) when postgres/redis are not reachable, like the other
 // integration tests here. Redis is needed only because samplePatternsJob
@@ -144,6 +145,7 @@ test("re-checking one pattern rescores it and leaves the session alone", async (
   // Closing only one leaves the test worker alive with no output flushed — it looks
   // exactly like a hung test.
   const { closeSitemapQueue } = await import("../queue/sitemapQueue.js");
+  const { closeRedisLockClient } = await import("../queue/redisLock.js");
 
   let sessionId: string | null = null;
 
@@ -158,6 +160,11 @@ test("re-checking one pattern rescores it and leaves the session alone", async (
 
     await closePreGenerateZipQueue().catch(() => {});
     await closeSitemapQueue().catch(() => {});
+    // The per-host strategy engine opens its own Redis connection (queue/redisLock.ts,
+    // shared with the publish lock). Every code path here reaches it now, and a leaked
+    // ioredis handle keeps the test worker alive after the last assertion — which looks
+    // exactly like a hung test, because a worker that never exits never flushes output.
+    await closeRedisLockClient().catch(() => {});
     await closePool().catch(() => {});
     rmSync(uploadDir, { recursive: true, force: true });
   });
@@ -247,13 +254,33 @@ test("re-checking one pattern rescores it and leaves the session alone", async (
   assert.equal(samples.rowCount, 1);
   assert.equal(samples.rows[0].http_status, 200);
   assert.equal(samples.rows[0].http_status_category, "success");
-  assert.equal(samples.rows[0].used_fallback_profile, true);
 
-  // The escalation actually happened at the socket: the crawler attempt (HEAD +
-  // the method-rejection GET) then the browser attempt (HEAD + soft-404 GET).
+  // used_fallback_profile is now FALSE, and that is the strategy engine working.
+  //
+  // The engine negotiates this host first, learns that the browser profile is what it
+  // answers, and hands that rung to the checker as the PRIMARY attempt — so the URL
+  // succeeds on attempt #1 and no fallback is needed. The column keeps its strict
+  // meaning ("the second attempt produced this verdict"); WHICH profile was used is
+  // recorded per host in host_probe_profiles, asserted below. Before the engine this
+  // row read true because every URL climbed from the honest UA on its own.
+  assert.equal(samples.rows[0].used_fallback_profile, false);
+
+  const learned = await pool.query<{ verdict: string; winning_rung: string }>(
+    "SELECT verdict, winning_rung FROM host_probe_profiles WHERE host = $1",
+    [new URL(baseUrl).host]
+  );
+
+  assert.equal(learned.rows[0].verdict, "OK");
+  assert.equal(learned.rows[0].winning_rung, "R1");
+
+  // At the socket: negotiation costs the crawler rung (HEAD + the method-rejection
+  // GET) then the browser rung (HEAD + soft-404 GET), and the per-URL check that
+  // follows is browser-only — two requests instead of the four it used to take.
   assert.deepEqual(requests, [
     "HEAD /about-us crawler",
     "GET /about-us crawler",
+    "HEAD /about-us browser",
+    "GET /about-us browser",
     "HEAD /about-us browser",
     "GET /about-us browser"
   ]);
