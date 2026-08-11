@@ -181,7 +181,11 @@ import { cn } from "@/lib/utils";
 
 import { appliesPatternWide, fixAcceptCount } from "@/lib/fix-accept-count";
 import { findSegmentDuplication } from "@/lib/segment-duplication";
-import { showFixButton, type PatternStatus } from "@/lib/fix-visibility";
+import {
+  showCheckButton,
+  showFixButton,
+  type PatternStatus
+} from "@/lib/fix-visibility";
 type StatusFilter = "ALL" | "GOOD" | "WARNING" | "BAD";
 
 // Per-column layout hints consumed by the table th/td renderers. A fixed
@@ -1478,6 +1482,29 @@ export default function ResultsDashboardPage({
             >
               <Wrench className="h-3 w-3" aria-hidden="true" />
               Fix
+            </button>
+          ) : showCheckButton(row.original) ? (
+            // Never-scored pattern (backend PENDING -> UNKNOWN here). Opens the
+            // SAME dialog as Fix — which renders PatternVerifyPanel whenever
+            // fixRow is set — so the triage/verify controls stop being reachable
+            // only through a button that requires a confirmed problem first.
+            //
+            // Slate outline, NOT the amber Fix pill: amber asserts "a problem is
+            // confirmed here", which is precisely the claim we have no data for.
+            <button
+              type="button"
+              data-testid="pattern-check-button"
+              aria-label={`Check ${row.original.template}`}
+              title="Not scored yet — check this pattern's URLs"
+              className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2 py-0.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+              onClick={(event) => {
+                event.stopPropagation();
+                setFindReplaceToast(null);
+                setFixRow(row.original);
+              }}
+            >
+              <RefreshCw className="h-3 w-3" aria-hidden="true" />
+              Check
             </button>
           ) : null
       },
@@ -4679,11 +4706,23 @@ export default function ResultsDashboardPage({
                   {fixRow?.template}
                 </p>
               </div>
-              <p className="text-xs text-slate-500">
-                Sampled URLs were HTTP-checked and confirmed redirecting; the
-                rest match this pattern and get the same confirmed rewrite
-                applied by inference (not individually verified).
-              </p>
+              {/* Both of these describe a MEASUREMENT, so neither may appear for
+                  a pattern that was never sampled. Found by actually opening this
+                  dialog on a PENDING row: it claimed "Sampled URLs were
+                  HTTP-checked and confirmed redirecting" and "the confirmed
+                  redirects were too varied to infer a single rewrite rule" for a
+                  pattern with zero samples — the same never-measured-read-as-
+                  measured bug 54e08a3e fixed on the status, surfacing in the copy.
+                  fixInferredWithoutRule is TRUE for an unscored pattern
+                  (rule === null and total > 0 sampled redirects), which is
+                  literally accurate and completely misleading. (v1.53) */}
+              {fixRow && showCheckButton(fixRow) ? null : (
+                <p className="text-xs text-slate-500">
+                  Sampled URLs were HTTP-checked and confirmed redirecting; the
+                  rest match this pattern and get the same confirmed rewrite
+                  applied by inference (not individually verified).
+                </p>
+              )}
               {/* Gated on the same predicate as the Accept button (v1.53). It used
                   to key off the row-count comparison alone, so on a pattern whose
                   redirects were too varied to infer one rule it claimed a
@@ -4699,7 +4738,7 @@ export default function ResultsDashboardPage({
                   pattern&rsquo;s files.
                 </p>
               ) : null}
-              {fixInferredWithoutRule ? (
+              {fixInferredWithoutRule && !(fixRow && showCheckButton(fixRow)) ? (
                 <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
                   Only the sampled URLs are listed — the confirmed redirects were
                   too varied to infer a single rewrite rule for the rest.
@@ -4755,9 +4794,31 @@ export default function ResultsDashboardPage({
                       Loading URLs…
                     </div>
                   ) : fixCandidates.length === 0 ? (
-                    <p className="px-3 py-3 text-sm text-slate-500">
-                      No redirect URLs remain for this pattern.
-                    </p>
+                    // "No redirect URLs remain" asserts a clean result, which is
+                    // wrong for a pattern that was never checked — the same
+                    // never-measured-vs-measured-clean confusion 54e08a3e fixed on
+                    // the status itself. An unscored pattern gets told what to do
+                    // instead.
+                    // Same predicate as the Check button, not a re-derived
+                    // condition: the button and this copy must agree about what
+                    // "unscored" means. PatternRow.status is already normalised
+                    // (see normalizeStatus at row build), so no second pass.
+                    fixRow && showCheckButton(fixRow) ? (
+                      <p
+                        className="px-3 py-3 text-sm text-slate-500"
+                        data-testid="fix-empty-unscored"
+                      >
+                        This pattern hasn&rsquo;t been checked yet — run a Quick
+                        check or Full verification above to sample its URLs.
+                      </p>
+                    ) : (
+                      <p
+                        className="px-3 py-3 text-sm text-slate-500"
+                        data-testid="fix-empty-clean"
+                      >
+                        No redirect URLs remain for this pattern.
+                      </p>
+                    )
                   ) : filteredFixCandidates.length === 0 ? (
                     <p
                       className="px-3 py-3 text-sm text-slate-500"
