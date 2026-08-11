@@ -499,7 +499,6 @@ test("verification skips the redirect follow-up; final_url survives", async (t) 
 
   let sessionId: string | null = null;
 
-  const { closePool } = await import("../db/pool.js");
   const { closePreGenerateZipQueue } = await import(
     "../queue/preGenerateZipQueue.js"
   );
@@ -513,13 +512,12 @@ test("verification skips the redirect follow-up; final_url survives", async (t) 
         .catch(() => {});
     }
 
-    // LAST test in the file owns the module-level pool and temp dir. Closing
-    // them in an earlier test breaks the ones after it with "Cannot use a pool
-    // after calling end on the pool" — which is how this file failed twice
-    // while the code under test was fine.
+    // Ownership of the module-level pool and temp dir moved to the SAMPLING test
+    // below when it was appended after this one — the LAST test in the file owns
+    // them. Closing them here broke the test after this with "Cannot use a pool
+    // after calling end on the pool", which is exactly what the note this
+    // replaces warned about, and it caught the mistake immediately.
     await closePreGenerateZipQueue().catch(() => {});
-    await closePool().catch(() => {});
-    rmSync(uploadDir, { recursive: true, force: true });
   });
 
   const sessionResult = await pool.query<{ id: string }>(
@@ -606,5 +604,205 @@ test("verification skips the redirect follow-up; final_url survives", async (t) 
   console.log(
     `[redirect skip] ${REDIRECTS} redirect checks -> ${arrivals.length} requests ` +
       `(was ${REDIRECTS * 2}); final_url populated on all ${verified.rowCount}`
+  );
+});
+
+// ---------------------------------------------------------------------------
+// SAMPLING shares the same per-host budget as verification.
+//
+// The gap this closes, confirmed by production data rather than theory: 9ad4ddc6
+// paced verification (verifyProbe.ts) and left samplePatternsJob with NO pacing
+// at all — no beforeRequest hook, running at session.concurrency. Session
+// 431cbba3 then produced 8 patterns with sample_rows = 1 and statuses = {405},
+// the AWS WAF Bot Control signature, on the sampling path.
+//
+// Added to THIS file rather than a new one on purpose: node --test parallelises
+// by FILE, and a new heavy integration file is exactly what tipped the suite's
+// contention threshold in the previous two rounds. This file already pins the
+// rate env at module load, which is what the test needs.
+//
+// THE DISCRIMINATING ASSERTION IS THE DURATION FLOOR. An unpaced run of 40 checks
+// at session.concurrency = 10 against a local fixture finishes in tens of
+// milliseconds; a paced one cannot beat (40 - burst) / 25 seconds. A rate ceiling
+// alone would pass on the unpaced code too, because a fast local fixture never
+// exceeds it in the first place.
+// sessions.sample_size is CHECK-constrained to 5 | 10 | 20, and sampling draws
+// min(sample_size, total_urls) per pattern — so one pattern caps at 20 checks.
+// Two patterns of 20 on the SAME host gets to 40, and additionally proves the
+// per-host budget is shared ACROSS patterns rather than reset per pattern, which
+// is the property that makes an 823-pattern session safe.
+const SAMPLING_PATTERNS = 2;
+const SAMPLING_PER_PATTERN = 20;
+const SAMPLING_URL_COUNT = SAMPLING_PATTERNS * SAMPLING_PER_PATTERN;
+
+test("sampling is paced through the same per-host limiter as verification", async (t) => {
+  if (!(await postgresReachable())) {
+    t.skip(`postgres not reachable at ${process.env.DATABASE_URL} — skipping`);
+    return;
+  }
+
+  if (!(await redisReachable())) {
+    t.skip(`redis not reachable at ${process.env.REDIS_URL} — skipping`);
+    return;
+  }
+
+  const arrivals: number[] = [];
+  const server = createServer((_req, res) => {
+    arrivals.push(Date.now());
+    // 404 keeps it at exactly one HTTP request per check: no soft-404 GET, and
+    // no HEAD->GET method-rejection re-probe.
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise<void>((resolve) =>
+    server.listen(0, "127.0.0.1", () => resolve())
+  );
+
+  const port = (server.address() as { port: number }).port;
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  const { pool } = await import("../db/pool.js");
+  const { runMigrations } = await import("../db/migrate.js");
+  const { processSamplePatternsJob } = await import("./samplePatternsJob.js");
+  const { resetHostRateLimiter } = await import("../http/hostRateLimiter.js");
+  const { closePool } = await import("../db/pool.js");
+  const { closePreGenerateZipQueue } = await import(
+    "../queue/preGenerateZipQueue.js"
+  );
+  // processSamplePatternsJob finishes by calling markSessionComplete, which lives
+  // in sessionCompletion.ts and touches sitemapQueue as well as the zip queue —
+  // a SECOND BullMQ Redis connection. Leaving it open kept the test process alive
+  // after every test had passed, so the file "failed" on the runner's own timeout
+  // with nothing wrong in it. The verification-only tests above never reached
+  // that code path, which is why this file exited cleanly before.
+  const { closeSitemapQueue } = await import("../queue/sitemapQueue.js");
+
+  let sessionId: string | null = null;
+
+  t.after(async () => {
+    server.close();
+
+    if (sessionId) {
+      await pool
+        .query("DELETE FROM sessions WHERE id = $1", [sessionId])
+        .catch(() => {});
+    }
+
+    // LAST test in the file owns the module-level pool and temp dir. Closing them
+    // in an earlier test breaks every test after it with "Cannot use a pool after
+    // calling end on the pool" — which is exactly how appending this test failed
+    // the first time. If another test is ever added below, move these two lines.
+    await closePreGenerateZipQueue().catch(() => {});
+    await closeSitemapQueue().catch(() => {});
+    await closePool().catch(() => {});
+    rmSync(uploadDir, { recursive: true, force: true });
+  });
+
+  await runMigrations(silentLogger);
+
+  // concurrency 10 is the DEFAULT that used to run unpaced — the point is that
+  // pacing now governs regardless of how high this is set.
+  const sessionResult = await pool.query<{ id: string }>(
+    `
+      INSERT INTO sessions (name, base_url, sample_size, concurrency)
+      VALUES ('sampling rate limit', $1, $2, 10)
+      RETURNING id
+    `,
+    [baseUrl, SAMPLING_PER_PATTERN]
+  );
+
+  sessionId = sessionResult.rows[0].id;
+
+  // Sampling reads pattern_urls (loadSamplePool), not the sitemap file.
+  for (let group = 0; group < SAMPLING_PATTERNS; group += 1) {
+    const patternRow = await pool.query<{ id: string }>(
+      `
+        INSERT INTO patterns (session_id, template, total_urls)
+        VALUES ($1, $2, $3)
+        RETURNING id
+      `,
+      [sessionId, `/group-${group}/{param}`, SAMPLING_PER_PATTERN]
+    );
+    const patternId = patternRow.rows[0].id;
+
+    for (let index = 0; index < SAMPLING_PER_PATTERN; index += 1) {
+      await pool.query(
+        `
+          INSERT INTO pattern_urls (session_id, pattern_id, source_url, path)
+          VALUES ($1, $2, $3, $4)
+        `,
+        [
+          sessionId,
+          patternId,
+          `${baseUrl}/group-${group}/sku-${index}`,
+          `/group-${group}/sku-${index}`
+        ]
+      );
+    }
+  }
+
+  const stored = `${sessionId}-current.xml`;
+
+  writeFileSync(
+    path.join(uploadDir, stored),
+    urlset(
+      Array.from(
+        { length: SAMPLING_URL_COUNT },
+        (_, index) =>
+          `${baseUrl}/group-${Math.floor(index / SAMPLING_PER_PATTERN)}/sku-${
+            index % SAMPLING_PER_PATTERN
+          }`
+      )
+    ),
+    "utf8"
+  );
+  await pool.query(
+    `
+      INSERT INTO sitemap_files (session_id, filename, total_urls, parsed_at, is_valid, is_index)
+      VALUES ($1, $2, $3, now(), true, false)
+    `,
+    [sessionId, stored, SAMPLING_URL_COUNT]
+  );
+
+  resetHostRateLimiter();
+  arrivals.length = 0;
+
+  const startedMs = Date.now();
+
+  await processSamplePatternsJob({ session_id: sessionId }, silentLogger);
+
+  const elapsedMs = Date.now() - startedMs;
+
+  // PREMISE: one request per check. If this drifts the rate maths below is
+  // measuring something else, so it fails loudly rather than passing quietly.
+  assert.equal(
+    arrivals.length,
+    SAMPLING_URL_COUNT,
+    "expected exactly one HTTP request per sampled URL"
+  );
+
+  const spanMs = arrivals[arrivals.length - 1] - arrivals[0];
+  const observedRate = (arrivals.length - 1) / (spanMs / 1000);
+  // Burst credit is a fixed head start, so only the remainder is paced.
+  const expectedMinMs =
+    ((SAMPLING_URL_COUNT - BURST) / REQUESTS_PER_SECOND) * 1000;
+
+  console.log(
+    `[sampling rate limit] ${arrivals.length} requests over ${spanMs}ms = ` +
+      `${observedRate.toFixed(1)} req/s (cap ${REQUESTS_PER_SECOND}/s, burst ${BURST}); ` +
+      `job elapsed ${elapsedMs}ms, paced floor ${expectedMinMs}ms`
+  );
+
+  // THE ONE THAT PROVES THE FIX. Unpaced, this completes in tens of ms.
+  assert.ok(
+    elapsedMs >= expectedMinMs,
+    `sampling finished in ${elapsedMs}ms, faster than the ${expectedMinMs}ms floor — it is not being paced`
+  );
+
+  // And the sustained rate respects the shared ceiling.
+  assert.ok(
+    observedRate <= REQUESTS_PER_SECOND + WINDOW_JITTER_ALLOWANCE,
+    `sampling sustained ${observedRate.toFixed(1)} req/s against a ${REQUESTS_PER_SECOND}/s cap`
   );
 });

@@ -2,6 +2,12 @@ import type { FastifyBaseLogger } from "fastify";
 
 import { pool } from "../db/pool.js";
 import { checkSampleUrl, type SampleCheckResult } from "./sampleUrlCheck.js";
+import {
+  acquireHostSlot,
+  rateLimitHostKey,
+  verificationRateLimit
+} from "../http/hostRateLimiter.js";
+import { resolveSampleTarget } from "./sampleTarget.js";
 // Pure scoring lives in its own module so it is unit-testable without loading
 // this job (and with it a BullMQ/Redis connection). See patternScore.ts.
 import { calculatePatternScore } from "./patternScore.js";
@@ -254,8 +260,43 @@ export async function processSamplePatternsJob(
       const results = await mapWithConcurrency(
         samplePool,
         session.concurrency,
-        (sample, index) =>
-          checkSampleUrl(
+        (sample, index) => {
+          // PACE SAMPLING THROUGH THE SAME PER-HOST BUDGET AS VERIFICATION.
+          //
+          // 9ad4ddc6 dropped verification to 5 req/s per host after AWS WAF Bot
+          // Control returned 405 + x-amzn-waf-action: captcha under sustained
+          // load. It only touched verifyProbe.ts. THIS path had no pacing at all
+          // — no beforeRequest hook, running at session.concurrency (default 10)
+          // with zero throttling — so it reproduced the identical WAF trigger on
+          // a different code path. Confirmed by data, not theory: session
+          // 431cbba3, 8 of 9 affected patterns had sample_rows = 1 and
+          // statuses = {405}. checkSampleUrl already re-probes a 405 HEAD with
+          // GET, so a 405 surviving as the final status means GET was refused
+          // too, which for a real page is essentially never legitimate.
+          //
+          // verificationRateLimit() rather than a new limiter: hostRateLimiter is
+          // per-host and PROCESS-GLOBAL, and its own comment says triage and full
+          // verification "provably share one budget per host". Sampling joining
+          // that shared budget is the point — two limiters against one origin
+          // would just be 2x the intended rate, which is the bug this fixes.
+          //
+          // Keyed on the RESOLVED target host, exactly as probeUrl does, because
+          // resolveSampleTarget can send the probe to a different host than
+          // base_url names (the www-equivalence rule). The host that receives the
+          // traffic is the host whose budget must be charged.
+          //
+          // NOT passing skipRedirectFollow: that is a verification-specific
+          // optimisation (verified_urls does not store the follow-up HEAD's
+          // responseMs). Sampling still follows redirects fully — only the pacing
+          // is new.
+          const target = resolveSampleTarget(
+            session.base_url,
+            sample.path,
+            sample.source_url
+          );
+          const host = rateLimitHostKey(target);
+
+          return checkSampleUrl(
             session.base_url,
             sample.path,
             sample.source_url,
@@ -266,8 +307,10 @@ export async function processSamplePatternsJob(
               patternId: pattern.id,
               template: pattern.template,
               sampleIndex: index
-            }
-          )
+            },
+            { beforeRequest: () => acquireHostSlot(host, verificationRateLimit()) }
+          );
+        }
       );
       const score = await persistPatternSamples(
         pattern.id,
