@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import net from "node:net";
 
@@ -109,6 +110,10 @@ test("pattern re-check routes scope, attach and explain", async (t) => {
 
   let sessionId: string | null = null;
   let scopedPatternId: string | null = null;
+  // Distinct per run so the fleet-report rows cannot collide with another test or
+  // with a real host learned on this machine.
+  const refusedHost = `fleet-refused-${randomUUID()}.example.com`;
+  const okHost = `fleet-ok-${randomUUID()}.example.com`;
 
   t.after(async () => {
     // Exercising the real route means really enqueueing. The session is deleted
@@ -127,6 +132,12 @@ test("pattern re-check routes scope, attach and explain", async (t) => {
         .query("DELETE FROM sessions WHERE id = $1", [sessionId])
         .catch(() => {});
     }
+
+    await pool
+      .query("DELETE FROM host_probe_profiles WHERE host = ANY($1::text[])", [
+        [refusedHost, okHost]
+      ])
+      .catch(() => {});
 
     await app.close().catch(() => {});
     await closeVerificationQueue().catch(() => {});
@@ -259,6 +270,61 @@ test("pattern re-check routes scope, attach and explain", async (t) => {
   assert.equal(status.json().used_fallback_count, 1);
   assert.equal(status.json().pool_total, 1);
   assert.equal(status.json().running, true);
+
+  // --- the fleet report ------------------------------------------------------
+  // The deliverable: one request that answers "which hosts can we see, and which
+  // are refusing us", instead of 1.3M per-URL rows that all say the same thing.
+  await pool.query(
+    `
+      INSERT INTO host_probe_profiles
+        (host, verdict, winning_rung, edge_server, last_status, decided_at)
+      VALUES ($1, 'REFUSED', NULL, 'awselb/2.0', 403, now()),
+             ($2, 'OK', 'R1', 'nginx/1.28.3', 200, now())
+      ON CONFLICT (host) DO NOTHING
+    `,
+    [refusedHost, okHost]
+  );
+
+  const fleet = await app.inject({ method: "GET", url: "/api/host-strategies" });
+
+  assert.equal(fleet.statusCode, 200);
+
+  const reported = fleet.json().hosts as Array<{
+    host: string;
+    verdict: string;
+    edge_server: string | null;
+  }>;
+  const mine = reported.filter(
+    (row) => row.host === refusedHost || row.host === okHost
+  );
+
+  // Refused first — they are the rows that need action.
+  assert.equal(mine[0].host, refusedHost);
+  assert.equal(mine[0].verdict, "REFUSED");
+  // The column that makes it actionable: a load balancer refusing our egress IP is
+  // an allowlist request; the origin refusing us is a different conversation.
+  assert.equal(mine[0].edge_server, "awselb/2.0");
+  assert.equal(mine[1].verdict, "OK");
+  assert.ok(fleet.json().totals.refused >= 1);
+
+  const refusedOnly = await app.inject({
+    method: "GET",
+    url: "/api/host-strategies?verdict=REFUSED"
+  });
+
+  assert.equal(
+    (refusedOnly.json().hosts as Array<{ verdict: string }>).every(
+      (row) => row.verdict === "REFUSED"
+    ),
+    true
+  );
+
+  const badFilter = await app.inject({
+    method: "GET",
+    url: "/api/host-strategies?verdict=MAYBE"
+  });
+
+  assert.equal(badFilter.statusCode, 400);
 
   const emptyStatus = await app.inject({
     method: "GET",

@@ -79,6 +79,7 @@ import {
   getPatternSourceFiles,
   getPatternStructures,
   getPatterns,
+  getPatternsResponse,
   getProblemUrlCount,
   type PatternStructuresResponse,
   type StructureFilter,
@@ -101,6 +102,7 @@ import {
   type ExportFormat,
   type MismatchedUrl,
   type Pattern,
+  type RefusedHost,
   type PatternSourceFile,
   type RedirectCandidate,
   type SampledUrl,
@@ -737,6 +739,9 @@ export default function ResultsDashboardPage({
   const router = useRouter();
   const [sessionData, setSessionData] = useState<SessionResponse | null>(null);
   const [patterns, setPatterns] = useState<Pattern[]>([]);
+  // Hosts whose edge refused every request profile, from the same payload as the
+  // patterns — so the banner and the rows can never disagree.
+  const [refusedHosts, setRefusedHosts] = useState<RefusedHost[]>([]);
   const [isResuming, setIsResuming] = useState(false);
   const [resumeError, setResumeError] = useState("");
   const [samplesByPattern, setSamplesByPattern] = useState<SamplesByPattern>({});
@@ -1079,12 +1084,13 @@ export default function ResultsDashboardPage({
       }
 
       try {
-        const [nextSessionData, nextPatterns, nextMismatches] =
+        const [nextSessionData, nextPatternsResponse, nextMismatches] =
           await Promise.all([
             getSession(params.id),
-            getPatterns(params.id),
+            getPatternsResponse(params.id),
             getMismatchedUrls(params.id)
           ]);
+        const nextPatterns = nextPatternsResponse.patterns;
         const sampleEntries = await Promise.all(
           nextPatterns.map(async (pattern) => [
             pattern.id,
@@ -1094,6 +1100,7 @@ export default function ResultsDashboardPage({
 
         setSessionData(nextSessionData);
         setPatterns(nextPatterns);
+        setRefusedHosts(nextPatternsResponse.refusedHosts);
         setMismatches(nextMismatches);
         setSamplesByPattern(Object.fromEntries(sampleEntries));
         setError("");
@@ -4161,6 +4168,48 @@ export default function ResultsDashboardPage({
                 </CardDescription>
               </CardHeader>
               <CardContent>
+                {/* SAID ONCE, ABOVE THE TABLE IT EXPLAINS.
+                    When a host refuses every request profile the checker knows, its
+                    patterns are skipped without a single request — so every row below
+                    reads "Not scored" and looks like an ordinary not-measured-yet. This
+                    is the difference between a screen nobody can act on and a specific
+                    allowlist request: which host, which edge answered, what it said. */}
+                {refusedHosts.length > 0 ? (
+                  <div
+                    className="mb-4 space-y-1 rounded-md border border-amber-300 bg-amber-50 px-3 py-3"
+                    data-testid="refused-host-banner"
+                  >
+                    {refusedHosts.map((refused) => (
+                      <p
+                        key={refused.host}
+                        className="flex items-start gap-2 text-sm text-amber-900"
+                      >
+                        <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                        <span>
+                          <span className="font-semibold">{refused.host}</span>{" "}
+                          refused every request profile the checker knows
+                          {refused.edge_server ? (
+                            <>
+                              {" "}
+                              (answered by{" "}
+                              <span className="font-mono text-xs">
+                                {refused.edge_server}
+                              </span>
+                              {refused.last_status
+                                ? `, HTTP ${refused.last_status}`
+                                : ""}
+                              )
+                            </>
+                          ) : null}
+                          . Its patterns were skipped rather than probed one by one, so
+                          they show as &ldquo;Not scored&rdquo; — that is missing
+                          measurement, not broken URLs. The checker needs to be
+                          allowlisted at that edge before this site can be checked.
+                        </span>
+                      </p>
+                    ))}
+                  </div>
+                ) : null}
                 {!isPrintMode ? (
                   <div className="mb-4 flex items-center gap-2">
                     <label
@@ -4768,6 +4817,10 @@ export default function ResultsDashboardPage({
                   // just show a panel. Opened via the amber "Fix" → leave it to an
                   // explicit press; that row already has a measurement.
                   autoStartRecheck={showCheckButton(fixRow)}
+                  // Why this pattern has no score, when the reason is that the
+                  // site refused us. Without it the panel would say "nobody
+                  // sampled these URLs", which is true and misleading.
+                  hostRefused={refusedHosts[0] ?? null}
                   selectedStatuses={fixStatusFilter}
                   onSelectedStatusesChange={(next) => {
                     setFixStatusFilter(next);

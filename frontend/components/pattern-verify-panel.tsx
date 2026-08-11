@@ -23,6 +23,7 @@ import {
   startPatternTriage,
   startUrlVerification,
   type PatternRecheckStatus,
+  type RefusedHost,
   type TriageRun,
   type VerificationStatus
 } from "@/lib/api";
@@ -87,6 +88,14 @@ type Props = {
   // leaves this false — that row already has a measurement, so re-probing it stays
   // an explicit choice.
   autoStartRecheck?: boolean;
+  // The host verdict for this session, when its edge refused every request profile.
+  //
+  // Without it this panel would tell a skipped pattern "none of its URLs were sampled
+  // during analysis", which is technically true and actively misleading: they were not
+  // sampled because the site refused us, not because anybody forgot. A skipped pattern
+  // and a never-attempted one look identical in the data, so the reason has to be
+  // passed in.
+  hostRefused?: RefusedHost | null;
 };
 
 function formatNumber(value: number) {
@@ -144,7 +153,8 @@ export function PatternVerifyPanel({
   selectedStatuses,
   onSelectedStatusesChange,
   onRescored,
-  autoStartRecheck = false
+  autoStartRecheck = false,
+  hostRefused = null
 }: Props) {
   const [verification, setVerification] = useState<VerificationStatus | null>(
     null
@@ -605,6 +615,21 @@ export function PatternVerifyPanel({
               : ""}
             . This row reads &ldquo;Not scored&rdquo; because a blocked response
             measures nothing, not because the URLs are broken.
+          </span>
+        </p>
+      ) : hostRefused ? (
+        <p
+          className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900"
+          data-testid="sample-host-refused-note"
+        >
+          <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            Skipped — {hostRefused.host}&rsquo;s edge refused every request
+            profile
+            {hostRefused.edge_server ? ` (${hostRefused.edge_server})` : ""}, so
+            this pattern was not probed at all. Nothing is wrong with these URLs
+            as far as we know; the checker needs to be allowlisted at that edge
+            first.
           </span>
         </p>
       ) : neverSampled ? (

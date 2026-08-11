@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 
 import { pool } from "../db/pool.js";
+import { hostStrategyFleetReport } from "../http/hostStrategyReport.js";
 import { VERIFY_PROBLEM_STATUSES } from "../jobs/verifyUrlsJob.js";
 import { enqueueDeleteProblemUrlsJob } from "../queue/maintenanceQueue.js";
 import {
@@ -74,6 +75,40 @@ function parseTargetStatuses(raw: unknown): number[] | null | Error {
 }
 
 export async function verificationRoutes(app: FastifyInstance) {
+  // THE FLEET REPORT. One request, runnable straight from the box, answering the
+  // question 650+ sites made unanswerable from per-URL rows: which hosts can the
+  // checker see, at which request profile, and which are refusing it.
+  //
+  // Lives here rather than in a new plugin because this is the same subject as the
+  // rest of this file — what a probe of a host actually produced. `?verdict=REFUSED`
+  // narrows it to the allowlist conversation, which is the list devops asked for.
+  app.get<{ Querystring: { verdict?: string } }>(
+    "/api/host-strategies",
+    async (request, reply) => {
+      const wanted = request.query.verdict?.toUpperCase();
+
+      if (wanted && wanted !== "OK" && wanted !== "REFUSED") {
+        return reply
+          .code(400)
+          .send(badRequest("verdict must be OK or REFUSED"));
+      }
+
+      const rows = await hostStrategyFleetReport();
+      const hosts = wanted ? rows.filter((row) => row.verdict === wanted) : rows;
+
+      return {
+        hosts,
+        // Counted server-side so a caller cannot mis-add them, and because "how many
+        // of the fleet refuse us" is the headline number this endpoint exists for.
+        totals: {
+          hosts: rows.length,
+          refused: rows.filter((row) => row.verdict === "REFUSED").length,
+          ok: rows.filter((row) => row.verdict === "OK").length
+        }
+      };
+    }
+  );
+
   // Start (or attach to) a full-population verification. Body may carry
   // pattern_ids to verify a subset; absent → every current pattern.
   app.post<{

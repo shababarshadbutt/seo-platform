@@ -22,6 +22,7 @@ import type {
 import { config } from "../config.js";
 import { decryptSecret, encryptSecret } from "../crypto/secrets.js";
 import { pool } from "../db/pool.js";
+import { refusedHostsForSession } from "../http/hostStrategyReport.js";
 import { fsErrorResponse } from "../errors/fsErrors.js";
 import {
   deleteFromGSC,
@@ -2661,9 +2662,10 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
   app.get<{ Params: SessionParams }>(
     "/api/sessions/:id/patterns",
     async (request, reply) => {
-      const sessionResult = await pool.query("SELECT 1 FROM sessions WHERE id = $1", [
-        request.params.id
-      ]);
+      const sessionResult = await pool.query<{ base_url: string }>(
+        "SELECT base_url FROM sessions WHERE id = $1",
+        [request.params.id]
+      );
 
       if (sessionResult.rowCount === 0) {
         return reply.code(404).send({
@@ -2714,7 +2716,18 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       );
 
       return {
-        patterns: patternsResult.rows
+        patterns: patternsResult.rows,
+        // SAY IT ONCE. When a host refuses every request profile, the circuit breaker
+        // skips its patterns entirely, so the table fills with unscored rows that each
+        // look like an ordinary "not measured yet". One line naming the host and the
+        // edge that refused us is the honest version of that, and it is what turns a
+        // screenful of "Not scored" into an actionable allowlist request.
+        //
+        // Served from the endpoint the table already calls: no extra round trip, and
+        // the banner cannot disagree with the rows it sits above.
+        refused_hosts: await refusedHostsForSession(
+          sessionResult.rows[0].base_url
+        )
       };
     }
   );

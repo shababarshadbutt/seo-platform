@@ -222,8 +222,25 @@ type CreateSessionResponse = {
   session_id: string;
 };
 
+// A host whose edge refused EVERY request profile the checker knows.
+//
+// Its patterns were skipped without a single request rather than probed one by one to
+// learn the same refusal thousands of times, so the table shows them unscored. This is
+// how the page says that ONCE, with the piece of information that makes it actionable:
+// edge_server tells whoever reads it whether a load balancer is refusing our egress IP
+// (an allowlist request) or the origin itself is (a different conversation).
+export type RefusedHost = {
+  host: string;
+  verdict: "OK" | "REFUSED";
+  winning_rung: string | null;
+  edge_server: string | null;
+  last_status: number | null;
+  decided_at: string;
+};
+
 type PatternsResponse = {
   patterns: Pattern[];
+  refused_hosts?: RefusedHost[];
 };
 
 type SamplesResponse = {
@@ -1050,7 +1067,12 @@ export async function resumeSession(sessionId: string) {
 // drawer never spins forever — on timeout it shows an error + Retry. (v1.36 Fix 1)
 export const DRAWER_SAMPLES_TIMEOUT_MS = 15000;
 
-export async function getPatterns(sessionId: string) {
+// The full payload: patterns plus any host whose edge refused every profile. One
+// request, so the "this site refused us" banner can never disagree with the rows it
+// sits above.
+export async function getPatternsResponse(
+  sessionId: string
+): Promise<{ patterns: Pattern[]; refusedHosts: RefusedHost[] }> {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/patterns`),
     {
@@ -1059,7 +1081,11 @@ export async function getPatterns(sessionId: string) {
   );
   const data = await readJsonResponse<PatternsResponse>(response);
 
-  return data.patterns;
+  return { patterns: data.patterns, refusedHosts: data.refused_hosts ?? [] };
+}
+
+export async function getPatterns(sessionId: string) {
+  return (await getPatternsResponse(sessionId)).patterns;
 }
 
 export async function getPatternSamples(
