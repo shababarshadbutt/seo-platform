@@ -126,9 +126,10 @@ async function persistPatternSamples(
             redirect_count,
             http_status_category,
             source_file,
-            error_reason
+            error_reason,
+            used_fallback_profile
           )
-          VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11)
+          VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, $12)
         `,
         [
           patternId,
@@ -141,7 +142,10 @@ async function persistPatternSamples(
           result.redirectCount,
           result.httpStatusCategory,
           sourceFile,
-          result.errorReason
+          result.errorReason,
+          // Which profile produced this verdict (mig 043) — a pattern that needed
+          // the browser fallback must not look like one that never did.
+          result.usedFallbackProfile
         ]
       );
     }

@@ -30,7 +30,8 @@ function result(scoreWeight: number, redirectCount = 0): SampleCheckResult {
     httpStatusCategory: "success",
     scoreWeight,
     timedOut: false,
-    errorReason: null
+    errorReason: null,
+    usedFallbackProfile: false
   };
 }
 

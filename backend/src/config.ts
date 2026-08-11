@@ -13,6 +13,26 @@ type NumberEnvOptions = {
 export const DEFAULT_HTTP_USER_AGENT =
   "Mozilla/5.0 (compatible; SitemapHealthChecker/1.0)";
 
+// The ESCALATION user-agent, used only after the honest UA above is confirmed
+// blocked (see BROWSER_FALLBACK_PROFILE in jobs/sampleUrlCheck.ts).
+//
+// This is NOT interchangeable with DEFAULT_HTTP_USER_AGENT, and the two must never
+// be collapsed: that constant is deliberately the honest crawler UA because a
+// browser UA tripped AWS WAF Bot Control on aerooemparts.com and friends (the
+// comment above, migration 032). stackedindustrials.com measured the exact
+// reverse — the honest UA gets 403/405 there, and this string plus four
+// Sec-Fetch-* headers returns clean 200s.
+//
+// Both findings are real, on sites in the same family, which is why neither UA can
+// be "the" default across 650+ sites. The honest one stays primary so nothing
+// working today regresses; this one is the second attempt.
+//
+// The exact string is the pre-migration-032 built-in default, i.e. the one that
+// was in production long enough to be measured — kept verbatim rather than bumped
+// to a newer Chrome version, because a version nobody has tested is not evidence.
+export const BROWSER_PROFILE_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
 function readNumber(name: string, options: NumberEnvOptions): number {
   const raw = process.env[name];
 

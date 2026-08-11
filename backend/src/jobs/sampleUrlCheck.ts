@@ -3,6 +3,7 @@ import { performance } from "node:perf_hooks";
 import type { FastifyBaseLogger } from "fastify";
 import { request } from "undici";
 
+import { BROWSER_PROFILE_USER_AGENT } from "../config.js";
 import { tlsAwareDispatcher } from "../http/tlsDispatcher.js";
 import { SOFT_404_TEXT_SIGNALS } from "../sitemaps/softNotFound.js";
 import { hasWafBlockHeader, isMethodRejectedStatus } from "./sampleHttpStatus.js";
@@ -81,6 +82,61 @@ export type HttpStatusCategory =
   | "soft_404"
   | "blocked";
 
+// How a request identifies itself. A profile rather than a bare UA string because
+// the two strategies below differ by HEADERS as well as user-agent, and passing
+// them separately through four call sites is how they drift apart.
+export type RequestProfile = {
+  userAgent: string;
+  extraHeaders?: Record<string, string>;
+};
+
+// The escalation profile, tried ONLY after the primary one is confirmed blocked.
+//
+// WHY THERE IS NO SINGLE CORRECT UA. Migration 032 documented the opposite
+// finding on a DIFFERENT site in this same family: a browser UA arriving without a
+// matching browser fingerprint tripped AWS WAF Bot Control into a CAPTCHA, and the
+// honest crawler UA passed. On stackedindustrials.com devops measured the reverse
+// — the honest UA is blocked 403/405, and this Chrome UA plus Sec-Fetch-* returns
+// clean 200s. Both observations are real. Across 650+ sites there is no winner to
+// pick, so the primary strategy is left completely unchanged (nothing that works
+// today can regress) and this is only reached on a confirmed block.
+//
+// NOT DEFAULT_HTTP_USER_AGENT. That constant is the HONEST CRAWLER UA
+// ("...compatible; SitemapHealthChecker/1.0"), which is the session default and
+// therefore already the PRIMARY profile — using it here would make the retry
+// byte-identical to the attempt that just failed, doubling request cost while
+// changing nothing. config.ts's BROWSER_PROFILE_USER_AGENT is the Chrome string,
+// kept there so both UAs and the reason they differ live in one place.
+//
+// Sec-Fetch-* only. Deliberately NO sec-ch-ua Client Hints: those are version-tied
+// to the UA string and become a maintenance burden to keep consistent, and they
+// were not what was proven to matter here.
+export const BROWSER_FALLBACK_PROFILE: RequestProfile = {
+  userAgent: BROWSER_PROFILE_USER_AGENT,
+  extraHeaders: {
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+    "sec-fetch-user": "?1",
+    "sec-fetch-dest": "document"
+  }
+};
+
+// Base headers first, profile extras second. user-agent/accept/accept-language are
+// re-applied AFTER the spread so extraHeaders can never override the three the
+// checker controls — a profile is additive, not a rewrite.
+function profileHeaders(
+  profile: RequestProfile,
+  extra?: Record<string, string>
+): Record<string, string> {
+  return {
+    ...(profile.extraHeaders ?? {}),
+    ...(extra ?? {}),
+    "user-agent": profile.userAgent,
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.9"
+  };
+}
+
 type HeadResult = {
   statusCode: number | null;
   responseMs: number;
@@ -105,6 +161,12 @@ export type SampleCheckResult = {
   scoreWeight: number;
   timedOut: boolean;
   errorReason: SampleErrorReason | null;
+  // True when this verdict came from the browser fallback profile rather than the
+  // caller's own UA — the primary attempt was blocked and the retry ran. Persisted
+  // so a pattern that NEEDED the fallback is distinguishable in the data from one
+  // that never did: across 650+ sites, knowing which consistently require the
+  // browser profile is useful, and nobody should re-derive it from logs.
+  usedFallbackProfile: boolean;
 };
 
 type BodyPrefixResult = {
@@ -171,7 +233,7 @@ function firstHeaderValue(value: string | string[] | undefined) {
 
 async function headOnce(
   url: string,
-  userAgent: string,
+  profile: RequestProfile,
   beforeRequest?: BeforeRequestHook
 ): Promise<HeadResult> {
   const started = performance.now();
@@ -183,12 +245,7 @@ async function headOnce(
       method: "HEAD",
       maxRedirections: 0,
       dispatcher: tlsAwareDispatcher,
-      headers: {
-        "user-agent": userAgent,
-        accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "accept-language": "en-US,en;q=0.9"
-      },
+      headers: profileHeaders(profile),
       headersTimeout: HTTP_TIMEOUT_MS,
       bodyTimeout: HTTP_TIMEOUT_MS,
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
@@ -261,7 +318,7 @@ async function readBodyPrefix(
 // new.
 async function getStatusOnce(
   url: string,
-  userAgent: string,
+  profile: RequestProfile,
   beforeRequest?: BeforeRequestHook
 ): Promise<HeadResult> {
   const started = performance.now();
@@ -273,13 +330,7 @@ async function getStatusOnce(
       method: "GET",
       maxRedirections: 0,
       dispatcher: tlsAwareDispatcher,
-      headers: {
-        "user-agent": userAgent,
-        accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "accept-language": "en-US,en;q=0.9",
-        "accept-encoding": "identity"
-      },
+      headers: profileHeaders(profile, { "accept-encoding": "identity" }),
       headersTimeout: HTTP_TIMEOUT_MS,
       bodyTimeout: HTTP_TIMEOUT_MS,
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
@@ -318,7 +369,7 @@ async function getStatusOnce(
 
 async function checkSoft404Signals(
   url: string,
-  userAgent: string,
+  profile: RequestProfile,
   beforeRequest?: BeforeRequestHook
 ): Promise<Soft404CheckResult> {
   const started = performance.now();
@@ -330,14 +381,10 @@ async function checkSoft404Signals(
       method: "GET",
       maxRedirections: 0,
       dispatcher: tlsAwareDispatcher,
-      headers: {
-        "user-agent": userAgent,
-        accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "accept-language": "en-US,en;q=0.9",
+      headers: profileHeaders(profile, {
         "accept-encoding": "identity",
         range: `bytes=0-${SOFT_404_BODY_SAMPLE_BYTES - 1}`
-      },
+      }),
       headersTimeout: HTTP_TIMEOUT_MS,
       bodyTimeout: HTTP_TIMEOUT_MS,
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
@@ -394,28 +441,25 @@ function resolveRedirectUrl(location: string | null, sourceUrl: string) {
   }
 }
 
-export async function checkSampleUrl(
-  baseUrl: string,
-  samplePath: string,
-  sampleSourceUrl: string | null,
-  userAgent: string,
+// ONE attempt, with ONE profile: HEAD, the method-rejection GET re-probe, the
+// soft-404 sniff and the redirect follow — the whole check.
+//
+// This function contains NO retry logic, which is what makes the recursion guard
+// structural rather than a flag: checkSampleUrl below is the only place that can
+// start a second attempt, and it never calls itself. There is no code path from
+// here back into a retry.
+async function runCheckWithProfile(
+  url: string,
+  profile: RequestProfile,
   logger: FastifyBaseLogger,
-  context: SampleLogContext,
-  options: SampleCheckOptions = {}
+  logContext: Record<string, unknown>,
+  options: SampleCheckOptions
 ): Promise<SampleCheckResult> {
   const { beforeRequest, skipRedirectFollow = false } = options;
-  const url = resolveSampleTarget(baseUrl, samplePath, sampleSourceUrl);
-  const logContext = {
-    session_id: context.sessionId,
-    pattern_id: context.patternId,
-    template: context.template,
-    sample_index: context.sampleIndex,
-    url
-  };
 
   logger.info(logContext, "sample url HEAD request started");
 
-  let firstResult = await headOnce(url, userAgent, beforeRequest);
+  let firstResult = await headOnce(url, profile, beforeRequest);
   let methodFallbackFrom: number | null = null;
 
   // HEAD refused for being HEAD: re-probe with GET and classify on THAT, so the
@@ -428,7 +472,7 @@ export async function checkSampleUrl(
       "sample url HEAD method-rejected, re-probing with GET"
     );
 
-    const getResult = await getStatusOnce(url, userAgent, beforeRequest);
+    const getResult = await getStatusOnce(url, profile, beforeRequest);
 
     firstResult = {
       ...getResult,
@@ -444,7 +488,7 @@ export async function checkSampleUrl(
 
     const soft404Result = await checkSoft404Signals(
       url,
-      userAgent,
+      profile,
       beforeRequest
     );
 
@@ -472,14 +516,17 @@ export async function checkSampleUrl(
       httpStatusCategory: soft404Result.isSoft404 ? "soft_404" : "success",
       scoreWeight: soft404Result.isSoft404 ? 0.25 : 1,
       timedOut: firstResult.timedOut || soft404Result.timedOut,
-      errorReason: null
+      errorReason: null,
+      // The runner does not know about escalation; checkSampleUrl overrides this
+      // when a verdict came from the fallback attempt.
+      usedFallbackProfile: false
     };
   } else if (isRedirectStatus(firstResult.statusCode)) {
     const finalUrl = resolveRedirectUrl(firstResult.location, url);
     let responseMs = firstResult.responseMs;
 
     if (finalUrl && !skipRedirectFollow) {
-      const followResult = await headOnce(finalUrl, userAgent, beforeRequest);
+      const followResult = await headOnce(finalUrl, profile, beforeRequest);
 
       responseMs += followResult.responseMs;
     }
@@ -495,7 +542,8 @@ export async function checkSampleUrl(
       httpStatusCategory: "redirect",
       scoreWeight: 0.5,
       timedOut: firstResult.timedOut,
-      errorReason: null
+      errorReason: null,
+      usedFallbackProfile: false
     };
   } else {
     // BLOCKED vs FAILURE. Two high-confidence signals only — no vendor guessing,
@@ -533,7 +581,8 @@ export async function checkSampleUrl(
       // httpStatus and errorReason stay exactly as observed: an operator looking
       // at sampled_urls must still see the raw 403/405. Only the pattern-level
       // verdict changes.
-      errorReason: firstResult.errorReason
+      errorReason: firstResult.errorReason,
+      usedFallbackProfile: false
     };
   }
 
@@ -551,7 +600,8 @@ export async function checkSampleUrl(
       // Non-null when HEAD was method-rejected and the verdict came from the GET
       // re-probe instead — makes the fallback auditable in the logs rather than
       // silently changing what a status means.
-      method_fallback_from: methodFallbackFrom
+      method_fallback_from: methodFallbackFrom,
+      user_agent: profile.userAgent
     },
     "sample url HEAD request completed"
   );
@@ -559,4 +609,80 @@ export async function checkSampleUrl(
   return {
     ...result
   };
+}
+
+// The public checker. Callers still pass a bare session user_agent — nothing about
+// how samplePatternsJob or verifyProbe call this changed.
+//
+// TWO ATTEMPTS, MAXIMUM. The primary profile is the caller's UA with no extra
+// headers, i.e. exactly today's behaviour, so a site that is not blocking pays
+// nothing and cannot regress. Only a CONFIRMED block escalates to
+// BROWSER_FALLBACK_PROFILE, and the second attempt is the full check again (its own
+// HEAD, GET re-probe and soft-404 sniff) rather than a half-check.
+//
+// COST. Unblocked sites: unchanged. A consistently-blocking site: at worst 4
+// requests per check instead of 2 — and every one still goes through the same
+// beforeRequest hook, so the per-host rate limiter paces the retry identically. No
+// volume is reintroduced.
+export async function checkSampleUrl(
+  baseUrl: string,
+  samplePath: string,
+  sampleSourceUrl: string | null,
+  userAgent: string,
+  logger: FastifyBaseLogger,
+  context: SampleLogContext,
+  options: SampleCheckOptions = {}
+): Promise<SampleCheckResult> {
+  const url = resolveSampleTarget(baseUrl, samplePath, sampleSourceUrl);
+  const logContext = {
+    session_id: context.sessionId,
+    pattern_id: context.patternId,
+    template: context.template,
+    sample_index: context.sampleIndex,
+    url
+  };
+
+  const primary: RequestProfile = { userAgent, extraHeaders: {} };
+  const primaryResult = await runCheckWithProfile(
+    url,
+    primary,
+    logger,
+    logContext,
+    options
+  );
+
+  if (primaryResult.httpStatusCategory !== "blocked") {
+    return primaryResult;
+  }
+
+  logger.info(
+    { ...logContext, blocked_status: primaryResult.httpStatus },
+    "sample url blocked on the primary profile, retrying with the browser profile"
+  );
+
+  const fallbackResult = await runCheckWithProfile(
+    url,
+    BROWSER_FALLBACK_PROFILE,
+    logger,
+    { ...logContext, profile: "browser-fallback" },
+    options
+  );
+
+  // Still blocked on both: report blocked, exactly as before. Two attempts is the
+  // ceiling — there is no third profile and no loop.
+  if (fallbackResult.httpStatusCategory === "blocked") {
+    return { ...fallbackResult, usedFallbackProfile: true };
+  }
+
+  // The fallback got a real answer, so THAT is the truth about this URL.
+  logger.info(
+    {
+      ...logContext,
+      recovered_status: fallbackResult.httpStatus,
+      recovered_category: fallbackResult.httpStatusCategory
+    },
+    "sample url recovered with the browser fallback profile"
+  );
+
+  return { ...fallbackResult, usedFallbackProfile: true };
 }
