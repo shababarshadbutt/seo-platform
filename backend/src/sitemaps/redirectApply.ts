@@ -25,6 +25,27 @@ import type { RedirectRule } from "./redirectRule.js";
 // using the SAME scoreWeight formula as the sampling job (success=1,
 // soft_404=0.25, redirect=0.5, failure=0), so apply-redirects and its undo are
 // exact inverses. Parameter $1 is the pattern id.
+//
+// BLOCKED ROWS ARE EXCLUDED FROM BOTH SIDES OF BOTH FRACTIONS, exactly as
+// calculatePatternScore's `measurable` filter does (patternScore.ts). A blocked row
+// is not a data point — the site's security answered instead of the page — and
+// averaging it in as a zero reports a working URL as broken. This SQL had drifted
+// from that filter: `ELSE 0` scored blocked rows as failures AND counted them in
+// the denominator, so the first apply-redirects (or its undo) on a pattern with any
+// blocked sample silently dragged confidence back down, re-introducing the exact
+// lie the "blocked" category was added to stop.
+//
+// When EVERY sample is blocked the filtered count is 0, so NULLIF -> NULL and
+// COALESCE leaves the stored values untouched — the same "nothing measurable, so
+// assert nothing" outcome patternScore produces.
+//
+// IS DISTINCT FROM, not <>: http_status_category is nullable (migration 003 kept
+// NULLs), and a plain <> would silently drop those legacy rows from the population
+// instead of scoring them 0 the way the CASE always has.
+//
+// `status` is deliberately NOT recomputed here. It is owned by the sampling job,
+// which is the only thing that actually re-probes a URL; a redirect apply rewrites
+// XML and re-derives percentages from rows it did not re-measure.
 export const recomputePatternStatsSql = `
   UPDATE patterns
   SET
@@ -34,7 +55,9 @@ export const recomputePatternStatsSql = `
           / NULLIF(COUNT(*), 0),
         2
       )
-      FROM sampled_urls WHERE pattern_id = $1
+      FROM sampled_urls
+      WHERE pattern_id = $1
+        AND http_status_category IS DISTINCT FROM 'blocked'
     ), redirect_pct),
     confidence_pct = COALESCE((
       SELECT ROUND(
@@ -48,7 +71,9 @@ export const recomputePatternStatsSql = `
         ) / NULLIF(COUNT(*), 0),
         2
       )
-      FROM sampled_urls WHERE pattern_id = $1
+      FROM sampled_urls
+      WHERE pattern_id = $1
+        AND http_status_category IS DISTINCT FROM 'blocked'
     ), confidence_pct)
   WHERE id = $1
 `;
