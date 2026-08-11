@@ -2,6 +2,9 @@ import type { FastifyBaseLogger } from "fastify";
 
 import { pool } from "../db/pool.js";
 import { checkSampleUrl, type SampleCheckResult } from "./sampleUrlCheck.js";
+// Pure scoring lives in its own module so it is unit-testable without loading
+// this job (and with it a BullMQ/Redis connection). See patternScore.ts.
+import { calculatePatternScore } from "./patternScore.js";
 import { isSessionCancelled, markSessionComplete } from "./sessionCompletion.js";
 
 // The per-URL HTTP checker (HEAD -> GET fallback -> soft-404 sniff) lives in
@@ -37,7 +40,6 @@ type PatternUrlRow = {
   source_url: string | null;
 };
 
-type PatternStatus = "GOOD" | "WARNING" | "BAD";
 
 async function mapWithConcurrency<T, R>(
   items: T[],
@@ -68,43 +70,6 @@ async function mapWithConcurrency<T, R>(
   );
 
   return results;
-}
-
-function patternStatusForConfidence(confidencePct: number): PatternStatus {
-  if (confidencePct >= 80) {
-    return "GOOD";
-  }
-
-  if (confidencePct >= 50) {
-    return "WARNING";
-  }
-
-  return "BAD";
-}
-
-function calculatePatternScore(results: SampleCheckResult[]) {
-  if (results.length === 0) {
-    return {
-      confidencePct: 0,
-      redirectPct: 0,
-      status: "BAD" as const
-    };
-  }
-
-  const scoreTotal = results.reduce(
-    (total, result) => total + result.scoreWeight,
-    0
-  );
-  const redirectTotal = results.filter((result) => result.redirectCount > 0)
-    .length;
-  const confidencePct = Number(((scoreTotal / results.length) * 100).toFixed(2));
-  const redirectPct = Number(((redirectTotal / results.length) * 100).toFixed(2));
-
-  return {
-    confidencePct,
-    redirectPct,
-    status: patternStatusForConfidence(confidencePct)
-  };
 }
 
 async function loadSamplePool(patternId: string, sampleLimit: number) {
