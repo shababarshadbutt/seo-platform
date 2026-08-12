@@ -1,5 +1,9 @@
 import type { FastifyBaseLogger } from "fastify";
 
+import {
+  logDiagnosticEvent,
+  type DiagnosticEmitter
+} from "../diagnostics/eventLog.js";
 import { runCheckWithProfile } from "../jobs/sampleUrlCheck.js";
 import {
   acquireHostSlot,
@@ -7,6 +11,7 @@ import {
   verificationRateLimit
 } from "./hostRateLimiter.js";
 import {
+  noteHostCheckOutcome,
   resolveHostStrategy,
   type ResolvedHostStrategy
 } from "./hostStrategy.js";
@@ -30,6 +35,28 @@ export type HostStrategyRun = {
   forTarget: (targetUrl: string, probeUrl?: string | null) => Promise<ResolvedHostStrategy>;
   // Everything resolved so far, for the end-of-run report.
   resolved: () => ResolvedHostStrategy[];
+  // Record that this run declined to check something because the host refuses us.
+  //
+  // ON THE RUN, not free-floating, so it cannot be called without the session and phase
+  // that make it meaningful. Callers decide the GRANULARITY, and that is the whole point:
+  // sampling calls it once per pattern, verification once per HOST for an entire run of
+  // up to 1.3M URLs. See the note on each call site.
+  noteSkipped: (
+    strategy: ResolvedHostStrategy,
+    fields: { pattern?: string | null; url_count_affected: number }
+  ) => void;
+  // Feed the staleness heuristic, with this run's session and phase attached.
+  //
+  // Wraps noteHostCheckOutcome rather than exposing the emitter, because this is the one
+  // hook called PER URL — up to 1.3M times — and a call site holding a raw emitter here
+  // is one refactor away from writing a line per URL. Routing it through the run keeps
+  // the "only on a threshold crossing" rule in one place.
+  noteOutcome: (host: string, wasClean: boolean) => void;
+};
+
+export type HostStrategyRunContext = {
+  sessionId: string;
+  phase: "sampling" | "recheck" | "verification" | "triage";
 };
 
 function isBareRoot(url: string): boolean {
@@ -42,10 +69,24 @@ function isBareRoot(url: string): boolean {
 
 export function createHostStrategyRun(
   sessionUserAgent: string,
-  logger: FastifyBaseLogger
+  logger: FastifyBaseLogger,
+  // WHICH SESSION this run belongs to, and which PHASE is asking. Both go on every
+  // diagnostic event: the durable files are keyed by session, and "sampling skipped this
+  // pattern" and "verification skipped this host" are different findings that used to be
+  // indistinguishable in one interleaved log stream.
+  //
+  // Required — the three callers all have a session row in hand before they get here, so
+  // there is no path that legitimately omits it.
+  context: HostStrategyRunContext
 ): HostStrategyRun {
   const byHost = new Map<string, ResolvedHostStrategy>();
   const inFlight = new Map<string, Promise<ResolvedHostStrategy>>();
+  const emit: DiagnosticEmitter = (event, fields) => {
+    logDiagnosticEvent(event, context.sessionId, {
+      phase: context.phase,
+      ...fields
+    });
+  };
 
   async function resolve(
     host: string,
@@ -54,6 +95,8 @@ export function createHostStrategyRun(
     const strategy = await resolveHostStrategy(host, probeUrl, sessionUserAgent, {
       store: hostStrategyStore,
       logger,
+      sessionId: context.sessionId,
+      emit,
       // Negotiation is a real request to the client's origin, so it is paced by the
       // SAME per-host budget as everything else. No separate limiter, no exception:
       // a "quick pre-flight" that bypassed the budget would be the second unmetered
@@ -120,6 +163,30 @@ export function createHostStrategyRun(
     },
     resolved() {
       return Array.from(byHost.values());
+    },
+    noteSkipped(strategy, fields) {
+      // THE EVENT THAT PROVES THE CIRCUIT BREAKER IS BEING CONSULTED. If a session is
+      // full of unscored rows and there are almost no skip events, the breaker is not
+      // running — which is the most likely bug after a change to this engine, and it is
+      // invisible in outcome data because "skipped" and "never measured" look identical
+      // in the database.
+      //
+      // decided_at is what turns it from an observation into something actionable: a
+      // skip obeying a verdict from six days ago may be enforcing a block that the
+      // target's side already lifted.
+      emit("host_strategy_skipped", {
+        host: strategy.host,
+        reason: "verdict_REFUSED",
+        edge_server: strategy.edgeServer,
+        last_status: strategy.lastStatus,
+        source: strategy.source,
+        decided_at: strategy.decidedAt,
+        pattern: fields.pattern ?? null,
+        url_count_affected: fields.url_count_affected
+      });
+    },
+    noteOutcome(host, wasClean) {
+      noteHostCheckOutcome(host, wasClean, emit);
     }
   };
 }

@@ -212,7 +212,10 @@ export async function processTriageSampleJob(
     // estimate of zero — an estimate built from refusals is not an estimate, and
     // "0 problem URLs" would be the single most misleading thing this panel could
     // say about a site nobody can see.
-    const strategyRun = createHostStrategyRun(session.user_agent, logger);
+    const strategyRun = createHostStrategyRun(session.user_agent, logger, {
+      sessionId,
+      phase: "triage"
+    });
     const firstUrl = plan.strata[0]?.urls[0] ?? allUrls[0];
     const strategy = firstUrl
       ? await strategyRun.forTarget(
@@ -238,6 +241,14 @@ export async function processTriageSampleJob(
         },
         "triage sample abandoned — the host refused every request profile"
       );
+      // Once per run. url_count_affected is the population the estimate WOULD have
+      // covered, which is what makes the abandonment legible: the panel showing an
+      // error instead of "0 problem URLs" is the correct outcome, and this says how much
+      // it declined to guess about.
+      strategyRun.noteSkipped(strategy, {
+        pattern: null,
+        url_count_affected: allUrls.length
+      });
 
       return;
     }

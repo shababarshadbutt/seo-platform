@@ -11,7 +11,6 @@ import {
   rateLimitHostKey,
   verificationRateLimit
 } from "../http/hostRateLimiter.js";
-import { noteHostCheckOutcome } from "../http/hostStrategy.js";
 import { createHostStrategyRun } from "../http/hostStrategyRun.js";
 import { resolveSampleTarget } from "./sampleTarget.js";
 // Pure scoring lives in its own module so it is unit-testable without loading
@@ -327,7 +326,15 @@ export async function processSamplePatternsJob(
     let sampledUrlCount = 0;
     let skippedPatternCount = 0;
     let refusedPatternCount = 0;
-    const strategyRun = createHostStrategyRun(session.user_agent, logger);
+    let emptyPoolPatternCount = 0;
+    const strategyRun = createHostStrategyRun(session.user_agent, logger, {
+      sessionId: data.session_id,
+      // A scoped run is the Check button re-measuring ONE pattern, which is a different
+      // thing from a session's original sampling pass and has to be readable as such:
+      // "the row still says Not scored after I pressed Check" is answered by the recheck
+      // events, and mixing them into the sampling ones would hide it.
+      phase: scopedPatternId ? "recheck" : "sampling"
+    });
 
     // PRE-FLIGHT: negotiate the host ONCE, before any per-URL work, using a deep URL
     // from the largest pattern (patterns arrive ordered by total_urls DESC) and the
@@ -336,21 +343,34 @@ export async function processSamplePatternsJob(
     // Doing it here rather than lazily inside the loop is what makes the cost bounded
     // and legible: at most three probes decide the host, and a REFUSED host is known
     // before a single pattern is touched.
-    for (const candidate of patternsResult.rows.slice(0, 2)) {
-      const probe = await loadNegotiationProbeUrl(candidate.id);
+    //
+    // GUARDED, for the same reason resolveHostStrategy is: choosing a probe URL is
+    // optional work. loadNegotiationProbeUrl is a query and resolveSampleTarget
+    // parses a URL, and neither is a reason to abandon a session's measurement —
+    // the run simply proceeds without a learned recipe, which is what it did
+    // before this engine existed.
+    try {
+      for (const candidate of patternsResult.rows.slice(0, 2)) {
+        const probe = await loadNegotiationProbeUrl(candidate.id);
 
-      if (!probe) {
-        continue;
+        if (!probe) {
+          continue;
+        }
+
+        const probeTarget = resolveSampleTarget(
+          session.base_url,
+          probe.path,
+          probe.source_url
+        );
+
+        await strategyRun.forTarget(probeTarget, probeTarget);
+        break;
       }
-
-      const probeTarget = resolveSampleTarget(
-        session.base_url,
-        probe.path,
-        probe.source_url
+    } catch (error) {
+      logger.warn(
+        { session_id: data.session_id, error },
+        "host pre-flight failed — sampling continues on the default request ladder"
       );
-
-      await strategyRun.forTarget(probeTarget, probeTarget);
-      break;
     }
 
     for (const pattern of patternsResult.rows) {
@@ -371,29 +391,50 @@ export async function processSamplePatternsJob(
       const sampleLimit = Math.min(session.sample_size, totalUrls);
       const samplePool = await loadSamplePool(pattern.id, sampleLimit);
 
-      // THE CIRCUIT BREAKER. Every rung was refused for this host, so there is
-      // nothing left to learn from probing its URLs one at a time: skip the pattern
-      // outright, issuing ZERO requests.
+      // NEVER CALL persistPatternSamples WITH AN EMPTY RESULT SET. It DELETEs the
+      // pattern's sampled_urls and then inserts what it was given, so an empty set
+      // erases a real measurement from an earlier run and rewrites the row as
+      // PENDING — "Not scored" — for a reason that has nothing to do with the site.
+      // A pattern that was not measured on this pass instead keeps status NULL
+      // (migration 002 dropped the NOT NULL and the 'PENDING' default), which
+      // normalizeStatus renders as the same honest "Not scored", and a pattern that
+      // already has data keeps the data it legitimately has.
       //
-      // persistPatternSamples is deliberately NOT called. It DELETEs then re-inserts,
-      // so calling it with an empty result set would wipe real measurements from an
-      // earlier run whenever a host became temporarily refused. A never-sampled
-      // pattern instead keeps status NULL (migration 002 dropped the NOT NULL and the
-      // 'PENDING' default), which the frontend's normalizeStatus renders as
-      // "Not scored" — the same honest cell PENDING produces — and an older pattern
-      // keeps the data it legitimately has.
+      // Two ways to arrive at "measured nothing", and BOTH have to return here:
       const firstSample = samplePool[0];
-      const patternStrategy = firstSample
-        ? await strategyRun.forTarget(
-            resolveSampleTarget(
-              session.base_url,
-              firstSample.path,
-              firstSample.source_url
-            )
-          )
-        : null;
 
-      if (patternStrategy?.skip) {
+      // 1. NO STORED POOL. Extraction kept no candidate URLs for this pattern, so
+      //    there is nothing to probe. No amount of retrying fixes it and neither
+      //    does a re-check — the recheck endpoint correctly 400s on pool_total = 0
+      //    and says "re-run the analysis". This branch used to fall through into
+      //    persistPatternSamples([]) and take the footgun above.
+      if (!firstSample) {
+        emptyPoolPatternCount += 1;
+        logger.warn(
+          {
+            session_id: data.session_id,
+            pattern_id: pattern.id,
+            template: pattern.template,
+            total_urls: totalUrls,
+            requested_sample_size: sampleLimit
+          },
+          "pattern has no stored sample URLs — leaving its score untouched rather than overwriting it with an empty measurement"
+        );
+        continue;
+      }
+
+      const patternStrategy = await strategyRun.forTarget(
+        resolveSampleTarget(
+          session.base_url,
+          firstSample.path,
+          firstSample.source_url
+        )
+      );
+
+      // 2. THE CIRCUIT BREAKER. Every rung was refused for this host, so there is
+      //    nothing left to learn from probing its URLs one at a time: skip the
+      //    pattern outright, issuing ZERO requests.
+      if (patternStrategy.skip) {
         refusedPatternCount += 1;
         logger.warn(
           {
@@ -406,6 +447,13 @@ export async function processSamplePatternsJob(
           },
           "pattern skipped — the host refused every request profile"
         );
+        // ONE PER PATTERN — roughly 14 lines on a session like the one that started this
+        // investigation, and it carries total_urls so the file says how much measurement
+        // was actually forgone (4,020,427 URLs on that session's largest pattern).
+        strategyRun.noteSkipped(patternStrategy, {
+          pattern: pattern.template,
+          url_count_affected: totalUrls
+        });
         continue;
       }
 
@@ -467,14 +515,14 @@ export async function processSamplePatternsJob(
               // profile this is the whole saving: attempt #1 succeeds instead of
               // climbing from R0 on every single URL. Empty/absent ladder = today's
               // default pair, so an unknown host behaves exactly as before.
-              profileLadder: patternStrategy?.ladder.length
+              profileLadder: patternStrategy.ladder.length
                 ? patternStrategy.ladder
                 : undefined
             }
           ).then((result) => {
             // Feeds the staleness heuristic: enough consecutive refusals on a
             // previously-OK host and the next resolve re-negotiates once.
-            noteHostCheckOutcome(host, isRealMeasurement(result));
+            strategyRun.noteOutcome(host, isRealMeasurement(result));
 
             return result;
           });
@@ -532,6 +580,10 @@ export async function processSamplePatternsJob(
         // profile. On a fully-refused site this is every pattern, and the run costs
         // three probes instead of a full sample pass per pattern.
         refused_pattern_count: refusedPatternCount,
+        // Patterns with no stored sample pool. Distinct from refused: nothing about
+        // the SITE is implied, and a re-check cannot help them. If this equals
+        // pattern_count the whole run was a no-op and extraction is the suspect.
+        empty_pool_pattern_count: emptyPoolPatternCount,
         host_strategies: strategyRun.resolved().map((strategy) => ({
           host: strategy.host,
           verdict: strategy.verdict,

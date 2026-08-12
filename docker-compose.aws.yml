@@ -168,6 +168,7 @@ services:
       REDIS_URL: redis://redis:6379
       UPLOAD_DIR: /uploads
       EXPORT_DIR: /exports
+      DIAGNOSTICS_DIR: /diagnostics
       FRONTEND_URL: http://frontend:3000
       PDF_BACKEND_URL: http://localhost:3001
       CHROMIUM_PATH: /usr/bin/chromium-browser
@@ -219,6 +220,15 @@ services:
     volumes:
       - uploads:/uploads
       - exports:/exports
+      # A BIND MOUNT, not a named volume, and deliberately so: these files exist to be
+      # read by a human over SSH. On the host they land in ./diagnostics, so `tail -f`,
+      # `grep` and `scp` all work with no docker knowledge — whereas a named volume
+      # would need `docker compose exec` or `docker cp` for every look.
+      #
+      # The containers run as root (no USER in the Dockerfile), so the files are
+      # root-owned and world-readable: reading needs nothing, `rm` needs sudo. The
+      # directory is created by this mount on the first `up`.
+      - ${DIAGNOSTICS_HOST_PATH:-./diagnostics}:/diagnostics
       # Mount the SFTP private key read-only if using key-based auth; omit if
       # Transfer Family is configured for a different auth method.
       - ${SFTP_PRIVATE_KEY_HOST_PATH:-./secrets/sftp_private_key}:/run/secrets/sftp_private_key:ro
@@ -255,6 +265,7 @@ services:
       REDIS_URL: redis://redis:6379
       UPLOAD_DIR: /uploads
       EXPORT_DIR: /exports
+      DIAGNOSTICS_DIR: /diagnostics
 
       # Same Phase 1 config as backend — the queued SFTP-pull / S3-publish jobs
       # (mirroring the existing >200-file redirect-fix job pattern) run here.
@@ -282,6 +293,10 @@ services:
     volumes:
       - uploads:/uploads
       - exports:/exports
+      # Same mount as the backend: the worker is the process that NEGOTIATES hosts, so
+      # most of these events are written here. Both append to the same per-session file
+      # and each stamps its own `service`.
+      - ${DIAGNOSTICS_HOST_PATH:-./diagnostics}:/diagnostics
       - ${SFTP_PRIVATE_KEY_HOST_PATH:-./secrets/sftp_private_key}:/run/secrets/sftp_private_key:ro
     depends_on:
       postgres:

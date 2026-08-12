@@ -154,7 +154,12 @@ describe("sweepStaleArtifacts — cleaner run directories", () => {
       cleanerRunsRemoved: 0,
       cleanerBytesFreed: 0,
       partFilesRemoved: 0,
-      partBytesFreed: 0
+      partBytesFreed: 0,
+      // Reported as zero rather than omitted even when no diagnostics limits were
+      // passed, so the "sweep complete" log line always has the same shape and
+      // "is the diagnostics sweep running at all?" stays answerable from the logs.
+      diagnosticFilesRemoved: 0,
+      diagnosticBytesFreed: 0
     });
   });
 });
@@ -196,5 +201,124 @@ describe("sweepStaleArtifacts — abandoned .part copies", () => {
     await sweepStaleArtifacts(uploadDir, silent);
 
     assert.equal(existsSync(real), true);
+  });
+});
+
+// --- host-strategy diagnostics retention ------------------------------------
+//
+// The VM has already had one disk-growth incident from logs nobody bounded
+// (d8ca7df4, uncapped container logs). Writing per-session JSONL without a sweep
+// would be the same mistake with a different filename, so these are the tests
+// that keep the promise.
+describe("diagnostics retention", () => {
+  let diagnosticsDir: string;
+
+  beforeEach(async () => {
+    diagnosticsDir = await mkdtemp(path.join(tmpdir(), "diag-sweep-"));
+  });
+
+  afterEach(async () => {
+    await rm(diagnosticsDir, { recursive: true, force: true });
+  });
+
+  // Day directories are named YYYY-MM-DD in UTC, so seeding one is just a name.
+  async function seedDay(day: string, bytes: number, sessions = 1) {
+    const dir = path.join(diagnosticsDir, "host-strategy", day);
+
+    await mkdir(dir, { recursive: true });
+
+    for (let index = 0; index < sessions; index += 1) {
+      await writeFile(
+        path.join(dir, `session-${index}.jsonl`),
+        "x".repeat(Math.max(1, Math.floor(bytes / sessions))),
+        "utf8"
+      );
+    }
+
+    return dir;
+  }
+
+  function dayOffset(days: number) {
+    return new Date(Date.now() - days * 24 * HOUR).toISOString().slice(0, 10);
+  }
+
+  const limits = { retentionDays: 7, maxTotalBytes: 1024 * 1024 };
+
+  it("removes days past the retention window and keeps the rest", async () => {
+    const old = await seedDay(dayOffset(30), 100);
+    const edge = await seedDay(dayOffset(8), 100);
+    const fresh = await seedDay(dayOffset(1), 100);
+    const today = await seedDay(dayOffset(0), 100);
+
+    const result = await sweepStaleArtifacts(uploadDir, silent, {
+      dir: diagnosticsDir,
+      ...limits
+    });
+
+    assert.equal(existsSync(old), false);
+    assert.equal(existsSync(edge), false);
+    assert.equal(existsSync(fresh), true);
+    // TODAY's file is the one someone is most likely to be reading right now. A sweep
+    // that touched it would delete the evidence out from under an investigation.
+    assert.equal(existsSync(today), true);
+    assert.equal(result.diagnosticFilesRemoved, 2);
+    assert.ok(result.diagnosticBytesFreed > 0);
+  });
+
+  it("keeps a day exactly at the edge of the window", async () => {
+    const boundary = await seedDay(dayOffset(7), 100);
+
+    await sweepStaleArtifacts(uploadDir, silent, {
+      dir: diagnosticsDir,
+      ...limits
+    });
+
+    // Compared as ISO date STRINGS, so "7 days old" is kept and only day 8 goes —
+    // no partial-day arithmetic, and nothing disappears at 00:01.
+    assert.equal(existsSync(boundary), true);
+  });
+
+  it("enforces the total ceiling oldest-first, even inside the window", async () => {
+    // THE BACKSTOP, for the one bug that would matter: a call site regressing to
+    // per-URL logging. At 1.3M URLs a volume fills long before anything is seven days
+    // old, so age alone is not enough.
+    const oldest = await seedDay(dayOffset(5), 4000);
+    const middle = await seedDay(dayOffset(3), 4000);
+    const newest = await seedDay(dayOffset(1), 4000);
+
+    const result = await sweepStaleArtifacts(uploadDir, silent, {
+      dir: diagnosticsDir,
+      retentionDays: 7,
+      maxTotalBytes: 9000
+    });
+
+    // Oldest goes first and it stops as soon as it is under the ceiling: whatever is
+    // most likely to be under investigation survives.
+    assert.equal(existsSync(oldest), false);
+    assert.equal(existsSync(middle), true);
+    assert.equal(existsSync(newest), true);
+    assert.equal(result.diagnosticFilesRemoved, 1);
+  });
+
+  it("does nothing when the diagnostics directory was never written", async () => {
+    const result = await sweepStaleArtifacts(uploadDir, silent, {
+      dir: path.join(diagnosticsDir, "not-mounted"),
+      ...limits
+    });
+
+    // The usual case on a box where the volume is not mounted. Not an error.
+    assert.equal(result.diagnosticFilesRemoved, 0);
+    assert.equal(result.diagnosticBytesFreed, 0);
+  });
+
+  it("leaves diagnostics completely alone when no limits are passed", async () => {
+    const ancient = await seedDay(dayOffset(90), 100);
+
+    const result = await sweepStaleArtifacts(uploadDir, silent);
+
+    // The uploads sweep predates this and must keep working on its own. A caller that
+    // does not ask for diagnostics retention must not get it as a side effect.
+    assert.equal(existsSync(ancient), true);
+    assert.equal(result.diagnosticFilesRemoved, 0);
   });
 });

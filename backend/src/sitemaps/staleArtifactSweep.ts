@@ -47,11 +47,22 @@ export const CLEANER_RUN_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 // table — it looks at what is actually on disk and how old it is, which is the only
 // signal that survives the process that created it.
 
+// Diagnostics retention. SEVEN DAYS, matching the horizon an investigation actually
+// spans: the "Not scored" question took a week of screenshots to settle, and a window
+// shorter than that would have expired the evidence mid-diagnosis.
+//
+// This is a real cap, not decoration. The VM has already had one disk-growth incident
+// from logs nobody bounded (d8ca7df4, uncapped container logs), and writing per-session
+// JSONL without a sweep would be the same mistake with a different filename.
+export const DIAGNOSTICS_RETENTION_DAYS_DEFAULT = 7;
+
 export type SweepResult = {
   cleanerRunsRemoved: number;
   cleanerBytesFreed: number;
   partFilesRemoved: number;
   partBytesFreed: number;
+  diagnosticFilesRemoved: number;
+  diagnosticBytesFreed: number;
 };
 
 // A directory's own mtime changes when entries are added or removed directly in it,
@@ -229,23 +240,143 @@ async function sweepPartFiles(
   return { removed, bytes };
 }
 
+// Host-strategy diagnostics, which are laid out as
+// <diagnosticsDir>/host-strategy/<YYYY-MM-DD>/<session_id>.jsonl.
+//
+// TWO limits, because they fail differently. Age is the normal mechanism and does the
+// work every day. The total ceiling is the backstop for the one bug that would matter:
+// a call site regressing to per-URL logging, which at 1.3M URLs would fill a volume long
+// before anything was seven days old. Deleting oldest-day-first when over the ceiling
+// keeps whatever is most likely to be under investigation right now.
+export async function sweepDiagnostics(
+  diagnosticsDir: string,
+  logger: FastifyBaseLogger,
+  limits: { retentionDays: number; maxTotalBytes: number },
+  now: number
+): Promise<{ removed: number; bytes: number }> {
+  const root = path.join(diagnosticsDir, "host-strategy");
+  let entries;
+
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch {
+    // Nothing has ever been written — the usual case on a box where the volume is not
+    // mounted, and not an error.
+    return { removed: 0, bytes: 0 };
+  }
+
+  // Day directories sort lexicographically BECAUSE the name is an ISO date. That is the
+  // reason the writer uses YYYY-MM-DD and UTC rather than anything friendlier: oldest
+  // first needs no parsing and cannot be fooled by a local timezone change.
+  const days = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+  const maxAgeMs = limits.retentionDays * 24 * 60 * 60 * 1000;
+  const cutoff = new Date(now - maxAgeMs).toISOString().slice(0, 10);
+  let removed = 0;
+  let bytes = 0;
+  const survivors: Array<{ day: string; dir: string; size: number }> = [];
+
+  for (const day of days) {
+    const dir = path.join(root, day);
+    const size = await directorySizeBytes(dir);
+
+    // String comparison on ISO dates, so a day directory is removed once the DAY it
+    // names is older than the cutoff day — no partial-day arithmetic and no surprise
+    // deletion of today's file at 00:01.
+    if (day < cutoff) {
+      try {
+        await rm(dir, { recursive: true, force: true });
+        removed += 1;
+        bytes += size;
+        logger.info(
+          { day, bytes: size, retention_days: limits.retentionDays },
+          "diagnostics sweep: removed a day past the retention window"
+        );
+      } catch (error) {
+        logger.error(
+          { day, error },
+          "diagnostics sweep: could not remove a day directory"
+        );
+      }
+
+      continue;
+    }
+
+    survivors.push({ day, dir, size });
+  }
+
+  let total = survivors.reduce((sum, entry) => sum + entry.size, 0);
+
+  for (const entry of survivors) {
+    if (total <= limits.maxTotalBytes) {
+      break;
+    }
+
+    try {
+      await rm(entry.dir, { recursive: true, force: true });
+      removed += 1;
+      bytes += entry.size;
+      total -= entry.size;
+      // WARN, not info: reaching this ceiling means something is writing far more than
+      // the bounded per-host/per-pattern events these files are supposed to contain.
+      // The deletion is the symptom; the call site is the bug.
+      logger.warn(
+        {
+          day: entry.day,
+          bytes: entry.size,
+          total_after: total,
+          max_total_bytes: limits.maxTotalBytes
+        },
+        "diagnostics sweep: over the total size ceiling — removed the oldest surviving day. Something is very likely logging per-URL"
+      );
+    } catch (error) {
+      logger.error(
+        { day: entry.day, error },
+        "diagnostics sweep: could not remove a day directory while over the size ceiling"
+      );
+    }
+  }
+
+  return { removed, bytes };
+}
+
 // `uploadDir` is a parameter rather than read from config so the sweep can be
 // exercised against a temp directory with real files and real mtimes — the whole
 // behaviour IS filesystem age, so a test that stubbed the filesystem would prove
-// nothing.
+// nothing. Same for `diagnostics`.
 export async function sweepStaleArtifacts(
   uploadDir: string,
-  logger: FastifyBaseLogger
+  logger: FastifyBaseLogger,
+  diagnostics?: {
+    dir: string;
+    retentionDays: number;
+    maxTotalBytes: number;
+  }
 ): Promise<SweepResult> {
   const now = Date.now();
   const runs = await sweepCleanerRuns(uploadDir, logger, now);
   const parts = await sweepPartFiles(uploadDir, logger, now);
+  const diagnosticSweep = diagnostics
+    ? await sweepDiagnostics(
+        diagnostics.dir,
+        logger,
+        {
+          retentionDays: diagnostics.retentionDays,
+          maxTotalBytes: diagnostics.maxTotalBytes
+        },
+        now
+      )
+    : { removed: 0, bytes: 0 };
 
   const result: SweepResult = {
     cleanerRunsRemoved: runs.removed,
     cleanerBytesFreed: runs.bytes,
     partFilesRemoved: parts.removed,
-    partBytesFreed: parts.bytes
+    partBytesFreed: parts.bytes,
+    diagnosticFilesRemoved: diagnosticSweep.removed,
+    diagnosticBytesFreed: diagnosticSweep.bytes
   };
 
   // Logged at info even when it found nothing, so "is the sweep running at all?"

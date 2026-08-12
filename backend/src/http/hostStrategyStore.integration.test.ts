@@ -130,8 +130,14 @@ test("the host strategy store round-trips through Redis and the table", async (t
   // Written to BOTH tiers.
   const fromCache = await hostStrategyStore.read(host);
 
-  assert.equal(fromCache?.rung, "R2");
-  assert.equal(fromCache?.edgeServer, "nginx/1.28.3");
+  assert.equal(fromCache?.value.rung, "R2");
+  assert.equal(fromCache?.value.edgeServer, "nginx/1.28.3");
+  // WHICH TIER ANSWERED, reported alongside the value. This is what lets a diagnostic
+  // line say whether a verdict was measured just now or read from a cache — the
+  // difference between "this site refuses us" and "it refused us once, up to a week
+  // ago". Asserted against a REAL Redis, because the whole field is about which of two
+  // real tiers replied.
+  assert.equal(fromCache?.source, "redis");
   assert.equal(await lockRedis().exists(`host-strategy:${host}`), 1);
 
   const row = await pool.query(
@@ -151,8 +157,12 @@ test("the host strategy store round-trips through Redis and the table", async (t
 
   const fromTable = await hostStrategyStore.read(host);
 
-  assert.equal(fromTable?.rung, "R2");
+  assert.equal(fromTable?.value.rung, "R2");
+  // The durable tier, correctly named as such — and only on the FIRST read after the
+  // cache was dropped, since that read re-warms it.
+  assert.equal(fromTable?.source, "table");
   assert.equal(await lockRedis().exists(`host-strategy:${host}`), 1);
+  assert.equal((await hostStrategyStore.read(host))?.source, "redis");
 
   // A re-negotiation overwrites in place — one row per host, no history pile-up.
   await hostStrategyStore.write({
@@ -166,8 +176,8 @@ test("the host strategy store round-trips through Redis and the table", async (t
 
   const refused = await hostStrategyStore.read(host);
 
-  assert.equal(refused?.verdict, "REFUSED");
-  assert.equal(refused?.rung, null);
+  assert.equal(refused?.value.verdict, "REFUSED");
+  assert.equal(refused?.value.rung, null);
 
   const count = await pool.query(
     "SELECT count(*)::int AS n FROM host_probe_profiles WHERE host = $1",

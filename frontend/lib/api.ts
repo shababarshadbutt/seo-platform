@@ -168,6 +168,14 @@ export type SampledUrl = {
     | "success"
     | "redirect"
     | "failure"
+    // The site's security answered instead of the page (a WAF header, or a
+    // 405/501 that survived the GET re-probe). Migration 042 added it to the
+    // enum and the checker has been writing it since v1.59 — this union did not
+    // list it, so every branch here keyed on the category was type-checked
+    // against a value it provably receives and TypeScript called those
+    // comparisons impossible. NOT a failure: it means we could not measure the
+    // URL, not that the URL is broken.
+    | "blocked"
     | "soft_404"
     | null;
   is_soft_404: boolean;

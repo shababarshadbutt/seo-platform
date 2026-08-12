@@ -2,9 +2,20 @@
 **/node_modules/
 .next/
 **/.next/
+# Compiled backend output (tsc -p tsconfig.build.json). Produced inside the Docker
+# image at build time; a local dist/ only appears when someone runs `npm run build`
+# on their machine, and committing one would be ~100 files of generated noise.
+backend/dist/
 .env
 **/.env
 data/
+# Host-strategy diagnostics, bind-mounted from the backend/worker containers. JSONL
+# rather than .log, so the *.log rule below does not cover them.
+#
+# LEADING SLASH, anchoring this to the repo root. Without it the pattern matches a
+# directory of that name at ANY depth — which silently excluded the entire
+# backend/src/diagnostics/ source module from `git add`.
+/diagnostics/
 *.log
 *.xaml
 .DS_Store

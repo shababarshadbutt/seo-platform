@@ -188,6 +188,12 @@ import {
   showFixButton,
   type PatternStatus
 } from "@/lib/fix-visibility";
+import {
+  analysisSettled,
+  unscoredReasonFor,
+  unscoredReasonLabel,
+  type UnscoredReason
+} from "@/lib/unscored-reason";
 type StatusFilter = "ALL" | "GOOD" | "WARNING" | "BAD";
 
 // Per-column layout hints consumed by the table th/td renderers. A fixed
@@ -212,6 +218,8 @@ type PatternRow = {
   confidencePct: number;
   redirectPct: number;
   status: PatternStatus;
+  // Null unless the row is unscored AND the reason is knowable. See unscoredReasonFor.
+  unscoredReason: UnscoredReason | null;
   soft404Count: number;
   hasSoft404: boolean;
   hasSuspiciousSegment: boolean;
@@ -284,6 +292,7 @@ function normalizeStatus(status: string | null): PatternStatus {
 
   return "UNKNOWN";
 }
+
 
 function formatNumber(value: number) {
   return new Intl.NumberFormat("en-US").format(value);
@@ -391,6 +400,10 @@ function categoryLabel(category: SampledUrl["http_status_category"]) {
     return "Soft-404";
   }
 
+  if (category === "blocked") {
+    return "Blocked";
+  }
+
   return category ?? "unknown";
 }
 
@@ -441,6 +454,20 @@ function sampleTone(sample: SampledUrl) {
       borderClass: "border-l-red-500",
       badgeVariant: "destructive" as const,
       icon: "✕"
+    };
+  }
+
+  // BLOCKED IS DELIBERATELY NOT RED. It is the same neutral tone the fallback
+  // already gave it, made explicit so it cannot drift into "destructive" later: a
+  // blocked sample is the absence of a measurement, and painting it as a failure
+  // would assert the URL is broken when the only thing we know is that the site's
+  // security answered. That claim is exactly what the 'blocked' category exists to
+  // stop making.
+  if (category === "blocked") {
+    return {
+      borderClass: "border-l-slate-300",
+      badgeVariant: "secondary" as const,
+      icon: "⚠"
     };
   }
 
@@ -544,11 +571,18 @@ function redirectArtifactSegment(template: string, samples: SampledUrl[]) {
   return segment ?? null;
 }
 
-function buildRows(patterns: Pattern[], samplesByPattern: SamplesByPattern) {
+function buildRows(
+  patterns: Pattern[],
+  samplesByPattern: SamplesByPattern,
+  // Whether the analysis has finished producing scores. Only used to decide whether
+  // an unscored row may be EXPLAINED yet — see unscoredReasonFor.
+  settled: boolean
+) {
   return patterns.map<PatternRow>((pattern) => {
     const samples = samplesByPattern[pattern.id] ?? [];
     const hitCount = samples.filter((sample) => sample.is_hit).length;
     const soft404Count = samples.filter((sample) => sample.is_soft_404).length;
+    const status = normalizeStatus(pattern.status);
 
     return {
       id: pattern.id,
@@ -561,7 +595,13 @@ function buildRows(patterns: Pattern[], samplesByPattern: SamplesByPattern) {
       missCount: samples.length - hitCount,
       confidencePct: numberValue(pattern.confidence_pct),
       redirectPct: numberValue(pattern.redirect_pct),
-      status: normalizeStatus(pattern.status),
+      status,
+      unscoredReason: unscoredReasonFor(
+        status,
+        pattern.source_role,
+        samples,
+        settled
+      ),
       soft404Count,
       hasSoft404: soft404Count > 0,
       hasSuspiciousSegment: pattern.has_suspicious_segment,
@@ -1241,9 +1281,10 @@ export default function ResultsDashboardPage({
     }
   }, [params.id, router]);
 
+  const settled = analysisSettled(sessionStatus);
   const rows = useMemo(
-    () => buildRows(patterns, samplesByPattern),
-    [patterns, samplesByPattern]
+    () => buildRows(patterns, samplesByPattern, settled),
+    [patterns, samplesByPattern, settled]
   );
   const currentRows = useMemo(
     () => rows.filter((row) => row.sourceRole === "current"),
@@ -1314,6 +1355,24 @@ export default function ResultsDashboardPage({
       missingLegacyCount: missingLegacyRows.length,
       totalUrls,
       mismatchCount: mismatches.length,
+      // A WHOLLY UNSCORED SESSION, counted from the rows themselves.
+      //
+      // The refused-host banner below only fires when a REFUSED verdict was
+      // recorded AND filed under a host spelled the way base_url spells it. Every
+      // other road to a page of unscored rows — every sample blocked with the host
+      // itself answering fine, no samples written, a sampling pass that never
+      // reached these patterns — left the page saying nothing at all, and the user
+      // counting identical cells. This summary is derived from the rows, so it
+      // cannot miss any of those cases.
+      unscored: {
+        total: currentRows.length,
+        count: currentRows.filter((row) => row.status === "UNKNOWN").length,
+        blocked: currentRows.filter((row) => row.unscoredReason === "blocked")
+          .length,
+        notSampled: currentRows.filter(
+          (row) => row.unscoredReason === "not-sampled"
+        ).length
+      },
       insights: makeInsights(currentRows, missingLegacyRows)
     };
   }, [currentRows, mismatches.length, missingLegacyRows, sessionData?.sitemap_files]);
@@ -1462,11 +1521,28 @@ export default function ResultsDashboardPage({
       {
         accessorKey: "status",
         header: ({ column }) => <HeaderButton column={column} label="Status" />,
-        meta: { width: "100px" } satisfies PatternColumnMeta,
+        meta: { width: "132px" } satisfies PatternColumnMeta,
         cell: ({ row }) => (
-          <Badge variant={statusBadgeVariant(row.original.status)}>
-            {statusLabels[row.original.status]}
-          </Badge>
+          <div className="flex flex-col items-start gap-1">
+            <Badge variant={statusBadgeVariant(row.original.status)}>
+              {statusLabels[row.original.status]}
+            </Badge>
+            {/* The reason, in the same cell as the verdict. Without it "Not
+                scored" is a dead end: the user cannot tell a site that blocked
+                every check from an analysis that never sampled anything, and
+                those need opposite actions (an allowlist vs. a re-check). */}
+            {row.original.unscoredReason ? (
+              <span
+                className="text-[11px] leading-tight text-slate-500"
+                data-testid="unscored-reason"
+              >
+                {unscoredReasonLabel(
+                  row.original.unscoredReason,
+                  row.original.sampledCount
+                )}
+              </span>
+            ) : null}
+          </div>
         )
       },
       {
@@ -4208,6 +4284,52 @@ export default function ResultsDashboardPage({
                         </span>
                       </p>
                     ))}
+                  </div>
+                ) : settled &&
+                  dashboard.unscored.total > 0 &&
+                  dashboard.unscored.count === dashboard.unscored.total ? (
+                  /* NOTHING HERE IS MEASURED, AND WE KNOW WHY — say it once,
+                     above the table, without depending on a host verdict having
+                     been recorded under the right spelling. Shown only when the
+                     refused-host banner did NOT fire, so the two can never both
+                     claim the page.
+
+                     GATED ON `settled`. Every row of a session that is still
+                     sampling is legitimately unscored, and telling someone to go
+                     ask a third party for a WAF allowlist because a run has not
+                     finished yet would be the most expensive wrong guess on this
+                     page. */
+                  <div
+                    className="mb-4 flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-3 text-sm text-amber-900"
+                    data-testid="all-unscored-banner"
+                  >
+                    <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>
+                      <span className="font-semibold">
+                        No pattern on this page has a score.
+                      </span>{" "}
+                      {dashboard.unscored.blocked > 0 ? (
+                        <>
+                          The site refused every check on{" "}
+                          {formatNumber(dashboard.unscored.blocked)} of{" "}
+                          {formatNumber(dashboard.unscored.total)} pattern
+                          {dashboard.unscored.total === 1 ? "" : "s"} — its
+                          security answered instead of the pages, so that is
+                          missing measurement, not broken URLs.{" "}
+                        </>
+                      ) : null}
+                      {dashboard.unscored.notSampled > 0 ? (
+                        <>
+                          {formatNumber(dashboard.unscored.notSampled)} pattern
+                          {dashboard.unscored.notSampled === 1 ? "" : "s"} had no
+                          URLs sampled at all.{" "}
+                        </>
+                      ) : null}
+                      Use <span className="font-semibold">Check</span> on a row to
+                      re-measure it now. If every row reports the same refusal, the
+                      checker needs to be allowlisted at the site&rsquo;s edge
+                      before this site can be checked.
+                    </span>
                   </div>
                 ) : null}
                 {!isPrintMode ? (

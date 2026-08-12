@@ -198,6 +198,16 @@ export type SampleCheckResult = {
   // WHICH edge answered for a host (awselb/2.0 vs nginx/... — an allowlist problem
   // vs an origin problem).
   edgeServer: string | null;
+  // The verb the verdict came from: "GET" exactly when HEAD was method-rejected and the
+  // re-probe decided it. Not persisted; read by the host-strategy diagnostics, where
+  // "HEAD refused AND GET refused" is a materially stronger statement about an edge than
+  // a bare status code.
+  //
+  // Optional because the two escalation helpers construct results without running a
+  // request; undefined there means "not applicable", not "HEAD".
+  methodUsed?: "HEAD" | "GET";
+  // The HEAD status that triggered the GET re-probe, null when HEAD was not rejected.
+  methodFallbackFrom?: number | null;
 };
 
 type BodyPrefixResult = {
@@ -679,7 +689,14 @@ export async function runCheckWithProfile(
   );
 
   return {
-    ...result
+    ...result,
+    // WHICH VERB produced this verdict, and what HEAD said if it was refused for being
+    // HEAD. Both were already in the log line above and nowhere else; surfacing them
+    // lets the host-strategy diagnostics say "the edge refused HEAD with 405 and GET
+    // with 405" instead of just "405", which is the difference between a WAF and a
+    // method policy.
+    methodUsed: methodFallbackFrom === null ? "HEAD" : "GET",
+    methodFallbackFrom
   };
 }
 

@@ -85,6 +85,10 @@ function rowToStored(row: ProfileRow): StoredHostStrategy {
 }
 
 export const hostStrategyStore: HostStrategyStore = {
+  // Returns WHICH TIER answered alongside the value. The caller records it on the
+  // resolved strategy so a diagnostic line can say whether a verdict was measured just
+  // now or read from a cache — the difference between "this site refuses us" and "this
+  // site refused us once, up to a week ago".
   async read(host) {
     const cached = await withRedisTimeout(
       () => lockRedis().get(`${KEY_PREFIX}${host}`),
@@ -93,7 +97,10 @@ export const hostStrategyStore: HostStrategyStore = {
 
     if (cached) {
       try {
-        return JSON.parse(cached) as StoredHostStrategy;
+        return {
+          value: JSON.parse(cached) as StoredHostStrategy,
+          source: "redis" as const
+        };
       } catch {
         // A corrupt cache entry is not worth failing a run over — fall through to
         // the durable copy.
@@ -119,7 +126,7 @@ export const hostStrategyStore: HostStrategyStore = {
 
     await cacheStrategy(stored);
 
-    return stored;
+    return { value: stored, source: "table" as const };
   },
 
   async write(value) {

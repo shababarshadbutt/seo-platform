@@ -15,7 +15,7 @@ import {
 import { resolveSampleTarget } from "./sampleTarget.js";
 import { probeUrl, verifyConcurrency } from "./verifyProbe.js";
 import { rateLimitHostKey } from "../http/hostRateLimiter.js";
-import { noteHostCheckOutcome } from "../http/hostStrategy.js";
+import type { ResolvedHostStrategy } from "../http/hostStrategy.js";
 import { createHostStrategyRun } from "../http/hostStrategyRun.js";
 import type { VerifyUrlsJobData } from "../queue/verificationQueue.js";
 
@@ -296,10 +296,16 @@ export async function processVerifyUrlsJob(
     //
     // Sampling usually resolved this host already; the run-level memo and Redis both
     // return that answer, so this normally costs no requests at all.
-    const strategyRun = createHostStrategyRun(session.user_agent, logger);
+    const strategyRun = createHostStrategyRun(session.user_agent, logger, {
+      sessionId,
+      phase: "verification"
+    });
     const ladderByHost = new Map<string, RequestProfile[] | undefined>();
     const toCheck: EnumeratedUrl[] = [];
     let refusedByHost = 0;
+    // Counted per host, EMITTED ONCE PER HOST after this loop. See the note at the
+    // emit — this loop body runs up to 1.3M times.
+    const refusedPerHost = new Map<string, { count: number; strategy: ResolvedHostStrategy }>();
 
     for (const entry of notDeleted) {
       const target = resolveSampleTarget(session.base_url, entry.url, entry.url);
@@ -307,6 +313,15 @@ export async function processVerifyUrlsJob(
 
       if (strategy.skip) {
         refusedByHost += 1;
+
+        const seen = refusedPerHost.get(strategy.host);
+
+        if (seen) {
+          seen.count += 1;
+        } else {
+          refusedPerHost.set(strategy.host, { count: 1, strategy });
+        }
+
         continue;
       }
 
@@ -315,6 +330,18 @@ export async function processVerifyUrlsJob(
         strategy.ladder.length ? strategy.ladder : undefined
       );
       toCheck.push(entry);
+    }
+
+    // ONE LINE PER HOST, NOT PER URL — the single most important volume rule in these
+    // diagnostics. The loop above runs once per enumerated URL, so emitting inside it
+    // would write up to 1.3M identical lines and recreate the disk problem these files
+    // exist to help diagnose. url_count_affected carries the number that per-URL logging
+    // would have been trying to convey anyway, and carries it more usefully.
+    for (const [, refused] of refusedPerHost) {
+      strategyRun.noteSkipped(refused.strategy, {
+        pattern: null,
+        url_count_affected: refused.count
+      });
     }
 
     const skippedDeleted = entries.length - toCheck.length;
@@ -400,7 +427,7 @@ export async function processVerifyUrlsJob(
           }
         );
 
-        noteHostCheckOutcome(
+        strategyRun.noteOutcome(
           rateLimitHostKey(
             resolveSampleTarget(session.base_url, entry.url, entry.url)
           ),

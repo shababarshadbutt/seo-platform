@@ -5,6 +5,7 @@ import { Worker } from "bullmq";
 // an outbound request. (v1.39 Fix 1)
 import "./http/tlsDispatcher.js";
 import { config } from "./config.js";
+import { initEventLog } from "./diagnostics/eventLog.js";
 import { closePool } from "./db/pool.js";
 import { runMigrations } from "./db/migrate.js";
 import {
@@ -129,6 +130,15 @@ import { processWatchdogStuckSessionsJob } from "./jobs/watchdogStuckSessionsJob
 // of independent per-file parse jobs) drain the queue about twice as fast
 // (v1.33 Fix 2).
 const SITEMAP_WORKER_CONCURRENCY = 10;
+
+// See the matching call in server.ts: both processes append to the same per-session
+// diagnostic file, so each stamps which one it was.
+initEventLog({
+  service: "worker",
+  dir: config.diagnostics.dir,
+  enabled: config.diagnostics.enabled,
+  maxFileBytes: config.diagnostics.maxFileBytes
+});
 
 const app = Fastify({
   logger: true

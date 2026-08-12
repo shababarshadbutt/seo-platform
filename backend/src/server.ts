@@ -6,6 +6,7 @@ import multipart from "@fastify/multipart";
 // an outbound request. (v1.39 Fix 1)
 import "./http/tlsDispatcher.js";
 import { config } from "./config.js";
+import { initEventLog } from "./diagnostics/eventLog.js";
 import { closeSitemapQueue } from "./queue/sitemapQueue.js";
 import { destroyCleanerPools } from "./jobs/cleanerPool.js";
 import { closePool } from "./db/pool.js";
@@ -19,6 +20,16 @@ import {
   SERVER_EPOCH,
   startAbandonedRunWatchdog
 } from "./sitemaps/cleanerRuns.js";
+
+// Both the API and the worker append to the SAME per-session diagnostic file, so each
+// has to stamp which one it was: "who observed this" is the first question when the two
+// disagree about a host.
+initEventLog({
+  service: "backend",
+  dir: config.diagnostics.dir,
+  enabled: config.diagnostics.enabled,
+  maxFileBytes: config.diagnostics.maxFileBytes
+});
 
 const app = Fastify({
   logger: true

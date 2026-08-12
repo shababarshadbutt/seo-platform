@@ -87,6 +87,53 @@ export const config = {
   redisUrl: process.env.REDIS_URL ?? "redis://localhost:6379",
   uploadDir: process.env.UPLOAD_DIR ?? "/uploads",
   exportDir: process.env.EXPORT_DIR ?? "/exports",
+
+  // ---- Durable host-strategy diagnostics ---------------------------------
+  //
+  // Its own bind-mounted directory rather than a corner of uploads/: these files exist
+  // to be read by a human over SSH, and mixing them into the volume that holds session
+  // data would put them behind the upload cleanup's rules instead of their own.
+  diagnostics: {
+    dir: process.env.DIAGNOSTICS_DIR ?? "/diagnostics",
+    // DEFAULT ON. The events are bounded per host and per pattern (roughly 25KB per
+    // session), and the entire point is that the record is there when a screenshot
+    // arrives — not that somebody remembered to turn it on first. A kill switch, not
+    // an opt-in.
+    enabled: readBooleanFlag(process.env.HOST_STRATEGY_DIAGNOSTICS, true),
+    // A hard stop, not a rotation. 32MB of these events means something is emitting
+    // per-URL, which is a bug at a call site; rotating would consume the volume while
+    // hiding it.
+    maxFileBytes: readNumber("DIAGNOSTICS_MAX_FILE_BYTES", {
+      fallback: 32 * 1024 * 1024,
+      min: 64 * 1024
+    }),
+    retentionDays: readNumber("DIAGNOSTICS_RETENTION_DAYS", {
+      fallback: 7,
+      min: 1
+    }),
+    // The backstop behind the per-file cap, in MB to keep the env var readable. At the
+    // measured ~25KB/session this is roughly three orders of magnitude above steady
+    // state; it only ever engages if a call site regresses to per-URL logging.
+    maxTotalBytes:
+      readNumber("DIAGNOSTICS_MAX_TOTAL_MB", { fallback: 2048, min: 16 }) *
+      1024 *
+      1024,
+    // OFF, and it should stay off. A successful S3 publish reclaiming a session's
+    // diagnostics saves nothing anyone needs at the box's free space, and the daily
+    // sweep already covers abandoned and failed runs — which is most of them, since
+    // most sessions never publish at all. The knob exists so that if disk pressure ever
+    // becomes real it is already written and tested.
+    deleteOnSuccess: readBooleanFlag(
+      process.env.DIAGNOSTICS_DELETE_ON_SUCCESS,
+      false
+    ),
+    // "Keep the last day of successful runs", as one number instead of a keep-last-N
+    // rule that would need two processes to agree on an ordering.
+    deleteOnSuccessMinAgeHours: readNumber(
+      "DIAGNOSTICS_DELETE_ON_SUCCESS_MIN_AGE_HOURS",
+      { fallback: 24, min: 0 }
+    )
+  },
   frontendUrl: process.env.FRONTEND_URL ?? "http://localhost:3000",
   pdfBackendUrl: process.env.PDF_BACKEND_URL,
   chromiumPath: process.env.CHROMIUM_PATH,

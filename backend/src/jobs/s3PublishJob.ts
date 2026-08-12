@@ -3,6 +3,7 @@ import type { FastifyBaseLogger } from "fastify";
 
 import { config } from "../config.js";
 import { pool } from "../db/pool.js";
+import { deleteSessionDiagnostics } from "../diagnostics/eventLog.js";
 import { withPublishLock } from "../publish/publishLock.js";
 import { resolvePublishTarget } from "../publish/publishTarget.js";
 import { buildPublishPlan, executePublish } from "../publish/s3Publish.js";
@@ -260,6 +261,48 @@ export async function processS3PublishJob(
       },
       "s3 publish complete"
     );
+
+    // OPTIONAL space reclamation, OFF by default.
+    //
+    // The daily sweep is the primary mechanism and stays that way: most sessions never
+    // publish at all, so a publish-triggered delete could never cover the abandoned and
+    // failed runs that actually accumulate. This exists so that if disk pressure ever
+    // becomes real the knob is already written and tested.
+    //
+    // Two things protect the evidence, both inside deleteSessionDiagnostics: a session
+    // whose host REFUSED us (or whose patterns were skipped) carries a .keep marker and
+    // is never touched, and a minimum age keeps the most recent runs regardless. A
+    // successful publish says nothing about whether the checker could see the site, so
+    // "it published" must not be allowed to erase "and we could not check any of it".
+    if (config.diagnostics.deleteOnSuccess) {
+      const reclaimed = await deleteSessionDiagnostics(sessionId, {
+        minAgeMs:
+          config.diagnostics.deleteOnSuccessMinAgeHours * 60 * 60 * 1000
+      }).catch((error) => {
+        // Best-effort, exactly like every other write in that module: a publish that
+        // succeeded must not be reported as failed because a log file would not delete.
+        logger.warn(
+          { session_id: sessionId, error },
+          "could not clean up this session's diagnostics after a successful publish"
+        );
+
+        return null;
+      });
+
+      if (reclaimed && (reclaimed.filesRemoved > 0 || reclaimed.kept > 0)) {
+        logger.info(
+          {
+            session_id: sessionId,
+            files_removed: reclaimed.filesRemoved,
+            bytes_freed: reclaimed.bytesFreed,
+            // Days kept because the session was interesting (a .keep marker) or too
+            // recent. A non-zero count here is the guard working, not a failure.
+            kept: reclaimed.kept
+          },
+          "diagnostics cleaned up after a successful publish"
+        );
+      }
+    }
 
     // Returned, not just written to progress: BullMQ persists a job's return
     // value ATOMICALLY as part of marking it completed, whereas progress is a

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -267,6 +267,503 @@ test("a REFUSED host costs three negotiation probes and nothing else", async (t)
   );
 
   assert.equal(samples.rows[0].n, 0);
+});
+
+// THE REGRESSION THIS GUARDS, and it is the reason a whole site came back
+// unscored: the pre-flight is the FIRST thing this job does, and the real store
+// issues a plain pool.query against host_probe_profiles. On a box where migration
+// 044 had not run, that threw, the job's catch marked the session FAILED and
+// rethrew, and NOT ONE pattern was ever measured. Under v1.60 the same error would
+// have been one URL's problem. Learning how to talk to a host is an optimisation;
+// an optimisation must not be able to take a session down.
+//
+// The store is broken by replacing its methods rather than by touching the schema:
+// this file runs concurrently with other integration files against one database,
+// and dropping a shared table to make a point would break them instead.
+test("a strategy store that throws still measures every pattern", async (t) => {
+  if (!(await postgresReachable())) {
+    t.skip("postgres not reachable — skipping");
+    return;
+  }
+
+  if (!(await redisReachable())) {
+    t.skip("redis not reachable — skipping");
+    return;
+  }
+
+  // A perfectly healthy host. Everything unscored here would be the checker's own
+  // fault, which is exactly the failure being fixed.
+  const fixture = await startFixture((_hit, res) => {
+    res.writeHead(200, { "content-type": "text/html" });
+    res.end(LONG_BODY);
+  });
+
+  const { pool } = await import("../db/pool.js");
+  const { runMigrations } = await import("../db/migrate.js");
+  const { processSamplePatternsJob } = await import("./samplePatternsJob.js");
+  const { resetHostRateLimiter } = await import("../http/hostRateLimiter.js");
+  const { resetHostStrategyMemory } = await import("../http/hostStrategy.js");
+  const { hostStrategyStore } = await import("../http/hostStrategyStore.js");
+
+  let sessionId: string | null = null;
+  const host = new URL(fixture.baseUrl).host;
+  const realRead = hostStrategyStore.read;
+  const realWrite = hostStrategyStore.write;
+
+  t.after(async () => {
+    hostStrategyStore.read = realRead;
+    hostStrategyStore.write = realWrite;
+    fixture.server.close();
+
+    if (sessionId) {
+      await pool
+        .query("DELETE FROM sessions WHERE id = $1", [sessionId])
+        .catch(() => {});
+    }
+
+    await pool
+      .query("DELETE FROM host_probe_profiles WHERE host = $1", [host])
+      .catch(() => {});
+  });
+
+  await runMigrations(silentLogger);
+  resetHostRateLimiter();
+  resetHostStrategyMemory();
+
+  // The exact production symptom.
+  hostStrategyStore.read = async () => {
+    throw new Error('relation "host_probe_profiles" does not exist');
+  };
+  hostStrategyStore.write = async () => {
+    throw new Error('relation "host_probe_profiles" does not exist');
+  };
+
+  const sessionRow = await pool.query<{ id: string }>(
+    `
+      INSERT INTO sessions (name, base_url, sample_size, concurrency, status)
+      VALUES ('host strategy store broken', $1, 5, 4, 'PROCESSING')
+      RETURNING id
+    `,
+    [fixture.baseUrl]
+  );
+
+  sessionId = sessionRow.rows[0].id;
+
+  const patternRow = await pool.query<{ id: string }>(
+    "INSERT INTO patterns (session_id, template, total_urls) VALUES ($1, '/product/{param}/{param}', 4) RETURNING id",
+    [sessionId]
+  );
+  const patternId = patternRow.rows[0].id;
+
+  for (let index = 0; index < 4; index += 1) {
+    const urlPath = `/product/x/y-${index}`;
+
+    await pool.query(
+      "INSERT INTO pattern_urls (session_id, pattern_id, source_url, path) VALUES ($1, $2, $3, $4)",
+      [sessionId, patternId, `${fixture.baseUrl}${urlPath}`, urlPath]
+    );
+  }
+
+  // Before the fix this REJECTED. That alone is the headline assertion.
+  await processSamplePatternsJob({ session_id: sessionId }, silentLogger);
+
+  const session = await pool.query<{ status: string }>(
+    "SELECT status FROM sessions WHERE id = $1",
+    [sessionId]
+  );
+
+  assert.notEqual(
+    session.rows[0].status,
+    "FAILED",
+    "an unreadable strategy cache must not fail the session"
+  );
+  assert.equal(session.rows[0].status, "COMPLETE");
+
+  // And the pattern was really MEASURED, on the default ladder — degrading to
+  // "we know nothing about this host" is only correct if it still checks the URLs.
+  const scored = await pool.query<{ status: string; confidence_pct: string }>(
+    "SELECT status, confidence_pct FROM patterns WHERE id = $1",
+    [patternId]
+  );
+
+  assert.equal(scored.rows[0].status, "GOOD");
+  assert.equal(Number(scored.rows[0].confidence_pct), 100);
+
+  const samples = await pool.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM sampled_urls WHERE pattern_id = $1",
+    [patternId]
+  );
+
+  assert.equal(samples.rows[0].n, 4);
+});
+
+// THE OTHER SILENT WAY A ROW BECOMES "Not scored". persistPatternSamples DELETEs a
+// pattern's sampled_urls and then inserts what it was handed, so calling it with an
+// empty result set erased a real measurement and rewrote the row as PENDING — for a
+// reason that had nothing to do with the site. The REFUSED branch documented that
+// hazard and stepped around it; the empty-pool branch fell straight into it.
+test("a pattern with no stored sample pool keeps the score and samples it already had", async (t) => {
+  if (!(await postgresReachable())) {
+    t.skip("postgres not reachable — skipping");
+    return;
+  }
+
+  if (!(await redisReachable())) {
+    t.skip("redis not reachable — skipping");
+    return;
+  }
+
+  const fixture = await startFixture((_hit, res) => {
+    res.writeHead(200, { "content-type": "text/html" });
+    res.end(LONG_BODY);
+  });
+
+  const { pool } = await import("../db/pool.js");
+  const { runMigrations } = await import("../db/migrate.js");
+  const { processSamplePatternsJob } = await import("./samplePatternsJob.js");
+  const { resetHostRateLimiter } = await import("../http/hostRateLimiter.js");
+  const { resetHostStrategyMemory } = await import("../http/hostStrategy.js");
+
+  let sessionId: string | null = null;
+  const host = new URL(fixture.baseUrl).host;
+
+  t.after(async () => {
+    fixture.server.close();
+
+    if (sessionId) {
+      await pool
+        .query("DELETE FROM sessions WHERE id = $1", [sessionId])
+        .catch(() => {});
+    }
+
+    await pool
+      .query("DELETE FROM host_probe_profiles WHERE host = $1", [host])
+      .catch(() => {});
+  });
+
+  await runMigrations(silentLogger);
+  resetHostRateLimiter();
+  resetHostStrategyMemory();
+
+  const sessionRow = await pool.query<{ id: string }>(
+    `
+      INSERT INTO sessions (name, base_url, sample_size, concurrency, status)
+      VALUES ('host strategy empty pool', $1, 10, 4, 'PROCESSING')
+      RETURNING id
+    `,
+    [fixture.baseUrl]
+  );
+
+  sessionId = sessionRow.rows[0].id;
+
+  // A pattern that HAS a good measurement from an earlier pass and NO pattern_urls
+  // rows to re-sample from.
+  const patternRow = await pool.query<{ id: string }>(
+    `
+      INSERT INTO patterns (session_id, template, total_urls, status, confidence_pct, redirect_pct)
+      VALUES ($1, '/contact-us', 5, 'GOOD', 100, 0)
+      RETURNING id
+    `,
+    [sessionId]
+  );
+  const patternId = patternRow.rows[0].id;
+
+  await pool.query(
+    `
+      INSERT INTO sampled_urls (
+        pattern_id, url, http_status, response_ms, is_hit, is_soft_404,
+        checked_at, redirect_count, http_status_category
+      )
+      VALUES ($1, $2, 200, 12, true, false, now(), 0, 'success')
+    `,
+    [patternId, `${fixture.baseUrl}/contact-us`]
+  );
+
+  await processSamplePatternsJob({ session_id: sessionId }, silentLogger);
+
+  // Nothing was probed — there was nothing to probe with.
+  assert.equal(
+    fixture.hits.length,
+    0,
+    `expected zero requests, got ${fixture.hits.length}`
+  );
+
+  // THE ASSERTION. Before the fix both of these were destroyed: the row read
+  // "Not scored" and its sample was gone.
+  const scored = await pool.query<{ status: string; confidence_pct: string }>(
+    "SELECT status, confidence_pct FROM patterns WHERE id = $1",
+    [patternId]
+  );
+
+  assert.equal(scored.rows[0].status, "GOOD");
+  assert.equal(Number(scored.rows[0].confidence_pct), 100);
+
+  const samples = await pool.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM sampled_urls WHERE pattern_id = $1",
+    [patternId]
+  );
+
+  assert.equal(
+    samples.rows[0].n,
+    1,
+    "the earlier measurement must survive a pass that had nothing to sample"
+  );
+});
+
+// THE TEST THAT MUST NOT BE DROPPED OR WEAKENED.
+//
+// Everything about these diagnostics rests on them being bounded per HOST and per
+// PATTERN. The dangerous bug is not a missing field, it is a skip event that moves
+// inside the per-URL loop in verifyUrlsJob: 1.3M identical lines, which would recreate
+// the very disk problem these files exist to help diagnose — and it would look entirely
+// correct in any outcome-based assertion, because the outcomes are identical either way.
+//
+// So the assertions are EXACT COUNTS, read back off the real JSONL file, for the same
+// reason the tests above assert request counts rather than results.
+test("diagnostics are bounded: exact event counts for a refused host, per pattern and per host", async (t) => {
+  if (!(await postgresReachable())) {
+    t.skip("postgres not reachable — skipping");
+    return;
+  }
+
+  if (!(await redisReachable())) {
+    t.skip("redis not reachable — skipping");
+    return;
+  }
+
+  // Refuses every profile, the measured stackedindustrials.com signature.
+  const fixture = await startFixture((_hit, res) => {
+    res.writeHead(405, { server: "awselb/2.0" });
+    res.end();
+  });
+
+  const { pool } = await import("../db/pool.js");
+  const { runMigrations } = await import("../db/migrate.js");
+  const { processSamplePatternsJob } = await import("./samplePatternsJob.js");
+  const { processVerifyUrlsJob } = await import("./verifyUrlsJob.js");
+  const { resetHostRateLimiter } = await import("../http/hostRateLimiter.js");
+  const { resetHostStrategyMemory } = await import("../http/hostStrategy.js");
+  const { initEventLog, flushEventLog, dayStamp } = await import(
+    "../diagnostics/eventLog.js"
+  );
+
+  const diagnosticsDir = mkdtempSync(
+    path.join(os.tmpdir(), "host-strategy-diag-")
+  );
+
+  let sessionId: string | null = null;
+  const host = new URL(fixture.baseUrl).host;
+
+  t.after(async () => {
+    initEventLog({ service: "unknown", dir: "/diagnostics", enabled: false });
+    fixture.server.close();
+
+    if (sessionId) {
+      await pool
+        .query("DELETE FROM sessions WHERE id = $1", [sessionId])
+        .catch(() => {});
+    }
+
+    await pool
+      .query("DELETE FROM host_probe_profiles WHERE host = $1", [host])
+      .catch(() => {});
+    rmSync(diagnosticsDir, { recursive: true, force: true });
+  });
+
+  await runMigrations(silentLogger);
+  resetHostRateLimiter();
+  resetHostStrategyMemory();
+  initEventLog({ service: "worker", dir: diagnosticsDir, enabled: true });
+
+  const sessionRow = await pool.query<{ id: string }>(
+    `
+      INSERT INTO sessions (name, base_url, sample_size, concurrency, status)
+      VALUES ('host strategy diagnostics', $1, 10, 4, 'PROCESSING')
+      RETURNING id
+    `,
+    [fixture.baseUrl]
+  );
+
+  sessionId = sessionRow.rows[0].id;
+
+  // TWO patterns, TEN pool URLs each. Twenty URLs is the number a per-URL bug would
+  // multiply by; two patterns is the number a correct implementation writes.
+  const patternIds: string[] = [];
+  const locs: string[] = [];
+
+  for (const template of ["/product/{param}/{param}", "/rfq/{param}/{param}"]) {
+    const row = await pool.query<{ id: string }>(
+      "INSERT INTO patterns (session_id, template, total_urls) VALUES ($1, $2, 10) RETURNING id",
+      [sessionId, template]
+    );
+
+    patternIds.push(row.rows[0].id);
+
+    for (let index = 0; index < 10; index += 1) {
+      const urlPath = `${template.replace(/\{param\}/g, "x")}-${index}`;
+
+      locs.push(`${fixture.baseUrl}${urlPath}`);
+      await pool.query(
+        "INSERT INTO pattern_urls (session_id, pattern_id, source_url, path) VALUES ($1, $2, $3, $4)",
+        [sessionId, row.rows[0].id, `${fixture.baseUrl}${urlPath}`, urlPath]
+      );
+    }
+  }
+
+  // Verification enumerates from the sitemap XML on disk, not from pattern_urls.
+  const stored = `${sessionId}-diagnostics.xml`;
+
+  writeFileSync(path.join(uploadDir, stored), urlset(locs), "utf8");
+  await pool.query(
+    `
+      INSERT INTO sitemap_files (session_id, filename, total_urls, parsed_at, is_valid, is_index)
+      VALUES ($1, $2, $3, now(), true, false)
+    `,
+    [sessionId, stored, locs.length]
+  );
+
+  await processSamplePatternsJob({ session_id: sessionId }, silentLogger);
+  await flushEventLog();
+
+  const file = path.join(
+    diagnosticsDir,
+    "host-strategy",
+    dayStamp(new Date()),
+    `${sessionId}.jsonl`
+  );
+  const readEvents = () =>
+    readFileSync(file, "utf8")
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  const countOf = (events: Array<Record<string, unknown>>, name: string) =>
+    events.filter((entry) => entry.event === name).length;
+
+  const afterSampling = readEvents();
+
+  // ONE resolve for the one host — not one per pattern, even though the pattern loop
+  // asks for it every time. The run-level memo is what makes that true, and this is the
+  // assertion that would catch it regressing.
+  assert.equal(
+    countOf(afterSampling, "host_strategy_resolved"),
+    1,
+    `resolve events: ${JSON.stringify(
+      afterSampling.filter((e) => e.event === "host_strategy_resolved")
+    )}`
+  );
+  // THREE rung attempts — for SIX actual HTTP requests. One event per rung, not per
+  // request: a rung is one runCheckWithProfile call, which internally sends HEAD and
+  // then re-probes with GET because a 405 is method-rejection. The `method` field is
+  // what bridges the two numbers (asserted just below), and that pairing is the whole
+  // reason it was surfaced onto SampleCheckResult: "HEAD refused AND GET refused" is a
+  // materially stronger statement about an edge than a bare 405.
+  assert.equal(countOf(afterSampling, "host_strategy_rung_attempt"), 3);
+
+  const rungAttempts = afterSampling.filter(
+    (entry) => entry.event === "host_strategy_rung_attempt"
+  );
+
+  assert.deepEqual(
+    rungAttempts.map((entry) => entry.rung),
+    ["R0", "R1", "R2"]
+  );
+  // GET, not HEAD: every rung's HEAD was method-rejected and the GET re-probe was
+  // refused too. That is the pair of facts the fixture is simulating, and it is now
+  // readable straight off the file.
+  assert.deepEqual(
+    rungAttempts.map((entry) => entry.method),
+    ["GET", "GET", "GET"]
+  );
+  assert.equal(rungAttempts[0].status, 405);
+  assert.equal(rungAttempts[0].host_answered, false);
+  assert.equal(rungAttempts[0].category, "blocked");
+  // TWO: one per skipped pattern. Not twenty (per URL), not one (per host).
+  assert.equal(countOf(afterSampling, "host_strategy_skipped"), 2);
+
+  const skips = afterSampling.filter(
+    (entry) => entry.event === "host_strategy_skipped"
+  );
+
+  assert.deepEqual(
+    skips.map((entry) => entry.pattern).sort(),
+    ["/product/{param}/{param}", "/rfq/{param}/{param}"]
+  );
+  // The number a per-URL log would have been trying to convey, carried on one line.
+  assert.deepEqual(
+    skips.map((entry) => entry.url_count_affected),
+    [10, 10]
+  );
+  assert.equal(skips[0].phase, "sampling");
+  assert.equal(skips[0].edge_server, "awselb/2.0");
+  assert.equal(skips[0].session_id, sessionId);
+  // No streak event: a refused host issues zero per-URL checks, so nothing can
+  // accumulate. Its absence is EXPECTED, and the runbook says so — silence here must
+  // not be read as the host having recovered.
+  assert.equal(countOf(afterSampling, "host_strategy_refusal_streak"), 0);
+  // Plain http fixture: no TLS, so no ALPN. Asserted as null rather than "h1", because
+  // guessing "h1" would make an unmeasured value look measured.
+  assert.equal(
+    afterSampling.find((entry) => entry.event === "host_strategy_rung_attempt")
+      ?.alpn_negotiated,
+    null
+  );
+
+  // ---- VERIFICATION over the same refused host: ONE line, not one per URL ----
+  const jobRow = await pool.query<{ id: string }>(
+    "INSERT INTO maintenance_jobs (session_id, kind, pattern_ids) VALUES ($1, 'verify-urls', $2::uuid[]) RETURNING id",
+    [sessionId, patternIds]
+  );
+
+  await processVerifyUrlsJob(
+    {
+      session_id: sessionId,
+      job_row_id: jobRow.rows[0].id,
+      pattern_ids: patternIds,
+      target_statuses: null
+    },
+    silentLogger
+  );
+  await flushEventLog();
+
+  const afterVerification = readEvents();
+  const verificationSkips = afterVerification.filter(
+    (entry) =>
+      entry.event === "host_strategy_skipped" && entry.phase === "verification"
+  );
+
+  // THE HEADLINE ASSERTION OF THIS TEST. Twenty enumerated URLs were dropped, and the
+  // file gained exactly ONE line saying so — with 20 on it. The skip check itself runs
+  // inside the per-URL loop; only the LOGGING is aggregated, which is the distinction a
+  // future edit is most likely to lose.
+  assert.equal(
+    verificationSkips.length,
+    1,
+    `expected one verification skip line, got ${verificationSkips.length}`
+  );
+  assert.equal(verificationSkips[0].url_count_affected, 20);
+  assert.equal(verificationSkips[0].pattern, null);
+  assert.equal(verificationSkips[0].host, host);
+
+  // And the whole session's diagnostics stayed small. A per-URL regression would show
+  // up here as hundreds of lines even at this toy scale.
+  assert.ok(
+    afterVerification.length <= 20,
+    `expected a handful of events, got ${afterVerification.length}`
+  );
+
+  // The session is marked as worth KEEPING, so the optional success-triggered cleanup
+  // can never delete the one run someone will actually want to read.
+  assert.equal(
+    existsSync(
+      path.join(
+        diagnosticsDir,
+        "host-strategy",
+        dayStamp(new Date()),
+        `${sessionId}.keep`
+      )
+    ),
+    true
+  );
 });
 
 test("a browser-only host is learned once, then sampling and verification both lead with it", async (t) => {

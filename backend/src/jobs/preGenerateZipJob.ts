@@ -226,7 +226,15 @@ export async function processCleanupZipsJob(logger: FastifyBaseLogger) {
   // Awaited but never allowed to fail the job: a sweep error must not stop the ZIP
   // half from having run, and the next tick will try again.
   try {
-    await sweepStaleArtifacts(config.uploadDir, logger);
+    await sweepStaleArtifacts(config.uploadDir, logger, {
+      // Diagnostics retention rides along on this daily job rather than getting its own
+      // repeatable entry: it is the same kind of work (age-based cleanup of files whose
+      // writer has no idea when they stop being useful), and one scheduled sweep is one
+      // thing to reason about instead of two.
+      dir: config.diagnostics.dir,
+      retentionDays: config.diagnostics.retentionDays,
+      maxTotalBytes: config.diagnostics.maxTotalBytes
+    });
   } catch (error) {
     logger.error({ error }, "stale artifact sweep failed");
   }
