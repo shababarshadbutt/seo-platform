@@ -194,3 +194,43 @@ export function verificationRateLimit(): RateLimiterOptions {
     burst: config.verification.rateLimitBurst
   };
 }
+
+// The budget for requests that go over a host's private VPC address.
+//
+// A SEPARATE BUDGET, because the number above is not about capacity. 5 req/s was
+// chosen after AWS WAF Bot Control rate-limited this box's egress IP — a constraint
+// that exists at the public edge and simply is not in the path of a private request.
+// Sharing the public number would carry a WAF's opinion into a network where no WAF
+// runs.
+export function privateRouteRateLimit(): RateLimiterOptions {
+  return {
+    requestsPerSecond: config.privateRoute.maxRequestsPerSecond,
+    burst: config.privateRoute.rateLimitBurst
+  };
+}
+
+// Which budget a request is charged to, and under which key.
+//
+// KEYED ON THE PRIVATE IP, not the hostname, and the difference matters: ~93 of these
+// sites share each box, so the thing that can be overloaded is the SERVER. Per-host
+// keying would hand one machine 93 independent budgets and call it rate limiting.
+//
+// The `priv:` prefix is load-bearing. acquireHostSlot takes its options per call, so a
+// key shared between the 5/s public budget and a different private one would produce
+// incoherent spacing for both — the same bucket paced by two different schedules.
+//
+// rateLimitHostKey is deliberately NOT changed to do this. Its return value is also the
+// host-strategy cache key, the host_probe_profiles primary key and verifyUrlsJob's
+// ladder key; making it return an IP would silently re-file every learned strategy
+// under an address shared by 93 sites. Only the BUDGET moves here — every identity use
+// keeps the hostname.
+export function rateLimitBucketFor(
+  url: string,
+  privateIp: string | null
+): { key: string; options: RateLimiterOptions } {
+  if (privateIp) {
+    return { key: `priv:${privateIp}`, options: privateRouteRateLimit() };
+  }
+
+  return { key: rateLimitHostKey(url), options: verificationRateLimit() };
+}

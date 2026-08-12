@@ -1,0 +1,259 @@
+DEPLOY v1.63-Live — private-VPC routing for URL health checks
+Box: /home/ubuntu/seo-platform   Compose: docker-compose.aws.yml
+
+===========================================================================
+WHAT THIS RELEASE DOES
+===========================================================================
+Health checks can now reach a managed site at its PRIVATE VPC address instead
+of going out to the public internet and back in through the site's edge.
+
+Why it matters, in the two terms that have been blocking this project:
+  * COST. Every probe currently leaves through the box's public IP. The ~650
+    sites live on 7 EC2 boxes in the SAME VPC as this box (10.0.x.x), so the
+    traffic never needed to leave the VPC at all. No new AWS resource is
+    involved — no PrivateLink, no VPC peering, no per-site Route53 zone. That
+    matters because devops refused those on cost (fleet-strategy-650-sites.txt).
+  * BLOCKING. The private path does not pass through the site's AWS WAF, which
+    is the entire reason VERIFY_MAX_REQUESTS_PER_SECOND is 5 and the reason
+    stackedindustrials.com reports "Not scored".
+
+HOW IT WORKS, in one sentence: for a hostname listed in the map file, only DNS
+RESOLUTION is overridden. The URL, the Host header and the TLS SNI servername
+all still say the site's public hostname — which is what makes ~93 vhosts per
+box work, and what keeps the stored verdict describing the right page.
+
+DEFAULT OFF. PRIVATE_ROUTE_ENABLED=false ships in this release. Steps 5 and 6
+below are the gate; do not skip them because ":80 answers".
+
+===========================================================================
+1. Pull and check out
+===========================================================================
+cd /home/ubuntu/seo-platform
+git fetch --all
+git checkout feature/aws-s3-sftp-deploy
+git pull
+
+===========================================================================
+2. Put the map file on the box
+===========================================================================
+The map is NOT in the image and NOT in git: it is infrastructure topology, and
+changing it must never need a rebuild. It is bind-mounted read-only.
+
+  mkdir -p ./private-routes
+  cp private-routes/private-hosts.conf.example private-routes/private-hosts.conf
+  vi private-routes/private-hosts.conf
+
+Format is /etc/hosts, verbatim — paste what `pm2 list` on each box produces.
+
+  >>> THE SUPPLIED MAP HAS ONE CONFLICT. www.industrialworld360.com is listed
+  >>> under BOTH 10.0.61.203 and 10.0.49.183. A hostname claimed by two
+  >>> addresses is DROPPED from the map and keeps using public https — first
+  >>> wins would silently pin that site to one of two servers, and a plausible
+  >>> 200 from the wrong box is the hardest failure here to notice. Ask devops
+  >>> which server hosts it and delete the other line.
+
+Note the mount is a DIRECTORY (./private-routes -> /etc/sitemap:ro), not the
+file. Docker creates a DIRECTORY at any missing bind-mount source, so mounting
+the file directly would turn a missing file into an EISDIR forever.
+
+===========================================================================
+3. Set .env
+===========================================================================
+APP_VERSION=v1.63-Live
+
+Leave the routing flag OFF for now. It is switched on in step 7.
+  PRIVATE_ROUTE_ENABLED=false
+
+Everything else has a working default (see .env.example for all eight knobs).
+Do NOT raise PRIVATE_MAX_REQUESTS_PER_SECOND yet — see step 9.
+
+===========================================================================
+4. Build, push, deploy, migrate
+===========================================================================
+docker compose -f docker-compose.aws.yml build frontend backend worker
+docker compose -f docker-compose.aws.yml up -d --force-recreate frontend backend worker
+
+MIGRATION 045 runs automatically at backend start (two ALTER TABLE ... ADD
+COLUMN IF NOT EXISTS, both instant — nullable, no default). Confirm:
+
+docker compose -f docker-compose.aws.yml exec postgres \
+  psql -U sitemap -d sitemap_health -c \
+  "select name from schema_migrations order by name desc limit 2;"
+
+Expect 045_private_route_columns.sql at the top.
+
+Then confirm the map loaded, with the flag still off:
+
+curl -s localhost:3000/api/backend/api/private-routes | head -40
+
+Expect: "enabled": false, "hosts": ~650, "ips": 7, "warnings": [] apart from
+the known conflict, and "conflicts" listing exactly what you expect. A warning
+you did not expect is a typo in the map — fix it before going further; the file
+is re-read within a minute, no restart needed.
+
+The same information is in the boot log of BOTH services (they must agree):
+docker compose -f docker-compose.aws.yml logs backend worker | grep "private host map"
+
+===========================================================================
+5. GATE 1 — does the origin select a vhost from the Host header?
+===========================================================================
+RUN THIS EVEN THOUGH :80 ALREADY ANSWERS. ":80 answers" and ":80 answers as the
+right site" are different claims, and only the second one makes this safe.
+~93 hostnames share each IP; if the listener has one default backend, every one
+of those sites gets measured against whichever site the default serves —
+silently, at fleet scale. No code can detect that.
+
+Two hostnames, one IP, from INSIDE the backend container so it uses the real
+network path:
+
+docker compose -f docker-compose.aws.yml exec backend node -e "
+const http=require('http');
+for (const host of ['www.aeropartshub.com','www.aeroworld360.com']) {
+  const r=http.request({host:'10.0.61.203',port:80,path:'/',method:'HEAD',headers:{host},timeout:5000},
+    x=>console.log(host,x.statusCode,JSON.stringify({server:x.headers.server,location:x.headers.location})));
+  r.on('error',e=>console.log(host,'ERR',e.code));
+  r.on('timeout',()=>{console.log(host,'TIMEOUT');r.destroy()}); r.end(); }"
+
+  * Two DIFFERENT responses  -> vhost routing works. Continue.
+  * IDENTICAL responses, or a default/welcome page for both -> STOP. This is a
+    devops fix, not a code change.
+  * TIMEOUT -> the security group or route table blocks this box. Also devops.
+  * 301 -> https://<same host><same path> -> :80 only redirects to TLS. You can
+    continue: the checker detects that as a transport artifact, remembers https
+    for that host and re-probes over the same private route (SNI stays the real
+    hostname, so the site's real certificate validates). But confirm :443 is
+    reachable privately before trusting the run.
+
+Repeat for one representative hostname on EACH of the 7 IPs.
+
+===========================================================================
+6. GATE 2 — does the private IP serve the SAME content as the public one?
+===========================================================================
+Pick a real deep URL from an existing session:
+
+docker compose -f docker-compose.aws.yml exec postgres \
+  psql -U sitemap -d sitemap_health -Atc \
+  "select url from sampled_urls where http_status = 200 limit 1;"
+
+HEAD it both ways and compare the STATUS, then GET the first 2KB both ways and
+compare the <title> and the byte length. A matching 200 from a different app
+version is still the wrong measurement.
+
+  * They agree -> continue.
+  * They differ -> that IP fronts a different tier (staging, a different app
+    version, an un-warmed origin behind a cache that holds the real pages).
+    LEAVE THAT IP OUT OF THE MAP. No code change and no flag is needed for a
+    partial rollout: an unmapped host simply uses public https.
+
+Record the per-IP results at the bottom of this file. That table is the evidence
+for which IPs belong in the map.
+
+===========================================================================
+7. Switch it on for ONE HOST first
+===========================================================================
+Scope the pilot by DATA, not by code:
+
+  cp private-routes/private-hosts.conf private-routes/private-hosts.conf.full
+  # leave exactly ONE hostname in the live file
+  printf '10.0.50.234 www.stackedindustrials.com\n' > private-routes/private-hosts.conf
+  # .env: PRIVATE_ROUTE_ENABLED=true
+  docker compose -f docker-compose.aws.yml up -d --force-recreate backend worker
+
+Every other host is unmapped, so every other host is unchanged.
+
+Re-run that site's session and compare it against its last public-path run:
+pattern status, confidence_pct, redirect_pct, and a verified_urls status
+histogram. AGREEMENT IS THE GATE.
+
+  docker compose -f docker-compose.aws.yml exec postgres \
+    psql -U sitemap -d sitemap_health -c \
+    "select via_private_route, http_status, count(*) from verified_urls
+      where session_id = '<id>' group by 1,2 order by 3 desc;"
+
+stackedindustrials.com is the interesting pilot: it currently has a REFUSED row
+in host_probe_profiles from the public path. That row STAYS — it is a true
+statement about the public edge and the substance of the allowlist request to
+devops — and the engine ignores it for a privately-routed host rather than
+deleting it. So the expected result is patterns that score instead of "Not
+scored", with no change to that table.
+
+===========================================================================
+8. Widen to one IP, then the fleet
+===========================================================================
+Put back one full block (~93 hosts), leave the rate at 5/s, and run a real
+session. THEN confirm the thing this release is for:
+
+  * the box's NAT-gateway / data-transfer metric drops. That number is the
+    requirement; everything else is a means to it.
+
+Only after that, restore the full map.
+
+===========================================================================
+9. ONLY THEN raise the rate
+===========================================================================
+Routing and throughput are two separate changes. If a verdict looks wrong after
+both land at once, nothing distinguishes "wrong network path" from "origin under
+load" — and config.ts records what happened the last time a rate was raised on a
+theory (50/s -> WAF captcha -> back to 5).
+
+When you do raise it, raise BOTH or the rate is a fiction (measured: 25 req/s
+against a 50/s ceiling because concurrency stayed at 8):
+  PRIVATE_MAX_REQUESTS_PER_SECOND=50
+  PRIVATE_MAX_CONCURRENCY=32
+
+The private budget is keyed on the PRIVATE IP, so all ~93 vhosts on one box
+share it — which is correct, because the box is the thing that can fall over.
+Note the side effect: two sessions on the same box now share one budget rather
+than getting one each.
+
+===========================================================================
+10. What to watch in the logs
+===========================================================================
+docker compose -f docker-compose.aws.yml logs -f --tail=100 backend worker
+
+  * "private_route_selected" -> one per host per run, carrying private_ip. This
+    is where a map typo becomes visible: it names the box a whole site family
+    was measured against.
+  * "private route abandoned" / "private_route_failed" -> a route stopped
+    answering. Its sites fell back to public https automatically, so nothing is
+    mismeasured — but IT DOES NOT RECOVER ON A TIMER. The route stays abandoned
+    for the life of the process; `docker compose restart backend worker` is the
+    only way back. GET /api/private-routes lists disabled routes with
+    recovers_on.
+  * "private route forced TLS, re-probing" -> an origin refused cleartext. Once
+    per host, expected on any box whose :80 redirects.
+  * "private_routed_url_count" / "public_routed_url_count" on the job-completion
+    lines -> how the run was actually measured. Counted from results, so a route
+    abandoned mid-run shows as a split rather than as fully private.
+
+===========================================================================
+ROLLBACK
+===========================================================================
+FASTEST: no deploy needed. Set PRIVATE_ROUTE_ENABLED=false in .env and
+  docker compose -f docker-compose.aws.yml up -d --force-recreate backend worker
+Every check returns to the public path immediately. Or empty the map file — it
+is re-read within a minute with no restart at all.
+
+FULL: previous images.
+  # edit .env back to APP_VERSION=v1.62-Live
+  git checkout ebfde24d
+  docker compose -f docker-compose.aws.yml build frontend backend worker
+  docker compose -f docker-compose.aws.yml up -d --force-recreate frontend backend worker
+
+Migration 045 does NOT need reverting: two nullable columns the old code never
+reads. Rows written by v1.63 keep their via_private_route value harmlessly.
+
+If anything in steps 4-8 fails, stop and paste the exact output. Do not retry
+blind — this is production.
+
+===========================================================================
+GATE RESULTS (fill in — this is the record of which IPs are in the map)
+===========================================================================
+IP             | :80 reachable | vhost selection | deep URL matches public | in map
+10.0.49.183    |               |                 |                         |
+10.0.49.240    |               |                 |                         |
+10.0.50.234    |               |                 |                         |
+10.0.54.36     |               |                 |                         |
+10.0.55.55     |               |                 |                         |
+10.0.58.191    |               |                 |                         |
+10.0.61.203    |               |                 |                         |

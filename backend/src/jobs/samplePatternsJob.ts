@@ -8,10 +8,11 @@ import {
 } from "./sampleUrlCheck.js";
 import {
   acquireHostSlot,
-  rateLimitHostKey,
-  verificationRateLimit
+  rateLimitBucketFor,
+  rateLimitHostKey
 } from "../http/hostRateLimiter.js";
 import { createHostStrategyRun } from "../http/hostStrategyRun.js";
+import { privateRouteFor } from "../http/privateRoute.js";
 import { resolveSampleTarget } from "./sampleTarget.js";
 // Pure scoring lives in its own module so it is unit-testable without loading
 // this job (and with it a BullMQ/Redis connection). See patternScore.ts.
@@ -187,9 +188,10 @@ async function persistPatternSamples(
             http_status_category,
             source_file,
             error_reason,
-            used_fallback_profile
+            used_fallback_profile,
+            via_private_route
           )
-          VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, $12)
+          VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, $12, $13)
         `,
         [
           patternId,
@@ -205,7 +207,11 @@ async function persistPatternSamples(
           result.errorReason,
           // Which profile produced this verdict (mig 043) — a pattern that needed
           // the browser fallback must not look like one that never did.
-          result.usedFallbackProfile
+          result.usedFallbackProfile,
+          // Which NETWORK PATH produced it (mig 045). The public path goes through
+          // the site's WAF and the private one does not, so two rows are only
+          // comparable when this agrees.
+          result.viaPrivateRoute
         ]
       );
     }
@@ -324,6 +330,10 @@ export async function processSamplePatternsJob(
       [data.session_id, scopedPatternId]
     );
     let sampledUrlCount = 0;
+    // Counted from the RESULTS, not from the config flag: what matters is how many URLs
+    // were actually measured over the private path, which differs from "the feature is
+    // on" whenever the breaker abandoned a route mid-run.
+    let privateRoutedUrlCount = 0;
     let skippedPatternCount = 0;
     let refusedPatternCount = 0;
     let emptyPoolPatternCount = 0;
@@ -495,6 +505,15 @@ export async function processSamplePatternsJob(
             sample.source_url
           );
           const host = rateLimitHostKey(target);
+          // A privately-routed target is charged to its BOX's budget (keyed on the
+          // private IP, shared by the ~93 vhosts on it) rather than to its own
+          // hostname's. `host` above stays the hostname because it is an IDENTITY —
+          // it feeds the staleness heuristic below, which is keyed the same way the
+          // strategy store is.
+          const bucket = rateLimitBucketFor(
+            target,
+            privateRouteFor(target)?.ip ?? null
+          );
 
           return checkSampleUrl(
             session.base_url,
@@ -509,7 +528,7 @@ export async function processSamplePatternsJob(
               sampleIndex: index
             },
             {
-              beforeRequest: () => acquireHostSlot(host, verificationRateLimit()),
+              beforeRequest: () => acquireHostSlot(bucket.key, bucket.options),
               // The learned rung goes FIRST, with the rung above it as the per-URL
               // safety net (ladderForRung). On a host that answers the browser
               // profile this is the whole saving: attempt #1 succeeds instead of
@@ -535,6 +554,9 @@ export async function processSamplePatternsJob(
       );
 
       sampledUrlCount += results.length;
+      privateRoutedUrlCount += results.filter(
+        (result) => result.viaPrivateRoute
+      ).length;
 
       if (results.length < sampleLimit) {
         logger.warn(
@@ -588,8 +610,17 @@ export async function processSamplePatternsJob(
           host: strategy.host,
           verdict: strategy.verdict,
           rung: strategy.rung,
-          edge_server: strategy.edgeServer
+          edge_server: strategy.edgeServer,
+          // "private-route" here means no rung was negotiated because the host was
+          // reached inside the VPC. Without it a reader sees verdict OK / rung R0 and
+          // assumes the public edge answered.
+          source: strategy.source
         })),
+        // How the URLs in this run were actually measured. The whole point of enabling
+        // private routing is that this number is not zero, and it is the one field that
+        // says so without a database query.
+        private_routed_url_count: privateRoutedUrlCount,
+        public_routed_url_count: sampledUrlCount - privateRoutedUrlCount,
         sampled_url_count: sampledUrlCount
       },
       "sample patterns job completed"

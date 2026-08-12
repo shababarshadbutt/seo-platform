@@ -3,8 +3,15 @@ import { performance } from "node:perf_hooks";
 import type { FastifyBaseLogger } from "fastify";
 import { request } from "undici";
 
-import { BROWSER_PROFILE_USER_AGENT } from "../config.js";
-import { dispatcherFor } from "../http/tlsDispatcher.js";
+import { BROWSER_PROFILE_USER_AGENT, config } from "../config.js";
+import type { PrivateRoute } from "../http/privateRoute.js";
+import {
+  applyPrivateRoute,
+  isForcedTlsRedirect,
+  notePrivateSchemeFlip
+} from "../http/privateRoute.js";
+import { notePrivateRouteOutcome } from "../http/privateRouteHealth.js";
+import { dispatcherFor, privateDispatcherFor } from "../http/tlsDispatcher.js";
 import { SOFT_404_TEXT_SIGNALS } from "../sitemaps/softNotFound.js";
 import { hasWafBlockHeader, isMethodRejectedStatus } from "./sampleHttpStatus.js";
 import { resolveSampleTarget } from "./sampleTarget.js";
@@ -208,6 +215,14 @@ export type SampleCheckResult = {
   methodUsed?: "HEAD" | "GET";
   // The HEAD status that triggered the GET re-probe, null when HEAD was not rejected.
   methodFallbackFrom?: number | null;
+  // TRUE when this verdict came from a request that went to the host's private VPC
+  // address instead of over the public internet. Persisted, because the two paths
+  // meet different infrastructure — the public one goes through the site's WAF —
+  // and a verdict is only comparable to another verdict measured the same way.
+  //
+  // Note the URL above is UNAFFECTED: it stays the public https identity of the
+  // page. This flag is the only place the transport is recorded.
+  viaPrivateRoute: boolean;
 };
 
 type BodyPrefixResult = {
@@ -299,9 +314,24 @@ function firstHeaderValue(value: string | string[] | undefined) {
   return value ?? null;
 }
 
+// Which cached dispatcher carries this request.
+//
+// The private pair is selected ONLY from an explicit route argument, never inferred
+// from the URL's host. That distinction is load-bearing: the redirect follow-up
+// below requests a Location-derived URL which may well be on a mapped host, and
+// private routing is deliberately scoped to the URL health check itself. Inferring
+// would silently widen the scope to whatever a site's redirects happen to point at.
+function dispatcherForRequest(
+  route: PrivateRoute | null,
+  allowH2: boolean | undefined
+) {
+  return route ? privateDispatcherFor(allowH2) : dispatcherFor(allowH2);
+}
+
 async function headOnce(
   url: string,
   profile: RequestProfile,
+  route: PrivateRoute | null,
   beforeRequest?: BeforeRequestHook
 ): Promise<HeadResult> {
   const started = performance.now();
@@ -312,7 +342,7 @@ async function headOnce(
     const response = await request(url, {
       method: "HEAD",
       maxRedirections: 0,
-      dispatcher: dispatcherFor(profile.allowH2),
+      dispatcher: dispatcherForRequest(route, profile.allowH2),
       headers: profileHeaders(profile),
       headersTimeout: HTTP_TIMEOUT_MS,
       bodyTimeout: HTTP_TIMEOUT_MS,
@@ -389,6 +419,7 @@ async function readBodyPrefix(
 async function getStatusOnce(
   url: string,
   profile: RequestProfile,
+  route: PrivateRoute | null,
   beforeRequest?: BeforeRequestHook
 ): Promise<HeadResult> {
   const started = performance.now();
@@ -399,7 +430,7 @@ async function getStatusOnce(
     const response = await request(url, {
       method: "GET",
       maxRedirections: 0,
-      dispatcher: dispatcherFor(profile.allowH2),
+      dispatcher: dispatcherForRequest(route, profile.allowH2),
       headers: profileHeaders(profile, { "accept-encoding": "identity" }),
       headersTimeout: HTTP_TIMEOUT_MS,
       bodyTimeout: HTTP_TIMEOUT_MS,
@@ -442,6 +473,7 @@ async function getStatusOnce(
 async function checkSoft404Signals(
   url: string,
   profile: RequestProfile,
+  route: PrivateRoute | null,
   beforeRequest?: BeforeRequestHook
 ): Promise<Soft404CheckResult> {
   const started = performance.now();
@@ -452,7 +484,7 @@ async function checkSoft404Signals(
     const response = await request(url, {
       method: "GET",
       maxRedirections: 0,
-      dispatcher: dispatcherFor(profile.allowH2),
+      dispatcher: dispatcherForRequest(route, profile.allowH2),
       headers: profileHeaders(profile, {
         "accept-encoding": "identity",
         range: `bytes=0-${SOFT_404_BODY_SAMPLE_BYTES - 1}`
@@ -536,10 +568,83 @@ export async function runCheckWithProfile(
 ): Promise<SampleCheckResult> {
   const { beforeRequest, skipRedirectFollow = false } = options;
 
+  // IDENTITY vs TRANSPORT, decided once, here.
+  //
+  // `url` is the public identity of the page: it is what goes into the result, into
+  // sampled_urls.url, into every finding a user reads, and what a sitemap <loc>
+  // gets compared against. `requestUrl` is where the bytes actually go — the same
+  // hostname and path, but over http when this host has a private VPC address, so
+  // the request never leaves the VPC and never meets the site's WAF.
+  //
+  // With private routing off (the default) these are the same string and every line
+  // below behaves exactly as it did before.
+  let routed = applyPrivateRoute(url);
+  let requestUrl = routed.url;
+
   logger.info(logContext, "sample url HEAD request started");
 
-  let firstResult = await headOnce(url, profile, beforeRequest);
+  let firstResult = await headOnce(requestUrl, profile, routed.route, beforeRequest);
   let methodFallbackFrom: number | null = null;
+
+  // FORCED-TLS ARTIFACT, not a redirect.
+  //
+  // If a private origin answers cleartext with "301 -> https://<same page>", that
+  // says nothing about the page — it is the origin declining our transport choice.
+  // Recorded as-is it would relabel every healthy URL on ~93 sites as "redirect",
+  // which is the most damaging false finding this feature could produce.
+  //
+  // So: remember https for this host (one way, once — never back to http, so it
+  // cannot ping-pong), and re-probe the same page over the same private route. The
+  // SNI servername is still the real hostname because only DNS was overridden, so
+  // the site's real certificate validates with verification left ON.
+  if (routed.route && isForcedTlsRedirect(requestUrl, firstResult.statusCode, firstResult.location)) {
+    notePrivateSchemeFlip(new URL(requestUrl).hostname);
+
+    routed = applyPrivateRoute(url);
+    requestUrl = routed.url;
+
+    logger.info(
+      { ...logContext, private_route_ip: routed.route?.ip, request_url: requestUrl },
+      "private route forced TLS, re-probing the same page over https"
+    );
+
+    const httpsResult = await headOnce(
+      requestUrl,
+      profile,
+      routed.route,
+      beforeRequest
+    );
+
+    firstResult = {
+      ...httpsResult,
+      // Both probes were paid for; the total stays honest.
+      responseMs: firstResult.responseMs + httpsResult.responseMs
+    };
+  }
+
+  // Did the private path carry this request at all? ANY status — 200, 404, even a
+  // 403 — proves it reached a web server; only "nothing answered" condemns the
+  // route. Charged once per check rather than once per request, so a check that
+  // makes three requests cannot trip the breaker on its own.
+  if (routed.route) {
+    const tripped = notePrivateRouteOutcome(
+      routed.route.ip,
+      firstResult.statusCode !== null,
+      config.privateRoute.failureStreak
+    );
+
+    if (tripped) {
+      logger.error(
+        {
+          ...logContext,
+          private_route_ip: tripped.ip,
+          consecutive_failures: tripped.consecutiveFailures,
+          recovers: tripped.recovers
+        },
+        "private route abandoned — falling back to the public path for this IP"
+      );
+    }
+  }
 
   // HEAD refused for being HEAD: re-probe with GET and classify on THAT, so the
   // page is judged on whether it actually serves, not on which verb we happened
@@ -551,7 +656,12 @@ export async function runCheckWithProfile(
       "sample url HEAD method-rejected, re-probing with GET"
     );
 
-    const getResult = await getStatusOnce(url, profile, beforeRequest);
+    const getResult = await getStatusOnce(
+      requestUrl,
+      profile,
+      routed.route,
+      beforeRequest
+    );
 
     firstResult = {
       ...getResult,
@@ -566,8 +676,9 @@ export async function runCheckWithProfile(
     logger.info(logContext, "sample url soft-404 GET check started");
 
     const soft404Result = await checkSoft404Signals(
-      url,
+      requestUrl,
       profile,
+      routed.route,
       beforeRequest
     );
 
@@ -599,14 +710,22 @@ export async function runCheckWithProfile(
       // The runner does not know about escalation; checkSampleUrl overrides this
       // when a verdict came from the fallback attempt.
       usedFallbackProfile: false,
-      edgeServer: firstResult.serverHeader
+      edgeServer: firstResult.serverHeader,
+      viaPrivateRoute: routed.route !== null
     };
   } else if (isRedirectStatus(firstResult.statusCode)) {
+    // Resolved against the PUBLIC identity, not the request URL: finalUrl is
+    // persisted, drives the redirect rules and the Fix modal, and must describe
+    // where a real visitor would land — not our transport.
     const finalUrl = resolveRedirectUrl(firstResult.location, url);
     let responseMs = firstResult.responseMs;
 
     if (finalUrl && !skipRedirectFollow) {
-      const followResult = await headOnce(finalUrl, profile, beforeRequest);
+      // PUBLIC PATH, deliberately: private routing is scoped to the URL health
+      // check itself, and a redirect destination is a different page — often on a
+      // different host. Passing route: null keeps this request byte-identical to
+      // what it was before this feature existed.
+      const followResult = await headOnce(finalUrl, profile, null, beforeRequest);
 
       responseMs += followResult.responseMs;
     }
@@ -624,7 +743,8 @@ export async function runCheckWithProfile(
       timedOut: firstResult.timedOut,
       errorReason: null,
       usedFallbackProfile: false,
-      edgeServer: firstResult.serverHeader
+      edgeServer: firstResult.serverHeader,
+      viaPrivateRoute: routed.route !== null
     };
   } else {
     // BLOCKED vs FAILURE. Two high-confidence signals only — no vendor guessing,
@@ -664,7 +784,8 @@ export async function runCheckWithProfile(
       // verdict changes.
       errorReason: firstResult.errorReason,
       usedFallbackProfile: false,
-      edgeServer: firstResult.serverHeader
+      edgeServer: firstResult.serverHeader,
+      viaPrivateRoute: routed.route !== null
     };
   }
 
@@ -683,7 +804,12 @@ export async function runCheckWithProfile(
       // re-probe instead — makes the fallback auditable in the logs rather than
       // silently changing what a status means.
       method_fallback_from: methodFallbackFrom,
-      user_agent: profile.userAgent
+      user_agent: profile.userAgent,
+      // The transport, alongside the verdict it produced: a status that looks wrong
+      // is the first thing anyone reads, and "which network path measured it" is the
+      // first question to ask about it.
+      via_private_route: routed.route !== null,
+      private_route_ip: routed.route?.ip ?? null
     },
     "sample url HEAD request completed"
   );

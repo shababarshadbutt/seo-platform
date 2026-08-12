@@ -1,7 +1,10 @@
 import type { FastifyInstance } from "fastify";
 
+import { config } from "../config.js";
 import { pool } from "../db/pool.js";
 import { hostStrategyFleetReport } from "../http/hostStrategyReport.js";
+import { privateHostMapSnapshot } from "../http/privateHostMap.js";
+import { privateRouteHealthSnapshot } from "../http/privateRouteHealth.js";
 import { VERIFY_PROBLEM_STATUSES } from "../jobs/verifyUrlsJob.js";
 import { enqueueDeleteProblemUrlsJob } from "../queue/maintenanceQueue.js";
 import {
@@ -108,6 +111,55 @@ export async function verificationRoutes(app: FastifyInstance) {
       };
     }
   );
+
+  // IS PRIVATE ROUTING ON, AND IS IT WORKING — the one request ops runs.
+  //
+  // Read-only, and same home as /api/host-strategies for the same reason: both answer
+  // "what does a probe of a host actually do". There is deliberately no reload
+  // endpoint. This API is unauthenticated (see the note in docker-compose.aws.yml),
+  // the map is re-read on mtime change within a minute anyway, and an endpoint that
+  // re-pointed 650 sites at different servers is not something to leave unguarded.
+  app.get("/api/private-routes", async () => {
+    const map = privateHostMapSnapshot({
+      file: config.privateRoute.mapFile,
+      reloadSeconds: config.privateRoute.mapReloadSeconds
+    });
+
+    return {
+      enabled: config.privateRoute.enabled,
+      scheme: config.privateRoute.scheme,
+      map: {
+        file: map.file,
+        present: map.present,
+        mtime: map.mtimeMs === null ? null : new Date(map.mtimeMs).toISOString(),
+        loaded_at:
+          map.loadedAt === null ? null : new Date(map.loadedAt).toISOString(),
+        hosts: map.entryCount,
+        ips: Object.keys(map.hostsByIp).length,
+        hosts_by_ip: map.hostsByIp,
+        // Hostnames claimed by two different IPs. These route PUBLICLY — first-wins
+        // would silently pin a site to one of two servers, and a plausible 200 from
+        // the wrong box is the hardest failure here to notice.
+        conflicts: map.conflicts,
+        warnings: map.warnings
+      },
+      // recovers_on rather than a bare `disabled: true`, because a breaker that never
+      // half-opens is surprising: without saying so, the natural assumption is that it
+      // recovers on a timer and a site family sits on the public path for days.
+      disabled_routes: privateRouteHealthSnapshot().map((entry) => ({
+        private_ip: entry.ip,
+        disabled_since: new Date(entry.disabledSince).toISOString(),
+        consecutive_failures: entry.consecutiveFailures,
+        recovers_on: entry.recoversOn
+      })),
+      limits: {
+        max_requests_per_second: config.privateRoute.maxRequestsPerSecond,
+        rate_limit_burst: config.privateRoute.rateLimitBurst,
+        max_concurrency: config.privateRoute.maxConcurrency,
+        failure_streak: config.privateRoute.failureStreak
+      }
+    };
+  });
 
   // Start (or attach to) a full-population verification. Body may carry
   // pattern_ids to verify a subset; absent → every current pattern.

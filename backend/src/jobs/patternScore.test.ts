@@ -32,7 +32,8 @@ function result(scoreWeight: number, redirectCount = 0): SampleCheckResult {
     timedOut: false,
     errorReason: null,
     usedFallbackProfile: false,
-    edgeServer: null
+    edgeServer: null,
+    viaPrivateRoute: false
   };
 }
 

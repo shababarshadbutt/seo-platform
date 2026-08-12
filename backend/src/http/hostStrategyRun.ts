@@ -7,15 +7,19 @@ import {
 import { runCheckWithProfile } from "../jobs/sampleUrlCheck.js";
 import {
   acquireHostSlot,
+  rateLimitBucketFor,
   rateLimitHostKey,
   verificationRateLimit
 } from "./hostRateLimiter.js";
 import {
   noteHostCheckOutcome,
+  profileForRung,
   resolveHostStrategy,
   type ResolvedHostStrategy
 } from "./hostStrategy.js";
 import { hostStrategyStore } from "./hostStrategyStore.js";
+import { privateRouteFor } from "./privateRoute.js";
+import { disablePrivateRoute } from "./privateRouteHealth.js";
 
 // Per-RUN wrapper around the strategy engine: one resolved strategy per host, held
 // for the life of a job.
@@ -124,6 +128,104 @@ export function createHostStrategyRun(
     return strategy;
   }
 
+  // A host reached over the private VPC path needs no strategy, and must not obey the
+  // one it has.
+  //
+  // WHY NO NEGOTIATION. Every rung above R0 exists to get past a WAF or a bot filter.
+  // A request to the origin's private address never meets either, so climbing the
+  // ladder there could only cost requests — R1's browser profile has nothing to
+  // recover. The ladder is therefore a SINGLE rung, and checkSampleUrl already treats
+  // a one-entry ladder as "a request saved rather than a check weakened".
+  //
+  // WHY skip IS ALWAYS FALSE. The circuit breaker records that a PUBLIC EDGE refused
+  // our egress IP. That is a true statement about a different network path and it
+  // stays in host_probe_profiles as evidence for the allowlist conversation with
+  // devops — but obeying it here would skip a host that now answers perfectly well.
+  // Because this branch never reads the store, a stale REFUSED verdict cannot leak
+  // in: no migration deletes rows, and no cache has to be invalidated.
+  function privateStrategy(host: string): ResolvedHostStrategy {
+    return {
+      host,
+      verdict: "OK",
+      rung: "R0",
+      skip: false,
+      ladder: [profileForRung("R0", sessionUserAgent)],
+      edgeServer: null,
+      lastStatus: null,
+      source: "private-route",
+      decidedAt: null,
+      rungsTried: []
+    };
+  }
+
+  // Which private IPs this run has already proved carry traffic.
+  //
+  // Per IP, not per host: ~93 hostnames share each box, so what is being tested is
+  // whether the BOX answers. Per-host would pay 93 probes to learn one fact.
+  const preProbedIps = new Set<string>();
+
+  // ONE request, before any bulk work, that decides whether this private route works.
+  //
+  // WHY IT EARNS ITS REQUEST. Without it the failure mode of a dead or unroutable
+  // private IP is: the first N URLs come back with no status and are recorded as
+  // `failure` — real, wrong, user-visible verdicts — and only then does the streak
+  // breaker in sampleUrlCheck trip. With it, a dead route costs exactly one request
+  // and produces zero measurements, because the run falls back to the public path
+  // before measuring anything.
+  //
+  // Returns true when the route carried the request. ANY http status counts: a 404 or
+  // a 403 still proves a web server is at the other end.
+  async function privateRouteAnswers(
+    host: string,
+    ip: string,
+    probeUrl: string
+  ): Promise<boolean> {
+    const result = await runCheckWithProfile(
+      probeUrl,
+      profileForRung("R0", sessionUserAgent),
+      logger,
+      { host, probe_url: probeUrl, private_route_preflight: true },
+      {
+        // Paced by the same budget as every other request to this origin — the
+        // private one, since that is where this probe is going.
+        beforeRequest: () => {
+          const bucket = rateLimitBucketFor(probeUrl, ip);
+
+          return acquireHostSlot(bucket.key, bucket.options);
+        },
+        skipRedirectFollow: true
+      }
+    );
+
+    if (result.httpStatus !== null) {
+      return true;
+    }
+
+    const tripped = disablePrivateRoute(ip);
+
+    logger.error(
+      {
+        host,
+        private_ip: ip,
+        probe_url: probeUrl,
+        error_reason: result.errorReason,
+        recovers: tripped.recovers
+      },
+      "private route pre-probe got no response — using the public path for this IP"
+    );
+
+    emit("private_route_failed", {
+      private_ip: ip,
+      host,
+      consecutive_failures: tripped.consecutiveFailures,
+      error_reason: result.errorReason,
+      action: "fell back to public https",
+      recovers: tripped.recovers
+    });
+
+    return false;
+  }
+
   return {
     async forTarget(targetUrl, probeUrl) {
       const host = rateLimitHostKey(targetUrl);
@@ -143,6 +245,46 @@ export function createHostStrategyRun(
       // returns UNKNOWN, which runs today's default ladder.
       const candidate = probeUrl ?? targetUrl;
       const usableProbe = isBareRoot(candidate) ? null : candidate;
+
+      // Checked BEFORE the store, the lock and the negotiation race — all three are
+      // about a public edge this request will not touch.
+      const route = privateRouteFor(targetUrl);
+
+      if (route) {
+        // The pre-probe uses the SAME deep-URL rule as negotiation, and for the same
+        // reason. With no usable deep URL it is skipped rather than run against "/":
+        // the streak breaker in sampleUrlCheck still covers a route that fails later,
+        // and a pessimistic verdict from an entry-point path is worse than no verdict.
+        const needsPreProbe = usableProbe !== null && !preProbedIps.has(route.ip);
+
+        if (needsPreProbe) {
+          preProbedIps.add(route.ip);
+
+          if (!(await privateRouteAnswers(host, route.ip, usableProbe))) {
+            // Route abandoned. Fall through to the ordinary public resolution below —
+            // privateRouteFor now returns null for this IP, so nothing else in the run
+            // will try it either.
+            return resolve(host, usableProbe);
+          }
+        }
+
+        const strategy = privateStrategy(host);
+
+        byHost.set(host, strategy);
+
+        // ONE EVENT PER HOST PER RUN, guaranteed by the memo above. This is where a
+        // map typo becomes visible: it names the IP a whole site family was measured
+        // against, so a host silently pointed at the wrong box is a grep away rather
+        // than an unexplained set of findings.
+        emit("private_route_selected", {
+          host,
+          private_ip: route.ip,
+          scheme: route.scheme,
+          matched_via: route.matchedVia
+        });
+
+        return strategy;
+      }
 
       // Two patterns resolving the same never-seen host at once must not both
       // negotiate. The Redis lock guards ACROSS processes; this guards within one,

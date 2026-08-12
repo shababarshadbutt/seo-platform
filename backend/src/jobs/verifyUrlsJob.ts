@@ -13,7 +13,7 @@ import {
   type SampleCheckResult
 } from "./sampleUrlCheck.js";
 import { resolveSampleTarget } from "./sampleTarget.js";
-import { probeUrl, verifyConcurrency } from "./verifyProbe.js";
+import { probeUrl, verifyConcurrency, verifyTargetFor } from "./verifyProbe.js";
 import { rateLimitHostKey } from "../http/hostRateLimiter.js";
 import type { ResolvedHostStrategy } from "../http/hostStrategy.js";
 import { createHostStrategyRun } from "../http/hostStrategyRun.js";
@@ -97,10 +97,12 @@ async function upsertVerifiedBatch(
       result.httpStatusCategory,
       result.finalUrl,
       result.errorReason,
-      Array.from(entry.sourceFiles).sort()
+      Array.from(entry.sourceFiles).sort(),
+      // Which network path measured this URL (mig 045).
+      result.viaPrivateRoute
     );
     values.push(
-      `($1, $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}::text[], now())`
+      `($1, $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}::text[], now(), $${base + 8})`
     );
   }
 
@@ -115,7 +117,8 @@ async function upsertVerifiedBatch(
         final_url,
         error_reason,
         source_files,
-        checked_at
+        checked_at,
+        via_private_route
       )
       VALUES ${values.join(", ")}
       ON CONFLICT (session_id, url) DO UPDATE SET
@@ -125,7 +128,8 @@ async function upsertVerifiedBatch(
         final_url = EXCLUDED.final_url,
         error_reason = EXCLUDED.error_reason,
         source_files = EXCLUDED.source_files,
-        checked_at = EXCLUDED.checked_at
+        checked_at = EXCLUDED.checked_at,
+        via_private_route = EXCLUDED.via_private_route
     `,
     params
   );
@@ -308,7 +312,7 @@ export async function processVerifyUrlsJob(
     const refusedPerHost = new Map<string, { count: number; strategy: ResolvedHostStrategy }>();
 
     for (const entry of notDeleted) {
-      const target = resolveSampleTarget(session.base_url, entry.url, entry.url);
+      const { target } = verifyTargetFor(session.base_url, entry.url);
       const strategy = await strategyRun.forTarget(target);
 
       if (strategy.skip) {
@@ -329,6 +333,7 @@ export async function processVerifyUrlsJob(
         rateLimitHostKey(target),
         strategy.ladder.length ? strategy.ladder : undefined
       );
+
       toCheck.push(entry);
     }
 
@@ -377,13 +382,17 @@ export async function processVerifyUrlsJob(
           host: strategy.host,
           verdict: strategy.verdict,
           rung: strategy.rung,
-          edge_server: strategy.edgeServer
+          edge_server: strategy.edgeServer,
+          // "private-route" means no rung was negotiated because the host was reached
+          // inside the VPC — otherwise verdict OK / rung R0 reads as "the public edge
+          // answered", which it did not.
+          source: strategy.source
         })),
         // Separated from the HTTP phase so the two costs stay distinguishable
         // in the logs — the whole scoping fix was diagnosed from the fact that
         // urls_total, not enumeration, was the number out of proportion.
         enumerate_ms: enumerateMs,
-        concurrency: verifyConcurrency()
+        concurrency: verifyConcurrency(session.base_url)
       },
       "verify urls: population enumerated, checking started"
     );
@@ -393,6 +402,9 @@ export async function processVerifyUrlsJob(
     // (single-threaded between awaits), so concurrent onSettled calls never
     // double-write a row.
     let pending: Array<{ entry: EnumeratedUrl; result: SampleCheckResult }> = [];
+    // Counted from results, so a route the breaker abandoned mid-sweep shows as a split
+    // rather than being reported as fully private.
+    let privateRoutedUrlCount = 0;
 
     await runWithBoundedConcurrency(
       toCheck,
@@ -400,8 +412,15 @@ export async function processVerifyUrlsJob(
       // (which sizes the SAMPLER's burst). Load is bounded separately and
       // per-request by the rate limiter inside probeUrl, so this is a throughput
       // parameter rather than a politeness one — see verifyConcurrency.
-      verifyConcurrency(),
+      verifyConcurrency(session.base_url),
       async (entry, index) => {
+        // ONE derivation per URL, shared by the ladder lookup and the outcome note
+        // below. It used to be computed twice here (and wrongly — see
+        // verifyTargetFor), which meant three chances for the bookkeeping key to
+        // disagree with the URL actually requested.
+        const host = rateLimitHostKey(
+          verifyTargetFor(session.base_url, entry.url).target
+        );
         // The loc itself is passed as source_url, so resolveSampleTarget applies
         // the same www-equivalence rule sampling uses when base_url and the
         // sitemap disagree about the host label.
@@ -419,20 +438,15 @@ export async function processVerifyUrlsJob(
           {
             // The learned rung leads, so on a host that needs the browser profile
             // every URL succeeds on attempt #1 instead of climbing from R0.
-            profileLadder: ladderByHost.get(
-              rateLimitHostKey(
-                resolveSampleTarget(session.base_url, entry.url, entry.url)
-              )
-            )
+            profileLadder: ladderByHost.get(host)
           }
         );
 
-        strategyRun.noteOutcome(
-          rateLimitHostKey(
-            resolveSampleTarget(session.base_url, entry.url, entry.url)
-          ),
-          isRealMeasurement(result)
-        );
+        strategyRun.noteOutcome(host, isRealMeasurement(result));
+
+        if (result.viaPrivateRoute) {
+          privateRoutedUrlCount += 1;
+        }
 
         return { entry, result };
       },
@@ -528,6 +542,11 @@ export async function processVerifyUrlsJob(
         urls_checked: toCheck.length,
         counted_statuses: countedStatuses,
         problem_urls: problemCount,
+        // Which network path measured this sweep. Counted from results rather than from
+        // the config flag, so a route abandoned mid-run shows up as a split instead of
+        // being reported as fully private.
+        private_routed_url_count: privateRoutedUrlCount,
+        public_routed_url_count: toCheck.length - privateRoutedUrlCount,
         enumerate_ms: enumerateMs,
         duration_ms: durationMs,
         // The measurement that made the original bug diagnosable, kept as a

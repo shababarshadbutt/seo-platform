@@ -55,7 +55,8 @@ function cleanResult(): SampleCheckResult {
     errorReason: null,
     usedFallbackProfile: false,
     edgeServer: "nginx/1.28.3",
-    httpStatusCategory: "success"
+    httpStatusCategory: "success",
+    viaPrivateRoute: false
   };
 }
 

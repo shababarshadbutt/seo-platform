@@ -237,8 +237,17 @@ async function appendLine(file: string, line: string): Promise<void> {
 // A marker FILE rather than a scan: the success-triggered delete then answers "is this
 // interesting" with one existence check instead of reading up to 32MB per session, and
 // `ls */*.keep` doubles as the list of interesting runs.
+// private_route_failed is here, and private_route_selected deliberately is NOT: a
+// working private route is the normal case for the whole fleet, and marking every
+// session interesting would make the marker mean nothing. An ABANDONED route is the
+// opposite — it silently moved a site family back onto the public path, which is
+// exactly the run someone needs the diagnostics for a week later.
 function isInteresting(event: string, fields: EventFields): boolean {
-  return event === "host_strategy_skipped" || fields.verdict === "REFUSED";
+  return (
+    event === "host_strategy_skipped" ||
+    event === "private_route_failed" ||
+    fields.verdict === "REFUSED"
+  );
 }
 
 async function markInteresting(dir: string, key: string): Promise<void> {

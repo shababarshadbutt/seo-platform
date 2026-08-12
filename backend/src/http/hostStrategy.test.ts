@@ -75,6 +75,7 @@ function outcome(
     errorReason: null,
     usedFallbackProfile: false,
     edgeServer: null,
+    viaPrivateRoute: false,
     ...overrides
   };
 }

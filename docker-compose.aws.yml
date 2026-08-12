@@ -213,6 +213,43 @@ services:
 
       # --- Phase 1: per-domain publish lock (Redis-backed, TTL'd) ---
       PUBLISH_LOCK_TTL_SECONDS: ${PUBLISH_LOCK_TTL_SECONDS:-300}
+
+      # --- Private-VPC routing for URL health checks (default OFF) ---
+      #
+      # The ~650 managed sites run on 7 EC2 boxes in this same VPC (10.0.x.x). With this
+      # on, a health check for a host listed in the map file goes to that host's PRIVATE
+      # address over http: it never leaves the VPC, so it costs no egress and never meets
+      # the site's AWS WAF — the WAF that forced VERIFY_MAX_REQUESTS_PER_SECOND to 5.
+      #
+      # OFF BY DEFAULT because this changes what the tool REPORTS about a site, and the
+      # failure mode is a plausible-looking measurement of the WRONG server: ~93 hostnames
+      # share each IP, so the origin must select the site from the Host header. Before
+      # switching it on, run the two checks in docs/deployment/deploy-v1.63-Live.txt —
+      # vhost selection, and private-vs-public agreement on a real deep URL.
+      #
+      # SCOPE: URL health checks only. Remote sitemap fetches and the Cleaner keep using
+      # the public path.
+      PRIVATE_ROUTE_ENABLED: ${PRIVATE_ROUTE_ENABLED:-false}
+      PRIVATE_HOST_MAP_FILE: /etc/sitemap/private-hosts.conf
+      # http, because these origins answer on :80 privately. If one turns out to redirect
+      # :80 -> https, the checker detects that per host and flips itself; this is only the
+      # starting assumption.
+      PRIVATE_ROUTE_SCHEME: ${PRIVATE_ROUTE_SCHEME:-http}
+      PRIVATE_HOST_MAP_RELOAD_SECONDS: ${PRIVATE_HOST_MAP_RELOAD_SECONDS:-60}
+      # DELIBERATELY THE SAME 5/s THE PUBLIC PATH USES, even though a private origin has
+      # no WAF and could take 10-40x that. Routing and throughput are two separate
+      # changes: raise this only after a full session over the private path has been
+      # compared against its public-path run, or a wrong verdict cannot be attributed to
+      # either one. Keyed per private IP, so all ~93 vhosts on a box share it.
+      PRIVATE_MAX_REQUESTS_PER_SECOND: ${PRIVATE_MAX_REQUESTS_PER_SECOND:-5}
+      PRIVATE_RATE_LIMIT_BURST: ${PRIVATE_RATE_LIMIT_BURST:-10}
+      # Must be raised WITH the rate above or the rate is a fiction — measured once at
+      # 25 req/s against a 50/s ceiling because concurrency stayed at 8.
+      PRIVATE_MAX_CONCURRENCY: ${PRIVATE_MAX_CONCURRENCY:-16}
+      # Consecutive no-response results before an IP is abandoned FOR THE LIFE OF THE
+      # PROCESS. It does NOT heal on a timer: `docker compose restart backend worker` is
+      # the only way back. GET /api/private-routes lists any disabled routes.
+      PRIVATE_ROUTE_FAILURE_STREAK: ${PRIVATE_ROUTE_FAILURE_STREAK:-3}
     # No published port. The frontend reaches this over the internal compose
     # network (http://backend:3001) and proxies browser traffic to it; exposing
     # it publicly as well would defeat the single-entry-point design and put an
@@ -229,6 +266,18 @@ services:
       # root-owned and world-readable: reading needs nothing, `rm` needs sudo. The
       # directory is created by this mount on the first `up`.
       - ${DIAGNOSTICS_HOST_PATH:-./diagnostics}:/diagnostics
+      # The private-host map: hostname -> private VPC IP, in /etc/hosts format.
+      #
+      # A DIRECTORY MOUNT, not a file mount, and that is deliberate. Docker creates a
+      # DIRECTORY at any bind-mount source path that does not exist, so mounting the file
+      # directly turns a missing file into an EISDIR the app can never read. Mounting the
+      # directory also survives an in-place `vi` save (which replaces the inode) and lets
+      # ops drop the file in later without editing this compose file.
+      #
+      # READ-ONLY: this is infrastructure topology. Nothing in the app writes it, and it
+      # deliberately is not baked into the image — a topology change must not need a
+      # rebuild. Start from private-routes/private-hosts.conf.example.
+      - ${PRIVATE_ROUTES_HOST_PATH:-./private-routes}:/etc/sitemap:ro
       # Mount the SFTP private key read-only if using key-based auth; omit if
       # Transfer Family is configured for a different auth method.
       - ${SFTP_PRIVATE_KEY_HOST_PATH:-./secrets/sftp_private_key}:/run/secrets/sftp_private_key:ro
@@ -290,6 +339,21 @@ services:
       S3_PUBLISH_ALLOW_DELETE: "false"
       CLOUDFRONT_DISTRIBUTION_ID: ${CLOUDFRONT_DISTRIBUTION_ID:?CLOUDFRONT_DISTRIBUTION_ID must be set in .env}
       PUBLISH_LOCK_TTL_SECONDS: ${PUBLISH_LOCK_TTL_SECONDS:-300}
+
+      # --- Private-VPC routing for URL health checks (default OFF) ---
+      #
+      # THE COPY THAT MATTERS MOST: the worker is the process that actually issues health
+      # checks, so if these drift from the backend's the two will disagree about how a site
+      # was measured. Both read the same map file and both log what they loaded at boot.
+      # See the backend service above for the full rationale on each value.
+      PRIVATE_ROUTE_ENABLED: ${PRIVATE_ROUTE_ENABLED:-false}
+      PRIVATE_HOST_MAP_FILE: /etc/sitemap/private-hosts.conf
+      PRIVATE_ROUTE_SCHEME: ${PRIVATE_ROUTE_SCHEME:-http}
+      PRIVATE_HOST_MAP_RELOAD_SECONDS: ${PRIVATE_HOST_MAP_RELOAD_SECONDS:-60}
+      PRIVATE_MAX_REQUESTS_PER_SECOND: ${PRIVATE_MAX_REQUESTS_PER_SECOND:-5}
+      PRIVATE_RATE_LIMIT_BURST: ${PRIVATE_RATE_LIMIT_BURST:-10}
+      PRIVATE_MAX_CONCURRENCY: ${PRIVATE_MAX_CONCURRENCY:-16}
+      PRIVATE_ROUTE_FAILURE_STREAK: ${PRIVATE_ROUTE_FAILURE_STREAK:-3}
     volumes:
       - uploads:/uploads
       - exports:/exports
@@ -297,6 +361,9 @@ services:
       # most of these events are written here. Both append to the same per-session file
       # and each stamps its own `service`.
       - ${DIAGNOSTICS_HOST_PATH:-./diagnostics}:/diagnostics
+      # Same private-host map as the backend — a directory mount, read-only. See the
+      # backend service for why it is a directory and not the file.
+      - ${PRIVATE_ROUTES_HOST_PATH:-./private-routes}:/etc/sitemap:ro
       - ${SFTP_PRIVATE_KEY_HOST_PATH:-./secrets/sftp_private_key}:/run/secrets/sftp_private_key:ro
     depends_on:
       postgres:

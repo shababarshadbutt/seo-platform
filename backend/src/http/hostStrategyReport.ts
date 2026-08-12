@@ -1,4 +1,5 @@
 import { pool } from "../db/pool.js";
+import { privateRouteStatusFor } from "./privateRoute.js";
 
 // THE FLEET REPORT — the deliverable this whole investigation was missing.
 //
@@ -25,12 +26,23 @@ export type HostStrategyReportRow = {
   edge_server: string | null;
   last_status: number | null;
   decided_at: string;
+  // Which network path this host is reached over NOW — not when the verdict was
+  // decided. Computed in Node from the private-host map, which deliberately does not
+  // live in the database.
+  //
+  // WHY THIS COLUMN EXISTS. Every verdict in this table was measured over the PUBLIC
+  // path, because that is the only path the negotiation ladder ever uses. Once a host
+  // is routed privately, a REFUSED row next to it stops meaning "this site is
+  // unreachable" and starts meaning "this site's public edge refuses our egress IP,
+  // and we now bypass it". Those are opposite conclusions, and without this field the
+  // report states the first one.
+  route: "private" | "private-disabled" | "public";
 };
 
 export async function hostStrategyFleetReport(): Promise<
   HostStrategyReportRow[]
 > {
-  const result = await pool.query<HostStrategyReportRow>(
+  const result = await pool.query<Omit<HostStrategyReportRow, "route">>(
     `
       SELECT host, verdict, winning_rung, edge_server, last_status,
              decided_at::text AS decided_at
@@ -42,7 +54,10 @@ export async function hostStrategyFleetReport(): Promise<
     `
   );
 
-  return result.rows;
+  return result.rows.map((row) => ({
+    ...row,
+    route: privateRouteStatusFor(row.host)
+  }));
 }
 
 // The host variants a session's probes can legitimately land on.
@@ -78,7 +93,7 @@ export async function refusedHostsForSession(
     return [];
   }
 
-  const result = await pool.query<HostStrategyReportRow>(
+  const result = await pool.query<Omit<HostStrategyReportRow, "route">>(
     `
       SELECT host, verdict, winning_rung, edge_server, last_status,
              decided_at::text AS decided_at
@@ -90,5 +105,12 @@ export async function refusedHostsForSession(
     [variants]
   );
 
-  return result.rows;
+  // A host that is now routed privately is NOT refused any more, whatever this row
+  // says: the verdict describes a public edge that no longer sits in the path. Left in
+  // the fleet report (where `route` explains it) but filtered out of the session
+  // banner, which exists to tell a user why their patterns are unscored — and they are
+  // not.
+  return result.rows
+    .map((row) => ({ ...row, route: privateRouteStatusFor(row.host) }))
+    .filter((row) => row.route !== "private");
 }

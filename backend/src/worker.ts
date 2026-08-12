@@ -6,6 +6,7 @@ import { Worker } from "bullmq";
 import "./http/tlsDispatcher.js";
 import { config } from "./config.js";
 import { initEventLog } from "./diagnostics/eventLog.js";
+import { logPrivateHostMapStatus } from "./http/privateHostMap.js";
 import { closePool } from "./db/pool.js";
 import { runMigrations } from "./db/migrate.js";
 import {
@@ -143,6 +144,17 @@ initEventLog({
 const app = Fastify({
   logger: true
 });
+
+// See the matching call in server.ts. It matters MORE here: this is the process that
+// actually issues the health checks, so if the two disagree about the map — one has a
+// stale copy, or the mount is missing from only one service — this line is where that
+// shows.
+logPrivateHostMapStatus(app.log, {
+  enabled: config.privateRoute.enabled,
+  file: config.privateRoute.mapFile,
+  reloadSeconds: config.privateRoute.mapReloadSeconds
+});
+
 let parseWorker: Worker<
   SitemapJobData,
   void,

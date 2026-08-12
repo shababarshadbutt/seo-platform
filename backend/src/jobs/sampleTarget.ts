@@ -31,6 +31,16 @@ export function targetUrlForPath(baseUrl: string, path: string) {
 // isSameDomain's subdomain allowance is deliberately NOT reused here, since
 // probing shop.example.com when the user asked for example.com would change
 // which page is being checked.
+//
+// WHAT THIS FUNCTION DOES NOT DO: private routing. It returns the PUBLIC identity
+// of the page — the URL that gets stored in sampled_urls.url, shown in findings and
+// compared against sitemap <loc> values. Rewriting its scheme to http for a
+// privately-routed host would put "http://..." in the database for a site whose
+// sitemap says https, silently changing user-visible data.
+//
+// The private scheme is applied one layer down, at the moment of the request, in
+// sampleUrlCheck.runCheckWithProfile. Identity and transport are deliberately two
+// different values.
 export function resolveSampleTarget(
   baseUrl: string,
   path: string,

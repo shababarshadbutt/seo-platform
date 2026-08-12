@@ -108,12 +108,19 @@ export type ResolvedHostStrategy = {
 // decision being obeyed, and the run that produced it may be days old. Without it, a
 // resolve log line cannot tell those apart, which is exactly the ambiguity that made a
 // screenful of unscored rows take a week to explain.
+// "private-route" is the one value this module never produces itself: it means the
+// caller reached the host over its private VPC address, where there is no WAF to
+// negotiate with, so no rung was tried and nothing was read or written. It is in the
+// union so the always-emitted host_strategy_resolved event can still state truthfully
+// where the answer came from — a resolved strategy with no source would be worse than
+// one labelled honestly.
 export type HostStrategySource =
   | "redis"
   | "table"
   | "negotiated"
   | "cached-stale"
-  | "none";
+  | "none"
+  | "private-route";
 
 export type ReadHostStrategy = {
   value: StoredHostStrategy;

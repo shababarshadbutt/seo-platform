@@ -1,4 +1,8 @@
+import { lookup as dnsLookup } from "node:dns";
+
 import { Agent, buildConnector, setGlobalDispatcher } from "undici";
+
+import { privateIpForHostname } from "./privateRoute.js";
 
 // Corporate HTTPS-inspection proxies (common on SEO team machines) intercept
 // outbound TLS and re-sign certificates with a corporate CA that Node.js does
@@ -116,9 +120,66 @@ function connectorHostKey(options: {
   return isDefaultPort ? hostname : `${hostname}:${port}`;
 }
 
-function buildDispatcher(allowH2: boolean) {
-  const connect = buildConnector({ rejectUnauthorized });
+// ---- The private-VPC DNS override ---------------------------------------
+//
+// Answers a mapped hostname with its private 10.x address and delegates
+// everything else to the real resolver. This is the ENTIRE mechanism by which a
+// health check reaches a site privately: the URL, the Host header, the SNI
+// servername and every host-derived cache key keep saying the public hostname,
+// and only the socket goes somewhere else.
+//
+// It is installed on its own dispatcher pair, NOT on the two above. The h1 agent
+// above is also the global dispatcher, which serves remote sitemap fetches and the
+// cleaner — traffic that is deliberately out of scope for private routing. Keeping
+// the override off it makes that scope a structural guarantee rather than a
+// convention someone has to remember.
+// Typed loosely on purpose. Node's LookupFunction is a set of overloads keyed on
+// whether options.all is true, and this one function answers BOTH — which no single
+// overload signature describes. The two callback shapes are what the tests pin
+// down; the cast at the call site is where that widening is admitted.
+type LookupCallback = (
+  error: NodeJS.ErrnoException | null,
+  address: string | Array<{ address: string; family: number }>,
+  family?: number
+) => void;
 
+// EXPORTED FOR TESTS ONLY. A mistake in here breaks every request that uses the private
+// dispatcher — including the delegation path, which would break requests to unmapped
+// hosts too — and none of that is reachable through the Agent without a live socket.
+export function privateAwareLookup(
+  hostname: string,
+  options: { all?: boolean },
+  callback: LookupCallback
+): void {
+  const ip = privateIpForHostname(hostname);
+
+  if (!ip) {
+    // Not mapped: behave exactly like no override existed.
+    (dnsLookup as unknown as (h: string, o: unknown, c: LookupCallback) => void)(
+      hostname,
+      options,
+      callback
+    );
+    return;
+  }
+
+  // BOTH CALLBACK SHAPES MATTER. net.connect calls lookup with options.all either
+  // unset (expecting `cb(null, address, family)`) or true (expecting
+  // `cb(null, [{address, family}])`). Answering the wrong shape does not fail
+  // gracefully — it breaks the connect for every request that uses this
+  // dispatcher, so both are handled and both are asserted in the tests.
+  if (options.all) {
+    callback(null, [{ address: ip, family: 4 }]);
+    return;
+  }
+
+  callback(null, ip, 4);
+}
+
+function buildDispatcher(
+  allowH2: boolean,
+  connect: ReturnType<typeof buildConnector>
+) {
   return new Agent({
     allowH2,
     // The socket is passed straight through untouched — this only reads a property on
@@ -150,8 +211,32 @@ function buildDispatcher(allowH2: boolean) {
   });
 }
 
-const http1Dispatcher = buildDispatcher(false);
-const http2Dispatcher = buildDispatcher(true);
+const publicConnector = buildConnector({ rejectUnauthorized });
+// `lookup` is not in undici's BuildOptions type, but buildConnector spreads its
+// remaining options into BOTH net.connect and tls.connect
+// (undici/lib/core/connect.js), which is exactly where node reads it — so the cast
+// is admitting a gap in the typings, not forcing something through.
+//
+// Verified in the same function: tls.connect is called with `servername` derived
+// from the hostname and `host: hostname`, so overriding the lookup changes the
+// socket's destination WITHOUT touching SNI. That is what lets the https fallback
+// validate a site's real certificate against its private IP.
+const privateConnector = buildConnector({
+  rejectUnauthorized,
+  lookup: privateAwareLookup
+} as Parameters<typeof buildConnector>[0]);
+
+const http1Dispatcher = buildDispatcher(false, publicConnector);
+const http2Dispatcher = buildDispatcher(true, publicConnector);
+
+// The private-routed pair. Same TLS posture, same ALPN observation, same pooling —
+// the ONLY difference is where the hostname resolves. rejectUnauthorized is
+// deliberately left alone: on the https fallback path (an origin that redirects
+// :80 to TLS) the SNI servername is still the real hostname, so the site's real
+// certificate validates. There is no "skip verification for private hosts" escape
+// hatch, because that would accept any host on the VPC as any customer site.
+const privateHttp1Dispatcher = buildDispatcher(false, privateConnector);
+const privateHttp2Dispatcher = buildDispatcher(true, privateConnector);
 
 // The default for every caller that does not care (sitemap fetches, the cleaner)
 // and the global dispatcher: HTTP/1.1 only, i.e. exactly the behaviour that
@@ -165,6 +250,14 @@ export const tlsAwareDispatcher = http1Dispatcher;
 // throughput.
 export function dispatcherFor(allowH2: boolean | undefined) {
   return allowH2 ? http2Dispatcher : http1Dispatcher;
+}
+
+// Same contract as dispatcherFor, for requests that should resolve mapped
+// hostnames to their private VPC address. Callers select this ONLY for URL health
+// checks whose target is privately routed; everything else keeps using
+// dispatcherFor, which has no DNS override at all.
+export function privateDispatcherFor(allowH2: boolean | undefined) {
+  return allowH2 ? privateHttp2Dispatcher : privateHttp1Dispatcher;
 }
 
 setGlobalDispatcher(http1Dispatcher);

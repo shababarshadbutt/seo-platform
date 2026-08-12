@@ -7,6 +7,7 @@ import multipart from "@fastify/multipart";
 import "./http/tlsDispatcher.js";
 import { config } from "./config.js";
 import { initEventLog } from "./diagnostics/eventLog.js";
+import { logPrivateHostMapStatus } from "./http/privateHostMap.js";
 import { closeSitemapQueue } from "./queue/sitemapQueue.js";
 import { destroyCleanerPools } from "./jobs/cleanerPool.js";
 import { closePool } from "./db/pool.js";
@@ -33,6 +34,16 @@ initEventLog({
 
 const app = Fastify({
   logger: true
+});
+
+// What the private-host map holds, said once at boot. A hostname claimed by two IPs or
+// a file mounted at the wrong path is an ops mistake, and the restart that followed the
+// edit is the moment to surface it — not, silently, at the first probe of an affected
+// site hours later, where it would read as a site problem.
+logPrivateHostMapStatus(app.log, {
+  enabled: config.privateRoute.enabled,
+  file: config.privateRoute.mapFile,
+  reloadSeconds: config.privateRoute.mapReloadSeconds
 });
 
 await app.register(cors, {

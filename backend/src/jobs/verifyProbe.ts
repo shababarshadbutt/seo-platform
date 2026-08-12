@@ -3,9 +3,9 @@ import type { FastifyBaseLogger } from "fastify";
 import { config } from "../config.js";
 import {
   acquireHostSlot,
-  rateLimitHostKey,
-  verificationRateLimit
+  rateLimitBucketFor
 } from "../http/hostRateLimiter.js";
+import { privateRouteFor } from "../http/privateRoute.js";
 import {
   checkSampleUrl,
   type RequestProfile,
@@ -57,8 +57,46 @@ import { resolveSampleTarget } from "./sampleTarget.js";
 // sweep whose load is bounded by the per-request rate limiter, so its socket
 // count is a throughput parameter, not a politeness one — the politeness knob
 // is maxRequestsPerSecond, and it is enforced regardless of what this returns.
-export function verifyConcurrency(): number {
+// `target` selects which ceiling applies: a privately-routed sweep gets its own,
+// because concurrency and rate are coupled and must be raised together — MEASURED
+// below, 25 req/s against a 50/s ceiling because concurrency stayed at 8. Called
+// without an argument it is exactly the public behaviour it always was.
+export function verifyConcurrency(target?: string | null): number {
+  if (target && privateRouteFor(target)) {
+    return Math.max(1, config.privateRoute.maxConcurrency);
+  }
+
   return Math.max(1, config.verification.maxConcurrency);
+}
+
+// The probe URL for one enumerated sitemap URL, derived ONCE and shared.
+//
+// EXPORTED BECAUSE THE CALLER KEPT GETTING IT WRONG. verifyUrlsJob called
+// `resolveSampleTarget(base_url, entry.url, entry.url)` — passing a full URL as the
+// `path` argument, which for a same-host entry produced
+// "https://example.com/https://example.com/x". That was harmless only because the
+// value was fed to rateLimitHostKey, which still parsed the right host out of the
+// wreckage. It stops being harmless the moment anything else reads it: the rate
+// BUCKET now depends on the target, so a mangled URL would decide which budget a host
+// is charged to and whether it routes privately, from a string that describes neither.
+//
+// One function, used by probeUrl and by its callers, so the URL that gets requested
+// and the URL used for bookkeeping cannot drift apart again.
+export function verifyTargetFor(
+  baseUrl: string,
+  sourceUrl: string
+): { path: string; target: string } {
+  let path: string;
+
+  try {
+    const url = new URL(sourceUrl);
+
+    path = `${url.pathname}${url.search}`;
+  } catch {
+    path = sourceUrl;
+  }
+
+  return { path, target: resolveSampleTarget(baseUrl, path, sourceUrl) };
 }
 
 export async function probeUrl(
@@ -78,18 +116,12 @@ export async function probeUrl(
   // is the one that decides what to do about a REFUSED host.
   options: { profileLadder?: RequestProfile[] } = {}
 ): Promise<SampleCheckResult> {
-  let path: string;
-
-  try {
-    const url = new URL(sourceUrl);
-
-    path = `${url.pathname}${url.search}`;
-  } catch {
-    path = sourceUrl;
-  }
-
-  const target = resolveSampleTarget(baseUrl, path, sourceUrl);
-  const host = rateLimitHostKey(target);
+  const { path, target } = verifyTargetFor(baseUrl, sourceUrl);
+  // The bucket comes from the RESOLVED target, which is the URL the request will
+  // actually be built from — not from whatever string the caller happened to pass as
+  // sourceUrl. A privately-routed host is charged to its box's shared budget instead
+  // of its own hostname's.
+  const bucket = rateLimitBucketFor(target, privateRouteFor(target)?.ip ?? null);
 
   // checkSampleUrl never throws — failures come back classified
   // (timeout/ssl_cert/no_response), which is what we want persisted.
@@ -99,7 +131,7 @@ export async function probeUrl(
   // resolved target's host means a redirect that leaves the origin is billed to
   // wherever it actually went.
   return checkSampleUrl(baseUrl, path, sourceUrl, userAgent, logger, context, {
-    beforeRequest: () => acquireHostSlot(host, verificationRateLimit()),
+    beforeRequest: () => acquireHostSlot(bucket.key, bucket.options),
     // The learned rung first, the rung above it as the per-URL safety net. Absent =
     // today's default pair.
     profileLadder: options.profileLadder,

@@ -16,6 +16,14 @@ data/
 # directory of that name at ANY depth — which silently excluded the entire
 # backend/src/diagnostics/ source module from `git add`.
 /diagnostics/
+# The REAL private-host map (hostname -> private VPC IP), bind-mounted read-only into
+# the backend/worker containers. Infrastructure topology, edited on the box: it changes
+# when servers change and must never need an image rebuild to update. The committed
+# .example alongside it is the documented starting point.
+#
+# LEADING SLASH for the same reason /diagnostics/ has one, and only the .conf — the
+# negation keeps the example tracked.
+/private-routes/*.conf
 *.log
 *.xaml
 .DS_Store

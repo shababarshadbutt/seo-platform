@@ -247,6 +247,76 @@ export const config = {
       max: 100
     })
   },
+
+  // ---- Private-VPC routing for URL health checks --------------------------
+  //
+  // The ~650 sites this checker measures run on 7 EC2 boxes inside the SAME VPC
+  // as the checker (10.0.x.x). Every health check nonetheless leaves through the
+  // box's public IP and comes back in through the site's public edge, which costs
+  // egress and puts an AWS WAF in the path — the WAF that forced
+  // maxRequestsPerSecond down to 5 above. When a host is listed in the map file,
+  // its checks are sent to the private address instead: no internet, no WAF, no
+  // new AWS resource (no PrivateLink, no peering, no per-site Route53 zone).
+  //
+  // OFF BY DEFAULT, for the same reason awsPublishEnabled is: this path changes
+  // what the tool REPORTS about a site, and the failure mode is a plausible-
+  // looking measurement of the wrong server. It must be switched on deliberately,
+  // after the vhost/content checks in the deploy note pass.
+  //
+  // SCOPE: URL health checks only. Remote sitemap fetches and the cleaner keep
+  // using the public path — which is why the DNS override lives on its own
+  // dispatcher pair in http/tlsDispatcher.ts rather than on the global one.
+  privateRoute: {
+    enabled: readBooleanFlag(process.env.PRIVATE_ROUTE_ENABLED),
+    mapFile: process.env.PRIVATE_HOST_MAP_FILE ?? "/etc/sitemap/private-hosts.conf",
+    // http, because these origins answer on :80 privately and the TLS the public
+    // edge terminates buys nothing inside the VPC. If an origin turns out to
+    // redirect :80 -> https, the checker detects that per host and flips itself
+    // (see isForcedTlsRedirect); this value is only the starting assumption.
+    scheme: (process.env.PRIVATE_ROUTE_SCHEME === "https"
+      ? "https"
+      : "http") as "http" | "https",
+    mapReloadSeconds: readNumber("PRIVATE_HOST_MAP_RELOAD_SECONDS", {
+      fallback: 60,
+      min: 5,
+      max: 3600
+    }),
+    // SHIPPED AT TODAY'S NUMBERS ON PURPOSE. A private origin has no WAF, so the
+    // reasoning that pinned verification to 5/s does not apply to it and these
+    // could be 10-40x higher. They are not raised here because routing and
+    // throughput are two separate changes: if a verdict looks wrong after both
+    // land at once, nothing distinguishes "wrong network path" from "origin under
+    // load". Raise them per-IP after a full session has been compared against its
+    // public-path run.
+    maxRequestsPerSecond: readNumber("PRIVATE_MAX_REQUESTS_PER_SECOND", {
+      fallback: 5,
+      min: 1,
+      max: 2000
+    }),
+    rateLimitBurst: readNumber("PRIVATE_RATE_LIMIT_BURST", {
+      fallback: 10,
+      min: 1,
+      max: 500
+    }),
+    // Concurrency must rise WITH the rate or the rate is a fiction — measured
+    // above: 25 req/s against a 50/s ceiling because concurrency was 8. Ceiling
+    // is higher than the public 32 because the private budget is shared by ~93
+    // vhosts per box.
+    maxConcurrency: readNumber("PRIVATE_MAX_CONCURRENCY", {
+      fallback: 16,
+      min: 1,
+      max: 128
+    }),
+    // Consecutive transport failures (nothing answered at all) before an IP is
+    // abandoned for the life of the process. Mirrors
+    // REFUSAL_STREAK_BEFORE_RENEGOTIATION so the two "stop trying" thresholds in
+    // this system agree.
+    failureStreak: readNumber("PRIVATE_ROUTE_FAILURE_STREAK", {
+      fallback: 3,
+      min: 1,
+      max: 50
+    })
+  },
   // Secret used to encrypt sensitive per-session data at rest (GSC service
   // account JSON). Any non-empty string works; it is stretched to a 32-byte
   // AES-256 key via scrypt. Falls back to a dev-only default so local runs
