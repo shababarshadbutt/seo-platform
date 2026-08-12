@@ -124,18 +124,19 @@ test("www fallback resolves in BOTH directions", () => {
   // Mapped as www., asked for bare (the four sites0N blocks are all www-only).
   assert.deepEqual(privateIpForHost("onlywww.com", { file, ...MAP_OPTIONS }), {
     ip: "10.0.61.203",
+    family: 4,
     matchedVia: "www-fallback"
   });
   // Mapped bare, asked for www.
   assert.deepEqual(
     privateIpForHost("www.onlybare.com", { file, ...MAP_OPTIONS }),
-    { ip: "10.0.55.55", matchedVia: "www-fallback" }
+    { ip: "10.0.55.55", family: 4, matchedVia: "www-fallback" }
   );
   // An exact hit is reported as exact, so diagnostics can tell a fleet that matches
   // entirely by fallback (i.e. a map generated for the other spelling).
   assert.deepEqual(
     privateIpForHost("www.onlywww.com", { file, ...MAP_OPTIONS }),
-    { ip: "10.0.61.203", matchedVia: "exact" }
+    { ip: "10.0.61.203", family: 4, matchedVia: "exact" }
   );
 });
 
@@ -196,6 +197,79 @@ test("several hostnames on one line are all mapped", () => {
 
   assert.equal(entries.size, 3);
   assert.equal(entries.get("b.com"), "10.0.1.1");
+});
+
+// A REAL /etc/hosts, fed in verbatim. This is the supported way to reuse a map that is
+// already maintained on the box: the format is identical, so the file can be derived from
+// it with one grep instead of being hand-copied.
+test("a real /etc/hosts parses cleanly, IPv6 boilerplate and all", () => {
+  const file = writeMap(
+    [
+      "127.0.0.1\tlocalhost",
+      "::1\tlocalhost ip6-localhost ip6-loopback",
+      "fe00::\tip6-localnet",
+      "ff02::1\tip6-allnodes",
+      "172.17.0.2\t2bee652da493",
+      "",
+      "# BEGIN internal-prod-sites-server01 (10.0.61.203)",
+      "10.0.61.203 www.aeropartshub.com",
+      "# END internal-prod-sites-server01"
+    ].join("\n")
+  );
+
+  resetPrivateHostMap();
+
+  // The site entry is what matters, and it resolves as IPv4.
+  assert.deepEqual(privateIpForHost("www.aeropartshub.com", { file, ...MAP_OPTIONS }), {
+    ip: "10.0.61.203",
+    family: 4,
+    matchedVia: "exact"
+  });
+
+  // THE LATENT BUG THIS PINS: the loopback boilerplate is accepted (it is valid hosts
+  // syntax) but its family is read from the ADDRESS. Answering a v6 address with
+  // family 4 fails the connect in a way that looks like a dead route.
+  assert.deepEqual(privateIpForHost("ip6-loopback", { file, ...MAP_OPTIONS }), {
+    ip: "::1",
+    family: 6,
+    matchedVia: "exact"
+  });
+
+  // AND THE PART THAT IS EASY TO GET WRONG: a stock /etc/hosts lists `localhost` on the
+  // 127.0.0.1 line AND on the ::1 line — two different addresses, so the cross-IP
+  // conflict rule drops it. That is the rule behaving correctly on real input, and it is
+  // harmless (nothing here ever probes localhost)...
+  assert.equal(privateIpForHost("localhost", { file, ...MAP_OPTIONS }), null);
+
+  // ...but it is exactly why the deploy note says to derive the map with
+  // `grep -E '^\s*10\.' /etc/hosts` rather than feeding the whole file: otherwise
+  // /api/private-routes reports a "conflict" that has nothing to do with the fleet, and
+  // a real conflict has to be picked out of the noise.
+  const snapshot = privateHostMapSnapshot({ file, ...MAP_OPTIONS });
+
+  assert.deepEqual(Object.keys(snapshot.conflicts), ["localhost"]);
+  assert.equal(snapshot.warnings.length, 1);
+
+  // The site entry is unaffected by that noise either way.
+  assert.equal(
+    privateIpForHost("www.aeropartshub.com", { file, ...MAP_OPTIONS })?.ip,
+    "10.0.61.203"
+  );
+});
+
+test("the grep the deploy note recommends yields a clean map", () => {
+  // Same /etc/hosts, filtered to 10.* as step 2 of the deploy note instructs.
+  const file = writeMap(
+    ["10.0.61.203 www.aeropartshub.com", "10.0.49.183 www.aerohdw.com"].join("\n")
+  );
+
+  resetPrivateHostMap();
+
+  const snapshot = privateHostMapSnapshot({ file, ...MAP_OPTIONS });
+
+  assert.equal(snapshot.entryCount, 2);
+  assert.deepEqual(snapshot.conflicts, {});
+  assert.deepEqual(snapshot.warnings, []);
 });
 
 // A laptop dev run has no production map file, and must not fail because of it.

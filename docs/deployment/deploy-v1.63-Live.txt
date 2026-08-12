@@ -36,14 +36,48 @@ git pull
 ===========================================================================
 2. Put the map file on the box
 ===========================================================================
-The map is NOT in the image and NOT in git: it is infrastructure topology, and
-changing it must never need a rebuild. It is bind-mounted read-only.
+"THE ENTRIES ARE ALREADY IN /etc/hosts ON THE BOX — ISN'T THAT ENOUGH?"
+No, for two independent reasons. Read this before skipping the step.
+
+  1. THE CONTAINERS CANNOT SEE THE HOST'S /etc/hosts. Docker writes a FRESH
+     /etc/hosts into every container (loopback boilerplate + the container's own
+     id). Verify it yourself in one command:
+
+       docker compose -f docker-compose.aws.yml exec backend cat /etc/hosts
+
+     Nothing you added on the EC2 host appears there. The backend and worker
+     resolve names through Docker's resolver, not the host's file.
+
+  2. DNS ALONE WOULD NOT BE ENOUGH ANYWAY. The app has to KNOW a host is private
+     in order to send it over http, bypass the strategy engine (so a stale
+     REFUSED verdict does not skip it), charge the per-box rate budget, and
+     record via_private_route on every row. A resolver change the app cannot see
+     would keep using https and the app would be blind to it.
+
+BUT YOU DO NOT HAVE TO RETYPE ANYTHING. The map file IS /etc/hosts format, so
+derive it from the file you already maintain — one command, no hand-editing:
 
   mkdir -p ./private-routes
-  cp private-routes/private-hosts.conf.example private-routes/private-hosts.conf
-  vi private-routes/private-hosts.conf
+  grep -E '^\s*10\.' /etc/hosts > ./private-routes/private-hosts.conf
+  wc -l ./private-routes/private-hosts.conf     # expect ~650
 
-Format is /etc/hosts, verbatim — paste what `pm2 list` on each box produces.
+The `10.` filter is the point: it takes the site entries and leaves the loopback
+and container boilerplate behind. (Harmless either way — a stock /etc/hosts line
+parses fine and nothing probes `localhost` — but a map that contains only what it
+needs is a map you can read.)
+
+  DO NOT bind-mount /etc/hosts into the container instead. Two reasons: editing it
+  with `vi` replaces the inode, so a file mount would silently keep serving the OLD
+  content until the container is recreated; and it would tie what the checker
+  measures to the box's own DNS, which is a different concern with a different
+  change cadence.
+
+Re-run that grep whenever devops changes /etc/hosts. The file is re-read within a
+minute — no restart, no rebuild. It is deliberately NOT in git and NOT in the
+image: it is infrastructure topology.
+
+Format is /etc/hosts, verbatim — the same thing `pm2 list` on each box produces.
+private-routes/private-hosts.conf.example is the committed reference copy.
 
   >>> THE SUPPLIED MAP HAS ONE CONFLICT. www.industrialworld360.com is listed
   >>> under BOTH 10.0.61.203 and 10.0.49.183. A hostname claimed by two

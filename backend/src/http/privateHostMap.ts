@@ -26,12 +26,23 @@ import { normalizeHost } from "../sitemaps/domain.js";
 
 export type PrivateHostMatch = {
   ip: string;
+  // 4 or 6, taken from the address itself rather than assumed.
+  //
+  // WHY IT IS CARRIED. The seven private addresses are all IPv4, so this looks like
+  // dead weight — until the map is pointed at a real /etc/hosts, which ALWAYS contains
+  // `::1 localhost ip6-localhost ip6-loopback`. Answering a v6 address with family 4
+  // produces a connect failure that looks like a dead route rather than a bad answer.
+  family: 4 | 6;
   // Whether the hostname was listed verbatim, or found via the www-label
   // fallback. Reported in diagnostics because a fleet where everything matches
   // via fallback means the map was generated for the other host form, which is
   // worth knowing before trusting it.
   matchedVia: "exact" | "www-fallback";
 };
+
+function ipFamily(ip: string): 4 | 6 {
+  return isIP(ip) === 6 ? 6 : 4;
+}
 
 export type ParsedHostMap = {
   entries: Map<string, string>;
@@ -303,14 +314,14 @@ export function privateIpForHost(
   const exact = parsed.entries.get(host);
 
   if (exact) {
-    return { ip: exact, matchedVia: "exact" };
+    return { ip: exact, family: ipFamily(exact), matchedVia: "exact" };
   }
 
   for (const candidate of [`www.${family}`, family]) {
     const found = parsed.entries.get(candidate);
 
     if (found) {
-      return { ip: found, matchedVia: "www-fallback" };
+      return { ip: found, family: ipFamily(found), matchedVia: "www-fallback" };
     }
   }
 

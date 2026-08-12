@@ -11,7 +11,13 @@ import { test } from "node:test";
 const MAP_DIR = mkdtempSync(path.join(tmpdir(), "private-dispatcher-"));
 const MAP_FILE = path.join(MAP_DIR, "private-hosts.conf");
 
-writeFileSync(MAP_FILE, "10.0.61.203 www.aeropartshub.com\n", "utf8");
+// Includes the IPv6 loopback line every real /etc/hosts carries, because the map is
+// allowed to BE an /etc/hosts derived on the box.
+writeFileSync(
+  MAP_FILE,
+  ["10.0.61.203 www.aeropartshub.com", "::1 ip6-loopback"].join("\n"),
+  "utf8"
+);
 
 process.env.PRIVATE_ROUTE_ENABLED = "true";
 process.env.PRIVATE_HOST_MAP_FILE = MAP_FILE;
@@ -48,6 +54,16 @@ test("a mapped hostname resolves to its private IP — options.all true", async 
 
   // IPv4 always: the map holds no IPv6 addresses.
   assert.deepEqual(answer, [null, [{ address: "10.0.61.203", family: 4 }]]);
+});
+
+test("the family comes from the address, not assumed to be 4", async () => {
+  const answer = await new Promise<unknown[]>((resolve) => {
+    privateAwareLookup("ip6-loopback", { all: true }, (...args) => resolve(args));
+  });
+
+  // Answering a v6 address with family 4 fails the connect in a way that looks like a
+  // dead route rather than a bad answer.
+  assert.deepEqual(answer, [null, [{ address: "::1", family: 6 }]]);
 });
 
 test("the www fallback applies to the lookup too", async () => {

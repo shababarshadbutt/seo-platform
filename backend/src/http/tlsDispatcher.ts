@@ -151,9 +151,9 @@ export function privateAwareLookup(
   options: { all?: boolean },
   callback: LookupCallback
 ): void {
-  const ip = privateIpForHostname(hostname);
+  const match = privateIpForHostname(hostname);
 
-  if (!ip) {
+  if (!match) {
     // Not mapped: behave exactly like no override existed.
     (dnsLookup as unknown as (h: string, o: unknown, c: LookupCallback) => void)(
       hostname,
@@ -163,17 +163,21 @@ export function privateAwareLookup(
     return;
   }
 
+  // The family comes from the ADDRESS, never assumed to be 4 — a v6 address answered as
+  // family 4 fails the connect in a way that looks like a dead route. It matters as soon
+  // as the map is pointed at a real /etc/hosts, which always carries `::1` lines.
+  //
   // BOTH CALLBACK SHAPES MATTER. net.connect calls lookup with options.all either
   // unset (expecting `cb(null, address, family)`) or true (expecting
   // `cb(null, [{address, family}])`). Answering the wrong shape does not fail
   // gracefully — it breaks the connect for every request that uses this
   // dispatcher, so both are handled and both are asserted in the tests.
   if (options.all) {
-    callback(null, [{ address: ip, family: 4 }]);
+    callback(null, [{ address: match.ip, family: match.family }]);
     return;
   }
 
-  callback(null, ip, 4);
+  callback(null, match.ip, match.family);
 }
 
 function buildDispatcher(

@@ -64,7 +64,9 @@ export function notePrivateSchemeFlip(hostname: string): void {
 // hostname, never a URL. Null means "resolve it normally", which is why the
 // override is safe to leave installed — an unmapped host simply falls through to
 // dns.lookup.
-export function privateIpForHostname(hostname: string): string | null {
+export function privateIpForHostname(
+  hostname: string
+): { ip: string; family: 4 | 6 } | null {
   if (!config.privateRoute.enabled) {
     return null;
   }
@@ -75,7 +77,7 @@ export function privateIpForHostname(hostname: string): string | null {
     return null;
   }
 
-  return match.ip;
+  return { ip: match.ip, family: match.family };
 }
 
 // Null — meaning "use the public internet exactly as before" — when the flag is
