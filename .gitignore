@@ -28,3 +28,15 @@ data/
 *.xaml
 .DS_Store
 Thumbs.db
+design-request-strategy-engine.txt
+dignostic/
+docs/deployment/deploy-v1.56-Live.txt
+docs/deployment/deploy-v1.58-Live.txt
+docs/deployment/deploy-v1.59-Live.txt
+docs/deployment/deploy-v1.60-Live.txt
+docs/deployment/deploy-v1.61-Live.txt
+docs/deployment/deploy-v1.62-Live.txt
+fleet-strategy-650-sites.txt
+how-to-read-logs.txt
+prompts/
+reply-to-devops-ua-recommendation.txt
