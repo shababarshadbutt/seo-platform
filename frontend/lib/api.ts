@@ -715,12 +715,16 @@ export type PatternSourceFile = {
   occurrences: number;
 };
 
+// What the finished rename job records in maintenance_jobs.result. Same fields
+// the route used to return synchronously, so the success toast is unchanged.
 export type RenamePatternResult = {
   old_template: string;
   new_template: string;
   occurrence_count: number;
   source_files_count: number;
+  files_rewritten?: number;
   undo?: boolean;
+  zero_work_reason?: string | null;
 };
 
 export async function getPatternSourceFiles(
@@ -738,6 +742,21 @@ export async function getPatternSourceFiles(
   return data.source_files;
 }
 
+// Rename, transform and undo are BACKGROUND JOBS: they insert a job row,
+// enqueue, and come back with 202 in well under a second. The heavy work
+// (rewriting hundreds of XML files) is reported by polling
+// getPatternStructureJobStatus, so the request can no longer outlive the
+// client's abort timer — which is what produced "Request timed out" on a
+// 491-file pattern while the server carried on and committed anyway.
+//
+// They use the DEFAULT timeout on purpose: a long timeout here would only
+// disguise a genuinely stuck kickoff.
+export type PatternJobHandle = {
+  job_row_id: string;
+  status: string;
+  files_total: number;
+};
+
 export async function renamePatternTemplate(
   sessionId: string,
   patternId: string,
@@ -752,23 +771,25 @@ export async function renamePatternTemplate(
         new_template: input.newTemplate,
         source_files: input.sourceFiles
       })
-    },
-    EXPORT_API_TIMEOUT_MS
+    }
   );
 
-  return readJsonResponse<RenamePatternResult>(response);
+  return readJsonResponse<PatternJobHandle>(response);
 }
 
+// The shape the finished job records in maintenance_jobs.result — what the old
+// synchronous response used to return directly.
 export type TransformPatternResult = {
   urls_transformed: number;
   files_rewritten: number;
   old_template: string;
   new_template: string;
   sample_before_after: Array<{ before: string; after: string }>;
+  unparsable_url_count?: number;
+  zero_work_reason?: string | null;
 };
 
 // Apply a pattern-scoped URL structure transformation (+ optional label rename).
-// Heavy like rename, so it uses the long timeout.
 export async function transformPatternStructure(
   sessionId: string,
   patternId: string,
@@ -790,11 +811,10 @@ export async function transformPatternStructure(
         new_structure: input.newStructure,
         source_files: input.sourceFiles
       })
-    },
-    EXPORT_API_TIMEOUT_MS
+    }
   );
 
-  return readJsonResponse<TransformPatternResult>(response);
+  return readJsonResponse<PatternJobHandle>(response);
 }
 
 export async function undoPatternTransform(
@@ -810,15 +830,56 @@ export async function undoPatternTransform(
       headers: { "content-type": "application/json" },
       // Fastify rejects an empty body when content-type is JSON — send "{}".
       body: JSON.stringify({})
-    },
-    EXPORT_API_TIMEOUT_MS
+    }
   );
 
-  return readJsonResponse<{
-    undo: boolean;
-    files_restored: number;
-    template: string;
-  }>(response);
+  return readJsonResponse<PatternJobHandle>(response);
+}
+
+export type PatternJobSkipReason =
+  | "remote-source"
+  | "missing-on-disk"
+  | "no-urls-matched";
+
+export type PatternStructureJob = {
+  id: string;
+  kind: string;
+  status: string;
+  files_total: number;
+  files_done: number;
+  items_changed: NumberLike;
+  files_skipped: number;
+  warnings: Array<{ file: string; reason: PatternJobSkipReason }>;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  started_at: string;
+  completed_at: string | null;
+};
+
+const PATTERN_JOB_IN_FLIGHT = ["PENDING", "RUNNING"];
+
+export function isPatternJobInFlight(job: PatternStructureJob | null) {
+  return job !== null && PATTERN_JOB_IN_FLIGHT.includes(job.status);
+}
+
+// Most recent rename/transform/undo job for this pattern, or null. Called once
+// when the modal opens (so a reload reattaches to a run in progress instead of
+// orphaning it) and then every 2s while one is in flight.
+export async function getPatternStructureJobStatus(
+  sessionId: string,
+  patternId: string
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/structure-job/status`
+    ),
+    { cache: "no-store" }
+  );
+  const data = await readJsonResponse<{ job: PatternStructureJob | null }>(
+    response
+  );
+
+  return data.job;
 }
 
 // A single row in the Fix Redirect URLs modal (v1.42): every URL in the

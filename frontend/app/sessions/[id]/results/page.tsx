@@ -59,6 +59,7 @@ import {
   saveDownloadZip,
   supportsDirectoryPicker,
   friendlyApiErrorMessage,
+  ApiError,
   getBulkReplaceStatus,
   getMismatchedUrls,
   getPatternSamples,
@@ -86,9 +87,15 @@ import {
   type PatternSourceFile,
   type RedirectCandidate,
   type RedirectCandidatesResponse,
+  type PatternStructureJob,
   type SampledUrl,
   type SessionResponse
 } from "@/lib/api";
+import {
+  summarisePatternJobSkips,
+  usePatternStructureJob,
+  waitForPatternStructureJob
+} from "@/lib/use-pattern-structure-job";
 import {
   countTemplateParams,
   parseStructure,
@@ -104,6 +111,7 @@ import {
 import { DeleteUrlDialog } from "@/components/delete-url-dialog";
 import { ProblemUrlsDialog } from "@/components/problem-urls-dialog";
 import { FixTrailingSlashesDialog } from "@/components/fix-trailing-slashes-dialog";
+import { PatternJobPanel } from "@/components/pattern-job-panel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -244,6 +252,36 @@ function formatNumber(value: number) {
 
 function formatPercent(value: number) {
   return `${Math.round(value)}%`;
+}
+
+// Rebuilds the success toast from the finished job's recorded result, so the
+// wording is unchanged from when these routes answered synchronously.
+function patternJobSuccessMessage(job: PatternStructureJob) {
+  const result = (job.result ?? {}) as Record<string, unknown>;
+
+  if (job.kind === "pattern-transform") {
+    const urls = Number(result.urls_transformed ?? 0);
+    const files = Number(result.files_rewritten ?? 0);
+
+    return `Transformed ${formatNumber(urls)} URL${
+      urls === 1 ? "" : "s"
+    } across ${formatNumber(files)} file${files === 1 ? "" : "s"}`;
+  }
+
+  if (job.kind === "pattern-transform-undo") {
+    return "URL structure transformation reverted";
+  }
+
+  if (result.undo === true) {
+    return "Pattern name reverted";
+  }
+
+  const occurrences = Number(result.occurrence_count ?? 0);
+  const files = Number(result.source_files_count ?? 0);
+
+  return `Pattern renamed — ${formatNumber(
+    occurrences
+  )} occurrences across ${formatNumber(files)} file${files === 1 ? "" : "s"}`;
 }
 
 // Human-readable ETA for the download overlay (e.g. "~2 min", "~30 sec").
@@ -809,6 +847,9 @@ export default function ResultsDashboardPage({
     new Set()
   );
   const [isLoadingRenameFiles, setIsLoadingRenameFiles] = useState(false);
+  // Distinguishes "this pattern has no source files" from "the request to load
+  // them failed" — the old bare catch rendered both as the former.
+  const [renameFilesError, setRenameFilesError] = useState<string | null>(null);
   const [isRenaming, setIsRenaming] = useState(false);
   const [undoingRenameId, setUndoingRenameId] = useState<string | null>(null);
   const [transformCurrentStructure, setTransformCurrentStructure] =
@@ -818,6 +859,11 @@ export default function ResultsDashboardPage({
     "form"
   );
   const [isTransforming, setIsTransforming] = useState(false);
+  // The pattern's rename/transform/undo background job. Kicking one off returns
+  // 202 immediately; this is what turns that into visible progress, and what
+  // reattaches to a run still going after a page reload.
+  const patternJob = usePatternStructureJob(params.id, renameRow?.id ?? null);
+  const patternJobSkips = summarisePatternJobSkips(patternJob.job);
   const [undoingTransformId, setUndoingTransformId] = useState<string | null>(
     null
   );
@@ -1644,13 +1690,23 @@ export default function ResultsDashboardPage({
     setSelectedRenameFiles(new Set());
     setIsLoadingRenameFiles(true);
 
+    setRenameFilesError(null);
+    // Adopt a job that is already running for this pattern, so reopening the
+    // modal (or reloading the page) rejoins it instead of looking idle.
+    void patternJob.attach(handlePatternJobSettled);
+
     try {
       const files = await getPatternSourceFiles(params.id, rowData.id);
 
       setRenameSourceFiles(files);
       setSelectedRenameFiles(new Set(files.map((file) => file.source_file)));
-    } catch {
+    } catch (nextError) {
+      // A failed load used to render as "No source files found for this
+      // pattern", which is what an EMPTY pattern looks like. Say which it is.
       setRenameSourceFiles([]);
+      setRenameFilesError(
+        friendlyApiErrorMessage(nextError, "Unable to load this pattern's source files.")
+      );
     } finally {
       setIsLoadingRenameFiles(false);
     }
@@ -1678,6 +1734,46 @@ export default function ResultsDashboardPage({
     );
   }
 
+  // Called once the background job reaches COMPLETE or FAILED. The modal stays
+  // open on a warning or a failure: a run that skipped files or died is exactly
+  // what the user needs still on screen, not a toast that fades in four seconds.
+  const handlePatternJobSettled = useCallback(
+    async (job: PatternStructureJob) => {
+      await loadResults({ silent: true });
+
+      if (job.status !== "COMPLETE") {
+        setFindReplaceToast({
+          tone: "error",
+          message: job.error ?? "The update failed."
+        });
+        return;
+      }
+
+      const result = (job.result ?? {}) as Record<string, unknown>;
+      const zeroWork = result.zero_work_reason as string | null | undefined;
+
+      if (zeroWork || job.files_skipped > 0) {
+        setFindReplaceToast({
+          tone: "error",
+          message:
+            zeroWork ??
+            `Finished, but ${job.files_skipped} file${
+              job.files_skipped === 1 ? " was" : "s were"
+            } skipped — see the details in the dialog.`
+        });
+        return;
+      }
+
+      setRenameRow(null);
+      patternJob.reset();
+      setFindReplaceToast({
+        tone: "success",
+        message: patternJobSuccessMessage(job)
+      });
+    },
+    [loadResults, patternJob]
+  );
+
   async function handleRenamePattern() {
     if (!renameRow || !canRename) {
       return;
@@ -1686,22 +1782,22 @@ export default function ResultsDashboardPage({
     setIsRenaming(true);
 
     try {
-      const result = await renamePatternTemplate(params.id, renameRow.id, {
+      await renamePatternTemplate(params.id, renameRow.id, {
         newTemplate: renameValue,
         sourceFiles: Array.from(selectedRenameFiles)
       });
 
-      await loadResults({ silent: true });
-      setRenameRow(null);
-      setFindReplaceToast({
-        tone: "success",
-        message: `Pattern renamed — ${formatNumber(
-          result.occurrence_count
-        )} occurrences across ${result.source_files_count} file${
-          result.source_files_count === 1 ? "" : "s"
-        }`
-      });
+      // 202 — the rewrite runs on the queue. Watch it rather than blocking on a
+      // response that used to outlive the client's abort timer.
+      patternJob.watch(handlePatternJobSettled);
     } catch (nextError) {
+      // 409 means a job for this pattern is already running: attach to it
+      // instead of reporting an error the user can do nothing about.
+      if (nextError instanceof ApiError && nextError.status === 409) {
+        patternJob.watch(handlePatternJobSettled);
+        return;
+      }
+
       setFindReplaceToast({
         tone: "error",
         message: friendlyApiErrorMessage(nextError, "Unable to rename pattern.")
@@ -1724,7 +1820,20 @@ export default function ResultsDashboardPage({
         sourceFiles: []
       });
 
+      // Row-level undo has no modal to show progress in, so hold the row
+      // spinner until the queued job actually finishes.
+      const job = await waitForPatternStructureJob(params.id, rowData.id);
+
       await loadResults({ silent: true });
+
+      if (job && job.status !== "COMPLETE") {
+        setFindReplaceToast({
+          tone: "error",
+          message: job.error ?? "Unable to undo rename."
+        });
+        return;
+      }
+
       setFindReplaceToast({
         tone: "success",
         message: "Pattern name reverted"
@@ -1747,24 +1856,20 @@ export default function ResultsDashboardPage({
     setIsTransforming(true);
 
     try {
-      const result = await transformPatternStructure(params.id, renameRow.id, {
+      await transformPatternStructure(params.id, renameRow.id, {
         newTemplate: renameValue,
         currentStructure: transformCurrentStructure,
         newStructure: transformNewStructure,
         sourceFiles: Array.from(selectedRenameFiles)
       });
 
-      await loadResults({ silent: true });
-      setRenameRow(null);
-      setFindReplaceToast({
-        tone: "success",
-        message: `Transformed ${formatNumber(
-          result.urls_transformed
-        )} URL${result.urls_transformed === 1 ? "" : "s"} across ${
-          result.files_rewritten
-        } file${result.files_rewritten === 1 ? "" : "s"}`
-      });
+      patternJob.watch(handlePatternJobSettled);
     } catch (nextError) {
+      if (nextError instanceof ApiError && nextError.status === 409) {
+        patternJob.watch(handlePatternJobSettled);
+        return;
+      }
+
       setFindReplaceToast({
         tone: "error",
         message: friendlyApiErrorMessage(
@@ -1786,10 +1891,37 @@ export default function ResultsDashboardPage({
 
     try {
       await undoPatternTransform(params.id, rowData.id);
+
+      const job = await waitForPatternStructureJob(params.id, rowData.id);
+
       await loadResults({ silent: true });
+
+      if (job && job.status !== "COMPLETE") {
+        setFindReplaceToast({
+          tone: "error",
+          message: job.error ?? "Unable to undo transformation."
+        });
+        return;
+      }
+
+      const undoResult = (job?.result ?? {}) as {
+        files_restored?: number;
+        files_expected?: number;
+      };
+      const restored = Number(undoResult.files_restored ?? 0);
+      const expected = Number(undoResult.files_expected ?? 0);
+
       setFindReplaceToast({
-        tone: "success",
-        message: "URL structure transformation reverted"
+        // Report what was actually repointed, not what was planned. The old
+        // route returned the intended count, so a file whose name had already
+        // moved on was reported as restored when nothing had been.
+        tone: restored < expected ? "error" : "success",
+        message:
+          restored < expected
+            ? `Reverted, but only ${formatNumber(restored)} of ${formatNumber(
+                expected
+              )} files could be restored.`
+            : "URL structure transformation reverted"
       });
     } catch (nextError) {
       setFindReplaceToast({
@@ -4297,7 +4429,17 @@ export default function ResultsDashboardPage({
                 across selected source files.
               </DialogDescription>
             </DialogHeader>
-            {transformStep === "form" ? (
+            {patternJob.phase !== "idle" ? (
+              <PatternJobPanel
+                job={patternJob.job}
+                phase={patternJob.phase}
+                skips={patternJobSkips}
+                onDismiss={() => {
+                  patternJob.reset();
+                  setRenameRow(null);
+                }}
+              />
+            ) : transformStep === "form" ? (
               <div className="space-y-4">
                 <div className="space-y-1">
                   <p className="text-sm font-semibold text-slate-700">
@@ -4425,6 +4567,10 @@ export default function ResultsDashboardPage({
                         <Loader2 className="h-4 w-4 animate-spin" />
                         Loading source files…
                       </div>
+                    ) : renameFilesError ? (
+                      <p className="px-3 py-3 text-sm text-rose-600">
+                        {renameFilesError}
+                      </p>
                     ) : renameSourceFiles.length === 0 ? (
                       <p className="px-3 py-3 text-sm text-slate-500">
                         No source files found for this pattern.

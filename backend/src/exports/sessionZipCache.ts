@@ -1,5 +1,7 @@
 import { unlink } from "node:fs/promises";
 
+import type { FastifyBaseLogger } from "fastify";
+
 import { pool } from "../db/pool.js";
 import { enqueuePreGenerateZipJob } from "../queue/preGenerateZipQueue.js";
 
@@ -12,8 +14,14 @@ export { isZipCacheFresh } from "./zipCacheFreshness.js";
 // Call after ANY operation that mutates the session's sitemap files (bulk
 // replace, pattern rename/transform, apply-redirects, trailing-slash fix, URL
 // deletion/restore, file soft-delete) so the cached ZIP never serves stale data.
-// Best-effort: failures here must not break the mutation that triggered them.
-export async function invalidateSessionZipCache(sessionId: string) {
+// Best-effort: failures here must not break the mutation that triggered them —
+// but they are LOGGED. This used to swallow everything into a bare `catch {}`,
+// so a failure to clear the cache was invisible and the user could go on
+// downloading a stale ZIP with no trace of why.
+export async function invalidateSessionZipCache(
+  sessionId: string,
+  logger?: FastifyBaseLogger
+) {
   try {
     const result = await pool.query<{
       zip_all_path: string | null;
@@ -44,7 +52,12 @@ export async function invalidateSessionZipCache(sessionId: string) {
 
     await enqueuePreGenerateZipJob({ session_id: sessionId, type: "all" });
     await enqueuePreGenerateZipJob({ session_id: sessionId, type: "edited" });
-  } catch {
-    // Non-fatal — the next completion/mutation or a manual download will rebuild.
+  } catch (error) {
+    // Non-fatal — the next completion/mutation or a manual download will
+    // rebuild. Logged so a persistently stale download has something to point at.
+    logger?.warn(
+      { session_id: sessionId, err: error },
+      "failed to invalidate the session ZIP cache; a stale ZIP may be served until the next mutation"
+    );
   }
 }

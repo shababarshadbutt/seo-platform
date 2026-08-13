@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync, statSync } from "node:fs";
 import {
   access,
@@ -54,9 +53,7 @@ import { isSameDomain, normalizeHost } from "../sitemaps/domain.js";
 import { fetchSitemapPreview } from "../sitemaps/fetchPreview.js";
 import { lazyStreamSitemapWithoutForeignLocs } from "../sitemaps/foreignLocFilter.js";
 import {
-  buildRenamedStoredFilename,
   buildStoredUploadFilename,
-  buildTransformedStoredFilename,
   displaySourceFilename,
   isHttpUrl
 } from "../sitemaps/filenames.js";
@@ -75,16 +72,20 @@ import { enqueuePreGenerateZipJob } from "../queue/preGenerateZipQueue.js";
 import { collectProblemFileGroups } from "../sitemaps/problemFiles.js";
 import { previewTrailingSlash } from "../sitemaps/trailingSlashApply.js";
 import {
+  PATTERN_RENAME_JOB,
+  PATTERN_TRANSFORM_JOB,
+  PATTERN_TRANSFORM_UNDO_JOB,
   enqueueDeleteProblemUrlsJob,
   enqueueFixTrailingSlashesJob,
   enqueueFixTrailingSlashesUndoJob,
+  enqueuePatternRenameJob,
+  enqueuePatternTransformJob,
+  enqueuePatternTransformUndoJob,
   enqueueRestoreDeletedUrlsJob
 } from "../queue/maintenanceQueue.js";
 import {
   buildPatternTemplateRewriter,
-  countTemplateParams,
-  type LocUrlRewriter,
-  rewriteSitemapLocFile
+  countTemplateParams
 } from "../sitemaps/rewriteLocs.js";
 import {
   applyRedirectRule,
@@ -100,7 +101,6 @@ import { looksLikeNotFoundUrl } from "../sitemaps/softNotFound.js";
 import {
   parseStructure,
   StructureSyntaxError,
-  transformUrl,
   validateStructures,
   type ParsedStructure
 } from "../sitemaps/transformStructure.js";
@@ -859,203 +859,89 @@ async function patternSourceFileBreakdown(
   return files.map((file) => ({ source_file: file, occurrences: per }));
 }
 
-type PatternFileRewrite = {
-  // Stored filenames written this call (for pattern_renames.renamed_file_path).
-  renamedStoredFilenames: string[];
-  // Original files to unlink AFTER the DB transaction commits.
-  oldFilePaths: string[];
-  // Newly written files to unlink if the DB transaction rolls back.
-  newFilePaths: string[];
-  rewrittenLocCount: number;
+// The three pattern structure operations (rename, transform, transform-undo)
+// are background jobs on the maintenance queue. Every route does the same three
+// things once its own validation passes: refuse if one is already in flight for
+// this pattern, insert the maintenance_jobs row the modal will poll, and
+// enqueue.
+
+export type PatternJobStatusRow = {
+  id: string;
+  kind: string;
+  status: string;
+  files_total: number;
+  files_done: number;
+  items_changed: string;
+  files_skipped: number;
+  warnings: Array<{ file: string; reason: string }>;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  started_at: string;
+  completed_at: string | null;
 };
 
-// Rewrite the <loc> URLs of a pattern's selected source files on disk so their
-// path segments reflect the rename (old template -> new template). Writes each
-// modified file to a fresh uniquely-named copy and repoints
-// sitemap_files.filename at it within the caller's transaction. Old files are
-// NOT deleted here — the caller unlinks oldFilePaths only after COMMIT and
-// unlinks newFilePaths on ROLLBACK, so a failure never destroys the original.
-async function rewritePatternSourceFilesOnDisk(
-  client: PoolClient,
-  options: {
-    sessionId: string;
-    sourceRole: string;
-    oldTemplate: string;
-    newTemplate: string;
-    selectedDisplayFiles: string[];
-  }
-): Promise<PatternFileRewrite> {
-  const selectedSet = new Set(options.selectedDisplayFiles);
-  const filesResult = await client.query<{ id: string; filename: string }>(
+const PATTERN_JOB_KINDS = [
+  PATTERN_RENAME_JOB,
+  PATTERN_TRANSFORM_JOB,
+  PATTERN_TRANSFORM_UNDO_JOB
+];
+
+async function inFlightPatternJob(patternId: string) {
+  const result = await pool.query<{ id: string; kind: string }>(
     `
-      SELECT id, filename
-      FROM sitemap_files
-      WHERE session_id = $1 AND source_role = $2
+      SELECT id, kind
+      FROM maintenance_jobs
+      WHERE pattern_id = $1
+        AND kind = ANY($2::text[])
+        AND status IN ('PENDING', 'RUNNING')
+      ORDER BY started_at DESC
+      LIMIT 1
     `,
-    [options.sessionId, options.sourceRole]
+    [patternId, PATTERN_JOB_KINDS]
   );
-  // Order-based param mapping: carries each {param} value across even when the
-  // new template changes segment count (e.g. inserting /aviation/). The old
-  // index-based rewriter left a literal {param} (URL-encoded to %7Bparam%7D) in
-  // that case — the "extra content in downloaded URLs" bug.
-  const rewriteUrl = buildPatternTemplateRewriter(
-    options.oldTemplate,
-    options.newTemplate
-  );
-  const result: PatternFileRewrite = {
-    renamedStoredFilenames: [],
-    oldFilePaths: [],
-    newFilePaths: [],
-    rewrittenLocCount: 0
-  };
 
-  for (const file of filesResult.rows) {
-    // URL-sourced entries are not stored on disk as rewritable local files.
-    if (isHttpUrl(file.filename)) {
-      continue;
-    }
-
-    const displayName = displaySourceFilename(options.sessionId, file.filename);
-
-    if (selectedSet.size > 0 && !selectedSet.has(displayName)) {
-      continue;
-    }
-
-    const inputPath = path.join(config.uploadDir, file.filename);
-
-    try {
-      await access(inputPath);
-    } catch {
-      // File already cleaned up / missing — nothing to rewrite for this row.
-      continue;
-    }
-
-    const isGzip = file.filename.toLowerCase().endsWith(".gz");
-    const newStored = buildRenamedStoredFilename(
-      options.sessionId,
-      displayName,
-      randomUUID()
-    );
-    const outputPath = path.join(config.uploadDir, newStored);
-
-    const rewrittenLocCount = await rewriteSitemapLocFile({
-      inputPath,
-      outputPath,
-      isGzip,
-      rewriteUrl
-    });
-
-    result.newFilePaths.push(outputPath);
-    await client.query(
-      "UPDATE sitemap_files SET filename = $1 WHERE id = $2",
-      [newStored, file.id]
-    );
-    result.renamedStoredFilenames.push(newStored);
-    result.oldFilePaths.push(inputPath);
-    result.rewrittenLocCount += rewrittenLocCount;
-  }
-
-  return result;
+  return result.rows[0] ?? null;
 }
 
-type PatternFileTransform = {
-  // Parallel arrays (same index = same file) recorded on the pattern_transforms
-  // row: the pre-transform stored filename and the repointed post-transform one.
-  oldStoredFilenames: string[];
-  newStoredFilenames: string[];
-  // Newly written files to unlink if the DB transaction ROLLS BACK.
-  newFilePaths: string[];
-  rewrittenLocCount: number;
-};
-
-// Rewrite a pattern's selected source files with an arbitrary per-URL rewriter
-// (the structure transform), repointing sitemap_files.filename at a fresh copy.
-// Unlike the rename rewriter this DOES NOT delete the previous file — a transform
-// can be lossy, so its pre-transform copy is kept on disk and its filename
-// recorded so undo can restore it. Files with no matching <loc> are left as-is.
-async function transformPatternSourceFilesOnDisk(
-  client: PoolClient,
-  options: {
-    sessionId: string;
-    sourceRole: string;
-    selectedDisplayFiles: string[];
-    rewriteUrl: LocUrlRewriter;
-  }
-): Promise<PatternFileTransform> {
-  const selectedSet = new Set(options.selectedDisplayFiles);
-  const filesResult = await client.query<{ id: string; filename: string }>(
-    `
-      SELECT id, filename
-      FROM sitemap_files
-      WHERE session_id = $1 AND source_role = $2
-    `,
-    [options.sessionId, options.sourceRole]
-  );
-  const result: PatternFileTransform = {
-    oldStoredFilenames: [],
-    newStoredFilenames: [],
-    newFilePaths: [],
-    rewrittenLocCount: 0
+// A 409 carries the live job id so the client reattaches to the run already in
+// progress. Without this, a user whose first attempt looked like it failed
+// could apply a compounding transform (e.g. {B|find|replace|}) a second time
+// and corrupt the URLs.
+function patternJobConflict(job: { id: string; kind: string }) {
+  return {
+    error: "Conflict",
+    message:
+      "Another update for this pattern is still running. Wait for it to finish, or undo it first.",
+    job_row_id: job.id,
+    kind: job.kind
   };
+}
 
-  for (const file of filesResult.rows) {
-    if (isHttpUrl(file.filename)) {
-      continue;
-    }
-
-    const displayName = displaySourceFilename(options.sessionId, file.filename);
-
-    if (selectedSet.size > 0 && !selectedSet.has(displayName)) {
-      continue;
-    }
-
-    const inputPath = path.join(config.uploadDir, file.filename);
-
-    try {
-      await access(inputPath);
-    } catch {
-      continue;
-    }
-
-    const isGzip = file.filename.toLowerCase().endsWith(".gz");
-    const newStored = buildTransformedStoredFilename(
+async function insertPatternJob(options: {
+  sessionId: string;
+  patternId: string;
+  kind: string;
+  filesTotal: number;
+  payload: Record<string, unknown>;
+}): Promise<string> {
+  const result = await pool.query<{ id: string }>(
+    `
+      INSERT INTO maintenance_jobs (
+        session_id, pattern_id, kind, files_total, payload
+      )
+      VALUES ($1, $2, $3, $4, $5::jsonb)
+      RETURNING id
+    `,
+    [
       options.sessionId,
-      displayName,
-      randomUUID()
-    );
-    const outputPath = path.join(config.uploadDir, newStored);
+      options.patternId,
+      options.kind,
+      options.filesTotal,
+      JSON.stringify(options.payload)
+    ]
+  );
 
-    let rewrittenLocCount = 0;
-
-    try {
-      rewrittenLocCount = await rewriteSitemapLocFile({
-        inputPath,
-        outputPath,
-        isGzip,
-        rewriteUrl: options.rewriteUrl
-      });
-    } catch (error) {
-      await unlink(outputPath).catch(() => {});
-      throw error;
-    }
-
-    if (rewrittenLocCount === 0) {
-      // Nothing matched — discard the identical copy and leave the original.
-      await unlink(outputPath).catch(() => {});
-      continue;
-    }
-
-    result.newFilePaths.push(outputPath);
-    await client.query(
-      "UPDATE sitemap_files SET filename = $1 WHERE id = $2",
-      [newStored, file.id]
-    );
-    result.oldStoredFilenames.push(file.filename);
-    result.newStoredFilenames.push(newStored);
-    result.rewrittenLocCount += rewrittenLocCount;
-  }
-
-  return result;
+  return result.rows[0].id;
 }
 
 async function unlinkQuietly(filePaths: string[], logger: FastifyBaseLogger) {
@@ -2597,126 +2483,59 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         (lastRename.rowCount ?? 0) > 0 &&
         lastRename.rows[0].old_template === newTemplate;
 
-      const client = await pool.connect();
-      // Old files are removed only after COMMIT; new files are removed on
-      // failure — so a file-write error never destroys the original sitemap.
-      let filesToDeleteAfterCommit: string[] = [];
-      let filesToDeleteOnError: string[] = [];
-      let committed = false;
+      const inFlight = await inFlightPatternJob(request.params.patternId);
 
-      try {
-        await client.query("BEGIN");
-        await client.query("UPDATE patterns SET template = $1 WHERE id = $2", [
-          newTemplate,
-          request.params.patternId
-        ]);
+      if (inFlight) {
+        return reply.code(409).send(patternJobConflict(inFlight));
+      }
 
-        if (isUndo) {
-          // Revert the on-disk URLs: rewrite the current (renamed) files from
-          // the current template back to the template we are restoring.
-          const rewrite = await rewritePatternSourceFilesOnDisk(client, {
-            sessionId: request.params.id,
-            sourceRole,
-            oldTemplate: currentTemplate,
-            newTemplate,
-            selectedDisplayFiles: lastRename.rows[0].source_files ?? []
-          });
-
-          filesToDeleteOnError = rewrite.newFilePaths;
-          filesToDeleteAfterCommit = rewrite.oldFilePaths;
-
-          await client.query("DELETE FROM pattern_renames WHERE id = $1", [
-            lastRename.rows[0].id
-          ]);
-          await client.query("COMMIT");
-          committed = true;
-          await unlinkQuietly(filesToDeleteAfterCommit, request.log);
-
-          return reply.send({
-            old_template: currentTemplate,
-            new_template: newTemplate,
-            occurrence_count: 0,
-            source_files_count: 0,
-            files_rewritten: rewrite.renamedStoredFilenames.length,
-            undo: true
-          });
-        }
-
-        const breakdown = await patternSourceFileBreakdown(
-          request.params.patternId,
-          Number(patternResult.rows[0].total_urls),
-          patternResult.rows[0].source_file
-        );
-        const selectedFiles =
-          sourceFiles.length > 0
-            ? sourceFiles
-            : breakdown.map((entry) => entry.source_file);
-        const selectedSet = new Set(selectedFiles);
-        const occurrenceCount =
-          breakdown
+      const breakdown = await patternSourceFileBreakdown(
+        request.params.patternId,
+        Number(patternResult.rows[0].total_urls),
+        patternResult.rows[0].source_file
+      );
+      // An undo replays the reverse rewrite over the SAME file set the original
+      // rename recorded, not the caller's current selection.
+      const selectedFiles = isUndo
+        ? lastRename.rows[0].source_files ?? []
+        : sourceFiles.length > 0
+          ? sourceFiles
+          : breakdown.map((entry) => entry.source_file);
+      const selectedSet = new Set(selectedFiles);
+      const occurrenceCount = isUndo
+        ? 0
+        : breakdown
             .filter((entry) => selectedSet.has(entry.source_file))
             .reduce((sum, entry) => sum + entry.occurrences, 0) ||
           Number(patternResult.rows[0].total_urls);
 
-        // Rewrite the matching source files on disk so their <loc> URLs carry
-        // the new path segments. Failures bubble to the catch and roll back.
-        const rewrite = await rewritePatternSourceFilesOnDisk(client, {
-          sessionId: request.params.id,
-          sourceRole,
-          oldTemplate: currentTemplate,
-          newTemplate,
-          selectedDisplayFiles: selectedFiles
-        });
-
-        filesToDeleteOnError = rewrite.newFilePaths;
-        filesToDeleteAfterCommit = rewrite.oldFilePaths;
-
-        await client.query(
-          `
-            INSERT INTO pattern_renames (
-              pattern_id,
-              old_template,
-              new_template,
-              source_files,
-              occurrence_count,
-              renamed_file_path
-            )
-            VALUES ($1, $2, $3, $4, $5, $6)
-          `,
-          [
-            request.params.patternId,
-            currentTemplate,
-            newTemplate,
-            selectedFiles,
-            occurrenceCount,
-            rewrite.renamedStoredFilenames.length > 0
-              ? rewrite.renamedStoredFilenames.join(",")
-              : null
-          ]
-        );
-        await client.query("COMMIT");
-        committed = true;
-        await unlinkQuietly(filesToDeleteAfterCommit, request.log);
-        await invalidateSessionZipCache(request.params.id);
-
-        return reply.send({
+      const jobRowId = await insertPatternJob({
+        sessionId: request.params.id,
+        patternId: request.params.patternId,
+        kind: PATTERN_RENAME_JOB,
+        filesTotal: selectedFiles.length,
+        payload: {
           old_template: currentTemplate,
           new_template: newTemplate,
-          occurrence_count: occurrenceCount,
-          source_files_count: selectedFiles.length,
-          files_rewritten: rewrite.renamedStoredFilenames.length
-        });
-      } catch (error) {
-        await client.query("ROLLBACK");
-
-        if (!committed) {
-          await unlinkQuietly(filesToDeleteOnError, request.log);
+          selected_files: selectedFiles,
+          source_role: sourceRole,
+          is_undo: isUndo,
+          rename_row_id: isUndo ? lastRename.rows[0].id : undefined,
+          occurrence_count: occurrenceCount
         }
+      });
 
-        throw error;
-      } finally {
-        client.release();
-      }
+      await enqueuePatternRenameJob({
+        session_id: request.params.id,
+        job_row_id: jobRowId,
+        pattern_id: request.params.patternId
+      });
+
+      return reply.code(202).send({
+        job_row_id: jobRowId,
+        status: "PENDING",
+        files_total: selectedFiles.length
+      });
     }
   );
 
@@ -2813,8 +2632,11 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           .send(badRequest("new_template must be 500 characters or fewer"));
       }
 
-      const rewriteUrl: LocUrlRewriter = (url) =>
-        transformUrl(url, current, next);
+      const inFlight = await inFlightPatternJob(request.params.patternId);
+
+      if (inFlight) {
+        return reply.code(409).send(patternJobConflict(inFlight));
+      }
 
       const breakdown = await patternSourceFileBreakdown(
         request.params.patternId,
@@ -2826,190 +2648,31 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           ? sourceFiles
           : breakdown.map((entry) => entry.source_file);
 
-      const client = await pool.connect();
-      // New files are removed on ROLLBACK; pre-transform originals are KEPT (undo
-      // restores them), so there is nothing to delete after COMMIT.
-      let filesToDeleteOnError: string[] = [];
-      let committed = false;
-      const sampleBeforeAfter: Array<{ before: string; after: string }> = [];
-
-      try {
-        await client.query("BEGIN");
-
-        // 1. Rewrite the matching source files on disk.
-        const rewrite = await transformPatternSourceFilesOnDisk(client, {
-          sessionId: request.params.id,
-          sourceRole,
-          selectedDisplayFiles: selectedFiles,
-          rewriteUrl
-        });
-        filesToDeleteOnError = rewrite.newFilePaths;
-
-        // 2. Transform the bounded sampled URLs, snapshotting the originals.
-        const sampled = await client.query<{ id: string; url: string }>(
-          "SELECT id, url FROM sampled_urls WHERE pattern_id = $1",
-          [request.params.patternId]
-        );
-        const sampledUpdates = sampled.rows
-          .map((row) => ({
-            id: row.id,
-            oldUrl: row.url,
-            newUrl: transformUrl(row.url, current, next)
-          }))
-          .filter(
-            (
-              update
-            ): update is { id: string; oldUrl: string; newUrl: string } =>
-              update.newUrl !== null
-          );
-
-        if (sampledUpdates.length > 0) {
-          await client.query(
-            `
-              UPDATE sampled_urls AS s
-              SET url = u.new_url, pre_transform_url = u.old_url
-              FROM UNNEST($1::uuid[], $2::text[], $3::text[])
-                AS u(id, new_url, old_url)
-              WHERE s.id = u.id
-            `,
-            [
-              sampledUpdates.map((u) => u.id),
-              sampledUpdates.map((u) => u.newUrl),
-              sampledUpdates.map((u) => u.oldUrl)
-            ]
-          );
-
-          for (const update of sampledUpdates.slice(0, 3)) {
-            sampleBeforeAfter.push({
-              before: update.oldUrl,
-              after: update.newUrl
-            });
-          }
-        }
-
-        // 3. Transform the bounded pattern_urls sample (drives re-sampling),
-        //    snapshotting the original path. source_url is kept in sync by
-        //    swapping its pathname so undo can rebuild it from original_path.
-        const patternUrls = await client.query<{
-          id: string;
-          source_url: string;
-          path: string;
-        }>(
-          "SELECT id, source_url, path FROM pattern_urls WHERE pattern_id = $1",
-          [request.params.patternId]
-        );
-        const patternUrlUpdates = patternUrls.rows
-          .map((row) => {
-            const newSourceUrl = transformUrl(row.source_url, current, next);
-
-            if (newSourceUrl === null) {
-              return null;
-            }
-
-            let newPath = row.path;
-
-            try {
-              newPath = new URL(newSourceUrl).pathname;
-            } catch {
-              // Keep the prior path if the rebuilt URL is somehow unparsable.
-            }
-
-            return { id: row.id, newSourceUrl, newPath };
-          })
-          .filter(
-            (
-              update
-            ): update is { id: string; newSourceUrl: string; newPath: string } =>
-              update !== null
-          );
-
-        if (patternUrlUpdates.length > 0) {
-          await client.query(
-            `
-              UPDATE pattern_urls AS p
-              SET source_url = u.new_source_url,
-                  path = u.new_path,
-                  original_path = p.path
-              FROM UNNEST($1::uuid[], $2::text[], $3::text[])
-                AS u(id, new_source_url, new_path)
-              WHERE p.id = u.id
-            `,
-            [
-              patternUrlUpdates.map((u) => u.id),
-              patternUrlUpdates.map((u) => u.newSourceUrl),
-              patternUrlUpdates.map((u) => u.newPath)
-            ]
-          );
-        }
-
-        // 4. Apply the (optional) label rename.
-        await client.query("UPDATE patterns SET template = $1 WHERE id = $2", [
-          newTemplate,
-          request.params.patternId
-        ]);
-
-        // 5. Record the operation for undo — only when something actually
-        //    changed, so a no-op transform doesn't leave a phantom undo entry.
-        const changedAnything =
-          rewrite.newStoredFilenames.length > 0 ||
-          sampledUpdates.length > 0 ||
-          patternUrlUpdates.length > 0 ||
-          newTemplate !== currentTemplate;
-
-        if (changedAnything) {
-          await client.query(
-            `
-              INSERT INTO pattern_transforms (
-                pattern_id,
-                old_template,
-                new_template,
-                current_structure,
-                new_structure,
-                source_files,
-                urls_transformed,
-                files_rewritten,
-                original_file_paths,
-                new_file_paths
-              )
-              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            `,
-            [
-              request.params.patternId,
-              currentTemplate,
-              newTemplate,
-              currentStructureRaw,
-              newStructureRaw,
-              selectedFiles,
-              rewrite.rewrittenLocCount,
-              rewrite.newStoredFilenames.length,
-              rewrite.oldStoredFilenames,
-              rewrite.newStoredFilenames
-            ]
-          );
-        }
-
-        await client.query("COMMIT");
-        committed = true;
-        await invalidateSessionZipCache(request.params.id);
-
-        return reply.send({
-          urls_transformed: rewrite.rewrittenLocCount,
-          files_rewritten: rewrite.newStoredFilenames.length,
-          old_template: currentTemplate,
+      const jobRowId = await insertPatternJob({
+        sessionId: request.params.id,
+        patternId: request.params.patternId,
+        kind: PATTERN_TRANSFORM_JOB,
+        filesTotal: selectedFiles.length,
+        payload: {
+          current_structure: currentStructureRaw,
+          new_structure: newStructureRaw,
           new_template: newTemplate,
-          sample_before_after: sampleBeforeAfter
-        });
-      } catch (error) {
-        await client.query("ROLLBACK");
-
-        if (!committed) {
-          await unlinkQuietly(filesToDeleteOnError, request.log);
+          selected_files: selectedFiles,
+          source_role: sourceRole
         }
+      });
 
-        throw error;
-      } finally {
-        client.release();
-      }
+      await enqueuePatternTransformJob({
+        session_id: request.params.id,
+        job_row_id: jobRowId,
+        pattern_id: request.params.patternId
+      });
+
+      return reply.code(202).send({
+        job_row_id: jobRowId,
+        status: "PENDING",
+        files_total: selectedFiles.length
+      });
     }
   );
 
@@ -3043,102 +2706,61 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         });
       }
 
-      const oldFiles = last.rows[0].original_file_paths ?? [];
-      const newFiles = last.rows[0].new_file_paths ?? [];
-      const client = await pool.connect();
-      let filesToDeleteAfterCommit: string[] = [];
-      let committed = false;
+      const inFlight = await inFlightPatternJob(request.params.patternId);
 
-      try {
-        await client.query("BEGIN");
-
-        // Repoint each transformed file back to its pre-transform copy.
-        for (let index = 0; index < newFiles.length; index += 1) {
-          await client.query(
-            "UPDATE sitemap_files SET filename = $1 WHERE session_id = $2 AND filename = $3",
-            [oldFiles[index], request.params.id, newFiles[index]]
-          );
-        }
-        filesToDeleteAfterCommit = newFiles.filter(
-          (file, index) => file !== oldFiles[index]
-        );
-
-        await client.query("UPDATE patterns SET template = $1 WHERE id = $2", [
-          last.rows[0].old_template,
-          request.params.patternId
-        ]);
-
-        await client.query(
-          `
-            UPDATE sampled_urls
-            SET url = pre_transform_url, pre_transform_url = NULL
-            WHERE pattern_id = $1 AND pre_transform_url IS NOT NULL
-          `,
-          [request.params.patternId]
-        );
-
-        const restore = await client.query<{
-          id: string;
-          source_url: string;
-          original_path: string;
-        }>(
-          `
-            SELECT id, source_url, original_path
-            FROM pattern_urls
-            WHERE pattern_id = $1 AND original_path IS NOT NULL
-          `,
-          [request.params.patternId]
-        );
-        const restoreUpdates = restore.rows.map((row) => {
-          let source = row.source_url;
-
-          try {
-            const url = new URL(row.source_url);
-            url.pathname = row.original_path;
-            source = url.toString();
-          } catch {
-            // Keep the stored source_url if it can't be reparsed.
-          }
-
-          return { id: row.id, source, path: row.original_path };
-        });
-
-        if (restoreUpdates.length > 0) {
-          await client.query(
-            `
-              UPDATE pattern_urls AS p
-              SET source_url = u.source, path = u.path, original_path = NULL
-              FROM UNNEST($1::uuid[], $2::text[], $3::text[])
-                AS u(id, source, path)
-              WHERE p.id = u.id
-            `,
-            [
-              restoreUpdates.map((u) => u.id),
-              restoreUpdates.map((u) => u.source),
-              restoreUpdates.map((u) => u.path)
-            ]
-          );
-        }
-
-        await client.query("DELETE FROM pattern_transforms WHERE id = $1", [
-          last.rows[0].id
-        ]);
-        await client.query("COMMIT");
-        committed = true;
-        await unlinkQuietly(filesToDeleteAfterCommit, request.log);
-        await invalidateSessionZipCache(request.params.id);
-
-        return reply.send({
-          undo: true,
-          files_restored: newFiles.length,
-          template: last.rows[0].old_template
-        });
-      } catch (error) {
-        await client.query("ROLLBACK");
-        throw error;
-      } finally {
-        client.release();
+      if (inFlight) {
+        return reply.code(409).send(patternJobConflict(inFlight));
       }
+
+      const filesTotal = (last.rows[0].new_file_paths ?? []).length;
+      const jobRowId = await insertPatternJob({
+        sessionId: request.params.id,
+        patternId: request.params.patternId,
+        kind: PATTERN_TRANSFORM_UNDO_JOB,
+        filesTotal,
+        // The undo derives everything it needs from the pattern_transforms row
+        // it pops, so there is nothing to carry across.
+        payload: {}
+      });
+
+      await enqueuePatternTransformUndoJob({
+        session_id: request.params.id,
+        job_row_id: jobRowId,
+        pattern_id: request.params.patternId
+      });
+
+      return reply.code(202).send({
+        job_row_id: jobRowId,
+        status: "PENDING",
+        files_total: filesTotal
+      });
+    }
+  );
+
+  // Live status for the pattern's most recent rename / transform / undo job.
+  // The modal polls this every 2s while a job is in flight, and calls it once on
+  // open so a reload reattaches to a run already in progress instead of
+  // orphaning it.
+  //
+  // `payload` is deliberately NOT selected: it carries the full selected-file
+  // list, and dragging that down every 2 seconds would be a self-inflicted
+  // performance bug.
+  app.get<{ Params: PatternParams }>(
+    "/api/sessions/:id/patterns/:patternId/structure-job/status",
+    async (request, reply) => {
+      const result = await pool.query<PatternJobStatusRow>(
+        `
+          SELECT id, kind, status, files_total, files_done, items_changed,
+                 files_skipped, warnings, result, error, started_at, completed_at
+          FROM maintenance_jobs
+          WHERE session_id = $1 AND pattern_id = $2
+          ORDER BY started_at DESC
+          LIMIT 1
+        `,
+        [request.params.id, request.params.patternId]
+      );
+
+      return reply.send({ job: result.rows[0] ?? null });
     }
   );
 

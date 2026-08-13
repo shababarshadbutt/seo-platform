@@ -7,6 +7,10 @@ import {
   type LocUrlRewriter
 } from "../sitemaps/rewriteLocs.js";
 import type { RedirectRule } from "../sitemaps/redirectRule.js";
+import {
+  parseStructure,
+  transformUrl
+} from "../sitemaps/transformStructure.js";
 
 // piscina worker: streams ONE sitemap file through a <loc> rewriter from
 // inputPath to outputPath (copy-on-write) off the worker PROCESS's main thread,
@@ -36,7 +40,13 @@ export type FileRewriteSpec =
       kind: "redirectApply";
       replacements: [string, string][];
       rule: RedirectRule | null;
-    };
+    }
+  // Pattern-scoped per-segment structure transform (Update Pattern modal). The
+  // rewriter is a closure over two ParsedStructures and can't cross the thread
+  // boundary, but the RAW structure strings can — and parseStructure /
+  // transformUrl are pure and deterministic, so rebuilding here yields a
+  // byte-identical result to the inline path.
+  | { kind: "patternStructure"; currentStructure: string; nextStructure: string };
 
 export type FileRewriteInput = {
   inputPath: string;
@@ -58,6 +68,18 @@ function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
 
   if (spec.kind === "redirectApply") {
     return buildRedirectApplyRewriter(new Map(spec.replacements), spec.rule);
+  }
+
+  if (spec.kind === "patternStructure") {
+    // Parsed once per worker task, not once per URL — parseStructure throws
+    // StructureSyntaxError on malformed input, which piscina propagates back to
+    // the caller as a rejected pool.run(). The route already rejects bad syntax
+    // with a 400 long before enqueueing, so reaching here is a real fault and
+    // must not be swallowed.
+    const current = parseStructure(spec.currentStructure);
+    const next = parseStructure(spec.nextStructure);
+
+    return (url) => transformUrl(url, current, next);
   }
 
   return buildTrailingSlashRewriter();

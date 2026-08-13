@@ -13,6 +13,12 @@ export const RESTORE_DELETED_URLS_JOB = "restore-deleted-urls" as const;
 export const FIX_TRAILING_SLASHES_JOB = "fix-trailing-slashes" as const;
 export const FIX_TRAILING_SLASHES_UNDO_JOB =
   "fix-trailing-slashes-undo" as const;
+// Pattern-scoped rename / structure transform / transform undo. They live on
+// this queue rather than their own because they rewrite the SAME sitemap files
+// as the trailing-slash fix, and concurrency 1 is what stops the two racing.
+export const PATTERN_RENAME_JOB = "pattern-rename" as const;
+export const PATTERN_TRANSFORM_JOB = "pattern-transform" as const;
+export const PATTERN_TRANSFORM_UNDO_JOB = "pattern-transform-undo" as const;
 
 export type DeleteProblemUrlsJobData = {
   session_id: string;
@@ -46,17 +52,41 @@ export type FixTrailingSlashesUndoJobData = {
   job_row_id: string;
 };
 
+export type PatternRenameJobData = {
+  session_id: string;
+  job_row_id: string;
+  pattern_id: string;
+};
+
+export type PatternTransformJobData = {
+  session_id: string;
+  job_row_id: string;
+  pattern_id: string;
+};
+
+export type PatternTransformUndoJobData = {
+  session_id: string;
+  job_row_id: string;
+  pattern_id: string;
+};
+
 export type MaintenanceQueueData =
   | DeleteProblemUrlsJobData
   | RestoreDeletedUrlsJobData
   | FixTrailingSlashesJobData
-  | FixTrailingSlashesUndoJobData;
+  | FixTrailingSlashesUndoJobData
+  | PatternRenameJobData
+  | PatternTransformJobData
+  | PatternTransformUndoJobData;
 
 export type MaintenanceJobName =
   | typeof DELETE_PROBLEM_URLS_JOB
   | typeof RESTORE_DELETED_URLS_JOB
   | typeof FIX_TRAILING_SLASHES_JOB
-  | typeof FIX_TRAILING_SLASHES_UNDO_JOB;
+  | typeof FIX_TRAILING_SLASHES_UNDO_JOB
+  | typeof PATTERN_RENAME_JOB
+  | typeof PATTERN_TRANSFORM_JOB
+  | typeof PATTERN_TRANSFORM_UNDO_JOB;
 
 export const maintenanceQueue = new Queue<
   MaintenanceQueueData,
@@ -122,6 +152,48 @@ export function enqueueFixTrailingSlashesUndoJob(
   data: FixTrailingSlashesUndoJobData
 ) {
   return enqueueSingleton(FIX_TRAILING_SLASHES_UNDO_JOB, data);
+}
+
+// Pattern jobs are singletons per PATTERN, not per session. Reusing the
+// session-scoped jobId would make a transform of pattern B silently return
+// pattern A's queued job and never run — the queue is concurrency 1, so
+// serialising them costs nothing anyway.
+//
+// attempts: 1 on purpose. The whole rewrite is one transaction, so a failure
+// rolls back cleanly and leaves nothing to resume; re-running a multi-minute
+// rewrite two more times on a deterministic failure only delays the error the
+// user needs to see.
+async function enqueuePatternSingleton(
+  name: MaintenanceJobName,
+  data: { session_id: string; pattern_id: string; job_row_id: string }
+) {
+  const jobId = `${name}-${data.pattern_id}`;
+  const existingJob = await reusableSingletonJob(jobId);
+
+  if (existingJob) {
+    return existingJob;
+  }
+
+  return maintenanceQueue.add(name, data, {
+    jobId,
+    removeOnComplete: { count: 100 },
+    removeOnFail: { count: 100 },
+    attempts: 1
+  });
+}
+
+export function enqueuePatternRenameJob(data: PatternRenameJobData) {
+  return enqueuePatternSingleton(PATTERN_RENAME_JOB, data);
+}
+
+export function enqueuePatternTransformJob(data: PatternTransformJobData) {
+  return enqueuePatternSingleton(PATTERN_TRANSFORM_JOB, data);
+}
+
+export function enqueuePatternTransformUndoJob(
+  data: PatternTransformUndoJobData
+) {
+  return enqueuePatternSingleton(PATTERN_TRANSFORM_UNDO_JOB, data);
 }
 
 export async function closeMaintenanceQueue() {

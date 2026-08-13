@@ -40,11 +40,17 @@ import {
   FIX_TRAILING_SLASHES_JOB,
   FIX_TRAILING_SLASHES_UNDO_JOB,
   MAINTENANCE_QUEUE_NAME,
+  PATTERN_RENAME_JOB,
+  PATTERN_TRANSFORM_JOB,
+  PATTERN_TRANSFORM_UNDO_JOB,
   RESTORE_DELETED_URLS_JOB,
   closeMaintenanceQueue,
   type DeleteProblemUrlsJobData,
   type FixTrailingSlashesJobData,
   type FixTrailingSlashesUndoJobData,
+  type PatternRenameJobData,
+  type PatternTransformJobData,
+  type PatternTransformUndoJobData,
   type MaintenanceJobName,
   type MaintenanceQueueData,
   type RestoreDeletedUrlsJobData
@@ -75,6 +81,11 @@ import {
   processFixTrailingSlashesUndoJob,
   processRestoreDeletedUrlsJob
 } from "./jobs/maintenanceJobs.js";
+import {
+  processPatternRenameJob,
+  processPatternTransformJob,
+  processPatternTransformUndoJob
+} from "./jobs/patternStructureJobs.js";
 import { destroyZipPool } from "./jobs/zipPool.js";
 import { destroyFileRewritePool } from "./jobs/fileRewritePool.js";
 import { processCleanupUploadsJob } from "./jobs/cleanupUploadsJob.js";
@@ -297,6 +308,27 @@ async function start() {
         if (job.name === FIX_TRAILING_SLASHES_UNDO_JOB) {
           await processFixTrailingSlashesUndoJob(
             job.data as FixTrailingSlashesUndoJobData,
+            app.log
+          );
+          return;
+        }
+
+        if (job.name === PATTERN_RENAME_JOB) {
+          await processPatternRenameJob(job.data as PatternRenameJobData, app.log);
+          return;
+        }
+
+        if (job.name === PATTERN_TRANSFORM_JOB) {
+          await processPatternTransformJob(
+            job.data as PatternTransformJobData,
+            app.log
+          );
+          return;
+        }
+
+        if (job.name === PATTERN_TRANSFORM_UNDO_JOB) {
+          await processPatternTransformUndoJob(
+            job.data as PatternTransformUndoJobData,
             app.log
           );
           return;
