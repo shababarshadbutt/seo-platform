@@ -5,13 +5,13 @@
 # when .env is missing entirely; they are not a second place to maintain.
 services:
   frontend:
-    image: shababarshadbutt/sitemap-frontend:${APP_VERSION:-v1.48}
+    image: shababarshadbutt/sitemap-frontend:${APP_VERSION:-v1.49}
     build:
       context: ./frontend
     environment:
       NEXT_TELEMETRY_DISABLED: "1"
       NEXT_PUBLIC_BACKEND_URL: http://localhost:${BACKEND_PORT:-3001}
-      NEXT_PUBLIC_APP_VERSION: ${APP_VERSION:-v1.48}
+      NEXT_PUBLIC_APP_VERSION: ${APP_VERSION:-v1.49}
       NEXT_PUBLIC_SEO_DESK_URL: ${NEXT_PUBLIC_SEO_DESK_URL:-http://localhost:4000}
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
@@ -32,7 +32,7 @@ services:
       start_period: 45s
 
   backend:
-    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.48}
+    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.49}
     build:
       context: ./backend
     environment:
@@ -75,7 +75,7 @@ services:
       start_period: 30s
 
   worker:
-    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.48}
+    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.49}
     build:
       context: ./backend
     command: npm run worker
