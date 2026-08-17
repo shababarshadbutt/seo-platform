@@ -16,6 +16,18 @@ import {
 } from "./api";
 import { chunkFiles } from "./chunk";
 import {
+  decideFromProbeError,
+  decideFromStatus,
+  reconnectDelayMs,
+  shouldReconnectStream,
+  STALL_CHECK_MS,
+  STALL_PROBE_ATTEMPTS,
+  STALL_PROBE_BACKOFF_MS,
+  STREAM_RECONNECT_ATTEMPTS,
+  STREAM_STALL_MS,
+  type StallDecision
+} from "./cleaner-stall";
+import {
   cleanerProgressInitial,
   reduceCleanerProgress,
   reduceCleanerUploadProgress,
@@ -32,10 +44,6 @@ import {
 //     ordering key. It keeps the v1.50 single-request path.
 
 const MAX_CONCURRENT_UPLOADS = 3;
-// The server keepalives every 15s, so a full minute of silence is a dead
-// connection, not a quiet stage.
-const STREAM_STALL_MS = 60_000;
-const STALL_CHECK_MS = 10_000;
 const BATCH_RETRY_DELAYS_MS = [1000, 2000, 4000];
 const ANNOUNCE_INTERVAL_MS = 10_000;
 
@@ -164,85 +172,225 @@ export function useCleanerRun() {
         fail = reject;
       });
 
-      // Stall watchdog.
+      // ---- Stream supervision (rewritten in v1.53) -------------------------
       //
-      // The server sends `: keepalive` every 15s, so silence for a full minute
-      // means the connection is dead rather than merely quiet. Without this the
-      // page could sit on a frozen percentage indefinitely — which is exactly
-      // what happened when an OOM killed the backend mid-clean: no error frame
-      // is possible from a process that has already aborted.
+      // v1.52's watchdog treated "the stream went quiet" as "the backend died",
+      // and ended healthy runs on a single failed status probe. The rule now is:
+      // SILENCE IS NOT EVIDENCE. Only a definite answer from the server — this
+      // run is gone, or this run finished — ends a run. Everything else
+      // reconnects, which the backend has always supported (it replays its last
+      // frame on resubscribe) and which the client simply never used.
+      //
+      // All the decisions live in lib/cleaner-stall.ts as pure functions, so the
+      // cases v1.52 got wrong are unit-tested rather than reasoned about.
+      let settled = false;
       let lastActivityAt = Date.now();
-      const watchdog = setInterval(() => {
-        if (Date.now() - lastActivityAt < STREAM_STALL_MS) {
+      let watchdog: ReturnType<typeof setInterval> | null = null;
+      let probing = false;
+      // Per-attempt abort, CHILD of the run's controller. A stalled socket that
+      // never closes would otherwise leave `reader.read()` pending forever, so
+      // the watchdog needs its own way to tear the attempt down and force a
+      // reattach. Aborting the run's own controller would cancel the run.
+      let streamAbort: AbortController | null = null;
+      let forcedReconnect = false;
+
+      const finish = (outcome: StallDecision) => {
+        if (settled) {
           return;
         }
 
-        clearInterval(watchdog);
-        // Ask the server whether the run is still alive before blaming it. A
-        // 404 means the run is genuinely gone; a network failure means the API
-        // itself is unreachable. Those deserve different messages.
-        void getCleanerRunStatus(handle.run_id).then(
-          (status) => {
-            if (status.status === "running") {
-              // Reachable and still working — the stream broke, not the run.
-              setNotice({
-                tone: "warning",
-                text: "Lost the progress stream, but the run is still going on the server."
-              });
-              lastActivityAt = Date.now();
+        if (outcome.kind === "settle") {
+          settled = true;
+          settle(outcome.done);
+        } else if (outcome.kind === "fail") {
+          settled = true;
+          fail(new Error(outcome.message));
+        }
+      };
 
-              return;
-            }
+      const stopWatchdog = () => {
+        if (watchdog) {
+          clearInterval(watchdog);
+          watchdog = null;
+        }
+      };
 
-            fail(new Error("The cleaning run stopped on the server."));
-          },
-          () =>
-            fail(
-              new Error(
-                "Lost contact with the backend — the cleaning run stopped. It may have run out of memory; check the backend logs."
-              )
-            )
-        );
-      }, STALL_CHECK_MS);
-
-      const streamed = streamCleanerRun(
-        handle.run_id,
-        handle.server_epoch,
-        (event) => {
-          if (event.type === "done") {
-            settle({
+      const onStreamEvent = (event: CleanerProgressEvent) => {
+        if (event.type === "done") {
+          finish({
+            kind: "settle",
+            done: {
               summary: event.summary,
               download_token: event.download_token,
               zip_filename: event.zip_filename
-            });
-          } else if (event.type === "error") {
-            fail(new Error(event.message));
-          } else {
-            onFrame(event);
-          }
-        },
-        controller.signal,
-        () => {
-          lastActivityAt = Date.now();
+            }
+          });
+        } else if (event.type === "error") {
+          finish({ kind: "fail", message: event.message });
+        } else {
+          onFrame(event);
         }
-      )
-        // Route stream failure into the SAME promise the terminal frames settle,
-        // so `await finished` below can never hang. The old `.catch(() =>
-        // undefined)` here discarded every one of these.
-        .catch((error: unknown) => {
+      };
+
+      // Reattach to the run's progress stream. The server sends `started` then
+      // replays lastFrame/terminalFrame, and the reducer's seq guard drops the
+      // replays — so a reconnect costs nothing and loses nothing. Resubscribing
+      // also refreshes the server's abandonment heartbeat, which is what stops
+      // the 5-minute reaper from killing a run whose client is merely
+      // reconnecting.
+      const connect = async (attempt: number): Promise<void> => {
+        streamAbort = new AbortController();
+        forcedReconnect = false;
+
+        // Cancelling the run must also tear down the in-flight stream.
+        const linkAbort = () => streamAbort?.abort();
+
+        controller.signal.addEventListener("abort", linkAbort, { once: true });
+
+        try {
+          await streamCleanerRun(
+            handle.run_id,
+            handle.server_epoch,
+            onStreamEvent,
+            streamAbort.signal,
+            () => {
+              lastActivityAt = Date.now();
+            }
+          );
+        } catch (error) {
+          if (settled) {
+            return;
+          }
+
+          // The user cancelled — not a fault, and nothing to reattach to.
           if (controller.signal.aborted) {
             return;
           }
 
-          fail(
-            error instanceof CleanerStreamEndedError
-              ? new Error(
-                  "Lost contact with the backend before the run finished — the cleaning run stopped. It may have run out of memory; check the backend logs."
-                )
-              : error
-          );
-        })
-        .finally(() => clearInterval(watchdog));
+          // Either the socket closed with no terminal frame, or the watchdog
+          // tore down a stalled-but-open socket. Both mean "reattach".
+          const reattachable = forcedReconnect || error instanceof CleanerStreamEndedError;
+
+          if (reattachable && shouldReconnectStream(attempt)) {
+            setNotice({
+              tone: "warning",
+              text: `Reconnecting to the cleaning run (attempt ${attempt} of ${STREAM_RECONNECT_ATTEMPTS})…`
+            });
+            await delay(reconnectDelayMs(attempt));
+
+            if (settled || controller.signal.aborted) {
+              return;
+            }
+
+            return connect(attempt + 1);
+          }
+
+          if (reattachable) {
+            // Out of reconnect attempts. Ask the server for a verdict rather
+            // than assuming the worst — the run may well have finished.
+            await probeUntilDecided();
+
+            // CRITICAL: the probe can legitimately return "still running", which
+            // settles nothing. Leaving it there would hang `await finished`
+            // forever — exactly the freeze this whole change exists to remove.
+            // So say something true and terminal instead.
+            finish({
+              kind: "fail",
+              message:
+                "Could not stay connected to the cleaning run. It may still be finishing on the server — check the backend logs before re-running, so the work is not repeated."
+            });
+
+            return;
+          }
+
+          finish({
+            kind: "fail",
+            message:
+              error instanceof Error ? error.message : "The progress stream failed."
+          });
+        } finally {
+          controller.signal.removeEventListener("abort", linkAbort);
+        }
+      };
+
+      // Probe with retry. Below the attempt budget a failure means nothing: the
+      // probe shares a transport with the stream that just went silent, so the
+      // two failures are correlated. Only a 404 is informative immediately.
+      const probeUntilDecided = async () => {
+        if (probing || settled) {
+          return;
+        }
+
+        probing = true;
+
+        try {
+          for (let attempt = 1; attempt <= STALL_PROBE_ATTEMPTS; attempt += 1) {
+            if (settled || controller.signal.aborted) {
+              return;
+            }
+
+            let decision: StallDecision;
+
+            try {
+              decision = decideFromStatus(await getCleanerRunStatus(handle.run_id));
+            } catch (error) {
+              decision = decideFromProbeError(error, attempt);
+            }
+
+            if (decision.kind === "wait") {
+              await delay(STALL_PROBE_BACKOFF_MS[attempt - 1] ?? 3000);
+              continue;
+            }
+
+            if (decision.kind === "reconnect") {
+              setNotice({ tone: "warning", text: decision.notice });
+              // Proof of life, so the watchdog does not fire again while the
+              // reattach is in flight.
+              lastActivityAt = Date.now();
+              // FORCE the reattach. A socket can be silent without ever closing
+              // (TCP black hole, VPN re-key, sleep/resume), in which case
+              // `reader.read()` stays pending forever and `connect`'s catch never
+              // runs. Tearing down this attempt is what turns "the server says
+              // it's alive" into an actual reconnection rather than a notice
+              // above a frozen bar — which is all v1.52 managed.
+              forcedReconnect = true;
+              streamAbort?.abort();
+
+              return;
+            }
+
+            finish(decision);
+
+            return;
+          }
+        } finally {
+          probing = false;
+        }
+      };
+
+      const armWatchdog = () => {
+        stopWatchdog();
+        lastActivityAt = Date.now();
+        // Deliberately armed only AFTER the stream is opened. v1.52 armed it
+        // before, so an upload-phase stall produced an unhandled rejection while
+        // the uploads carried on to completion for nobody.
+        watchdog = setInterval(() => {
+          if (settled || Date.now() - lastActivityAt < STREAM_STALL_MS) {
+            return;
+          }
+
+          // NOT cleared here. v1.52 cleared its own interval before probing and
+          // never re-armed, so even its benign branch left nothing able to
+          // settle the run — the bar froze forever, which is the bug the
+          // watchdog existed to fix.
+          void probeUntilDecided();
+        }, STALL_CHECK_MS);
+        watchdog.unref?.();
+      };
+
+      armWatchdog();
+
+      const streamed = connect(1).finally(stopWatchdog);
 
       const batches = chunkFiles(ordered, handle.batch_size);
       const totalBytes = ordered.reduce((sum, file) => sum + file.size, 0);

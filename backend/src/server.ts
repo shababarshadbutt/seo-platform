@@ -126,4 +126,48 @@ process.on("SIGTERM", () => {
   void close().finally(() => process.exit(0));
 });
 
+// Say WHY before dying.
+//
+// This exists because of a real incident that took hours to diagnose. A large
+// Sitemap Cleaner run killed this process, and because nothing logged the
+// reason, the only evidence anyone had was the browser reporting "Cannot connect
+// to backend". The container itself still reported `Up` — PID 1 is `tsx watch`,
+// not node, so the watcher outlives its dead child — and no service declares a
+// `restart:` policy, so it stayed dead while looking healthy.
+//
+// These handlers cannot save the process: an unhandled `error` event or a V8
+// heap abort is not recoverable. What they buy is a log line naming the cause,
+// which is the difference between a diagnosable incident and a mystery. (A V8
+// OOM abort bypasses even this — it is `abort()`, not an exception — which is
+// why the cleaner now binds `error` on its write streams at creation instead of
+// relying on a global net.)
+const logFatal = (kind: string, error: unknown) => {
+  const detail =
+    error instanceof Error
+      ? { name: error.name, message: error.message, stack: error.stack }
+      : { value: String(error) };
+
+  try {
+    app.log.fatal({ kind, ...detail }, "backend is exiting on an unhandled error");
+  } catch {
+    // Logger already torn down — stderr is the last resort.
+  }
+
+  // eslint-disable-next-line no-console
+  console.error(`[fatal] ${kind}:`, error);
+};
+
+process.on("uncaughtException", (error) => {
+  logFatal("uncaughtException", error);
+  // Exit deliberately rather than continuing in an unknown state. Fastify may
+  // still be listening, and a half-alive API that accepts requests it cannot
+  // serve is worse than one that is plainly gone.
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  logFatal("unhandledRejection", reason);
+  process.exit(1);
+});
+
 void start();

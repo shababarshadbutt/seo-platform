@@ -246,6 +246,92 @@ function buildIndexXml(
   return `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${entries}\n</sitemapindex>\n`;
 }
 
+/**
+ * A write stream whose `'error'` is captured from the moment it is created.
+ *
+ * This exists because `finishStream` alone was not enough, and the gap killed
+ * the API in production. `finishStream` attaches `'error'` at CLOSE time, so
+ * every byte written before it went to a stream with no listener — and an
+ * unhandled `fs.WriteStream` `'error'` on the main thread is an
+ * `uncaughtException`, which takes the whole process down. There is no
+ * `uncaughtException` handler and no container `restart:` policy, so the API
+ * simply stopped answering while its container still reported `Up`.
+ *
+ * The exposed windows were not small: the duplicates report is written for the
+ * whole of Pass 2 (and deliberately ignores backpressure, so ENOSPC arrives
+ * asynchronously, which is exactly the shape that had no listener), and each
+ * cleaned output file takes millions of `write` calls before its close.
+ *
+ * `throwIfFailed()` lets the per-URL hot loop stay synchronous — it does not
+ * need to await anything — while still surfacing the failure promptly.
+ */
+type GuardedStream = {
+  stream: import("node:fs").WriteStream;
+  write: (chunk: string) => boolean;
+  throwIfFailed: () => void;
+  finish: () => Promise<void>;
+};
+
+function guardedWriteStream(filePath: string): GuardedStream {
+  const stream = createWriteStream(filePath);
+  let failure: Error | null = null;
+
+  // Bound BEFORE any write. This is the whole point of the helper.
+  stream.on("error", (error: Error) => {
+    failure = failure ?? error;
+  });
+
+  const throwIfFailed = () => {
+    if (failure) {
+      throw describeWriteFailure(failure, filePath);
+    }
+  };
+
+  return {
+    stream,
+    write: (chunk: string) => {
+      throwIfFailed();
+
+      return stream.write(chunk);
+    },
+    throwIfFailed,
+    finish: async () => {
+      await new Promise<void>((resolve, reject) => {
+        stream.end(() => resolve());
+        stream.on("error", reject);
+      }).catch(() => undefined);
+
+      throwIfFailed();
+    }
+  };
+}
+
+/**
+ * Turn a raw fs error into something a user can act on.
+ *
+ * ENOSPC especially: the existing fsErrors.ts maps it to a 507, but that mapping
+ * is structurally unreachable here — the cleaner hijacks its reply and the
+ * terminal phase is detached, so there is no request left to attach a status to.
+ */
+export function describeWriteFailure(error: Error, filePath: string): Error {
+  const code = (error as NodeJS.ErrnoException).code;
+
+  if (code === "ENOSPC") {
+    return new Error(
+      "Server storage is full, so the cleaned sitemaps could not be written. " +
+        "Free up disk space on the server and run the clean again."
+    );
+  }
+
+  if (code === "EACCES" || code === "EPERM") {
+    return new Error(
+      `The server is not permitted to write ${path.basename(filePath)}. Check the uploads volume permissions.`
+    );
+  }
+
+  return new Error(`Could not write ${path.basename(filePath)}: ${error.message}`);
+}
+
 // Await a writable stream fully flushing and closing. Rejects on any stream
 // error so a disk-full / permission failure surfaces instead of hanging.
 function finishStream(stream: import("node:fs").WriteStream): Promise<void> {
@@ -550,7 +636,7 @@ async function writeCandidateFile(
   produce: (emit: (loc: string, key: string) => void) => void | Promise<unknown>
 ): Promise<{ kept: boolean; url_count: number; path: string }> {
   const outPath = path.join(outDir, outputNameOf(file));
-  const out = createWriteStream(outPath);
+  const out = guardedWriteStream(outPath);
   out.write(URLSET_HEADER);
   let keptCount = 0;
 
@@ -564,14 +650,14 @@ async function writeCandidateFile(
   await produce(emit);
 
   if (keptCount === 0) {
-    await finishStream(out);
+    await out.finish();
     await unlink(outPath).catch(() => undefined);
 
     return { kept: false, url_count: 0, path: outPath };
   }
 
   out.write(URLSET_FOOTER);
-  await finishStream(out);
+  await out.finish();
 
   return { kept: true, url_count: keptCount, path: outPath };
 }
@@ -971,7 +1057,10 @@ export async function cleanSitemaps(options: {
   // found, rather than assembled afterwards from an in-memory map. See the note
   // on DedupState: that map was what exhausted the heap on a real corpus.
   const reportPath = path.join(outDir, REPORT_FILENAME);
-  const reportStream = createWriteStream(reportPath);
+  // Guarded: this stream is written for the WHOLE of Pass 2 and deliberately
+  // ignores backpressure, so an ENOSPC arrives asynchronously — precisely the
+  // shape that had no `error` listener and killed the API process outright.
+  const reportStream = guardedWriteStream(reportPath);
 
   reportStream.write("url,kept_in_file,duplicate_in_file\r\n");
 
@@ -1103,9 +1192,10 @@ export async function cleanSitemaps(options: {
     survivors.map((file) => file.filename),
     today
   );
-  const indexStream = createWriteStream(indexPath);
+  const indexStream = guardedWriteStream(indexPath);
+
   indexStream.write(indexXml);
-  await finishStream(indexStream);
+  await indexStream.finish();
 
   onProgress?.({
     stage: "index",
@@ -1132,7 +1222,7 @@ export async function cleanSitemaps(options: {
 
   const endReport = metrics?.start("stage.report_ms");
 
-  await finishStream(reportStream);
+  await reportStream.finish();
   metrics?.inc("report.rows", reportRows);
 
   if (reportBackpressure) {
