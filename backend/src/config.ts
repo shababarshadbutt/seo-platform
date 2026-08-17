@@ -33,6 +33,9 @@ function readNumber(name: string, options: NumberEnvOptions): number {
 
 export const config = {
   nodeEnv: process.env.NODE_ENV ?? "development",
+  // Reported in the cleaner SSE `started` frame so the client can detect a
+  // frontend/backend version mismatch instead of it being diagnosed by hand.
+  appVersion: process.env.APP_VERSION ?? process.env.NEXT_PUBLIC_APP_VERSION ?? null,
   port: readNumber("PORT", { fallback: 3001, min: 1, max: 65535 }),
   workerHealthPort: readNumber("WORKER_HEALTH_PORT", {
     fallback: 3002,

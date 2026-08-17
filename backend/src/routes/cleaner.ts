@@ -11,7 +11,7 @@ import AdmZip from "adm-zip";
 import type { FastifyInstance } from "fastify";
 import { ZipArchive } from "archiver";
 
-import type { FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyBaseLogger, FastifyReply, FastifyRequest } from "fastify";
 
 import { config } from "../config.js";
 import {
@@ -89,11 +89,35 @@ type CachedRun = {
 };
 const runCache = new Map<string, CachedRun>();
 
+/**
+ * Remove a working directory, swallowing failure with a warning.
+ *
+ * Every one of these call sites used to be a bare `void rm(...)`, and v1.53 made
+ * that lethal: it installed `process.on("unhandledRejection") → process.exit(1)`
+ * so a crash would say why, but an unawaited `rm` rejection IS an unhandled
+ * rejection. `force: true` swallows ENOENT and nothing else — removing a tree
+ * that is still being written can raise EBUSY, EPERM or ENOTEMPTY, and that is
+ * most reachable on exactly the big slow runs this cleanup exists for.
+ *
+ * So one failed directory delete would kill the API and every other in-flight
+ * run with it, which then reads to the user as a healthy run "no longer
+ * available". Failing to reclaim disk is a warning; taking the service down over
+ * it is not.
+ */
+function discardDir(dir: string, log?: FastifyBaseLogger) {
+  void rm(dir, { recursive: true, force: true }).catch((error) => {
+    log?.warn(
+      { error, dir },
+      "cleaner: could not remove working directory (ignored)"
+    );
+  });
+}
+
 function storeRun(token: string, run: CachedRun) {
   runCache.set(token, run);
   const timer = setTimeout(() => {
     runCache.delete(token);
-    void rm(run.dir, { recursive: true, force: true });
+    discardDir(run.dir, routeLogger ?? undefined);
   }, RUN_TTL_MS);
   timer.unref?.();
 }
@@ -295,7 +319,7 @@ function awaitClassifyDrain(entry: BatchedRun): Promise<void> {
 
 function discardBatchedRun(entry: BatchedRun) {
   batched.delete(entry.run.runId);
-  void rm(entry.run.runDir, { recursive: true, force: true }).catch(() => undefined);
+  discardDir(entry.run.runDir, routeLogger ?? undefined);
 }
 
 export async function cleanerRoutes(app: FastifyInstance) {
@@ -327,8 +351,7 @@ export async function cleanerRoutes(app: FastifyInstance) {
       await mkdir(inDir, { recursive: true });
       await mkdir(outDir, { recursive: true });
 
-      const cleanupRunDir = () =>
-        void rm(runDir, { recursive: true, force: true });
+      const cleanupRunDir = () => discardDir(runDir, request.log);
 
       const inputFiles: CleanerInputFile[] = [];
       let domain = "";
@@ -1065,7 +1088,13 @@ function attachRunStream(options: {
     type: "started",
     run_id: run.runId,
     domain: run.domain,
-    server_epoch: SERVER_EPOCH
+    server_epoch: SERVER_EPOCH,
+    // The BACKEND's build, so the client can tell whether the two halves of the
+    // stack match. Twice now, a bug has been reported against a version that was
+    // not actually running — once diagnosed only by noticing the reported error
+    // string did not exist in the release it was attributed to. A stale half
+    // should be visible, not inferred.
+    app_version: config.appVersion
   });
 
   const subscription = subscribeRun(run.runId, (frame) => {
@@ -1236,7 +1265,7 @@ async function runTerminalPhase(entry: BatchedRun) {
     batched.delete(run.runId);
 
     if (!handedOff) {
-      void rm(run.runDir, { recursive: true, force: true }).catch(() => undefined);
+      discardDir(run.runDir, routeLogger ?? undefined);
     }
   }
 }

@@ -1776,7 +1776,17 @@ export type CleanerProgressEvent =
       zip_filename: string;
       seq?: number;
     }
-  | { type: "error"; message: string; seq?: number };
+  | { type: "error"; message: string; seq?: number }
+  | {
+      // First frame on a run's progress stream. `app_version` is the BACKEND's
+      // build, so the client can detect a half-stale stack.
+      type: "started";
+      run_id: string;
+      domain: string;
+      server_epoch: string;
+      app_version?: string | null;
+      seq?: number;
+    };
 
 export type CleanerDone = {
   summary: CleanerSummary;

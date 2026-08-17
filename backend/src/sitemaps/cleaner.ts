@@ -159,6 +159,10 @@ export type CleanerProgress = (event: {
 export const INDEX_FILENAME = "sitemap-index.xml";
 export const REPORT_FILENAME = "duplicates-report.csv";
 
+// Duplicate rows are accumulated to this size before hitting the stream. See the
+// note at the sink for why batching matters more than row size.
+const REPORT_BUFFER_FLUSH_BYTES = 64 * 1024;
+
 const URLSET_HEADER =
   '<?xml version="1.0" encoding="UTF-8"?>\n' +
   '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n';
@@ -668,10 +672,8 @@ function readProvisionalPairs(
   onPair: (loc: string, key: string) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const rl = createInterface({
-      input: createReadStream(provisionalPath),
-      crlfDelay: Infinity
-    });
+    const input = createReadStream(provisionalPath);
+    const rl = createInterface({ input, crlfDelay: Infinity });
 
     // A throw out of a readline "line" listener does NOT reject this promise —
     // it escapes as an uncaughtException and takes the whole API process down.
@@ -688,6 +690,10 @@ function readProvisionalPairs(
 
       settled = true;
       rl.close();
+      // rl.close() does NOT close the underlying fs.ReadStream. Without this the
+      // fd leaks on every failure and the stream keeps pumping into a buffer
+      // nobody reads.
+      input.destroy();
       reject(error);
     };
 
@@ -715,6 +721,11 @@ function readProvisionalPairs(
       }
     });
     rl.on("error", fail);
+    // Read errors reach the readline interface inconsistently, so bind the SOURCE
+    // too: otherwise a mid-read disk error leaves this promise pending forever,
+    // which on the SSE route is a permanently frozen progress bar rather than a
+    // failure anyone can see.
+    input.on("error", fail);
   });
 }
 
@@ -1071,18 +1082,37 @@ export async function cleanSitemaps(options: {
   // whole of Pass 2 — measured at 80% of the run, indistinguishable from
   // stage.pass2_ms. This span covers only the flush.
 
+  // Buffered to 64 KB before touching the stream.
+  //
+  // The previous version wrote once per duplicate row — 12,447,935 individual
+  // `stream.write()` calls on a real corpus — with backpressure ignored. Row size
+  // was the wrong thing to reason about: each QUEUED CHUNK costs a WriteReq object
+  // plus a linked-list node on top of the string, so when the disk lags behind,
+  // per-row writes carry ~500x the queue overhead of batched ones. That is a
+  // second route to heap exhaustion, independent of the dedup index.
+  //
+  // Backpressure is still not awaited, deliberately: doing so would make
+  // considerLoc async, and it sits in the innermost per-URL loop of the engine.
+  // Batching is what makes ignoring it affordable.
+  let reportBuffer = "";
+  const flushReport = () => {
+    if (reportBuffer.length === 0) {
+      return;
+    }
+
+    reportBackpressure = !reportStream.write(reportBuffer) || reportBackpressure;
+    reportBuffer = "";
+  };
+
   const state = createDedupState((row) => {
-    // Return value ignored deliberately: honouring backpressure here would mean
-    // making considerLoc async, which sits in the innermost per-URL loop of the
-    // whole engine. Node buffers the excess, and at ~70 bytes a row that buffer
-    // is orders of magnitude smaller than the map this replaced. The flag is
-    // recorded so a future change can tell whether it ever actually mattered.
-    reportBackpressure =
-      !reportStream.write(
-        `${csvField(row.url)},${csvField(row.kept_in)},${csvField(
-          row.duplicate_in
-        )}\r\n`
-      ) || reportBackpressure;
+    reportBuffer += `${csvField(row.url)},${csvField(row.kept_in)},${csvField(
+      row.duplicate_in
+    )}\r\n`;
+
+    if (reportBuffer.length >= REPORT_BUFFER_FLUSH_BYTES) {
+      flushReport();
+    }
+
     reportRows += 1;
   });
   const survivors: SurvivorFile[] = [];
@@ -1222,6 +1252,7 @@ export async function cleanSitemaps(options: {
 
   const endReport = metrics?.start("stage.report_ms");
 
+  flushReport();
   await reportStream.finish();
   metrics?.inc("report.rows", reportRows);
 

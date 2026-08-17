@@ -216,6 +216,24 @@ export function useCleanerRun() {
       };
 
       const onStreamEvent = (event: CleanerProgressEvent) => {
+        // A version mismatch means the two halves of the stack are not the same
+        // build. This has twice led to a bug being reported against code that was
+        // not running — once only caught because the reported error string did not
+        // exist in the release it was blamed on. Surface it instead of inferring it.
+        if (event.type === "started") {
+          const backend = event.app_version ?? null;
+          const frontend = process.env.NEXT_PUBLIC_APP_VERSION ?? null;
+
+          if (backend && frontend && backend !== frontend) {
+            setNotice({
+              tone: "warning",
+              text: `Version mismatch: this page is ${frontend} but the backend is ${backend}. Recreate the containers before trusting any result.`
+            });
+          }
+
+          return;
+        }
+
         if (event.type === "done") {
           finish({
             kind: "settle",

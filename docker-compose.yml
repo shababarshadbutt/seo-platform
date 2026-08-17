@@ -16,13 +16,13 @@ x-logging: &default-logging
 services:
   frontend:
     logging: *default-logging
-    image: shababarshadbutt/sitemap-frontend:${APP_VERSION:-v1.53}
+    image: shababarshadbutt/sitemap-frontend:${APP_VERSION:-v1.54}
     build:
       context: ./frontend
     environment:
       NEXT_TELEMETRY_DISABLED: "1"
       NEXT_PUBLIC_BACKEND_URL: http://localhost:${BACKEND_PORT:-3001}
-      NEXT_PUBLIC_APP_VERSION: ${APP_VERSION:-v1.53}
+      NEXT_PUBLIC_APP_VERSION: ${APP_VERSION:-v1.54}
       NEXT_PUBLIC_SEO_DESK_URL: ${NEXT_PUBLIC_SEO_DESK_URL:-http://localhost:4000}
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
@@ -43,7 +43,7 @@ services:
       start_period: 45s
 
   backend:
-    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.53}
+    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.54}
     build:
       context: ./backend
     environment:
@@ -107,7 +107,7 @@ services:
       start_period: 30s
 
   worker:
-    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.53}
+    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.54}
     build:
       context: ./backend
     command: npm run worker
@@ -122,13 +122,11 @@ services:
       REDIS_URL: redis://redis:6379
       UPLOAD_DIR: /uploads
       EXPORT_DIR: /exports
-      # NOT YET CONSUMED — see docs/cleaner-v1.52-memory.md. This was plumbed
-      # through for an age-based sweep of <UPLOAD_DIR>/cleaner/<runId> that has
-      # never been ported to this branch: config.cleanerRunMaxAgeMs is read
-      # nowhere, and processCleanupZipsJob only touches EXPORT_DIR. Until that
-      # sweep exists, a crashed or reaped run leaks its whole working directory
-      # permanently and nothing reclaims it. Kept so enabling the sweep needs no
-      # compose change.
+      # Age-based sweep of <UPLOAD_DIR>/cleaner/<runId>, run from the ZIP-cleanup
+      # job in THIS process (v1.54). A run dir is normally removed by an
+      # in-process TTL timer; an API restart or crash in that window orphans the
+      # whole tree permanently, which on a large corpus is several GB per orphan.
+      # The worker needs this even though it never runs a clean itself.
       CLEANER_RUN_MAX_AGE_HOURS: "${CLEANER_RUN_MAX_AGE_HOURS:-6}"
     logging: *default-logging
     volumes:

@@ -5,6 +5,7 @@ import path from "node:path";
 import type { FastifyBaseLogger } from "fastify";
 
 import { config } from "../config.js";
+import { sweepStaleArtifacts } from "../sitemaps/staleArtifactSweep.js";
 import { pool } from "../db/pool.js";
 import { isZipCacheFresh } from "../exports/sessionZipCache.js";
 import { resolveSessionZipPlan } from "../routes/sessions.js";
@@ -210,6 +211,27 @@ export async function processCleanupZipsJob(logger: FastifyBaseLogger) {
         [row.id, Boolean(allGone), Boolean(editedGone)]
       );
     }
+  }
+
+  // Reclaim orphaned Sitemap Cleaner working directories.
+  //
+  // A run dir is removed by a setTimeout scheduled in storeRun, RUN_TTL_MS after
+  // the run is cached. That timer lives in the API process, and nothing else knows
+  // the directory exists — so an API restart or crash in that window orphans the
+  // whole tree PERMANENTLY. On a large corpus that is several GB per orphan, and
+  // it is self-amplifying: the leak makes the next run likelier to fail, which
+  // leaks again.
+  //
+  // Deliberately inside its own try/catch: reclaiming disk must never be able to
+  // fail the ZIP cleanup this job exists for.
+  try {
+    const sweep = await sweepStaleArtifacts(config.uploadDir, logger);
+
+    if (sweep.cleanerRunsRemoved > 0 || sweep.partFilesRemoved > 0) {
+      logger.warn(sweep, "stale artifact sweep reclaimed orphaned cleaner artifacts");
+    }
+  } catch (error) {
+    logger.error({ error }, "stale artifact sweep failed");
   }
 
   logger.info({ removed }, "cleanup-zips complete");
