@@ -16,13 +16,13 @@ x-logging: &default-logging
 services:
   frontend:
     logging: *default-logging
-    image: shababarshadbutt/sitemap-frontend:${APP_VERSION:-v1.51}
+    image: shababarshadbutt/sitemap-frontend:${APP_VERSION:-v1.52}
     build:
       context: ./frontend
     environment:
       NEXT_TELEMETRY_DISABLED: "1"
       NEXT_PUBLIC_BACKEND_URL: http://localhost:${BACKEND_PORT:-3001}
-      NEXT_PUBLIC_APP_VERSION: ${APP_VERSION:-v1.51}
+      NEXT_PUBLIC_APP_VERSION: ${APP_VERSION:-v1.52}
       NEXT_PUBLIC_SEO_DESK_URL: ${NEXT_PUBLIC_SEO_DESK_URL:-http://localhost:4000}
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
@@ -43,13 +43,21 @@ services:
       start_period: 45s
 
   backend:
-    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.51}
+    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.52}
     build:
       context: ./backend
     environment:
       NODE_ENV: development
       PORT: "3001"
-      NODE_OPTIONS: "--max-old-space-size=4096"
+      # Backend only. The Sitemap Cleaner's cross-file dedup map holds one entry
+      # per unique URL for the whole run (~130 bytes each), so the ceiling is a
+      # direct function of corpus size: a real 1,605-file / 4.3 GB / ~35M-URL
+      # corpus aborted the API at 4096 with `FATAL ERROR: Reached heap limit`.
+      # That abort is uncatchable, so no error frame reaches the browser and the
+      # UI just freezes. The worker deliberately keeps the image default (4096
+      # from the Dockerfile) — it never runs a clean, and handing it 12 GB it
+      # cannot use would only over-commit the host.
+      NODE_OPTIONS: "--max-old-space-size=${BACKEND_HEAP_MB:-12288}"
       # Accept corporate SSL-inspection proxy certificates (v1.39). Defaults to
       # "0" (verification off) so sampling works behind such proxies; override
       # to "1" via the env if outbound TLS is not intercepted.
@@ -99,7 +107,7 @@ services:
       start_period: 30s
 
   worker:
-    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.51}
+    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.52}
     build:
       context: ./backend
     command: npm run worker

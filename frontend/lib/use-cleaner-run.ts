@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   cancelCleanerRun,
+  CleanerStreamEndedError,
   completeCleanerRun,
   createCleanerRun,
   getCleanerRunStatus,
@@ -31,6 +32,10 @@ import {
 //     ordering key. It keeps the v1.50 single-request path.
 
 const MAX_CONCURRENT_UPLOADS = 3;
+// The server keepalives every 15s, so a full minute of silence is a dead
+// connection, not a quiet stage.
+const STREAM_STALL_MS = 60_000;
+const STALL_CHECK_MS = 10_000;
 const BATCH_RETRY_DELAYS_MS = [1000, 2000, 4000];
 const ANNOUNCE_INTERVAL_MS = 10_000;
 
@@ -159,6 +164,47 @@ export function useCleanerRun() {
         fail = reject;
       });
 
+      // Stall watchdog.
+      //
+      // The server sends `: keepalive` every 15s, so silence for a full minute
+      // means the connection is dead rather than merely quiet. Without this the
+      // page could sit on a frozen percentage indefinitely — which is exactly
+      // what happened when an OOM killed the backend mid-clean: no error frame
+      // is possible from a process that has already aborted.
+      let lastActivityAt = Date.now();
+      const watchdog = setInterval(() => {
+        if (Date.now() - lastActivityAt < STREAM_STALL_MS) {
+          return;
+        }
+
+        clearInterval(watchdog);
+        // Ask the server whether the run is still alive before blaming it. A
+        // 404 means the run is genuinely gone; a network failure means the API
+        // itself is unreachable. Those deserve different messages.
+        void getCleanerRunStatus(handle.run_id).then(
+          (status) => {
+            if (status.status === "running") {
+              // Reachable and still working — the stream broke, not the run.
+              setNotice({
+                tone: "warning",
+                text: "Lost the progress stream, but the run is still going on the server."
+              });
+              lastActivityAt = Date.now();
+
+              return;
+            }
+
+            fail(new Error("The cleaning run stopped on the server."));
+          },
+          () =>
+            fail(
+              new Error(
+                "Lost contact with the backend — the cleaning run stopped. It may have run out of memory; check the backend logs."
+              )
+            )
+        );
+      }, STALL_CHECK_MS);
+
       const streamed = streamCleanerRun(
         handle.run_id,
         handle.server_epoch,
@@ -175,8 +221,28 @@ export function useCleanerRun() {
             onFrame(event);
           }
         },
-        controller.signal
-      ).catch(() => undefined);
+        controller.signal,
+        () => {
+          lastActivityAt = Date.now();
+        }
+      )
+        // Route stream failure into the SAME promise the terminal frames settle,
+        // so `await finished` below can never hang. The old `.catch(() =>
+        // undefined)` here discarded every one of these.
+        .catch((error: unknown) => {
+          if (controller.signal.aborted) {
+            return;
+          }
+
+          fail(
+            error instanceof CleanerStreamEndedError
+              ? new Error(
+                  "Lost contact with the backend before the run finished — the cleaning run stopped. It may have run out of memory; check the backend logs."
+                )
+              : error
+          );
+        })
+        .finally(() => clearInterval(watchdog));
 
       const batches = chunkFiles(ordered, handle.batch_size);
       const totalBytes = ordered.reduce((sum, file) => sum + file.size, 0);

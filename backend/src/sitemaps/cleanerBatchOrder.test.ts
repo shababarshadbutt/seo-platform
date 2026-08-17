@@ -299,7 +299,15 @@ async function cleanWith(files: { filename: string; path: string }[]) {
 
   rmSync(outDir, { recursive: true, force: true });
 
-  return { result, written };
+  return { result, written, csv: csvOf(written) };
+}
+
+// v1.52: the duplicates report is no longer carried in the result — it is
+// streamed straight to disk. `written` already contains it, so the report is
+// compared from its bytes, which is a stronger check than the old in-memory
+// array anyway.
+function csvOf(written: { name: string; body: string }[]): string {
+  return written.find((file) => file.name === "duplicates-report.csv")?.body ?? "";
 }
 
 test("scrambled batch arrival produces byte-identical output to a one-shot run", async () => {
@@ -319,7 +327,19 @@ test("scrambled batch arrival produces byte-identical output to a one-shot run",
       reference.result.duplicates_removed > 0,
       "fixture must contain cross-file duplicates"
     );
-    assert.equal(reference.result.duplicate_urls[0].kept_in, "a0.xml");
+    assert.ok(
+      reference.csv.startsWith("url,kept_in_file,duplicate_in_file\r\n"),
+      "report must use the one-row-per-occurrence header"
+    );
+    assert.ok(
+      reference.csv.includes(",a0.xml,"),
+      "the earliest file must win the shared URLs in selection order"
+    );
+    assert.equal(
+      reference.csv.trimEnd().split("\r\n").length - 1,
+      reference.result.duplicates_removed,
+      "one CSV row per removed duplicate"
+    );
 
     for (const arrival of [
       [2, 1, 0],
@@ -355,10 +375,10 @@ test("scrambled batch arrival produces byte-identical output to a one-shot run",
       const label = `arrival ${arrival.join(",")}`;
 
       assert.deepEqual(batched.written, reference.written, `${label}: cleaned XML differs`);
-      assert.deepEqual(
-        batched.result.duplicate_urls,
-        reference.result.duplicate_urls,
-        `${label}: duplicates report differs (kept_in/also_in attribution)`
+      assert.equal(
+        batched.csv,
+        reference.csv,
+        `${label}: duplicates report differs (kept_in attribution or row order)`
       );
       assert.deepEqual(
         batched.result.dropped_files,
@@ -394,9 +414,9 @@ test("the fixture would actually catch an arrival-order bug", async () => {
     const reference = await cleanWith(selection);
     const wrong = await cleanWith(arrivalOrdered);
 
-    assert.notDeepEqual(
-      wrong.result.duplicate_urls,
-      reference.result.duplicate_urls,
+    assert.notEqual(
+      wrong.csv,
+      reference.csv,
       "fixture is too weak: arrival order must change the duplicates report"
     );
   } finally {

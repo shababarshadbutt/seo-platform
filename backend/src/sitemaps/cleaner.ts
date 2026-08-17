@@ -23,10 +23,23 @@ import {
 //   5. rebuilds a fresh sitemap-index.xml pointing at the survivors
 //   6. emits the cleaned files, the index, and a duplicates CSV report
 //
-// Memory model (v1.38): only URL strings are ever held in memory. Files are
-// read one at a time and streamed; a file's kept URLs are written straight to
-// disk. The only unavoidable heap cost is the cross-file dedup Set plus the
-// duplicates report.
+// Memory model (v1.38, tightened in v1.52): only URL strings are ever held in
+// memory. Files are read one at a time and streamed; a file's kept URLs are
+// written straight to disk. The ONLY unbounded structure left is the cross-file
+// dedup map (`keptBy`), ~130 bytes per unique URL.
+//
+// The duplicates report used to be the second, and it was the larger: a map of
+// {url, kept_in, also_in[]} per distinct duplicated URL at ~370 bytes each,
+// retained for the whole run purely to ship to the browser. A real 1,605-file /
+// 4.3 GB / ~35M-URL corpus aborted the API with `FATAL ERROR: Reached heap
+// limit` a third of the way through Pass 2. It is now streamed to disk as it is
+// found and served from there.
+//
+// `keptBy` is SHARDED across 32 Maps (see DedupIndex). That is not a memory
+// optimisation — a single V8 Map is capped at 2^24 entries, and the same corpus
+// hit that cap with `RangeError: Map maximum size exceeded` once it had enough
+// heap to get that far. Sharding puts the ceiling back under the control of
+// --max-old-space-size, which can be tuned; the 2^24 constant cannot.
 //
 // Concurrency model (v1.45): on large file sets both passes run across a
 // piscina worker pool.
@@ -72,7 +85,20 @@ export interface CleanerResult {
   files_dropped: number;
   dropped_files: { filename: string; reason: DropReason }[];
   duplicates_removed: number;
-  duplicate_urls: { url: string; kept_in: string; also_in: string[] }[];
+  // NOTE: there is deliberately no `duplicate_urls` array here.
+  //
+  // It was a second complete in-memory copy of the duplicates report, built
+  // solely so the browser could rebuild a CSV this module had ALREADY written to
+  // disk. Two failure modes, both hit in production: it was the largest single
+  // consumer of the heap on a big corpus (~370 bytes per distinct duplicated
+  // URL), and JSON.stringify of the `done` frame hit V8's ~512 MB string cap at
+  // roughly 3-4M rows — a RangeError that publishFrame silently swallowed,
+  // leaving the SSE stream open with no `done` and no `error`.
+  //
+  // The rows live in exactly one place now: REPORT_FILENAME on disk, served by
+  // GET /api/cleaner/report/:token. `duplicates_removed` counts occurrences and
+  // matches the CSV's row count, which is all the UI needs to decide whether the
+  // report is worth offering.
   output_files: { filename: string; url_count: number }[];
   // Uploaded <sitemapindex> files are excluded from cleaning and replaced by a
   // freshly rebuilt index; surfaced separately so the count stays honest.
@@ -345,20 +371,139 @@ export async function writeProvisionalOnDomainFile(
 
 // ---- Cross-file dedup: the single source of truth -----------------------
 
+// V8's hard maximum for a SINGLE Map is 2^24 entries.
+//
+// MEASURED on a real 1,605-file / 4.3 GB corpus: with a 4 GB heap the process
+// OOM-aborted first (uncatchable — no error frame, the UI just froze); given
+// 12 GB it reached this cap instead and threw `RangeError: Map maximum size
+// exceeded`. No --max-old-space-size lifts it, because it is a count limit, not
+// a memory limit.
+const V8_MAX_MAP_ENTRIES = 16_777_216;
+
+// So the dedup index is SHARDED across several Maps. Each shard is an ordinary
+// Map well under the cap, and the ceiling becomes heap-bound again rather than
+// count-bound.
+//
+// Correctness rests on one property, which must survive any edit here:
+// `dedupShardOf` is pure in the KEY, so every occurrence of a URL lands in the
+// same shard. Sharding therefore loses no comparison a single Map would have
+// made, and because URLs are still fed in canonical (candidateIndex, ordinal)
+// order, the first sighting seen inside a shard IS the globally first sighting.
+// The hash only decides which Map a key is filed into — comparison inside a
+// shard is still exact-string, so a hash collision costs nothing but a slightly
+// fuller shard. Output is byte-identical, which cleaner.test.ts pins.
+const DEDUP_SHARDS = 32;
+
+// Total capacity before anything is at risk. 32 x 2^24 is ~537M unique URLs, far
+// beyond what the heap allows first — which is the point: the binding limit goes
+// back to being memory, which can be tuned, instead of a constant that cannot.
+export const MAX_DEDUP_ENTRIES = DEDUP_SHARDS * V8_MAX_MAP_ENTRIES;
+
+// djb2-xor. Not used for equality, only for placement.
+function dedupShardOf(key: string): number {
+  let hash = 5381;
+
+  for (let i = 0; i < key.length; i += 1) {
+    hash = (((hash << 5) + hash) ^ key.charCodeAt(i)) | 0;
+  }
+
+  return (hash >>> 0) % DEDUP_SHARDS;
+}
+
+/** The sharded cross-file dedup index. Behaves as one Map<string, string>. */
+export class DedupIndex {
+  private readonly shards: Map<string, string>[] = Array.from(
+    { length: DEDUP_SHARDS },
+    () => new Map<string, string>()
+  );
+
+  private count = 0;
+
+  get size(): number {
+    return this.count;
+  }
+
+  get(key: string): string | undefined {
+    return this.shards[dedupShardOf(key)].get(key);
+  }
+
+  /** Insert if absent. Returns the existing value, or null when it was new. */
+  claim(key: string, filename: string): string | null {
+    const shard = this.shards[dedupShardOf(key)];
+    const existing = shard.get(key);
+
+    if (existing !== undefined) {
+      return existing;
+    }
+
+    if (shard.size >= V8_MAX_MAP_ENTRIES) {
+      throw new CleanerCapacityError(this.count);
+    }
+
+    shard.set(key, filename);
+    this.count += 1;
+
+    return null;
+  }
+}
+
+/**
+ * The corpus has more unique URLs than one Map can hold.
+ *
+ * Distinct from an out-of-memory abort, and much better behaved: this is a
+ * normal throwable, so the run fails with a message instead of taking the API
+ * process — and every other run on it — down.
+ */
+export class CleanerCapacityError extends Error {
+  constructor(readonly uniqueUrls: number) {
+    super(
+      `This file set has more than ${uniqueUrls.toLocaleString()} unique URLs, which is the maximum a single cleaning run can deduplicate ` +
+        `(a JavaScript Map is capped at 16,777,216 entries — raising the server's memory does NOT lift this). ` +
+        `Split the sitemaps into smaller batches and clean them separately.`
+    );
+    this.name = "CleanerCapacityError";
+  }
+}
+
+/** Receives one CSV row per duplicate occurrence, as it is found. */
+export type DuplicateReportSink = (row: {
+  url: string;
+  kept_in: string;
+  duplicate_in: string;
+}) => void;
+
 export type DedupState = {
-  keptBy: Map<string, string>; // normalized URL -> kept-in filename
-  dupReport: Map<string, { url: string; kept_in: string; also_in: string[] }>;
+  keptBy: DedupIndex; // normalized URL -> kept-in filename, sharded
   duplicatesRemoved: number;
+  /**
+   * Where duplicate rows go. Streaming rather than accumulating is the point.
+   *
+   * There USED to be a `dupReport: Map<string, {url, kept_in, also_in[]}>` here,
+   * retained for the whole run alongside `keptBy`. It was the larger of the two
+   * by far — roughly 370 bytes per distinct duplicated URL (the object, a second
+   * copy of the raw loc, and a 16-slot backing array for `also_in`) against
+   * ~130 bytes for a `keptBy` entry. On a 35M-URL corpus that was multiple GB,
+   * and it existed only so the finished result could carry a `duplicate_urls`
+   * array to the browser — so the browser could rebuild the CSV this module had
+   * already written to disk.
+   *
+   * It killed the API. A real 1,605-file / 4.3 GB run aborted the process with
+   * `FATAL ERROR: Reached heap limit` about a third of the way through Pass 2,
+   * which is uncatchable, so no error frame was ever sent and the UI simply
+   * froze. The rows now exist in exactly one place: the CSV on disk, served by
+   * GET /api/cleaner/report/:token.
+   */
+  report: DuplicateReportSink;
 };
 
-export function createDedupState(): DedupState {
-  return { keptBy: new Map(), dupReport: new Map(), duplicatesRemoved: 0 };
+export function createDedupState(report: DuplicateReportSink): DedupState {
+  return { keptBy: new DedupIndex(), duplicatesRemoved: 0, report };
 }
 
 // Decide ONE on-domain loc against the running cross-file dedup state
 // (first-occurrence-across-files wins), given its precomputed dedup `key`.
 // Returns true when this loc is the first sighting and should be written; false
-// when it's a duplicate (recorded in the report). Mutates `state`. This is
+// when it's a duplicate (streamed to the report). Mutates `state`. This is
 // deliberately the only implementation of the dedup rule so the sequential and
 // parallel Pass-2 paths are byte-identical (both use normalizeForDedup — inline
 // on the sequential path, in the worker on the parallel path).
@@ -368,24 +513,20 @@ export function considerLoc(
   key: string,
   filename: string
 ): boolean {
-  if (!state.keptBy.has(key)) {
-    state.keptBy.set(key, filename);
+  // One lookup+insert instead of has/get/set: `claim` returns null when the key
+  // was new, or the filename that already owns it.
+  const keptIn = state.keptBy.claim(key, filename);
 
+  if (keptIn === null) {
     return true;
   }
 
   state.duplicatesRemoved += 1;
-  const keptIn = state.keptBy.get(key) as string;
-  let entry = state.dupReport.get(key);
-
-  if (!entry) {
-    entry = { url: loc, kept_in: keptIn, also_in: [] };
-    state.dupReport.set(key, entry);
-  }
-
-  if (!entry.also_in.includes(filename)) {
-    entry.also_in.push(filename);
-  }
+  // One row per OCCURRENCE. The old grouped form needed `also_in.includes()`
+  // before every append — a linear scan that went quadratic for a URL appearing
+  // in thousands of files — and could not be written until the whole run had
+  // finished, which is precisely why it had to be held in memory.
+  state.report({ url: loc, kept_in: keptIn, duplicate_in: filename });
 
   return false;
 }
@@ -446,8 +587,26 @@ function readProvisionalPairs(
       crlfDelay: Infinity
     });
 
+    // A throw out of a readline "line" listener does NOT reject this promise —
+    // it escapes as an uncaughtException and takes the whole API process down.
+    // Measured: a corpus with more than 2^24 unique URLs makes `considerLoc`
+    // throw `RangeError: Map maximum size exceeded` from in here, and the
+    // service died with it, killing every other in-flight run. Converting the
+    // throw into a rejection is what turns "the backend vanished" into "this run
+    // failed, with a reason".
+    let settled = false;
+    const fail = (error: unknown) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      rl.close();
+      reject(error);
+    };
+
     rl.on("line", (line) => {
-      if (!line) {
+      if (settled || !line) {
         return;
       }
 
@@ -457,10 +616,19 @@ function readProvisionalPairs(
         return;
       }
 
-      onPair(line.slice(tab + 1), line.slice(0, tab));
+      try {
+        onPair(line.slice(tab + 1), line.slice(0, tab));
+      } catch (error) {
+        fail(error);
+      }
     });
-    rl.on("close", () => resolve());
-    rl.on("error", reject);
+    rl.on("close", () => {
+      if (!settled) {
+        settled = true;
+        resolve();
+      }
+    });
+    rl.on("error", fail);
   });
 }
 
@@ -799,7 +967,35 @@ export async function cleanSitemaps(options: {
   // ---- Pass 2: dedup + write cleaned files (streaming, first wins) -------
   onProgress?.({ stage: "dedup", message: "Deduplicating URLs…" });
 
-  const state = createDedupState();
+  // The duplicates report is opened BEFORE Pass 2 and written as duplicates are
+  // found, rather than assembled afterwards from an in-memory map. See the note
+  // on DedupState: that map was what exhausted the heap on a real corpus.
+  const reportPath = path.join(outDir, REPORT_FILENAME);
+  const reportStream = createWriteStream(reportPath);
+
+  reportStream.write("url,kept_in_file,duplicate_in_file\r\n");
+
+  let reportRows = 0;
+  let reportBackpressure = false;
+  // Rows are written DURING Pass 2, so their cost belongs to Pass 2 and is
+  // already counted there. Timing from here to the close would double-count the
+  // whole of Pass 2 — measured at 80% of the run, indistinguishable from
+  // stage.pass2_ms. This span covers only the flush.
+
+  const state = createDedupState((row) => {
+    // Return value ignored deliberately: honouring backpressure here would mean
+    // making considerLoc async, which sits in the innermost per-URL loop of the
+    // whole engine. Node buffers the excess, and at ~70 bytes a row that buffer
+    // is orders of magnitude smaller than the map this replaced. The flag is
+    // recorded so a future change can tell whether it ever actually mattered.
+    reportBackpressure =
+      !reportStream.write(
+        `${csvField(row.url)},${csvField(row.kept_in)},${csvField(
+          row.duplicate_in
+        )}\r\n`
+      ) || reportBackpressure;
+    reportRows += 1;
+  });
   const survivors: SurvivorFile[] = [];
   const endPass2 = metrics?.start("stage.pass2_ms");
 
@@ -919,49 +1115,30 @@ export async function cleanSitemaps(options: {
   });
   endIndex?.();
 
-  // ---- Write the duplicates report (streamed, never one big string) ------
-  // Previously silent. On a domain with millions of duplicates this loop is
-  // real work, and charging its time to "index" (the last stage announced) is
-  // exactly the misattribution the stage timer cannot detect on its own.
-  const endReport = metrics?.start("stage.report_ms");
-  const reportTotal = state.dupReport.size;
-
+  // ---- Close the duplicates report ---------------------------------------
+  // The rows were written during Pass 2; only the flush happens here. The stage
+  // still ANNOUNCES itself, because StageTimer charges an unannounced phase to
+  // whichever stage preceded it and the progress contract asserts every stage
+  // reports at least once.
   onProgress?.({
     stage: "report",
-    current: 0,
-    total: reportTotal,
-    message: `Writing the duplicates report (${reportTotal} rows)…`
+    current: reportRows,
+    total: reportRows,
+    message:
+      reportRows > 0
+        ? `Wrote the duplicates report — ${reportRows} rows`
+        : "No duplicates to report"
   });
 
-  const reportPath = path.join(outDir, REPORT_FILENAME);
-  const reportStream = createWriteStream(reportPath);
-  reportStream.write("url,kept_in_file,duplicate_in_files\r\n");
-
-  const duplicateUrls: { url: string; kept_in: string; also_in: string[] }[] =
-    [];
-  let reportRows = 0;
-
-  for (const row of state.dupReport.values()) {
-    duplicateUrls.push(row);
-    reportStream.write(
-      `${csvField(row.url)},${csvField(row.kept_in)},${csvField(
-        row.also_in.join("; ")
-      )}\r\n`
-    );
-    reportRows += 1;
-
-    if (reportRows % 5000 === 0) {
-      onProgress?.({
-        stage: "report",
-        current: reportRows,
-        total: reportTotal,
-        message: `Writing the duplicates report — ${reportRows} of ${reportTotal}`
-      });
-    }
-  }
+  const endReport = metrics?.start("stage.report_ms");
 
   await finishStream(reportStream);
   metrics?.inc("report.rows", reportRows);
+
+  if (reportBackpressure) {
+    metrics?.inc("report.backpressure");
+  }
+
   endReport?.();
 
   // ---- Assemble the manifest --------------------------------------------
@@ -992,7 +1169,6 @@ export async function cleanSitemaps(options: {
     files_dropped: dropped.length,
     dropped_files: dropped,
     duplicates_removed: duplicatesRemoved,
-    duplicate_urls: duplicateUrls,
     output_files: survivors.map((file) => ({
       filename: file.filename,
       url_count: file.url_count

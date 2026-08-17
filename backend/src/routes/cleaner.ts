@@ -27,7 +27,8 @@ import {
   type CleanerClassification,
   type CleanerInputFile,
   type CleanerOutputFile,
-  type CleanerResult
+  type CleanerResult,
+  REPORT_FILENAME
 } from "../sitemaps/cleaner.js";
 import { createCleanerMetrics, type CleanerMetrics } from "../sitemaps/cleanerMetrics.js";
 import {
@@ -853,6 +854,58 @@ export async function cleanerRoutes(app: FastifyInstance) {
           cleanupRunDir();
         }
       }
+    }
+  );
+
+  // Stream the duplicates report CSV that the clean already wrote to disk.
+  //
+  // This route exists so the summary no longer has to CARRY the report. The rows
+  // used to ride along in the `done` frame as `duplicate_urls`, purely so the
+  // browser could rebuild a CSV already sitting in the run's working directory —
+  // a second complete copy of the same data, held on the API heap and then
+  // serialized through JSON. On a large corpus that copy was the single biggest
+  // consumer of the heap, and JSON.stringify of it hit V8's ~512 MB string cap
+  // and threw a RangeError that was silently swallowed, hanging the stream.
+  app.get<{ Params: { token: string } }>(
+    "/api/cleaner/report/:token",
+    async (request, reply) => {
+      const entry = runCache.get(request.params.token);
+      const file = entry?.files.find(
+        (candidate) => candidate.filename === REPORT_FILENAME
+      );
+      const missing = () =>
+        reply.code(404).send({
+          error: "Not Found",
+          message:
+            "duplicates report expired or not found — run the cleaner again"
+        });
+
+      if (!entry || !file) {
+        return missing();
+      }
+
+      let size: number;
+
+      try {
+        size = (await stat(file.path)).size;
+      } catch {
+        return missing();
+      }
+
+      // Named after this run rather than the bare REPORT_FILENAME, so reports
+      // for several domains don't pile up as duplicates-report(1).csv.
+      const downloadName = entry.filename
+        .replace(/\.zip$/i, "")
+        .replace(/^cleaned-sitemaps/, "duplicates-report");
+
+      reply.header("content-type", "text/csv; charset=utf-8");
+      reply.header("content-length", size);
+      reply.header(
+        "content-disposition",
+        `attachment; filename="${downloadName}.csv"`
+      );
+
+      return reply.send(createReadStream(file.path));
     }
   );
 

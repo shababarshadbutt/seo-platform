@@ -1746,7 +1746,9 @@ export type CleanerSummary = {
   files_dropped: number;
   dropped_files: { filename: string; reason: CleanerDropReason }[];
   duplicates_removed: number;
-  duplicate_urls: { url: string; kept_in: string; also_in: string[] }[];
+  // Removed in v1.52 — the rows are downloaded from
+  // GET /api/cleaner/report/:token instead of being carried in the summary.
+  // `duplicates_removed` counts occurrences and matches the CSV's row count.
   output_files: { filename: string; url_count: number }[];
   index_files_detected: number;
   total_urls_kept_files: number;
@@ -2217,11 +2219,38 @@ export async function cancelCleanerRun(runId: string) {
  * EventSource because this needs to be abortable and EventSource cannot be
  * cancelled cleanly, nor does it expose HTTP status on failure.
  */
+export class CleanerStreamEndedError extends Error {
+  constructor(readonly sawAnyFrame: boolean) {
+    super("The progress stream ended before the run finished.");
+    this.name = "CleanerStreamEndedError";
+  }
+}
+
+/**
+ * Consume a run's progress stream.
+ *
+ * RESOLVES only after a terminal (`done`/`error`) frame. If the socket closes
+ * without one, it THROWS `CleanerStreamEndedError`.
+ *
+ * That distinction is the whole point. Previously this resolved normally on any
+ * end-of-stream, because `reader.read()` reports `{done:true}` identically
+ * whether the server finished or its process died. When the backend was killed
+ * by an OOM mid-clean, the caller's `await finished` waited forever on a promise
+ * nothing would ever settle, and the UI sat frozen at the last percentage it had
+ * seen — no error, no timeout, no recovery. Any stream death did this: a crash,
+ * a redeploy, a laptop sleep, a proxy dropping an idle connection.
+ *
+ * `onActivity` fires for EVERY byte-bearing frame including `: keepalive`
+ * comments, which the frame parser otherwise discards. The server sends those
+ * every 15s, so they are the signal a stall watchdog needs — silence then means
+ * the connection is genuinely dead rather than merely between events.
+ */
 export async function streamCleanerRun(
   runId: string,
   epoch: string,
   onEvent: (event: CleanerProgressEvent) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onActivity?: () => void
 ): Promise<void> {
   const response = await fetch(
     backendUrl(
@@ -2241,14 +2270,24 @@ export async function streamCleanerRun(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let sawTerminal = false;
+  let sawAnyFrame = false;
 
   for (;;) {
     const { value, done } = await reader.read();
 
     if (done) {
+      if (!sawTerminal) {
+        // The server went away mid-run. Surface it instead of pretending the
+        // run completed.
+        throw new CleanerStreamEndedError(sawAnyFrame);
+      }
+
       return;
     }
 
+    sawAnyFrame = true;
+    onActivity?.();
     buffer += decoder.decode(value, { stream: true });
 
     let boundary = buffer.indexOf("\n\n");
@@ -2272,7 +2311,13 @@ export async function streamCleanerRun(
       }
 
       try {
-        onEvent(JSON.parse(json) as CleanerProgressEvent);
+        const event = JSON.parse(json) as CleanerProgressEvent;
+
+        if (event.type === "done" || event.type === "error") {
+          sawTerminal = true;
+        }
+
+        onEvent(event);
       } catch {
         // A malformed frame must not kill a 20-minute run's stream.
       }
@@ -2409,27 +2454,30 @@ function csvField(value: string) {
 // Build the duplicates CSV client-side from the summary (same columns the
 // backend writes into the ZIP), so the standalone CSV download needs no extra
 // round-trip or server state.
-export function buildDuplicatesCsv(
-  rows: { url: string; kept_in: string; also_in: string[] }[]
-) {
-  const header = "url,kept_in_file,duplicate_in_files";
-  const lines = rows.map(
-    (row) =>
-      `${csvField(row.url)},${csvField(row.kept_in)},${csvField(
-        row.also_in.join("; ")
-      )}`
-  );
-
-  return `${[header, ...lines].join("\r\n")}\r\n`;
-}
-
-export async function downloadDuplicatesCsv(
-  rows: { url: string; kept_in: string; also_in: string[] }[],
-  filename: string
-) {
-  const blob = new Blob([buildDuplicatesCsv(rows)], {
-    type: "text/csv;charset=utf-8"
+export async function downloadDuplicatesCsv(token: string, filename: string) {
+  // The rows are NOT sent to the browser any more.
+  //
+  // This used to build the CSV client-side from `summary.duplicate_urls` — an
+  // array the backend held in memory for the whole run purely to ship here, so
+  // the browser could reconstruct a file the backend had already written to
+  // disk. On a large corpus that array was the biggest single consumer of the
+  // API's heap, and serializing it hit V8's ~512 MB string cap. The CSV is now
+  // streamed straight from the run's working directory.
+  const response = await fetch(backendUrl(`/api/cleaner/report/${token}`), {
+    cache: "no-store"
   });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+
+    throw new ApiError(
+      text || `Report download failed with status ${response.status}`,
+      response.status,
+      null
+    );
+  }
+
+  const blob = await response.blob();
 
   await saveBlobWithPicker(blob, filename, { "text/csv": [".csv"] });
 }

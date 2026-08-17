@@ -43,7 +43,7 @@ type RunResult = {
   survivors: { filename: string; url_count: number }[];
   dropped: { filename: string; reason: DropReason }[];
   duplicates_removed: number;
-  duplicate_urls: { url: string; kept_in: string; also_in: string[] }[];
+  duplicate_rows: { url: string; kept_in: string; duplicate_in: string }[];
   outDir: string;
 };
 
@@ -53,7 +53,11 @@ async function run(
 ): Promise<RunResult> {
   const outDir = mkdtempSync(path.join(os.tmpdir(), "cleaner-order-"));
   const provDir = mkdtempSync(path.join(os.tmpdir(), "cleaner-prov-"));
-  const state = createDedupState();
+  // v1.52: the report is a STREAMING sink, one row per duplicate occurrence,
+  // instead of an in-memory map grouped by URL. Collect into an array here so
+  // the ordering assertions below can still compare it exactly.
+  const duplicateRows: { url: string; kept_in: string; duplicate_in: string }[] = [];
+  const state = createDedupState((row) => duplicateRows.push(row));
   const survivors: {
     filename: string;
     url_count: number;
@@ -94,7 +98,7 @@ async function run(
     })),
     dropped,
     duplicates_removed: state.duplicatesRemoved,
-    duplicate_urls: [...state.dupReport.values()],
+    duplicate_rows: duplicateRows,
     outDir
   };
 }
@@ -109,23 +113,35 @@ test("Pass 2 dedup + output is identical whatever order the workers finish in", 
     { filename: "c.xml", url_count: 1 }
   ];
   const expectedDropped = [{ filename: "d.xml", reason: "empty" as DropReason }];
+  // v1.52: ONE ROW PER OCCURRENCE, emitted in sighting order, rather than one
+  // grouped row per URL with an `also_in` list. Same information, but it can be
+  // written to disk the moment it is known — which is what removes the map that
+  // used to exhaust the heap. Note this is a STRICTLY STRONGER ordering
+  // assertion than the grouped form: it pins the sequence duplicates were seen
+  // in, not just the set.
   const expectedDuplicates = [
-    { url: `${HOST}/dup/`, kept_in: "a.xml", also_in: ["b.xml", "c.xml"] },
-    { url: `${HOST}/x`, kept_in: "a.xml", also_in: ["d.xml"] },
-    { url: `${HOST}/y`, kept_in: "a.xml", also_in: ["d.xml"] }
+    { url: `${HOST}/dup/`, kept_in: "a.xml", duplicate_in: "b.xml" },
+    { url: `${HOST}/dup`, kept_in: "a.xml", duplicate_in: "c.xml" },
+    { url: `${HOST}/x`, kept_in: "a.xml", duplicate_in: "d.xml" },
+    { url: `${HOST}/y`, kept_in: "a.xml", duplicate_in: "d.xml" }
   ];
 
   // Reference matches the hand-computed first-wins expectation.
   assert.deepEqual(reference.survivors, expectedSurvivors);
   assert.deepEqual(reference.dropped, expectedDropped);
   assert.equal(reference.duplicates_removed, 4);
-  assert.deepEqual(reference.duplicate_urls, expectedDuplicates);
+  assert.deepEqual(reference.duplicate_rows, expectedDuplicates);
+  assert.equal(
+    reference.duplicate_rows.length,
+    reference.duplicates_removed,
+    "one report row per removed duplicate"
+  );
 
   // Scrambled completion is identical in every reported dimension...
   assert.deepEqual(scrambled.survivors, reference.survivors);
   assert.deepEqual(scrambled.dropped, reference.dropped);
   assert.equal(scrambled.duplicates_removed, reference.duplicates_removed);
-  assert.deepEqual(scrambled.duplicate_urls, reference.duplicate_urls);
+  assert.deepEqual(scrambled.duplicate_rows, reference.duplicate_rows);
 
   // ...and so are the actual cleaned files on disk.
   for (const { filename } of expectedSurvivors) {
