@@ -1757,18 +1757,24 @@ export type CleanerSummary = {
 export type CleanerProgressEvent =
   | {
       type: "progress";
+      // Kept as a widened string rather than a union of the known stages so a
+      // backend that grows a new stage degrades to the reducer's default label
+      // instead of failing the build.
       stage: string;
       message: string;
       current?: number;
       total?: number;
+      /** Monotonic per-run sequence, when the backend supplies one. */
+      seq?: number;
     }
   | {
       type: "done";
       summary: CleanerSummary;
       download_token: string;
       zip_filename: string;
+      seq?: number;
     }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string; seq?: number };
 
 export type CleanerDone = {
   summary: CleanerSummary;
@@ -1777,131 +1783,238 @@ export type CleanerDone = {
 };
 
 // POST the upload to the cleaner and consume the Server-Sent Events stream,
-// invoking onEvent for each progress/done/error event. Resolves with the final
-// done payload (summary + download token).
+// invoking onEvent for each progress/done/error event and onUploadProgress for
+// each chunk of the request body that goes out. Resolves with the final done
+// payload (summary + download token).
+//
+// Why XHR and not fetch (v1.50): the backend hijacks THIS request's socket and
+// writes SSE frames onto it while the multipart body is still uploading — but
+// a browser will not surface a fetch response until the request body has been
+// fully sent. For a 1,681-file upload that meant every "Uploaded N of 1681"
+// frame was buffered until the upload was already over, and the UI sat on a
+// bare "Processing…" spinner for the entire slowest phase of the run.
+//
+// `xhr.upload.onprogress` sidesteps that completely: it is the browser's own
+// accounting of bytes it has sent, so it needs no cooperation from the server
+// and no readable response. The SSE frames are still parsed incrementally out
+// of `xhr.responseText` as they arrive, so the cleaning phase reports itself
+// exactly as before.
 export async function processCleaner(
   formData: FormData,
   onEvent: (event: CleanerProgressEvent) => void,
-  signal?: AbortSignal
+  options: {
+    onUploadProgress?: (progress: UploadProgress) => void;
+    totalFiles?: number;
+    signal?: AbortSignal;
+  } = {}
 ): Promise<CleanerDone> {
-  const response = await fetch(backendUrl("/api/cleaner/process"), {
-    method: "POST",
-    body: formData,
-    signal
-  });
+  const totalFiles = options.totalFiles ?? 0;
 
-  if (!response.ok || !response.body) {
-    const text = await response.text().catch(() => "");
-    let message = `Cleaning failed with status ${response.status}`;
+  return new Promise<CleanerDone>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let done: CleanerDone | null = null;
+    let errorMessage: string | null = null;
+    // How much of responseText has already been folded into events. XHR keeps
+    // the whole response buffered, so we track an offset rather than splicing.
+    let consumed = 0;
 
-    try {
-      const payload = text ? JSON.parse(text) : null;
+    const handleFrame = (raw: string) => {
+      const dataLine = raw.split("\n").find((line) => line.startsWith("data:"));
 
-      if (typeof payload?.message === "string") {
-        message = payload.message;
-      }
-    } catch {
-      if (text) {
-        message = text;
-      }
-    }
-
-    throw new ApiError(message, response.status, null);
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let done: CleanerDone | null = null;
-  let errorMessage: string | null = null;
-
-  const handleEvent = (raw: string) => {
-    const dataLine = raw
-      .split("\n")
-      .find((line) => line.startsWith("data:"));
-
-    if (!dataLine) {
-      return;
-    }
-
-    const json = dataLine.slice(5).trim();
-
-    if (!json) {
-      return;
-    }
-
-    let event: CleanerProgressEvent;
-
-    try {
-      event = JSON.parse(json) as CleanerProgressEvent;
-    } catch {
-      return;
-    }
-
-    onEvent(event);
-
-    if (event.type === "done") {
-      done = {
-        summary: event.summary,
-        download_token: event.download_token,
-        zip_filename: event.zip_filename
-      };
-    } else if (event.type === "error") {
-      errorMessage = event.message;
-    }
-  };
-
-  try {
-    for (;;) {
-      const { value, done: streamDone } = await reader.read();
-
-      if (streamDone) {
-        break;
+      if (!dataLine) {
+        return;
       }
 
-      buffer += decoder.decode(value, { stream: true });
+      const json = dataLine.slice(5).trim();
 
-      let boundary = buffer.indexOf("\n\n");
-
-      while (boundary !== -1) {
-        handleEvent(buffer.slice(0, boundary));
-        buffer = buffer.slice(boundary + 2);
-        boundary = buffer.indexOf("\n\n");
+      if (!json) {
+        return;
       }
-    }
-  } catch (readError) {
-    // The socket dropped mid-stream (timeout, proxy close, network blip). Only
-    // treat it as a genuine interruption if we never received the final `done`
-    // event — otherwise the clean actually finished. Flagged so the caller can
-    // show a "stream closed" message instead of the misleading "Cannot connect
-    // to backend". (v1.37 Fix 1)
-    if (!done && !errorMessage) {
-      throw new ApiError(
-        "The processing stream closed before finishing.",
-        0,
-        { code: "stream_closed", cause: readError }
+
+      let event: CleanerProgressEvent;
+
+      try {
+        event = JSON.parse(json) as CleanerProgressEvent;
+      } catch {
+        return;
+      }
+
+      onEvent(event);
+
+      if (event.type === "done") {
+        done = {
+          summary: event.summary,
+          download_token: event.download_token,
+          zip_filename: event.zip_filename
+        };
+      } else if (event.type === "error") {
+        errorMessage = event.message;
+      }
+    };
+
+    // Drain whole `\n\n`-terminated frames from whatever has arrived so far.
+    // A `: keepalive` comment frame has no `data:` line and is skipped.
+    const drain = () => {
+      const text = xhr.responseText;
+
+      for (;;) {
+        const boundary = text.indexOf("\n\n", consumed);
+
+        if (boundary === -1) {
+          break;
+        }
+
+        handleFrame(text.slice(consumed, boundary));
+        consumed = boundary + 2;
+      }
+    };
+
+    const settleFromStream = () => {
+      drain();
+
+      // Anything left without a trailing blank line (server closed mid-frame).
+      if (xhr.responseText.length > consumed) {
+        handleFrame(xhr.responseText.slice(consumed));
+        consumed = xhr.responseText.length;
+      }
+
+      if (errorMessage) {
+        reject(new ApiError(errorMessage, 500, null));
+        return;
+      }
+
+      if (!done) {
+        // Stream ended without a `done` event — the server closed early (e.g.
+        // its request timeout fired). Distinct from a connectivity failure, and
+        // flagged so the caller does not show "Cannot connect to backend".
+        // (v1.37 Fix 1)
+        reject(
+          new ApiError("The processing stream closed before finishing.", 0, {
+            code: "stream_closed"
+          })
+        );
+        return;
+      }
+
+      resolve(done);
+    };
+
+    xhr.open("POST", backendUrl("/api/cleaner/process"));
+    xhr.timeout = UPLOAD_API_TIMEOUT_MS;
+
+    xhr.upload.onprogress = (event) => {
+      const totalBytes = event.lengthComputable ? event.total : 0;
+      const percent =
+        totalBytes > 0 ? Math.min(100, (event.loaded / totalBytes) * 100) : 0;
+      // Bytes are exact; the file count derived from them is an estimate,
+      // because 1,681 XML files are not evenly sized. The reducer clamps it
+      // non-decreasing and yields to the server's spooled count once one lands.
+      const transferredFiles =
+        totalBytes > 0
+          ? Math.min(
+              totalFiles,
+              Math.floor((event.loaded / totalBytes) * totalFiles)
+            )
+          : 0;
+
+      options.onUploadProgress?.({
+        loadedBytes: event.loaded,
+        totalBytes,
+        transferredFiles,
+        totalFiles,
+        percent
+      });
+    };
+
+    xhr.upload.onload = () => {
+      options.onUploadProgress?.({
+        loadedBytes: 0,
+        totalBytes: 0,
+        transferredFiles: totalFiles,
+        totalFiles,
+        percent: 100
+      });
+    };
+
+    // Fires repeatedly as response bytes arrive — this is the SSE pump.
+    xhr.onprogress = () => {
+      drain();
+    };
+
+    xhr.onload = () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        // A pre-hijack failure (e.g. bad domain) is a plain JSON error body.
+        let payload: unknown = null;
+
+        try {
+          payload = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+        } catch {
+          payload = null;
+        }
+
+        const message =
+          typeof (payload as { message?: unknown } | null)?.message === "string"
+            ? ((payload as { message: string }).message)
+            : `Cleaning failed with status ${xhr.status}`;
+
+        reject(new ApiError(message, xhr.status, payload));
+        return;
+      }
+
+      settleFromStream();
+    };
+
+    xhr.onerror = () => {
+      // The socket dropped mid-stream. If `done` already arrived the clean
+      // actually finished, so honour it rather than reporting a failure.
+      if (done) {
+        resolve(done);
+        return;
+      }
+
+      if (errorMessage) {
+        reject(new ApiError(errorMessage, 500, null));
+        return;
+      }
+
+      reject(
+        new ApiError("The processing stream closed before finishing.", 0, {
+          code: "stream_closed"
+        })
       );
+    };
+
+    xhr.ontimeout = () => {
+      const error = new Error("Cleaning timed out");
+
+      error.name = "AbortError";
+      reject(error);
+    };
+
+    xhr.onabort = () => {
+      const error = new Error("Cleaning cancelled");
+
+      error.name = "AbortError";
+      reject(error);
+    };
+
+    if (options.signal) {
+      if (options.signal.aborted) {
+        const error = new Error("Cleaning cancelled");
+
+        error.name = "AbortError";
+        reject(error);
+
+        return;
+      }
+
+      options.signal.addEventListener("abort", () => xhr.abort(), {
+        once: true
+      });
     }
-  }
 
-  if (buffer.trim()) {
-    handleEvent(buffer);
-  }
-
-  if (errorMessage) {
-    throw new ApiError(errorMessage, 500, null);
-  }
-
-  if (!done) {
-    // Stream ended cleanly but no `done` event arrived — the server closed the
-    // connection early (e.g. its request timeout fired). Distinct from a
-    // connectivity failure. (v1.37 Fix 1)
-    throw new ApiError("The processing stream closed before finishing.", 0, {
-      code: "stream_closed"
-    });
-  }
-
-  return done;
+    xhr.send(formData);
+  });
 }
 
 export type CleanerHandoffFile = {

@@ -1,8 +1,10 @@
 import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, rm, stat } from "node:fs/promises";
+import { availableParallelism, totalmem } from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { randomUUID } from "node:crypto";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import type { ServerResponse } from "node:http";
 
 import AdmZip from "adm-zip";
@@ -10,11 +12,15 @@ import type { FastifyInstance } from "fastify";
 import { ZipArchive } from "archiver";
 
 import { config } from "../config.js";
+import { cleanerPoolConfig, cleanerPoolStats } from "../jobs/cleanerPool.js";
 import {
   cleanSitemaps,
   type CleanerInputFile,
-  type CleanerOutputFile
+  type CleanerOutputFile,
+  type CleanerResult
 } from "../sitemaps/cleaner.js";
+import { createCleanerMetrics } from "../sitemaps/cleanerMetrics.js";
+import { StageTimer } from "../sitemaps/stageTimer.js";
 
 // The Sitemap Cleaner is stateless — nothing is written to the DB. Uploads and
 // generated files ARE spilled to disk (a per-run working directory under the
@@ -82,15 +88,30 @@ function baseName(name: string) {
 // over size, matching the session download ZIPs (v1.34).
 function archiveToFile(
   files: CleanerOutputFile[],
-  zipPath: string
+  zipPath: string,
+  onEntry?: (done: number, total: number) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const archive = new ZipArchive({ zlib: { level: 0 } });
     const output = createWriteStream(zipPath);
+    let done = 0;
 
     output.on("close", () => resolve());
     output.on("error", reject);
     archive.on("error", reject);
+
+    // Packaging used to be a single "Packaging ZIP…" message followed by
+    // silence for the rest of the run. archiver emits `entry` per file, so the
+    // denominator is just files.length — deliberately NOT the `progress`
+    // event's entries.total, which counts entries APPENDED so far and therefore
+    // grows as the archive is built.
+    if (onEntry) {
+      archive.on("entry", () => {
+        done += 1;
+        onEntry(done, files.length);
+      });
+    }
+
     archive.pipe(output);
 
     for (const file of files) {
@@ -151,10 +172,151 @@ export async function cleanerRoutes(app: FastifyInstance) {
       let res: ServerResponse | null = null;
       let keepalive: ReturnType<typeof setInterval> | null = null;
 
+      // ---- Run instrumentation (v1.50) --------------------------------------
+      // Before this, the ONLY log statement anywhere in the cleaner was the
+      // error handler below. A real 1,681-file run could take 25 minutes and
+      // leave nothing behind saying where the time went: the stage names existed
+      // but were written only to the browser, so closing the tab destroyed the
+      // evidence and answering "which stage was slow?" meant reproducing the run.
+      const metrics = createCleanerMetrics();
+      const stageTimer = new StageTimer();
+      const runStartedAt = Date.now();
+
+      // StageTimer attributes elapsed time to the last-marked stage, so marking
+      // EVERY frame would be wrong here: Pass 2 interleaves throttled `dedup`
+      // frames with per-file `output` frames, and marking both would split one
+      // contiguous phase across two buckets by interleave order — a number that
+      // means nothing. Pass 2 is therefore marked wholly as `output`, and the
+      // authoritative split comes from the explicit spans instead.
+      const TIMED_STAGES = new Set([
+        "upload",
+        "unzip",
+        "start",
+        "parse",
+        "select",
+        "output",
+        "index",
+        "report",
+        "cleanup",
+        "zip"
+      ]);
+      const markStage = (stage: string) => {
+        if (TIMED_STAGES.has(stage)) {
+          stageTimer.mark(stage);
+        }
+      };
+
+      stageTimer.mark("upload");
+      let lastFrame: { stage: string; current?: number; total?: number } = {
+        stage: "upload"
+      };
+      let heartbeat: ReturnType<typeof setInterval> | null = null;
+
+      const stopHeartbeat = () => {
+        if (heartbeat) {
+          clearInterval(heartbeat);
+          heartbeat = null;
+        }
+      };
+
+      // Makes a hung run visible in `docker logs` WHILE it is hung, rather than
+      // only in the post-mortem. Bounded (one line per interval regardless of
+      // file count) and disable-able with CLEANER_HEARTBEAT_SECONDS=0.
+      if (config.cleanerHeartbeatMs > 0) {
+        heartbeat = setInterval(() => {
+          request.log.info(
+            {
+              run_id: runId,
+              stage: lastFrame.stage,
+              current: lastFrame.current,
+              total: lastFrame.total,
+              elapsed_ms: Date.now() - runStartedAt
+            },
+            "cleaner run progress"
+          );
+        }, config.cleanerHeartbeatMs);
+        heartbeat.unref?.();
+      }
+
       const send = (payload: unknown) => {
+        const frame = payload as {
+          type?: string;
+          stage?: string;
+          current?: number;
+          total?: number;
+        };
+
+        if (frame.type === "progress" && frame.stage) {
+          lastFrame = {
+            stage: frame.stage,
+            current: frame.current,
+            total: frame.total
+          };
+        }
+
         if (res && !res.writableEnded) {
           res.write(`data: ${JSON.stringify(payload)}\n\n`);
         }
+      };
+
+      // One line, at the end, leading with the answer. Explicit spans are
+      // authoritative; StageTimer's stage_ms is the coarse cross-check, and a
+      // material disagreement between them is itself a finding (it means work
+      // is happening under a stage that never announced itself).
+      const logRunTiming = (
+        req: typeof request,
+        outcome: "ok" | "error",
+        result: CleanerResult | null
+      ) => {
+        const snapshot = metrics.snapshot();
+        const { total_ms, stage_ms } = stageTimer.finish();
+        const dominant = StageTimer.dominant(stage_ms);
+        const files = snapshot.counters.files ?? 0;
+
+        req.log.info(
+          {
+            run_id: runId,
+            outcome,
+            domain,
+            source: "upload",
+            files,
+            candidates: snapshot.counters.candidates ?? 0,
+            files_kept: result?.output_files.length ?? 0,
+            files_dropped: result?.dropped_files.length ?? 0,
+            duplicates_removed: snapshot.counters.duplicates_removed ?? 0,
+            urls_kept: snapshot.counters.urls_kept ?? 0,
+
+            total_ms,
+            ms_per_file: files > 0 ? Math.round(total_ms / files) : null,
+            dominant_stage: dominant?.stage ?? null,
+            dominant_stage_ms: dominant?.ms ?? null,
+            stage_ms,
+
+            // Authoritative spans + counters.
+            spans: snapshot.totals,
+            counts: snapshot.counters,
+            per_file: snapshot.observations,
+
+            pools: cleanerPoolStats(),
+            pool_config: cleanerPoolConfig(),
+            // Makes a starved container visible in the data: 4 worker threads
+            // on a 2-vCPU WSL2 VM is a different run from 4 on a 16-core host,
+            // and nothing previously recorded which one produced a timing.
+            host: {
+              cpus: availableParallelism(),
+              mem_mb: Math.round(totalmem() / 1024 / 1024),
+              platform: process.platform,
+              node: process.version
+            },
+            mem: {
+              rss_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+              heap_used_mb: Math.round(
+                process.memoryUsage().heapUsed / 1024 / 1024
+              )
+            }
+          },
+          "cleaner run timing"
+        );
       };
 
       const stopKeepalive = () => {
@@ -289,31 +451,74 @@ export async function cleanerRoutes(app: FastifyInstance) {
             // is ever resident.
             const zipPath = path.join(inDir, `upload-${fileIndex}.zip`);
             fileIndex += 1;
-            await pipeline(part.file, createWriteStream(zipPath));
+            await metrics.timeAsync("upload.pipeline_ms", () =>
+              pipeline(part.file, createWriteStream(zipPath))
+            );
 
             const zip = new AdmZip(zipPath);
+            const entries = zip
+              .getEntries()
+              .filter(
+                (entry) =>
+                  !entry.isDirectory &&
+                  isXmlName(baseName(entry.entryName)) &&
+                  !baseName(entry.entryName).startsWith(".")
+              );
 
-            for (const entry of zip.getEntries()) {
+            markStage("unzip");
+            metrics.inc("unzip.archives");
+
+            // The whole extraction used to be silent: a 2,000-file ZIP counted
+            // as exactly ONE upload tick, so the UI sat frozen for its entire
+            // duration. Now every entry reports.
+            let extracted = 0;
+
+            for (const entry of entries) {
               const entryName = baseName(entry.entryName);
+              const dest = path.join(inDir, `${fileIndex}__${entryName}`);
+              fileIndex += 1;
 
-              if (
-                !entry.isDirectory &&
-                isXmlName(entryName) &&
-                !entryName.startsWith(".")
-              ) {
-                const dest = path.join(inDir, `${fileIndex}__${entryName}`);
-                fileIndex += 1;
+              // NOTE: extractEntryTo is SYNCHRONOUS — it blocks the event loop
+              // for the duration of each entry's inflate. The yield below lets
+              // the queued SSE frame actually flush; it does NOT make the
+              // extraction non-blocking. Whether that is worth replacing AdmZip
+              // is a question for the next pass, and unzip.extract_ms is the
+              // number that answers it.
+              metrics.timeSync("unzip.extract_ms", () => {
                 zip.extractEntryTo(entry, inDir, false, true, false, baseName(dest));
-                inputFiles.push({ filename: entryName, path: dest });
-              }
+              });
+              inputFiles.push({ filename: entryName, path: dest });
+              extracted += 1;
+
+              send({
+                type: "progress",
+                stage: "unzip",
+                current: extracted,
+                total: entries.length,
+                message: `Extracting ${extracted} of ${entries.length} files from ZIP`
+              });
+              await yieldToEventLoop();
             }
 
+            metrics.inc("unzip.entries", extracted);
             await rm(zipPath, { force: true });
+            markStage("upload");
           } else {
             // Stream the uploaded file straight to disk — never buffered.
+            // 1,681 files means 1,681 sequential create+write+close cycles, and
+            // the open is timed separately because on some filesystems the
+            // metadata op, not the bytes, is what costs.
             const dest = path.join(inDir, `${fileIndex}__${name}`);
             fileIndex += 1;
-            await pipeline(part.file, createWriteStream(dest));
+
+            const endOpen = metrics.start("upload.open_ms");
+            const stream = createWriteStream(dest);
+            endOpen();
+
+            await metrics.timeAsync("upload.pipeline_ms", () =>
+              pipeline(part.file, stream)
+            );
+            metrics.inc("upload.files");
             inputFiles.push({ filename: name, path: dest });
           }
 
@@ -389,17 +594,50 @@ export async function cleanerRoutes(app: FastifyInstance) {
           subfolder: subfolder || "sitemaps",
           today,
           outDir,
-          onProgress: (event) => send({ type: "progress", ...event })
+          metrics,
+          onProgress: (event) => {
+            markStage(event.stage);
+            send({ type: "progress", ...event });
+          }
         });
 
-        // Inputs are no longer needed — free the disk they occupy.
-        await rm(inDir, { recursive: true, force: true });
+        // Inputs are no longer needed — free the disk they occupy. On a
+        // 1,681-file run this is 1,681 unlinks and was previously both silent
+        // in the UI and invisible in any log — it could be minutes and nobody
+        // would know.
+        markStage("cleanup");
+        send({
+          type: "progress",
+          stage: "cleanup",
+          message: "Removing uploaded inputs…"
+        });
+        await metrics.timeAsync("stage.cleanup_ms", () =>
+          rm(inDir, { recursive: true, force: true })
+        );
 
-        send({ type: "progress", stage: "zip", message: "Packaging ZIP…" });
+        markStage("zip");
+        send({
+          type: "progress",
+          stage: "zip",
+          current: 0,
+          total: files.length,
+          message: `Packaging ${files.length} files into a ZIP…`
+        });
 
         const zipFilename = `cleaned-sitemaps-${today}.zip`;
         const zipPath = path.join(runDir, zipFilename);
-        await archiveToFile(files, zipPath);
+        await metrics.timeAsync("stage.zip_ms", () =>
+          archiveToFile(files, zipPath, (zipped, total) => {
+            send({
+              type: "progress",
+              stage: "zip",
+              current: zipped,
+              total,
+              message: `Packaging ZIP — ${zipped} of ${total}`
+            });
+          })
+        );
+        metrics.inc("zip.entries", files.length);
 
         const token = randomUUID();
 
@@ -420,13 +658,17 @@ export async function cleanerRoutes(app: FastifyInstance) {
           download_token: token,
           zip_filename: zipFilename
         });
+
+        logRunTiming(request, "ok", result);
       } catch (error) {
         request.log.error({ error }, "cleaner process failed");
+        logRunTiming(request, "error", null);
         send({
           type: "error",
           message: error instanceof Error ? error.message : "Cleaning failed"
         });
       } finally {
+        stopHeartbeat();
         stopKeepalive();
         res?.end();
 

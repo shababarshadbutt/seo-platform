@@ -59,6 +59,53 @@ export const config = {
   }),
   defaultHttpUserAgent:
     process.env.DEFAULT_HTTP_USER_AGENT ?? DEFAULT_HTTP_USER_AGENT,
+
+  // ---- Sitemap Cleaner ------------------------------------------------------
+  // A cleaner run is owned by the API process, not by a queue. These control how
+  // long one is allowed to live and how loudly it reports itself.
+
+  // A run whose client has stopped watching is aborted after this. Keyed on the
+  // SSE heartbeat, not on subscriber count — a socket can linger open long after
+  // the tab is gone, so counting subscribers never reaps.
+  cleanerAbandonGraceMs:
+    readNumber("CLEANER_ABANDON_GRACE_MINUTES", {
+      fallback: 5,
+      min: 1,
+      max: 120
+    }) *
+    60 *
+    1000,
+  // A run is reserved before its upload arrives. If the upload never comes, the
+  // reservation (and its working directory) must not leak.
+  cleanerPendingUploadMs:
+    readNumber("CLEANER_PENDING_UPLOAD_TIMEOUT_SECONDS", {
+      fallback: 120,
+      min: 10,
+      max: 3600
+    }) * 1000,
+  cleanerRequestTimeoutMs:
+    readNumber("CLEANER_REQUEST_TIMEOUT_MINUTES", {
+      fallback: 30,
+      min: 1,
+      max: 240
+    }) *
+    60 *
+    1000,
+  // Age-based sweep of <uploadDir>/cleaner/<runId>, so a directory whose owning
+  // timer died with a process restart is still reclaimed.
+  cleanerRunMaxAgeMs:
+    readNumber("CLEANER_RUN_MAX_AGE_HOURS", { fallback: 6, min: 1, max: 168 }) *
+    60 *
+    60 *
+    1000,
+  // Log volume. A default run must stay quiet: one timing line plus a bounded
+  // heartbeat, and nothing per-file.
+  //   trace     -> ~2 debug lines PER FILE (both passes). Diagnostic only.
+  //   heartbeat -> one info line per interval, independent of file count.
+  cleanerTrace: process.env.CLEANER_TRACE === "1",
+  cleanerHeartbeatMs:
+    readNumber("CLEANER_HEARTBEAT_SECONDS", { fallback: 30, min: 0, max: 3600 }) *
+    1000,
   // Secret used to encrypt sensitive per-session data at rest (GSC service
   // account JSON). Any non-empty string works; it is stretched to a 32-byte
   // AES-256 key via scrypt. Falls back to a dev-only default so local runs

@@ -15,15 +15,15 @@ import {
 } from "lucide-react";
 
 import {
-  apiErrorPayload,
   downloadCleanerZip,
   downloadDuplicatesCsv,
   friendlyApiErrorMessage,
-  processCleaner,
   type CleanerDropReason,
-  type CleanerProgressEvent,
   type CleanerSummary
 } from "@/lib/api";
+import { CLEANER_STEPS } from "@/lib/cleaner-progress";
+import { formatNumber } from "@/lib/format";
+import { useCleanerRun } from "@/lib/use-cleaner-run";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
@@ -34,15 +34,19 @@ import {
   CardTitle
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Progress } from "@/components/ui/progress";
+import { RunProgressPanel } from "@/components/run-progress";
 
 type Phase = "idle" | "processing" | "done" | "error";
 
 const ACCEPTED = /\.(xml|zip)$/i;
 
-function formatNumber(value: number) {
-  return new Intl.NumberFormat("en-US").format(value);
-}
+// Above this many files the run takes long enough that the user deserves a
+// heads-up before starting it. Deliberately a local const rather than an import
+// from app/page.tsx — a page module importing another page module is a bad
+// dependency edge in the app router, and one duplicated number is cheaper than
+// that coupling. Note the copy differs from the migration page's on purpose:
+// a cleaner run is tied to this tab and does NOT survive being closed.
+const LARGE_UPLOAD_NOTICE_THRESHOLD = 500;
 
 function isValidDomain(value: string) {
   try {
@@ -66,10 +70,7 @@ export default function CleanerPage() {
   const [files, setFiles] = useState<File[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
-  const [progressMessage, setProgressMessage] = useState("");
-  const [progress, setProgress] = useState<{ current: number; total: number } | null>(
-    null
-  );
+  const run = useCleanerRun();
   const [summary, setSummary] = useState<CleanerSummary | null>(null);
   const [downloadToken, setDownloadToken] = useState("");
   const [zipFilename, setZipFilename] = useState("cleaned-sitemaps.zip");
@@ -137,8 +138,7 @@ export default function CleanerPage() {
     setSummary(null);
     setDownloadToken("");
     setError("");
-    setProgress(null);
-    setProgressMessage("");
+    run.reset();
   }
 
   async function handleClean() {
@@ -149,28 +149,11 @@ export default function CleanerPage() {
     resetResults();
     setPhase("processing");
 
-    const formData = new FormData();
-    formData.append("domain", domain.trim());
-    formData.append("subfolder", cleanSub || "sitemaps");
-    // Send the selected-file count BEFORE the files so the backend can show an
-    // "X of Y" upload progress bar as each file spools to disk, instead of a
-    // countless spinner during the (slow, for 2000+ files) upload phase. (v1.43)
-    formData.append("fileCount", String(files.length));
-
-    for (const file of files) {
-      formData.append("files", file, file.name);
-    }
-
     try {
-      const done = await processCleaner(formData, (event: CleanerProgressEvent) => {
-        if (event.type === "progress") {
-          setProgressMessage(event.message);
-          setProgress(
-            typeof event.current === "number" && typeof event.total === "number"
-              ? { current: event.current, total: event.total }
-              : null
-          );
-        }
+      const done = await run.start({
+        domain: domain.trim(),
+        subfolder: cleanSub,
+        files
       });
 
       setSummary(done.summary);
@@ -178,18 +161,20 @@ export default function CleanerPage() {
       setZipFilename(done.zip_filename);
       setPhase("done");
     } catch (nextError) {
-      // A dropped SSE stream must NOT read as "Cannot connect to backend" — the
-      // backend is up, the long-running stream just closed. (v1.37 Fix 1)
-      const payload = apiErrorPayload(nextError) as { code?: string } | null;
+      // Cancelling is a user action, not a failure — drop straight back to idle
+      // rather than showing a red banner for something they asked for.
+      if (
+        nextError instanceof Error &&
+        nextError.name === "AbortError" &&
+        nextError.message === "Cleaning cancelled"
+      ) {
+        setPhase("idle");
+        run.reset();
 
-      if (payload?.code === "stream_closed") {
-        setError(
-          "Processing stream closed before finishing — the server may still be working. Wait a moment and try again, or upload fewer files at once."
-        );
-      } else {
-        setError(friendlyApiErrorMessage(nextError, "Cleaning failed."));
+        return;
       }
 
+      setError(friendlyApiErrorMessage(nextError, "Cleaning failed."));
       setPhase("error");
     }
   }
@@ -227,11 +212,6 @@ export default function CleanerPage() {
       setError(friendlyApiErrorMessage(nextError, "Could not download the CSV."));
     }
   }
-
-  const progressPercent =
-    progress && progress.total > 0
-      ? Math.round((progress.current / progress.total) * 100)
-      : null;
 
   // Derived counts for the reference-style summary tiles. "Sitemaps found" is
   // every uploaded sitemap: the processed files plus the index files (which are
@@ -404,6 +384,18 @@ export default function CleanerPage() {
                 ))}
               </ul>
             ) : null}
+
+            {files.length >= LARGE_UPLOAD_NOTICE_THRESHOLD ? (
+              <p className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                <span className="font-semibold">
+                  {formatNumber(files.length)} files selected.
+                </span>{" "}
+                Uploading and cleaning this many takes a while —{" "}
+                <span className="font-semibold">
+                  keep this tab open until it finishes.
+                </span>
+              </p>
+            ) : null}
           </CardContent>
         </Card>
 
@@ -420,7 +412,11 @@ export default function CleanerPage() {
             ) : (
               <Sparkles className="h-4 w-4" />
             )}
-            {phase === "processing" ? "Cleaning…" : "Clean Sitemaps"}
+            {phase !== "processing"
+              ? "Clean Sitemaps"
+              : run.progress?.step === "upload"
+                ? "Uploading…"
+                : "Cleaning…"}
           </Button>
           {!domainValid && domain ? null : !domainValid ? (
             <p className="mt-2 text-xs text-slate-500">
@@ -430,29 +426,22 @@ export default function CleanerPage() {
         </div>
 
         {/* Progress */}
-        {phase === "processing" ? (
-          <Card className="mb-4">
-            <CardContent className="space-y-2 py-4">
-              <p className="flex items-center gap-2 text-sm font-medium text-slate-700">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                {progressMessage || "Processing…"}
-              </p>
-              {progressPercent !== null ? (
-                <Progress value={progressPercent} />
-              ) : null}
-              {progress && progress.total > 0 ? (
-                <p className="text-xs text-slate-500">
-                  {formatNumber(progress.current)} of{" "}
-                  {formatNumber(progress.total)} processed
-                  {progress.total - progress.current > 0
-                    ? ` · ${formatNumber(
-                        progress.total - progress.current
-                      )} remaining`
-                    : ""}
-                </p>
-              ) : null}
-            </CardContent>
-          </Card>
+        {phase === "processing" && run.progress ? (
+          <div className="mb-4">
+            <RunProgressPanel
+              steps={CLEANER_STEPS}
+              activeStepIndex={run.progress.stepIndex}
+              overallPercent={run.progress.overallPercent}
+              stageLabel={run.progress.label}
+              current={run.progress.current}
+              total={run.progress.total}
+              determinate={run.progress.determinate}
+              etaSeconds={run.progress.etaSeconds}
+              announcement={run.announcement}
+              onCancel={run.cancel}
+              cancelling={run.cancelling}
+            />
+          </div>
         ) : null}
 
         {/* Error */}

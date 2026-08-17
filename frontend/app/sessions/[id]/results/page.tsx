@@ -149,6 +149,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger
 } from "@/components/ui/dropdown-menu";
+import { formatEta } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 type PatternStatus = "GOOD" | "WARNING" | "BAD" | "UNKNOWN";
@@ -282,17 +283,6 @@ function patternJobSuccessMessage(job: PatternStructureJob) {
   return `Pattern renamed — ${formatNumber(
     occurrences
   )} occurrences across ${formatNumber(files)} file${files === 1 ? "" : "s"}`;
-}
-
-// Human-readable ETA for the download overlay (e.g. "~2 min", "~30 sec").
-function formatEta(seconds: number) {
-  if (seconds >= 60) {
-    const minutes = Math.round(seconds / 60);
-
-    return `${minutes} min`;
-  }
-
-  return `${Math.max(1, Math.round(seconds))} sec`;
 }
 
 // When a trailing-slash fix was last applied — shown in the re-run warning.

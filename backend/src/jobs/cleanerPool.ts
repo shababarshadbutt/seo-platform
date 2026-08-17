@@ -1,3 +1,4 @@
+import { availableParallelism } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { Piscina } from "piscina";
@@ -33,8 +34,49 @@ function readThreshold(): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : 200;
 }
 
+// Thread count per pool. Made env-readable so the measurement matrix can sweep
+// {1,2,4,8} without a rebuild. The DEFAULT IS DELIBERATELY UNCHANGED at 4: this
+// release measures the cleaner, it does not tune it, and moving the default
+// would mean the numbers describe a system nobody actually ran.
+function readWorkers(): number {
+  const raw = Number.parseInt(process.env.CLEANER_MAX_WORKERS ?? "", 10);
+
+  if (!Number.isFinite(raw)) {
+    return 4;
+  }
+
+  return Math.max(1, Math.min(16, raw));
+}
+
 export const CLEANER_PARALLEL_THRESHOLD = readThreshold();
-export const CLEANER_MAX_WORKERS = 4;
+export const CLEANER_MAX_WORKERS = readWorkers();
+
+// Reported once per pool creation. `availableParallelism` is what makes a
+// starved container visible: 4 worker threads on a 2-vCPU WSL2 VM is a very
+// different run from 4 on a 16-core host, and until now nothing recorded which
+// one produced a given timing.
+export function cleanerPoolConfig() {
+  return {
+    workers: CLEANER_MAX_WORKERS,
+    threshold: CLEANER_PARALLEL_THRESHOLD,
+    cpus: availableParallelism()
+  };
+}
+
+// Live saturation of both pools, sampled at the end of each pass. `utilization`
+// near 1 means the threads are the bottleneck; near 0 means the main thread is.
+export function cleanerPoolStats() {
+  const snapshot = (pool: Piscina | null) =>
+    pool
+      ? {
+          utilization: Number(pool.utilization.toFixed(3)),
+          queue_size: pool.queueSize,
+          threads: pool.threads.length
+        }
+      : null;
+
+  return { classify: snapshot(classifyPool), parse: snapshot(parsePool) };
+}
 
 let classifyPool: Piscina | null = null;
 let parsePool: Piscina | null = null;

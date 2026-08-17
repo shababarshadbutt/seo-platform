@@ -5,6 +5,7 @@ import path from "node:path";
 
 import { streamUrlsetLocs } from "./parser.js";
 import { isSameDomain } from "./domain.js";
+import type { CleanerMetrics } from "./cleanerMetrics.js";
 import {
   CLEANER_MAX_WORKERS,
   CLEANER_PARALLEL_THRESHOLD,
@@ -85,8 +86,29 @@ export interface CleanerOutput {
   files: CleanerOutputFile[];
 }
 
+// Every stage a run can announce. The route contributes upload/unzip/start/
+// cleanup/zip; the engine contributes the rest.
+//
+// Widening this (v1.50) is a PREREQUISITE FOR TRUSTWORTHY TIMING, not just
+// nicer UI: StageTimer attributes elapsed time to whichever stage was last
+// announced, so a phase that announces nothing has its cost silently charged
+// to its predecessor. `select` and `report` exist here because those two loops
+// were previously invisible in both the UI and the numbers.
+export type CleanerStage =
+  | "upload"
+  | "unzip"
+  | "start"
+  | "parse"
+  | "select"
+  | "dedup"
+  | "output"
+  | "index"
+  | "report"
+  | "cleanup"
+  | "zip";
+
 export type CleanerProgress = (event: {
-  stage: "parse" | "dedup" | "index" | "output";
+  stage: CleanerStage;
   message: string;
   current?: number;
   total?: number;
@@ -198,7 +220,29 @@ export type CleanerClassification = {
   rootElement: string | null;
   total: number;
   matching: number;
+  // Timing carried back from the (possibly off-thread) parse, so the run-level
+  // log can separate sax CPU from disk wait even though the work happened in a
+  // piscina worker. Optional so the ordering test's fixtures stay valid.
+  saxMs?: number;
+  ioWaitMs?: number;
+  bytesRead?: number;
 };
+
+// Fold one parse's timing into the run metrics under a pass prefix. Kept in one
+// place so pass 1 and pass 2 report identically-named fields.
+export function recordParseTiming(
+  metrics: CleanerMetrics | undefined,
+  pass: "pass1" | "pass2",
+  timing: { saxMs?: number; ioWaitMs?: number; bytesRead?: number }
+) {
+  if (!metrics) {
+    return;
+  }
+
+  metrics.add(`${pass}.sax_ms`, timing.saxMs ?? 0);
+  metrics.add(`${pass}.io_wait_ms`, timing.ioWaitMs ?? 0);
+  metrics.inc(`${pass}.bytes_read`, timing.bytesRead ?? 0);
+}
 
 // Pass 1 core: stream a file and count total vs on-domain <loc>s + report
 // validity / root element. No shared state.
@@ -226,7 +270,10 @@ export async function classifyCleanerFile(
     isValid: parsed.isValid,
     rootElement: parsed.rootElement,
     total,
-    matching
+    matching,
+    saxMs: parsed.saxMs,
+    ioWaitMs: parsed.ioWaitMs,
+    bytesRead: parsed.bytesRead
   };
 }
 
@@ -235,16 +282,25 @@ export async function classifyCleanerFile(
 // expensive key normalization happens here, off the main thread. Returns the
 // count of on-domain locs written. The provisional file is the ONLY thing that
 // crosses to the main thread (via disk, not IPC).
+export type ProvisionalWriteResult = {
+  count: number;
+  saxMs: number;
+  ioWaitMs: number;
+  bytesRead: number;
+  /** Time closing the provisional write stream — a pure metadata/flush cost. */
+  flushMs: number;
+};
+
 export async function writeProvisionalOnDomainFile(
   inputPath: string,
   provisionalPath: string,
   isGzip: boolean,
   domainHost: string
-): Promise<number> {
+): Promise<ProvisionalWriteResult> {
   const out = createWriteStream(provisionalPath);
   let count = 0;
 
-  await streamUrlsetLocs(createReadStream(inputPath), isGzip, (loc) => {
+  const parsed = await streamUrlsetLocs(createReadStream(inputPath), isGzip, (loc) => {
     const host = hostOf(loc);
 
     if (host === null || !isSameDomain(host, domainHost)) {
@@ -255,9 +311,20 @@ export async function writeProvisionalOnDomainFile(
     count += 1;
   });
 
+  // Timed separately from the parse: the provisional hop's real cost is
+  // metadata operations (create + flush + later open/read/unlink), not bytes,
+  // and lumping the flush into "write" would hide that.
+  const flushStartedAt = process.hrtime.bigint();
+
   await finishStream(out);
 
-  return count;
+  return {
+    count,
+    saxMs: parsed.saxMs,
+    ioWaitMs: parsed.ioWaitMs,
+    bytesRead: parsed.bytesRead,
+    flushMs: Number(process.hrtime.bigint() - flushStartedAt) / 1e6
+  };
 }
 
 // ---- Cross-file dedup: the single source of truth -----------------------
@@ -434,6 +501,8 @@ export async function writeCandidatesParallel(options: {
   ) => Promise<string>;
   onProgress?: CleanerProgress;
   cleanupProvisional?: boolean;
+  metrics?: CleanerMetrics;
+  signal?: AbortSignal;
 }): Promise<void> {
   const {
     candidates,
@@ -444,10 +513,17 @@ export async function writeCandidatesParallel(options: {
     dropped,
     loadProvisional,
     onProgress,
-    cleanupProvisional = true
+    cleanupProvisional = true,
+    metrics,
+    signal
   } = options;
   const window = Math.max(1, options.concurrency);
   const inFlight = new Map<number, Promise<string>>();
+  // Total on-domain URLs across all candidates is known from Pass 1, so the
+  // dedup stage can report a real denominator instead of a bare spinner.
+  const totalOnDomain = candidates.reduce((sum, c) => sum + c.onDomainCount, 0);
+  let urlsSeen = 0;
+  let lastDedupEmit = 0;
 
   const dispatch = (index: number) => {
     if (index < candidates.length) {
@@ -460,8 +536,20 @@ export async function writeCandidatesParallel(options: {
   }
 
   for (let i = 0; i < candidates.length; i += 1) {
+    signal?.throwIfAborted();
+
     const { file, onDomainCount } = candidates[i];
+
+    // THE diagnostic number for this whole release. Time the main thread spends
+    // blocked here is time the 4-thread pool could not keep ahead of it:
+    //   ~0    -> workers are fine; the main-thread merge (provisional read +
+    //            dedup + final write) is the bottleneck.
+    //   large -> the pool is the bottleneck and CLEANER_MAX_WORKERS is the lever.
+    // Without this you cannot tell those two apart, and they have opposite fixes.
+    const endWait = metrics?.start("pass2.worker_wait_ms");
     const provisionalPath = await (inFlight.get(i) as Promise<string>);
+    endWait?.();
+
     inFlight.delete(i);
     dispatch(i + window);
 
@@ -472,12 +560,43 @@ export async function writeCandidatesParallel(options: {
       message: `Cleaning ${file.filename} (${i + 1} of ${candidates.length})`
     });
 
-    const result = await writeCandidateFile(file, outDir, today, state, (emit) =>
-      readProvisionalPairs(provisionalPath, emit)
-    );
+    const endCandidate = metrics?.start("pass2.candidate_ms");
+    let readMs = 0;
+    const result = await writeCandidateFile(file, outDir, today, state, async (emit) => {
+      const endRead = metrics?.start("pass2.read_provisional_ms");
+
+      await readProvisionalPairs(provisionalPath, (loc, key) => {
+        emit(loc, key);
+        urlsSeen += 1;
+      });
+
+      readMs = endRead?.() ?? 0;
+    });
+    const candidateMs = endCandidate?.() ?? 0;
+
+    // Everything in the candidate that was NOT reading the provisional back:
+    // the dedup Map work plus the final XML write. Splitting these is what
+    // decides whether the provisional hop is worth removing.
+    metrics?.add("pass2.dedup_and_write_ms", Math.max(0, candidateMs - readMs));
+
+    // Throttled so a multi-million-URL run does not emit a frame per URL.
+    const nowMs = Date.now();
+
+    if (totalOnDomain > 0 && nowMs - lastDedupEmit >= 250) {
+      lastDedupEmit = nowMs;
+      onProgress?.({
+        stage: "dedup",
+        current: Math.min(urlsSeen, totalOnDomain),
+        total: totalOnDomain,
+        message: `Deduplicated ${urlsSeen} of ${totalOnDomain} URLs`
+      });
+    }
 
     if (cleanupProvisional) {
+      const endUnlink = metrics?.start("pass2.unlink_provisional_ms");
+
       await unlink(provisionalPath).catch(() => undefined);
+      endUnlink?.();
     }
 
     if (result.kept) {
@@ -501,10 +620,18 @@ export async function cleanSitemaps(options: {
   // Directory the cleaned output files (+ index + report) are written into.
   outDir: string;
   onProgress?: CleanerProgress;
+  // Explicit spans. Authoritative over StageTimer, which can only attribute
+  // time to whichever stage was last announced to the browser.
+  metrics?: CleanerMetrics;
+  // Checked between files so an abandoned run stops promptly instead of
+  // running to completion with nobody watching.
+  signal?: AbortSignal;
 }): Promise<CleanerOutput> {
   const domainHost = new URL(options.domain).host;
-  const { today, outDir, files, onProgress } = options;
+  const { today, outDir, files, onProgress, metrics, signal } = options;
   const parallel = files.length >= CLEANER_PARALLEL_THRESHOLD;
+
+  metrics?.inc("files", files.length);
 
   // ---- Pass 1: classify each file (streaming, counters only) -------------
   // Decide keep/drop by root element, validity, and on-domain ratio WITHOUT
@@ -512,6 +639,7 @@ export async function cleanSitemaps(options: {
   // the worker pool (no shared state); results are assembled in file order
   // below so dropped/candidates ordering stays deterministic.
   let classifications: CleanerClassification[];
+  const endPass1 = metrics?.start("stage.pass1_ms");
 
   if (parallel) {
     let done = 0;
@@ -519,12 +647,19 @@ export async function cleanSitemaps(options: {
       files.length,
       CLEANER_MAX_WORKERS,
       async (index) => {
+        signal?.throwIfAborted();
+
         const file = files[index];
+        const endFile = metrics?.start("pass1.file_wall_ms");
         const result = await runCleanerClassify({
           filename: file.filename,
           path: file.path,
           domainHost
         });
+        const fileMs = endFile?.() ?? 0;
+
+        metrics?.observe("pass1.file_ms", fileMs);
+        recordParseTiming(metrics, "pass1", result);
         done += 1;
         onProgress?.({
           stage: "parse",
@@ -539,6 +674,8 @@ export async function cleanSitemaps(options: {
   } else {
     classifications = [];
     for (let i = 0; i < files.length; i += 1) {
+      signal?.throwIfAborted();
+
       const file = files[i];
       onProgress?.({
         stage: "parse",
@@ -546,9 +683,26 @@ export async function cleanSitemaps(options: {
         total: files.length,
         message: `Parsing ${file.filename} (${i + 1} of ${files.length})`
       });
-      classifications.push(await classifyCleanerFile(file, domainHost));
+
+      const endFile = metrics?.start("pass1.file_wall_ms");
+      const result = await classifyCleanerFile(file, domainHost);
+
+      metrics?.observe("pass1.file_ms", endFile?.() ?? 0);
+      recordParseTiming(metrics, "pass1", result);
+      classifications.push(result);
     }
   }
+
+  endPass1?.();
+
+  const endSelect = metrics?.start("stage.select_ms");
+
+  onProgress?.({
+    stage: "select",
+    current: 0,
+    total: files.length,
+    message: `Choosing which of ${files.length} sitemaps to clean…`
+  });
 
   const dropped: { filename: string; reason: DropReason }[] = [];
   // Each candidate carries its on-domain URL count from Pass 1 so the
@@ -584,11 +738,15 @@ export async function cleanSitemaps(options: {
     candidates.push({ file, onDomainCount: info.matching });
   }
 
+  endSelect?.();
+  metrics?.inc("candidates", candidates.length);
+
   // ---- Pass 2: dedup + write cleaned files (streaming, first wins) -------
   onProgress?.({ stage: "dedup", message: "Deduplicating URLs…" });
 
   const state = createDedupState();
   const survivors: SurvivorFile[] = [];
+  const endPass2 = metrics?.start("stage.pass2_ms");
 
   if (parallel) {
     await writeCandidatesParallel({
@@ -605,11 +763,20 @@ export async function cleanSitemaps(options: {
           provisionalPath: path.join(outDir, `.p${index}.provisional`),
           isGzip: isGzipName(candidate.file.filename),
           domainHost
-        }).then((r) => r.provisionalPath),
-      onProgress
+        }).then((r) => {
+          recordParseTiming(metrics, "pass2", r);
+          metrics?.add("pass2.worker_flush_ms", r.flushMs);
+
+          return r.provisionalPath;
+        }),
+      onProgress,
+      metrics,
+      signal
     });
   } else {
     for (let i = 0; i < candidates.length; i += 1) {
+      signal?.throwIfAborted();
+
       const { file, onDomainCount } = candidates[i];
 
       onProgress?.({
@@ -619,6 +786,7 @@ export async function cleanSitemaps(options: {
         message: `Cleaning ${file.filename} (${i + 1} of ${candidates.length})`
       });
 
+      const endCandidate = metrics?.start("pass2.candidate_ms");
       const result = await writeCandidateFile(
         file,
         outDir,
@@ -638,8 +806,14 @@ export async function cleanSitemaps(options: {
                 emit(loc, normalizeForDedup(loc));
               }
             }
-          )
+          ).then((parsed) => {
+            recordParseTiming(metrics, "pass2", parsed);
+
+            return parsed;
+          })
       );
+
+      metrics?.observe("pass2.file_ms", endCandidate?.() ?? 0);
 
       if (result.kept) {
         survivors.push({
@@ -654,12 +828,21 @@ export async function cleanSitemaps(options: {
     }
   }
 
+  endPass2?.();
+
   const duplicatesRemoved = state.duplicatesRemoved;
 
+  metrics?.inc("urls_kept", state.keptBy.size);
+  metrics?.inc("duplicates_removed", duplicatesRemoved);
+
   // ---- Rebuild the index -------------------------------------------------
+  const endIndex = metrics?.start("stage.index_ms");
+
   onProgress?.({
     stage: "index",
-    message: "Building sitemap-index.xml…"
+    current: 0,
+    total: survivors.length,
+    message: `Rebuilding sitemap-index.xml for ${survivors.length} files…`
   });
 
   const indexPath = path.join(outDir, INDEX_FILENAME);
@@ -673,13 +856,35 @@ export async function cleanSitemaps(options: {
   indexStream.write(indexXml);
   await finishStream(indexStream);
 
+  onProgress?.({
+    stage: "index",
+    current: survivors.length,
+    total: survivors.length,
+    message: "Rebuilt sitemap-index.xml"
+  });
+  endIndex?.();
+
   // ---- Write the duplicates report (streamed, never one big string) ------
+  // Previously silent. On a domain with millions of duplicates this loop is
+  // real work, and charging its time to "index" (the last stage announced) is
+  // exactly the misattribution the stage timer cannot detect on its own.
+  const endReport = metrics?.start("stage.report_ms");
+  const reportTotal = state.dupReport.size;
+
+  onProgress?.({
+    stage: "report",
+    current: 0,
+    total: reportTotal,
+    message: `Writing the duplicates report (${reportTotal} rows)…`
+  });
+
   const reportPath = path.join(outDir, REPORT_FILENAME);
   const reportStream = createWriteStream(reportPath);
   reportStream.write("url,kept_in_file,duplicate_in_files\r\n");
 
   const duplicateUrls: { url: string; kept_in: string; also_in: string[] }[] =
     [];
+  let reportRows = 0;
 
   for (const row of state.dupReport.values()) {
     duplicateUrls.push(row);
@@ -688,9 +893,21 @@ export async function cleanSitemaps(options: {
         row.also_in.join("; ")
       )}\r\n`
     );
+    reportRows += 1;
+
+    if (reportRows % 5000 === 0) {
+      onProgress?.({
+        stage: "report",
+        current: reportRows,
+        total: reportTotal,
+        message: `Writing the duplicates report — ${reportRows} of ${reportTotal}`
+      });
+    }
   }
 
   await finishStream(reportStream);
+  metrics?.inc("report.rows", reportRows);
+  endReport?.();
 
   // ---- Assemble the manifest --------------------------------------------
   const outputManifest: CleanerOutputFile[] = survivors.map((file) => ({

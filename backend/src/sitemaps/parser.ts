@@ -441,6 +441,20 @@ async function streamSitemapUrlLocsFromSource(
 export type CleanerLocStreamResult = {
   rootElement: string | null;
   isValid: boolean;
+  // ---- timing (v1.50) -------------------------------------------------------
+  // `sax` parses synchronously, so time spent inside parser.write() is pure CPU
+  // and everything else in the stream's lifetime is read syscalls, gunzip, and
+  // event-loop wait. That subtraction is the whole CPU-vs-disk question for the
+  // cleaner, and it costs a couple of hrtime calls per 64KB chunk to answer.
+  /** Milliseconds inside sax. CPU. */
+  saxMs: number;
+  /** Milliseconds from first read to settle. Wall clock. */
+  streamMs: number;
+  /** streamMs - saxMs: read syscalls + decompression + event-loop wait. */
+  ioWaitMs: number;
+  /** True bytes off the RAW source, measured before gunzip and before decode. */
+  bytesRead: number;
+  chunks: number;
 };
 
 // Streaming <loc> reader for the Sitemap Cleaner. Fires `onLoc` for every URL
@@ -464,6 +478,10 @@ export async function streamUrlsetLocs(
     let inLoc = false;
     let locText = "";
     let settled = false;
+    const startedAt = process.hrtime.bigint();
+    let saxNs = 0n;
+    let bytesRead = 0;
+    let chunks = 0;
 
     function settle() {
       if (settled) {
@@ -472,7 +490,22 @@ export async function streamUrlsetLocs(
 
       settled = true;
       destroySitemapInput(source, decodedInput, input);
-      resolve({ rootElement, isValid });
+
+      const streamNs = process.hrtime.bigint() - startedAt;
+      const saxMs = Number(saxNs) / 1e6;
+      const streamMs = Number(streamNs) / 1e6;
+
+      resolve({
+        rootElement,
+        isValid,
+        saxMs,
+        streamMs,
+        // Clamped at 0: the two clocks are read at slightly different points, so
+        // a near-instant file can otherwise produce a small negative wait.
+        ioWaitMs: Math.max(0, streamMs - saxMs),
+        bytesRead,
+        chunks
+      });
     }
 
     function fail() {
@@ -535,16 +568,32 @@ export async function streamUrlsetLocs(
 
     parser.onerror = fail;
 
+    // Byte accounting on the RAW source, deliberately not on `input`: the line
+    // below sets utf8 encoding, so `input` chunks are decoded strings and their
+    // .length is characters, not bytes — and for a .gz they would be the
+    // INFLATED size. `source` is always piped (createSitemapInput pipes it into
+    // either gunzip or the preamble stripper), so it is already in flowing mode
+    // and this extra listener observes chunks rather than stealing them.
+    source.on("data", (chunk: Buffer | string) => {
+      bytesRead += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length;
+      chunks += 1;
+    });
+
     input.setEncoding("utf8");
     input.on("data", (chunk) => {
       if (settled) {
         return;
       }
 
+      // sax is synchronous: this span IS the CPU cost of parsing this file.
+      const enteredSax = process.hrtime.bigint();
+
       try {
         parser.write(chunk);
       } catch {
         fail();
+      } finally {
+        saxNs += process.hrtime.bigint() - enteredSax;
       }
     });
 

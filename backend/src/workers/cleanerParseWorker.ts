@@ -24,17 +24,25 @@ export type CleanerParseInput = {
 export type CleanerParseResult = {
   provisionalPath: string;
   count: number;
+  // Worker-side timing, returned so the main thread can attribute the run's
+  // cost between sax CPU and disk wait even though the work happened here.
+  // These are plain numbers, so they add nothing meaningful to the
+  // structured-clone cost the v1.44 design was reverted for.
+  saxMs: number;
+  ioWaitMs: number;
+  bytesRead: number;
+  flushMs: number;
 };
 
 export default async function parse(
   input: CleanerParseInput
 ): Promise<CleanerParseResult> {
-  const count = await writeProvisionalOnDomainFile(
+  const result = await writeProvisionalOnDomainFile(
     input.inputPath,
     input.provisionalPath,
     input.isGzip,
     input.domainHost
   );
 
-  return { provisionalPath: input.provisionalPath, count };
+  return { provisionalPath: input.provisionalPath, ...result };
 }

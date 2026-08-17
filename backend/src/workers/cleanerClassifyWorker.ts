@@ -19,6 +19,12 @@ export type CleanerClassifyResult = {
   rootElement: string | null;
   total: number;
   matching: number;
+  // Worker-side parse timing, carried back so the run log can split sax CPU
+  // from disk wait. Still fixed-size scalars — no URL strings cross the
+  // boundary, which is the constraint the v1.45 redesign was built around.
+  saxMs?: number;
+  ioWaitMs?: number;
+  bytesRead?: number;
 };
 
 export default async function classify(
