@@ -12,7 +12,11 @@ import { closePool } from "./db/pool.js";
 import { runMigrations } from "./db/migrate.js";
 import { fsErrorResponse } from "./errors/fsErrors.js";
 import { sessionRoutes } from "./routes/sessions.js";
-import { cleanerRoutes } from "./routes/cleaner.js";
+import { cleanerBatchRoutes, cleanerRoutes } from "./routes/cleaner.js";
+import {
+  startAbandonedRunWatchdog,
+  stopAbandonedRunWatchdog
+} from "./sitemaps/cleanerRuns.js";
 
 const app = Fastify({
   logger: true
@@ -67,6 +71,18 @@ app.setErrorHandler((error, request, reply) => {
 
 await app.register(sessionRoutes);
 await app.register(cleanerRoutes);
+await app.register(cleanerBatchRoutes);
+
+// Batched cleaner runs outlive the requests that create them, so something has
+// to reclaim the ones nobody finishes. Two rules, one interval: a run whose SSE
+// viewer stopped heartbeating, and a run whose batches stopped arriving.
+//
+// NOTE: batched runs live in THIS process (see cleanerRuns.ts). The backend must
+// therefore stay a SINGLE REPLICA — with more than one, a batch POST could land
+// on a process that has never heard of the run and 404 mid-upload.
+startAbandonedRunWatchdog((runIds) => {
+  app.log.warn({ run_ids: runIds }, "reaped abandoned cleaner runs");
+});
 
 app.get("/health", async () => ({
   ok: true,
@@ -97,6 +113,7 @@ async function start() {
 async function close() {
   await app.close();
   await closeSitemapQueue();
+  stopAbandonedRunWatchdog();
   await destroyCleanerPools();
   await closePool();
 }

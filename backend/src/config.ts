@@ -106,6 +106,22 @@ export const config = {
   cleanerHeartbeatMs:
     readNumber("CLEANER_HEARTBEAT_SECONDS", { fallback: 30, min: 0, max: 3600 }) *
     1000,
+  // Files per upload request (v1.51). Chosen by the SERVER and returned from
+  // create-run so this number has exactly one home: a client and server that
+  // disagreed about it would silently mis-order files, and file order decides
+  // which duplicate URL is kept.
+  cleanerUploadBatchSize: readNumber("CLEANER_UPLOAD_BATCH_SIZE", {
+    fallback: 50,
+    min: 1,
+    max: 500
+  }),
+  // Ceiling on a single run. `total_files` is client-declared and drives
+  // allocation, so it needs a bound.
+  cleanerMaxFilesPerRun: readNumber("CLEANER_MAX_FILES_PER_RUN", {
+    fallback: 20000,
+    min: 1,
+    max: 200000
+  }),
   // Secret used to encrypt sensitive per-session data at rest (GSC service
   // account JSON). Any non-empty string works; it is stretched to a 32-byte
   // AES-256 key via scrypt. Falls back to a dev-only default so local runs

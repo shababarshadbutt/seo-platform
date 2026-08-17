@@ -48,6 +48,22 @@ export type DropReason = "empty" | "wrong_domain" | "unparsable";
 export interface CleanerInputFile {
   filename: string;
   path: string;
+  /**
+   * Name to write into out/ and the ZIP, when it must differ from `filename`.
+   *
+   * Two selected files can share a base name — one `sitemap.xml` per
+   * subdirectory is the norm in folder uploads. Without this the second write
+   * silently truncates the first, the rebuilt index lists the same <loc> twice,
+   * and the duplicates report says `kept_in: "sitemap.xml"` without saying
+   * which. The batched route assigns a deduplicated name in canonical order
+   * (see cleanerRunFiles.assignOutputNames); omitted, behaviour is unchanged.
+   */
+  outputName?: string;
+}
+
+/** The name a file is written and reported under. */
+export function outputNameOf(file: CleanerInputFile): string {
+  return file.outputName ?? file.filename;
 }
 
 export interface CleanerResult {
@@ -392,13 +408,13 @@ async function writeCandidateFile(
   state: DedupState,
   produce: (emit: (loc: string, key: string) => void) => void | Promise<unknown>
 ): Promise<{ kept: boolean; url_count: number; path: string }> {
-  const outPath = path.join(outDir, file.filename);
+  const outPath = path.join(outDir, outputNameOf(file));
   const out = createWriteStream(outPath);
   out.write(URLSET_HEADER);
   let keptCount = 0;
 
   const emit = (loc: string, key: string) => {
-    if (considerLoc(state, loc, key, file.filename)) {
+    if (considerLoc(state, loc, key, outputNameOf(file))) {
       out.write(urlEntry(loc, today));
       keptCount += 1;
     }
@@ -601,13 +617,13 @@ export async function writeCandidatesParallel(options: {
 
     if (result.kept) {
       survivors.push({
-        filename: file.filename,
+        filename: outputNameOf(file),
         url_count: result.url_count,
         path: result.path,
         onDomainCount
       });
     } else {
-      dropped.push({ filename: file.filename, reason: "empty" });
+      dropped.push({ filename: outputNameOf(file), reason: "empty" });
     }
   }
 }
@@ -626,10 +642,31 @@ export async function cleanSitemaps(options: {
   // Checked between files so an abandoned run stops promptly instead of
   // running to completion with nobody watching.
   signal?: AbortSignal;
+  /**
+   * Overrides the file-count threshold decision.
+   *
+   * The batched route MUST set this. `files.length >= CLEANER_PARALLEL_THRESHOLD`
+   * is evaluated from whatever subset reached this call, and under batching that
+   * is wrong twice over: a 50-file batch falls under the 200 default, and even
+   * at completion the candidate list is smaller than the declared total after
+   * drops. Either would silently force a large run onto the sequential path —
+   * no error, no log line, just the measured ~13% gone.
+   */
+  parallel?: boolean;
+  /**
+   * Pass-1 results, aligned index-for-index with `files`.
+   *
+   * Supplied by the batched route, which classifies each batch as it lands so
+   * the work overlaps the upload. When present Pass 1 is skipped entirely and a
+   * single summary `parse` frame is emitted, so the stage still announces itself
+   * and StageTimer does not misattribute.
+   */
+  classifications?: CleanerClassification[];
 }): Promise<CleanerOutput> {
   const domainHost = new URL(options.domain).host;
   const { today, outDir, files, onProgress, metrics, signal } = options;
-  const parallel = files.length >= CLEANER_PARALLEL_THRESHOLD;
+  const parallel =
+    options.parallel ?? files.length >= CLEANER_PARALLEL_THRESHOLD;
 
   metrics?.inc("files", files.length);
 
@@ -641,7 +678,25 @@ export async function cleanSitemaps(options: {
   let classifications: CleanerClassification[];
   const endPass1 = metrics?.start("stage.pass1_ms");
 
-  if (parallel) {
+  if (options.classifications) {
+    // Pass 1 already ran, per batch, while the upload was still arriving.
+    // Announce the stage anyway: every stage must report at least once or its
+    // wall clock is charged to whichever stage preceded it, and the progress
+    // contract test enforces exactly that.
+    if (options.classifications.length !== files.length) {
+      throw new Error(
+        `classifications length ${options.classifications.length} does not match files length ${files.length}`
+      );
+    }
+
+    classifications = options.classifications;
+    onProgress?.({
+      stage: "parse",
+      current: files.length,
+      total: files.length,
+      message: `Read ${files.length} of ${files.length} files`
+    });
+  } else if (parallel) {
     let done = 0;
     classifications = await runBoundedByIndex(
       files.length,
@@ -817,13 +872,13 @@ export async function cleanSitemaps(options: {
 
       if (result.kept) {
         survivors.push({
-          filename: file.filename,
+          filename: outputNameOf(file),
           url_count: result.url_count,
           path: result.path,
           onDomainCount
         });
       } else {
-        dropped.push({ filename: file.filename, reason: "empty" });
+        dropped.push({ filename: outputNameOf(file), reason: "empty" });
       }
     }
   }

@@ -16,13 +16,13 @@ x-logging: &default-logging
 services:
   frontend:
     logging: *default-logging
-    image: shababarshadbutt/sitemap-frontend:${APP_VERSION:-v1.50}
+    image: shababarshadbutt/sitemap-frontend:${APP_VERSION:-v1.51}
     build:
       context: ./frontend
     environment:
       NEXT_TELEMETRY_DISABLED: "1"
       NEXT_PUBLIC_BACKEND_URL: http://localhost:${BACKEND_PORT:-3001}
-      NEXT_PUBLIC_APP_VERSION: ${APP_VERSION:-v1.50}
+      NEXT_PUBLIC_APP_VERSION: ${APP_VERSION:-v1.51}
       NEXT_PUBLIC_SEO_DESK_URL: ${NEXT_PUBLIC_SEO_DESK_URL:-http://localhost:4000}
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
@@ -43,7 +43,7 @@ services:
       start_period: 45s
 
   backend:
-    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.50}
+    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.51}
     build:
       context: ./backend
     environment:
@@ -72,6 +72,8 @@ services:
       CLEANER_RUN_MAX_AGE_HOURS: "${CLEANER_RUN_MAX_AGE_HOURS:-6}"
       CLEANER_TRACE: "${CLEANER_TRACE:-0}"
       CLEANER_HEARTBEAT_SECONDS: "${CLEANER_HEARTBEAT_SECONDS:-30}"
+      CLEANER_UPLOAD_BATCH_SIZE: "${CLEANER_UPLOAD_BATCH_SIZE:-50}"
+      CLEANER_MAX_FILES_PER_RUN: "${CLEANER_MAX_FILES_PER_RUN:-20000}"
     logging: *default-logging
     ports:
       - "${BACKEND_PORT:-3001}:3001"
@@ -97,7 +99,7 @@ services:
       start_period: 30s
 
   worker:
-    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.50}
+    image: shababarshadbutt/sitemap-backend:${APP_VERSION:-v1.51}
     build:
       context: ./backend
     command: npm run worker

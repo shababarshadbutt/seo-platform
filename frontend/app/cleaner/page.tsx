@@ -437,6 +437,7 @@ export default function CleanerPage() {
               total={run.progress.total}
               determinate={run.progress.determinate}
               etaSeconds={run.progress.etaSeconds}
+              notice={run.notice}
               announcement={run.announcement}
               onCancel={run.cancel}
               cancelling={run.cancelling}

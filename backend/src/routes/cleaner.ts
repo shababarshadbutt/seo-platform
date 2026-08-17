@@ -11,15 +11,46 @@ import AdmZip from "adm-zip";
 import type { FastifyInstance } from "fastify";
 import { ZipArchive } from "archiver";
 
+import type { FastifyReply, FastifyRequest } from "fastify";
+
 import { config } from "../config.js";
-import { cleanerPoolConfig, cleanerPoolStats } from "../jobs/cleanerPool.js";
 import {
+  CLEANER_MAX_WORKERS,
+  CLEANER_PARALLEL_THRESHOLD,
+  cleanerPoolConfig,
+  cleanerPoolStats,
+  runCleanerClassify
+} from "../jobs/cleanerPool.js";
+import {
+  classifyCleanerFile,
   cleanSitemaps,
+  type CleanerClassification,
   type CleanerInputFile,
   type CleanerOutputFile,
   type CleanerResult
 } from "../sitemaps/cleaner.js";
-import { createCleanerMetrics } from "../sitemaps/cleanerMetrics.js";
+import { createCleanerMetrics, type CleanerMetrics } from "../sitemaps/cleanerMetrics.js";
+import {
+  createRun,
+  finishRun,
+  getRun,
+  publishFrame,
+  SERVER_EPOCH,
+  subscribeRun,
+  touchRun,
+  touchRunUpload,
+  type LiveRun
+} from "../sitemaps/cleanerRuns.js";
+import {
+  createRunFilesState,
+  expectedCountForBatch,
+  missingBatches,
+  orderedFiles,
+  receivedFileCount,
+  registerBatch,
+  renamedFiles,
+  type RunFilesState
+} from "../sitemaps/cleanerRunFiles.js";
 import { StageTimer } from "../sitemaps/stageTimer.js";
 
 // The Sitemap Cleaner is stateless — nothing is written to the DB. Uploads and
@@ -120,6 +151,150 @@ function archiveToFile(
 
     void archive.finalize();
   });
+}
+
+
+// ===========================================================================
+// Batched upload (v1.51)
+// ===========================================================================
+//
+// Why this exists: a browser cannot assemble a 1,681-part multipart body in
+// reasonable time. A real run sat at 0% for over ten minutes without sending a
+// single byte — `xhr.upload.onprogress` never fired, because there was nothing
+// to report yet. v1.50's XHR switch made upload progress reportable; it could
+// not make the browser faster at building the body.
+//
+// So the upload becomes N small requests against one server-side run. That in
+// turn requires a run to outlive a single request, which is what LiveRun is for.
+//
+// The hazard this design is shaped around: cleaner output is ORDER-DEFINED
+// (first-occurrence-across-files wins), and batches upload CONCURRENTLY, so
+// arrival order is not selection order. Files are therefore identified by the
+// (batchIndex, position) tuple and sorted into canonical order exactly once, at
+// completion — see cleanerRunFiles.ts.
+
+type BatchedRun = {
+  run: LiveRun;
+  files: RunFilesState;
+  metrics: CleanerMetrics;
+  stageTimer: StageTimer;
+  // Classification results by "batchIndex:position". Kept beside the slot list
+  // rather than inside it so a retry replacing a batch cannot orphan them.
+  classifications: Map<string, CleanerClassification>;
+  classifyErrors: Map<string, Error>;
+  classifyQueue: { batchIndex: number; position: number; attempt: number; path: string; filename: string }[];
+  classifyActive: number;
+  classified: number;
+  drained: (() => void)[];
+  domainHost: string;
+  createdAt: number;
+  // Accumulated wall clock across every batch request. The upload was never
+  // separable from the clean before, so no run has ever recorded this.
+  uploadWallMs: number;
+};
+
+// Set when the routes register, so the DETACHED terminal phase still has a
+// logger long after its originating request is gone.
+let routeLogger: FastifyInstance["log"] | null = null;
+
+const batched = new Map<string, BatchedRun>();
+
+const slotKey = (batchIndex: number, position: number) => `${batchIndex}:${position}`;
+
+function publishProgress(
+  entry: BatchedRun,
+  frame: { stage: string; message: string; current?: number; total?: number }
+) {
+  entry.stageTimer.mark(frame.stage);
+  publishFrame(entry.run.runId, { type: "progress", ...frame });
+}
+
+// Bounded, run-scoped Pass-1 drainer.
+//
+// The batch handler returns 202 WITHOUT awaiting this: awaiting would serialise
+// the three concurrent uploads behind a 4-thread pool and reinvent the very
+// stall this feature removes. Bounding it at CLEANER_MAX_WORKERS means overlap
+// adds no thread pressure beyond what a single-request run already applies — it
+// just applies it earlier.
+function pumpClassify(entry: BatchedRun) {
+  while (
+    entry.classifyActive < CLEANER_MAX_WORKERS &&
+    entry.classifyQueue.length > 0
+  ) {
+    entry.classifyActive += 1;
+    void drainClassify(entry);
+  }
+}
+
+async function drainClassify(entry: BatchedRun) {
+  for (;;) {
+    const task = entry.classifyQueue.shift();
+
+    if (!task || entry.run.controller.signal.aborted) {
+      entry.classifyActive -= 1;
+
+      if (entry.classifyActive === 0 && entry.classifyQueue.length === 0) {
+        for (const resolve of entry.drained.splice(0)) {
+          resolve();
+        }
+      }
+
+      return;
+    }
+
+    const key = slotKey(task.batchIndex, task.position);
+
+    try {
+      const result = entry.run.parallel
+        ? await runCleanerClassify({
+            filename: task.filename,
+            path: task.path,
+            domainHost: entry.domainHost
+          })
+        : await classifyCleanerFile(
+            { filename: task.filename, path: task.path },
+            entry.domainHost
+          );
+
+      // The attempt guard. A batch that was retried has a NEW attempt number,
+      // and a result issued for the superseded attempt must not land — it was
+      // computed from a file that has since been replaced on disk.
+      if (entry.files.batches.get(task.batchIndex)?.attempt !== task.attempt) {
+        continue;
+      }
+
+      entry.classifications.set(key, result as CleanerClassification);
+      entry.classified += 1;
+      publishProgress(entry, {
+        stage: "parse",
+        current: entry.classified,
+        total: entry.run.expectedTotal,
+        message: `Read ${entry.classified} of ${entry.run.expectedTotal} files`
+      });
+    } catch (error) {
+      // A malformed sitemap resolves {isValid:false} rather than rejecting, so a
+      // rejection here is a real I/O fault. Record it and let the terminal phase
+      // fail loudly — silently demoting it to "unparsable" would turn a disk
+      // error into a quietly smaller ZIP.
+      entry.classifyErrors.set(
+        key,
+        error instanceof Error ? error : new Error(String(error))
+      );
+    }
+  }
+}
+
+function awaitClassifyDrain(entry: BatchedRun): Promise<void> {
+  if (entry.classifyActive === 0 && entry.classifyQueue.length === 0) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => entry.drained.push(resolve));
+}
+
+function discardBatchedRun(entry: BatchedRun) {
+  batched.delete(entry.run.runId);
+  void rm(entry.run.runDir, { recursive: true, force: true }).catch(() => undefined);
 }
 
 export async function cleanerRoutes(app: FastifyInstance) {
@@ -777,6 +952,656 @@ export async function cleanerRoutes(app: FastifyInstance) {
       );
 
       return reply.send(createReadStream(file.path));
+    }
+  );
+}
+
+// SSE for a batched run. Ported from feature/aws-s3-sftp-deploy.
+//
+// This is a GET with NO request body, which is the whole point: the upload is
+// now N separate POSTs, so progress cannot ride on any one of them. It also
+// means the browser's inability to read a response while a request body is
+// still uploading — the v1.50 diagnosis — stops being relevant at all.
+function attachRunStream(options: {
+  request: FastifyRequest;
+  reply: FastifyReply;
+  run: LiveRun;
+}) {
+  const { request, reply, run } = options;
+
+  reply.hijack();
+  const stream = reply.raw;
+  stream.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+    "Access-Control-Allow-Origin":
+      (request.headers.origin as string | undefined) ?? "*"
+  });
+
+  const send = (payload: unknown) => {
+    if (!stream.writableEnded) {
+      stream.write(`data: ${JSON.stringify(payload)}\n\n`);
+    }
+  };
+
+  let cleanedUp = false;
+  let keepalive: NodeJS.Timeout | null = null;
+
+  const cleanup = () => {
+    if (cleanedUp) {
+      return;
+    }
+
+    cleanedUp = true;
+
+    if (keepalive) {
+      clearInterval(keepalive);
+      keepalive = null;
+    }
+
+    subscription?.unsubscribe();
+  };
+
+  // The run id goes out FIRST, before any work frame, so a client that loses the
+  // connection a second later already knows what to reconnect to. The epoch
+  // rides along so a reconnect can be told whether the process it is coming back
+  // to is the one that started its run.
+  send({
+    type: "started",
+    run_id: run.runId,
+    domain: run.domain,
+    server_epoch: SERVER_EPOCH
+  });
+
+  const subscription = subscribeRun(run.runId, (frame) => {
+    send(frame);
+
+    if (frame.type === "done" || frame.type === "error") {
+      cleanup();
+
+      if (!stream.writableEnded) {
+        stream.end();
+      }
+    }
+  });
+
+  if (!subscription) {
+    send({ type: "error", message: "no such cleaning run" });
+    stream.end();
+
+    return;
+  }
+
+  keepalive = setInterval(() => {
+    // `destroyed` as well as `writableEnded`: an aborted client leaves a socket
+    // that is destroyed but NOT ended, and writing to it fails asynchronously —
+    // so checking writableEnded alone would go on heartbeating a dead connection
+    // forever and the run would never look abandoned.
+    if (stream.destroyed || stream.writableEnded) {
+      cleanup();
+
+      return;
+    }
+
+    stream.write(": keepalive\n\n");
+    touchRun(run.runId);
+  }, SSE_KEEPALIVE_MS);
+  keepalive.unref?.();
+
+  // Bound on BOTH objects and on error: with a hijacked reply an aborted fetch
+  // was observed to fire `close` on neither reliably. The keepalive check above
+  // is the backstop that stops correctness depending on any one of these firing.
+  request.raw.on("close", cleanup);
+  request.raw.on("aborted", cleanup);
+  request.raw.on("error", cleanup);
+  stream.on("close", cleanup);
+  stream.on("error", cleanup);
+
+  for (const frame of subscription.replay) {
+    send(frame);
+  }
+}
+
+// Everything after the last batch: sort into canonical order, clean, zip, store.
+// Runs DETACHED — the complete request has already returned 202 — so its only
+// output channel is the run stream.
+async function runTerminalPhase(entry: BatchedRun) {
+  const { run, metrics } = entry;
+  const startedAt = Date.now();
+  let handedOff = false;
+
+  try {
+    await awaitClassifyDrain(entry);
+
+    if (entry.classifyErrors.size > 0) {
+      const [key, error] = [...entry.classifyErrors.entries()][0];
+
+      throw new Error(`could not read uploaded file ${key}: ${error.message}`);
+    }
+
+    // THE point at which arrival order stops mattering.
+    const ordered = orderedFiles(entry.files);
+    const files: CleanerInputFile[] = ordered.map((file) => ({
+      filename: file.filename,
+      path: file.path,
+      outputName: file.outputName
+    }));
+    const classifications = ordered.map((file) => {
+      const found = entry.classifications.get(slotKey(file.batchIndex, file.position));
+
+      if (!found) {
+        throw new Error(`missing classification for ${file.filename}`);
+      }
+
+      return found;
+    });
+
+    // `total` narrows exactly once here, at the phase boundary, if the server
+    // rejected any non-XML parts. It must never GROW — that is what would break
+    // the progress contract.
+    publishProgress(entry, {
+      stage: "start",
+      current: 0,
+      total: files.length,
+      message: `Received ${files.length} file(s)`
+    });
+
+    const today = new Date().toISOString().slice(0, 10);
+    const { result, files: outputs } = await cleanSitemaps({
+      files,
+      classifications,
+      // Decided from the run's DECLARED total, not from whatever subset reached
+      // this call — see the note on the option itself.
+      parallel: run.parallel,
+      domain: run.domain,
+      subfolder: run.subfolder || "sitemaps",
+      today,
+      outDir: run.outDir,
+      metrics,
+      signal: run.controller.signal,
+      onProgress: (event) => publishProgress(entry, event)
+    });
+
+    publishProgress(entry, {
+      stage: "cleanup",
+      message: "Removing uploaded inputs…"
+    });
+    await metrics.timeAsync("stage.cleanup_ms", () =>
+      rm(run.inDir, { recursive: true, force: true })
+    );
+
+    publishProgress(entry, {
+      stage: "zip",
+      current: 0,
+      total: outputs.length,
+      message: `Packaging ${outputs.length} files into a ZIP…`
+    });
+
+    const zipFilename = `cleaned-sitemaps-${today}.zip`;
+    const zipPath = path.join(run.runDir, zipFilename);
+
+    await metrics.timeAsync("stage.zip_ms", () =>
+      archiveToFile(outputs, zipPath, (zipped, total) =>
+        publishProgress(entry, {
+          stage: "zip",
+          current: zipped,
+          total,
+          message: `Packaging ZIP — ${zipped} of ${total}`
+        })
+      )
+    );
+
+    const token = randomUUID();
+
+    storeRun(token, {
+      dir: run.runDir,
+      zipPath,
+      filename: zipFilename,
+      domain: run.domain,
+      files: outputs
+    });
+    handedOff = true;
+
+    const renamed = renamedFiles(ordered);
+
+    finishRun(run.runId, "done", {
+      type: "done",
+      summary: { ...result, renamed_files: renamed },
+      download_token: token,
+      zip_filename: zipFilename
+    });
+    logBatchedRunTiming(entry, "ok", result, startedAt, renamed.length);
+  } catch (error) {
+    logBatchedRunTiming(entry, "error", null, startedAt, 0);
+    finishRun(run.runId, "error", {
+      type: "error",
+      message: error instanceof Error ? error.message : "Cleaning failed"
+    });
+  } finally {
+    batched.delete(run.runId);
+
+    if (!handedOff) {
+      void rm(run.runDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+}
+
+function logBatchedRunTiming(
+  entry: BatchedRun,
+  outcome: "ok" | "error",
+  result: CleanerResult | null,
+  startedAt: number,
+  renamedCount: number
+) {
+  const snapshot = entry.metrics.snapshot();
+  const { total_ms, stage_ms } = entry.stageTimer.finish();
+  const dominant = StageTimer.dominant(stage_ms);
+
+  routeLogger?.info(
+    {
+      run_id: entry.run.runId,
+      outcome,
+      domain: entry.run.domain,
+      source: "upload-batched",
+      files: snapshot.counters.files ?? 0,
+      declared_total: entry.run.expectedTotal,
+      batches: entry.files.batches.size,
+      batch_size: entry.run.batchSize,
+      parallel: entry.run.parallel,
+      renamed_files: renamedCount,
+      files_kept: result?.output_files.length ?? 0,
+      files_dropped: result?.dropped_files.length ?? 0,
+      duplicates_removed: snapshot.counters.duplicates_removed ?? 0,
+      // Upload wall clock — the number v1.50's next-steps asked for and which no
+      // run has ever recorded, because the upload was never separable before.
+      upload_wall_ms: entry.uploadWallMs,
+      clean_wall_ms: Date.now() - startedAt,
+      total_ms,
+      dominant_stage: dominant?.stage ?? null,
+      dominant_stage_ms: dominant?.ms ?? null,
+      stage_ms,
+      spans: snapshot.totals,
+      counts: snapshot.counters,
+      per_file: snapshot.observations,
+      pools: cleanerPoolStats(),
+      pool_config: cleanerPoolConfig(),
+      host: {
+        cpus: availableParallelism(),
+        mem_mb: Math.round(totalmem() / 1024 / 1024),
+        platform: process.platform,
+        node: process.version
+      }
+    },
+    "cleaner run timing"
+  );
+}
+
+export async function cleanerBatchRoutes(app: FastifyInstance) {
+  routeLogger = app.log;
+
+  // ---- 1. Reserve a run -----------------------------------------------------
+  // Domain validation moves HERE, out of the streaming path. Previously an
+  // invalid domain discovered after the socket was hijacked could only be an SSE
+  // error frame; now every validation failure is an ordinary JSON 400, before a
+  // single file byte moves.
+  app.post<{ Body: { domain?: string; subfolder?: string; total_files?: number } }>(
+    "/api/cleaner/runs",
+    async (request, reply) => {
+      const domain = String(request.body?.domain ?? "").trim();
+      const subfolder = String(request.body?.subfolder ?? "sitemaps").trim();
+      const totalFiles = Number(request.body?.total_files ?? 0);
+
+      if (!domain) {
+        return reply.code(400).send({ error: "Bad Request", message: "domain is required" });
+      }
+
+      try {
+        // eslint-disable-next-line no-new
+        new URL(domain);
+      } catch {
+        return reply.code(400).send({
+          error: "Bad Request",
+          message: "domain must be a valid URL (e.g. https://www.example.com)"
+        });
+      }
+
+      if (!Number.isFinite(totalFiles) || totalFiles < 1) {
+        return reply
+          .code(400)
+          .send({ error: "Bad Request", message: "total_files must be at least 1" });
+      }
+
+      if (totalFiles > config.cleanerMaxFilesPerRun) {
+        return reply.code(400).send({
+          error: "Bad Request",
+          message: `total_files exceeds the ${config.cleanerMaxFilesPerRun} limit for one run`
+        });
+      }
+
+      const runId = randomUUID();
+      const runDir = path.join(CLEANER_WORK_ROOT, runId);
+      const inDir = path.join(runDir, "in");
+      const outDir = path.join(runDir, "out");
+
+      await mkdir(inDir, { recursive: true });
+      await mkdir(outDir, { recursive: true });
+
+      const batchSize = config.cleanerUploadBatchSize;
+      const files = createRunFilesState({ batchSize, expectedTotal: totalFiles });
+      const run = createRun(runId, domain, {
+        subfolder,
+        runDir,
+        inDir,
+        outDir,
+        expectedTotal: totalFiles,
+        batchSize,
+        batchCount: files.batchCount,
+        // Decided ONCE from the declared total. Per-batch it would be 50 >= 200
+        // for every batch — false — silently forcing a large run sequential.
+        parallel: totalFiles >= CLEANER_PARALLEL_THRESHOLD,
+        phase: "uploading"
+      });
+
+      const stageTimer = new StageTimer();
+      stageTimer.mark("upload");
+
+      batched.set(runId, {
+        run,
+        files,
+        metrics: createCleanerMetrics(),
+        stageTimer,
+        classifications: new Map(),
+        classifyErrors: new Map(),
+        classifyQueue: [],
+        classifyActive: 0,
+        classified: 0,
+        drained: [],
+        domainHost: new URL(domain).host,
+        createdAt: Date.now(),
+        uploadWallMs: 0
+      });
+
+      return reply.code(201).send({
+        run_id: runId,
+        server_epoch: SERVER_EPOCH,
+        batch_size: batchSize,
+        batch_count: files.batchCount
+      });
+    }
+  );
+
+  // ---- 2. Progress stream ---------------------------------------------------
+  app.get<{ Params: { runId: string }; Querystring: { epoch?: string } }>(
+    "/api/cleaner/runs/:runId/progress",
+    {
+      onRequest: (request, reply, done) => {
+        // A batched run can outlive any single request by a long way, and the
+        // stream must not be the thing that kills it.
+        request.raw.setTimeout(0);
+        reply.raw.setTimeout(0);
+        done();
+      }
+    },
+    async (request, reply) => {
+      const run = getRun(request.params.runId);
+
+      if (!run) {
+        const restarted =
+          typeof request.query.epoch === "string" &&
+          request.query.epoch !== SERVER_EPOCH;
+
+        return reply.code(404).send({
+          error: "Not Found",
+          code: restarted ? "server_restarted" : "run_gone",
+          message: restarted
+            ? "The server restarted, so this run no longer exists. Please upload again."
+            : "This cleaning run is no longer available."
+        });
+      }
+
+      attachRunStream({ request, reply, run });
+
+      return reply;
+    }
+  );
+
+  // ---- 3. Upload one batch --------------------------------------------------
+  app.post<{ Params: { runId: string; batchIndex: string } }>(
+    "/api/cleaner/runs/:runId/batches/:batchIndex",
+    {
+      onRequest: (request, reply, done) => {
+        request.raw.setTimeout(config.cleanerRequestTimeoutMs);
+        reply.raw.setTimeout(config.cleanerRequestTimeoutMs);
+        done();
+      }
+    },
+    async (request, reply) => {
+      const entry = batched.get(request.params.runId);
+
+      if (!entry) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "no such cleaning run" });
+      }
+
+      if (entry.run.phase !== "uploading") {
+        return reply.code(409).send({
+          error: "Conflict",
+          code: "run_not_accepting_uploads",
+          phase: entry.run.phase,
+          message: "This run has already started cleaning."
+        });
+      }
+
+      const batchIndex = Number.parseInt(request.params.batchIndex, 10);
+
+      if (
+        !Number.isFinite(batchIndex) ||
+        batchIndex < 0 ||
+        batchIndex >= entry.files.batchCount
+      ) {
+        return reply.code(400).send({
+          error: "Bad Request",
+          message: `batchIndex must be between 0 and ${entry.files.batchCount - 1}`
+        });
+      }
+
+      // A retry gets a NEW attempt number, and its files land on attempt-qualified
+      // paths, so a stalled predecessor still streaming to disk cannot corrupt
+      // them. Computed before spooling because the paths depend on it.
+      const attempt = (entry.files.batches.get(batchIndex)?.attempt ?? 0) + 1;
+      const expectedCount = expectedCountForBatch(entry.files, batchIndex);
+      const accepted: { position: number; filename: string; path: string }[] = [];
+      const rejected: { filename: string; reason: string }[] = [];
+      const startedAt = Date.now();
+
+      try {
+        let position = 0;
+
+        for await (const part of request.files()) {
+          const name = baseName(part.filename ?? "upload");
+
+          if (!isXmlName(name)) {
+            // Drain so iteration can advance; the position is consumed either
+            // way, which is why gaps in the position space must stay harmless.
+            await part.toBuffer();
+            rejected.push({ filename: name, reason: "not an XML sitemap" });
+            position += 1;
+            continue;
+          }
+
+          if (position >= expectedCount) {
+            await part.toBuffer();
+            rejected.push({ filename: name, reason: "batch is larger than declared" });
+            position += 1;
+            continue;
+          }
+
+          const dest = path.join(
+            entry.run.inDir,
+            `b${batchIndex}-p${position}-a${attempt}__${name}`
+          );
+
+          await entry.metrics.timeAsync("upload.pipeline_ms", () =>
+            pipeline(part.file, createWriteStream(dest))
+          );
+          accepted.push({ position, filename: name, path: dest });
+          position += 1;
+        }
+      } catch (error) {
+        return reply.code(400).send({
+          error: "Bad Request",
+          message:
+            error instanceof Error
+              ? `Could not read upload: ${error.message}`
+              : "Could not read upload"
+        });
+      }
+
+      registerBatch(entry.files, batchIndex, accepted);
+      entry.run.receivedFiles = receivedFileCount(entry.files);
+      entry.uploadWallMs += Date.now() - startedAt;
+      entry.metrics.inc("upload.files", accepted.length);
+      entry.metrics.inc("upload.batches");
+      touchRunUpload(entry.run.runId);
+
+      publishProgress(entry, {
+        stage: "upload",
+        current: entry.run.receivedFiles,
+        total: entry.run.expectedTotal,
+        message: `Uploaded ${entry.run.receivedFiles} of ${entry.run.expectedTotal} files`
+      });
+
+      // Kick off Pass 1 for these files and return IMMEDIATELY. Awaiting here
+      // would serialise the three concurrent uploads behind a 4-thread pool and
+      // reinvent the stall this whole feature removes.
+      for (const file of accepted) {
+        entry.classifyQueue.push({ batchIndex, attempt, ...file });
+      }
+      pumpClassify(entry);
+
+      return reply.code(202).send({
+        run_id: entry.run.runId,
+        batch_index: batchIndex,
+        attempt,
+        accepted: accepted.length,
+        rejected,
+        received_files: entry.run.receivedFiles,
+        expected_files: entry.run.expectedTotal
+      });
+    }
+  );
+
+  // ---- 4. Complete ----------------------------------------------------------
+  app.post<{ Params: { runId: string } }>(
+    "/api/cleaner/runs/:runId/complete",
+    async (request, reply) => {
+      const entry = batched.get(request.params.runId);
+
+      if (!entry) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "no such cleaning run" });
+      }
+
+      if (entry.run.phase !== "uploading") {
+        return reply.code(409).send({
+          error: "Conflict",
+          code: "run_not_accepting_uploads",
+          phase: entry.run.phase
+        });
+      }
+
+      // Deliberately stricter than the Migration side's upload-complete. Cleaner
+      // output is a whole-corpus artifact: a missing batch does not mean a
+      // smaller ZIP, it means wrong kept_in attributions and a wrong
+      // sitemap-index.xml. Naming the exact batches lets the client re-send only
+      // those instead of redoing the whole upload.
+      const { missing, partial } = missingBatches(entry.files);
+
+      if (missing.length > 0 || partial.length > 0) {
+        return reply.code(409).send({
+          error: "Conflict",
+          code: "incomplete_upload",
+          missing_batches: missing,
+          partial_batches: partial,
+          message: `${missing.length} batch(es) missing, ${partial.length} incomplete`
+        });
+      }
+
+      entry.run.phase = "cleaning";
+
+      // Detached: the clean no longer holds a request open at all.
+      void runTerminalPhase(entry);
+
+      return reply.code(202).send({
+        run_id: entry.run.runId,
+        received_files: entry.run.receivedFiles,
+        phase: "cleaning"
+      });
+    }
+  );
+
+  // ---- 5. Status (server-authoritative resume) ------------------------------
+  app.get<{ Params: { runId: string } }>(
+    "/api/cleaner/runs/:runId",
+    async (request, reply) => {
+      const run = getRun(request.params.runId);
+
+      if (!run) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", code: "run_gone", message: "no such cleaning run" });
+      }
+
+      const entry = batched.get(request.params.runId);
+      const ledger = entry ? missingBatches(entry.files) : { missing: [], partial: [] };
+
+      return reply.send({
+        run_id: run.runId,
+        server_epoch: SERVER_EPOCH,
+        status: run.status,
+        phase: run.phase,
+        expected_files: run.expectedTotal,
+        received_files: run.receivedFiles,
+        classified_files: entry?.classified ?? 0,
+        batch_size: run.batchSize,
+        batch_count: run.batchCount,
+        missing_batches: ledger.missing,
+        partial_batches: ledger.partial,
+        terminal_frame: run.terminalFrame
+      });
+    }
+  );
+
+  // ---- 6. Cancel ------------------------------------------------------------
+  // Aborting the client's in-flight XHR is no longer enough: that would stop one
+  // batch and leave a live run holding a working directory.
+  app.delete<{ Params: { runId: string } }>(
+    "/api/cleaner/runs/:runId",
+    async (request, reply) => {
+      const run = getRun(request.params.runId);
+
+      if (!run) {
+        return reply.code(404).send({ error: "Not Found", message: "no such cleaning run" });
+      }
+
+      run.controller.abort();
+      finishRun(run.runId, "error", {
+        type: "error",
+        code: "cancelled",
+        message: "Cleaning cancelled."
+      });
+
+      const entry = batched.get(run.runId);
+
+      if (entry) {
+        discardBatchedRun(entry);
+      }
+
+      return reply.code(202).send({ run_id: run.runId, cancelled: true });
     }
   );
 }

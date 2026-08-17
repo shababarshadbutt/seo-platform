@@ -2017,6 +2017,269 @@ export async function processCleaner(
   });
 }
 
+
+// ---- Batched cleaner upload (v1.51) ----------------------------------------
+//
+// The single-request `processCleaner` above still exists and is still used for
+// ZIP uploads, but it cannot serve a large loose-file selection: the browser
+// spends minutes assembling a 1,681-part FormData before sending a byte, so
+// `xhr.upload.onprogress` never fires and the UI has nothing to show. Splitting
+// the upload into small batches against one server-side run fixes that, and
+// gives the progress stream a home that outlives any individual request.
+
+export type CleanerRunHandle = {
+  run_id: string;
+  server_epoch: string;
+  batch_size: number;
+  batch_count: number;
+};
+
+export type CleanerBatchResult = {
+  batch_index: number;
+  attempt: number;
+  accepted: number;
+  rejected: { filename: string; reason: string }[];
+  received_files: number;
+  expected_files: number;
+};
+
+export type CleanerRunStatus = {
+  run_id: string;
+  server_epoch: string;
+  status: "running" | "done" | "error" | "abandoned";
+  phase: "uploading" | "cleaning";
+  expected_files: number;
+  received_files: number;
+  classified_files: number;
+  batch_size: number;
+  batch_count: number;
+  missing_batches: number[];
+  partial_batches: number[];
+  terminal_frame: unknown;
+};
+
+/**
+ * Reserve a run. Validates the domain BEFORE any bytes move — previously an
+ * invalid domain could only surface after the socket was hijacked, i.e. after
+ * the whole upload.
+ */
+export async function createCleanerRun(input: {
+  domain: string;
+  subfolder: string;
+  totalFiles: number;
+}): Promise<CleanerRunHandle> {
+  const response = await fetchWithTimeout(
+    backendUrl("/api/cleaner/runs"),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        domain: input.domain,
+        subfolder: input.subfolder,
+        total_files: input.totalFiles
+      })
+    },
+    DEFAULT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CleanerRunHandle>(response);
+}
+
+/**
+ * Upload one batch. XHR rather than fetch so `upload.onprogress` gives real
+ * byte counts — the caller aggregates them across batches into an exact overall
+ * percentage, since total bytes are known up front from the File objects.
+ *
+ * Idempotent on the server by `batchIndex`: re-POSTing replaces that batch's
+ * slot wholesale rather than appending, which is what makes retry safe.
+ */
+export function uploadCleanerBatch(
+  runId: string,
+  batchIndex: number,
+  files: File[],
+  options: {
+    onProgress?: (loadedBytes: number, totalBytes: number) => void;
+    signal?: AbortSignal;
+  } = {}
+): Promise<CleanerBatchResult> {
+  const formData = new FormData();
+
+  for (const file of files) {
+    formData.append("files", file, file.name);
+  }
+
+  return new Promise<CleanerBatchResult>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+
+    xhr.open(
+      "POST",
+      backendUrl(`/api/cleaner/runs/${runId}/batches/${batchIndex}`)
+    );
+    xhr.timeout = UPLOAD_API_TIMEOUT_MS;
+
+    xhr.upload.onprogress = (event) => {
+      options.onProgress?.(
+        event.loaded,
+        event.lengthComputable ? event.total : 0
+      );
+    };
+
+    xhr.onload = () => {
+      let payload: unknown = null;
+
+      try {
+        payload = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch {
+        payload = null;
+      }
+
+      if (xhr.status < 200 || xhr.status >= 300) {
+        const message =
+          typeof (payload as { message?: unknown } | null)?.message === "string"
+            ? (payload as { message: string }).message
+            : `Batch ${batchIndex} failed with status ${xhr.status}`;
+
+        reject(new ApiError(message, xhr.status, payload));
+
+        return;
+      }
+
+      resolve(payload as CleanerBatchResult);
+    };
+
+    // A TypeError is what friendlyApiErrorMessage maps to the "cannot reach the
+    // backend" copy; keep that mapping intact.
+    xhr.onerror = () => reject(new TypeError("Failed to upload sitemap files"));
+    xhr.ontimeout = () => {
+      const error = new Error("Upload timed out");
+
+      error.name = "AbortError";
+      reject(error);
+    };
+    xhr.onabort = () => {
+      const error = new Error("Upload cancelled");
+
+      error.name = "AbortError";
+      reject(error);
+    };
+
+    if (options.signal) {
+      if (options.signal.aborted) {
+        const error = new Error("Upload cancelled");
+
+        error.name = "AbortError";
+        reject(error);
+
+        return;
+      }
+
+      options.signal.addEventListener("abort", () => xhr.abort(), { once: true });
+    }
+
+    xhr.send(formData);
+  });
+}
+
+export async function completeCleanerRun(runId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/cleaner/runs/${runId}/complete`),
+    { method: "POST" },
+    DEFAULT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<{ run_id: string; phase: string }>(response);
+}
+
+/** Server-authoritative view of what actually landed. Drives resume. */
+export async function getCleanerRunStatus(runId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/cleaner/runs/${runId}`),
+    {},
+    DEFAULT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CleanerRunStatus>(response);
+}
+
+export async function cancelCleanerRun(runId: string) {
+  await fetchWithTimeout(
+    backendUrl(`/api/cleaner/runs/${runId}`),
+    { method: "DELETE" },
+    DEFAULT_API_TIMEOUT_MS
+  ).catch(() => undefined);
+}
+
+/**
+ * Consume a run's progress stream.
+ *
+ * A GET with no request body, so the full-duplex limitation that motivated the
+ * XHR switch in v1.50 does not apply here at all. `fetch` + reader rather than
+ * EventSource because this needs to be abortable and EventSource cannot be
+ * cancelled cleanly, nor does it expose HTTP status on failure.
+ */
+export async function streamCleanerRun(
+  runId: string,
+  epoch: string,
+  onEvent: (event: CleanerProgressEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  const response = await fetch(
+    backendUrl(
+      `/api/cleaner/runs/${runId}/progress?epoch=${encodeURIComponent(epoch)}`
+    ),
+    { signal }
+  );
+
+  if (!response.ok || !response.body) {
+    throw new ApiError(
+      "Could not open the progress stream.",
+      response.status,
+      null
+    );
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for (;;) {
+    const { value, done } = await reader.read();
+
+    if (done) {
+      return;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf("\n\n");
+
+    while (boundary !== -1) {
+      const raw = buffer.slice(0, boundary);
+
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+
+      const dataLine = raw.split("\n").find((line) => line.startsWith("data:"));
+
+      if (!dataLine) {
+        continue; // `: keepalive` comment frame
+      }
+
+      const json = dataLine.slice(5).trim();
+
+      if (!json) {
+        continue;
+      }
+
+      try {
+        onEvent(JSON.parse(json) as CleanerProgressEvent);
+      } catch {
+        // A malformed frame must not kill a 20-minute run's stream.
+      }
+    }
+  }
+}
+
 export type CleanerHandoffFile = {
   index: number;
   filename: string;
