@@ -1,5 +1,7 @@
 import type { NextRequest } from "next/server";
 
+import { readBackendUrl } from "@/lib/runtime-config";
+
 // Server-side reverse proxy for every browser -> backend call.
 //
 // WHY THIS IS A ROUTE HANDLER AND NOT A next.config REWRITE
@@ -32,16 +34,16 @@ export const runtime = "nodejs";
 export const fetchCache = "force-no-store";
 
 function backendBase(): string {
-  const raw = process.env.BACKEND_URL?.trim();
+  const backend = readBackendUrl();
 
-  if (!raw) {
-    // Loud, not localhost. See the note above.
-    throw new Error(
-      "BACKEND_URL is not set: the frontend cannot reach the backend. Set it to the backend's address (in compose that is http://backend:3001)."
-    );
+  if (!backend.ok) {
+    // Loud, not localhost. See the note above. Same sentence /api/health reports
+    // as its failure reason, so one message identifies this misconfiguration
+    // whether it is met through a proxied call or through the healthcheck.
+    throw new Error(backend.message);
   }
 
-  return raw.replace(/\/+$/, "");
+  return backend.url;
 }
 
 // Headers that describe THIS connection rather than the message, so forwarding

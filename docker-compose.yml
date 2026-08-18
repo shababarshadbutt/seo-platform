@@ -1,3 +1,17 @@
+# DEV / LOCAL compose file. The DEPLOYED box uses docker-compose.aws.yml, and the
+# two are NOT interchangeable — that file runs production builds, requires its
+# variables rather than defaulting them, and is what every docs/deployment/
+# runbook names. Bringing the shared VM up with THIS file is what produced the
+# v1.63-Live outage: the frontend came up with no BACKEND_URL, so every
+# /api/backend/* call answered 502, and with no AWS_PUBLISH_ENABLED, so the
+# Cleaner's "From SFTP" tab silently disappeared.
+#
+# The env contract below is now kept deliberately in step with
+# docker-compose.aws.yml. Only the defaults differ: this file must still work
+# with no .env at all, so it uses :-fallbacks where that one uses :?hard-fails.
+# If you add a variable the frontend, backend or worker reads at runtime, add it
+# to BOTH files.
+#
 # APP_VERSION (.env, see .env.example) is the single source of truth for the
 # released version: it tags every image AND is what the UI displays, so the
 # navbar can never claim a version different from the images actually running.
@@ -28,9 +42,29 @@ services:
       context: ./frontend
     environment:
       NEXT_TELEMETRY_DISABLED: "1"
-      NEXT_PUBLIC_BACKEND_URL: http://localhost:${BACKEND_PORT:-3001}
+      # Plain (non-NEXT_PUBLIC_) server-side vars, read per request by
+      # lib/runtime-config.ts. NEXT_PUBLIC_* is inlined at BUILD time and is NOT
+      # read at runtime, so the NEXT_PUBLIC_BACKEND_URL / NEXT_PUBLIC_SEO_DESK_URL
+      # that used to sit here had stopped doing anything at all — the frontend
+      # they configured was reaching nothing.
+      #
+      # The compose SERVICE NAME, not localhost: these containers talk to each
+      # other over the compose network, and BACKEND_PORT only publishes the
+      # backend to the host.
+      BACKEND_URL: http://backend:3001
+      # A link the BROWSER navigates to, so it must be reachable from the user's
+      # machine — never the internal http://seo-desk:3000.
+      SEO_DESK_URL: ${SEO_DESK_URL:-http://localhost:4000}
+      # Runtime copy, preferred over the build arg below so editing APP_VERSION in
+      # .env and recreating the container updates the navbar pill with no rebuild.
+      APP_VERSION: ${APP_VERSION:-v1.47}
       NEXT_PUBLIC_APP_VERSION: ${APP_VERSION:-v1.47}
-      NEXT_PUBLIC_SEO_DESK_URL: ${NEXT_PUBLIC_SEO_DESK_URL:-http://localhost:4000}
+      # Hides the Cleaner/Migration "From SFTP" tab and the Publish-to-S3 button
+      # ENTIRELY (absent from the DOM, not greyed out). Off by default: those two
+      # paths have never completed a round trip against real AWS. The same one
+      # .env line must feed the backend and worker below, or the UI offers a
+      # control the endpoints refuse with 503.
+      AWS_PUBLISH_ENABLED: ${AWS_PUBLISH_ENABLED:-false}
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
     depends_on:
@@ -71,6 +105,11 @@ services:
       PDF_BACKEND_URL: http://localhost:3001
       CHROMIUM_PATH: /usr/bin/chromium-browser
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-dev-insecure-encryption-key-change-me}
+      # Same flag as the frontend. Checked independently here: /api/sftp/* and
+      # /api/sessions/:id/publish* refuse with 503 naming the variable, so a
+      # hand-crafted request cannot reach an unverified AWS path even when the
+      # UI happens to be showing the control.
+      AWS_PUBLISH_ENABLED: ${AWS_PUBLISH_ENABLED:-false}
     ports:
       - "${BACKEND_PORT:-3001}:3001"
     volumes:
@@ -112,6 +151,10 @@ services:
       UPLOAD_DIR: /uploads
       EXPORT_DIR: /exports
       DIAGNOSTICS_DIR: /diagnostics
+      # Same flag again. The SFTP-pull and S3-publish JOBS re-check it as they
+      # start, so a job queued while it was on cannot still run after it is
+      # turned off.
+      AWS_PUBLISH_ENABLED: ${AWS_PUBLISH_ENABLED:-false}
     volumes:
       - uploads:/uploads
       - exports:/exports
@@ -164,7 +207,7 @@ services:
       retries: 10
 
   # SEO Team Desk — separate Next.js + MongoDB app, linked from the sitemap
-  # tool navbar (NEXT_PUBLIC_SEO_DESK_URL). Its own auth context (NextAuth).
+  # tool navbar (SEO_DESK_URL). Its own auth context (NextAuth).
   seo-desk:
     logging: *default-logging
     build:

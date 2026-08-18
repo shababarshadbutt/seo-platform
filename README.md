@@ -51,7 +51,9 @@ http://localhost:3011/health
 | --- | --- |
 | `FRONTEND_PORT` | Host port for the Next.js frontend. Default in this project: `3010`. |
 | `BACKEND_PORT` | Host port for the Fastify API. Default in this project: `3011`. |
-| `NEXT_PUBLIC_BACKEND_URL` | Public API URL used by frontend requests. Docker Compose sets this from `BACKEND_PORT`. |
+| `BACKEND_URL` | Where the frontend's `/api/backend/*` proxy forwards to. Set by the compose files to `http://backend:3001`; not a per-deployment knob. A frontend without it answers 502 on every backend call and 503 on `/api/health`. |
+| `SEO_DESK_URL` | Browser-reachable address of the SEO Desk app, for the navbar link. Read at runtime, so it must not be a `NEXT_PUBLIC_*` value or an internal compose hostname. |
+| `AWS_PUBLISH_ENABLED` | Master flag for the SFTP-pull and S3-publish paths. `false` (default) removes the "From SFTP" tab and the Publish-to-S3 button from the page entirely and makes their endpoints answer 503. Only the exact string `true` enables it, and it must be set for the frontend, backend and worker together. |
 | `POSTGRES_PORT` | Host port for PostgreSQL. Default: `5432`. |
 | `REDIS_PORT` | Host port for Redis. Default in this project: `6380`. |
 | `POSTGRES_USER` | PostgreSQL username used by the database container. |
@@ -104,8 +106,12 @@ FRONTEND_PORT=3010
 BACKEND_PORT=3011
 ```
 
-The frontend receives `NEXT_PUBLIC_BACKEND_URL` from `docker-compose.yml`, so it
-will point at the configured backend host port automatically.
+The frontend reaches the backend through its own `/api/backend/*` proxy, which
+reads `BACKEND_URL` from the compose file at request time — so changing
+`BACKEND_PORT` needs no frontend rebuild. To check what a running frontend
+actually got, `curl` its `/api/health`: a 503 naming `BACKEND_URL` means the
+container was started without the environment it needs (most often by using
+`docker-compose.yml` where the deployed box needs `docker-compose.aws.yml`).
 
 ### Backend Is Unreachable From the UI
 
