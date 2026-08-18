@@ -7,6 +7,7 @@ import {
   ChevronDown,
   ChevronRight,
   Gauge,
+  FileText,
   Loader2,
   RefreshCw,
   ShieldAlert,
@@ -18,12 +19,14 @@ import {
   getDeleteProblemUrlsStatus,
   getPatternRecheck,
   getPatternTriage,
+  getStatusFileBreakdown,
   getVerificationStatus,
   startPatternRecheck,
   startPatternTriage,
   startUrlVerification,
   type PatternRecheckStatus,
   type RefusedHost,
+  type StatusFileBreakdown,
   type TriageRun,
   type VerificationStatus
 } from "@/lib/api";
@@ -163,6 +166,18 @@ export function PatternVerifyPanel({
   const [recheck, setRecheck] = useState<PatternRecheckStatus | null>(null);
   const [error, setError] = useState("");
   const [deleting, setDeleting] = useState(false);
+  // The per-file breakdown of what a delete is about to remove, shown as a
+  // confirmation step BEFORE anything is deleted.
+  //
+  // Deleting used to be one press against a bare total ("Delete 2,300 URLs"),
+  // which is enough to authorise the action and not enough to review it: a
+  // reviewer cannot tell from a total whether the URLs are spread thinly across
+  // the whole set or concentrated in one file that is itself the problem. null =
+  // no review open.
+  const [deleteReview, setDeleteReview] = useState<StatusFileBreakdown | null>(
+    null
+  );
+  const [reviewLoading, setReviewLoading] = useState(false);
   const [showStrata, setShowStrata] = useState(false);
   // True between the POST and the first poll that sees the job — without it the
   // button appears to do nothing for up to POLL_MS.
@@ -219,6 +234,12 @@ export function PatternVerifyPanel({
     (verifyJob?.urls_total ?? 0) === 0 &&
     enumFilesTotal !== null &&
     enumFilesTotal > 0;
+  // Whether the bar has anything to divide by. False in the window before either
+  // phase has published a total — the job is still queued, or the file list query
+  // has not returned — which is exactly when a determinate bar would sit at 0%
+  // and read as a stall.
+  const hasProgressDenominator =
+    isEnumerating || (verifyJob?.urls_total ?? 0) > 0;
   const triageRunning = Boolean(triage && IN_FLIGHT.includes(triage.status));
   // "Pending" covers the queue gap: the POST has returned but the job has not yet
   // shown up as waiting/active, and the poll loop must not stop in that window.
@@ -499,6 +520,31 @@ export function PatternVerifyPanel({
     }
   }
 
+  // Step one of deleting: fetch what is about to be removed and show it. Nothing
+  // is deleted here — handleDelete below is only reachable from the review.
+  async function openDeleteReview() {
+    if (reviewLoading || deleting) {
+      return;
+    }
+
+    setReviewLoading(true);
+    setError("");
+
+    try {
+      setDeleteReview(
+        await getStatusFileBreakdown(sessionId, patternId, effectiveStatuses)
+      );
+    } catch (nextError) {
+      setError(
+        nextError instanceof Error
+          ? nextError.message
+          : "Unable to list the files these URLs are in."
+      );
+    } finally {
+      setReviewLoading(false);
+    }
+  }
+
   async function handleDelete() {
     if (deleting) {
       return;
@@ -549,6 +595,11 @@ export function PatternVerifyPanel({
     }
 
     setSelected(next);
+    // The chips ARE the delete target, so an open review no longer describes
+    // what the button would do. Closing it is the only safe option: leaving a
+    // stale file list next to a changed target is how someone confirms a delete
+    // against numbers they were shown for a different status.
+    setDeleteReview(null);
   }
 
   // Chip text carries the MODE in the number itself: a bare count is confirmed,
@@ -679,23 +730,40 @@ export function PatternVerifyPanel({
               </>
             )}
           </p>
-          {/* One bar, two phases. It used to sit at 0 for the entire enumeration
-              because its only input was the URL counter, which is 0 until
-              enumeration finishes. Now phase 1 drives it off files and phase 2
-              off URLs, so the bar always reflects work actually completed. */}
-          <Progress
-            value={
-              isEnumerating
-                ? Math.round((enumFilesDone / (enumFilesTotal ?? 1)) * 100)
-                : (verifyJob?.urls_total ?? 0) > 0
-                  ? Math.round(
+          {/* One bar, THREE states. It used to sit at 0 for the entire
+              enumeration because its only input was the URL counter, which is 0
+              until enumeration finishes; phase 1 now drives it off files and
+              phase 2 off URLs.
+
+              The third state is the one reported from a live 1.3M-URL run: the
+              window before ANY denominator is known — the job is queued, or the
+              file list query has not returned — where both phases have nothing
+              to divide by. That rendered as a determinate bar at 0%, which is
+              indistinguishable from a run that has hung. A determinate bar makes
+              a claim about progress; with no denominator there is no claim to
+              make, so it animates instead of asserting zero. */}
+          {hasProgressDenominator ? (
+            <Progress
+              value={
+                isEnumerating
+                  ? Math.round((enumFilesDone / (enumFilesTotal ?? 1)) * 100)
+                  : Math.round(
                       ((verifyJob?.urls_done ?? 0) /
                         (verifyJob?.urls_total ?? 1)) *
                         100
                     )
-                  : 0
-            }
-          />
+              }
+            />
+          ) : (
+            <div
+              className="h-2 w-full overflow-hidden rounded-full bg-indigo-100"
+              role="progressbar"
+              aria-label="Starting verification"
+              data-testid="verify-progress-indeterminate"
+            >
+              <div className="h-full w-1/3 animate-pulse rounded-full bg-indigo-500" />
+            </div>
+          )}
           <p className="text-xs text-indigo-800/80">
             {etaSeconds !== null ? (
               <>
@@ -954,18 +1022,20 @@ export function PatternVerifyPanel({
             variant="destructive"
             size="sm"
             className="gap-1"
-            disabled={confirmedTarget === 0 || deleting}
-            onClick={() => void handleDelete()}
+            disabled={confirmedTarget === 0 || deleting || reviewLoading}
+            // Opens the review rather than deleting. The second press, inside
+            // the review, is the one that acts.
+            onClick={() => void openDeleteReview()}
           >
-            {deleting ? (
+            {reviewLoading ? (
               <>
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                Deleting…
+                Checking which files…
               </>
             ) : (
               <>
                 <Trash2 className="h-3.5 w-3.5" />
-                Delete {formatNumber(confirmedTarget)} confirmed{" "}
+                Review &amp; delete {formatNumber(confirmedTarget)} confirmed{" "}
                 {statusLabel(effectiveStatuses)} URL
                 {confirmedTarget === 1 ? "" : "s"}
               </>
@@ -973,6 +1043,113 @@ export function PatternVerifyPanel({
           </Button>
         ) : null}
       </div>
+
+      {/* ---- delete review: the file-by-file breakdown ---------------------
+          Named files with counts, because "Delete 2,300 URLs" is a number a
+          reviewer can approve but cannot check. Biggest first: the file at the
+          top is usually the finding, not just the largest total. */}
+      {deleteReview ? (
+        <div
+          className="space-y-3 rounded-md border border-red-200 bg-red-50 px-3 py-3"
+          data-testid="delete-file-breakdown"
+        >
+          <p className="text-sm font-semibold text-red-900">
+            About to remove {formatNumber(deleteReview.total_urls)}{" "}
+            {statusLabel(deleteReview.statuses)} URL
+            {deleteReview.total_urls === 1 ? "" : "s"} from{" "}
+            {formatNumber(deleteReview.files.length)} file
+            {deleteReview.files.length === 1 ? "" : "s"}
+          </p>
+
+          {deleteReview.files.length === 0 ? (
+            // Zero files AND zero URLs means nothing has been verified for these
+            // statuses — which is a different thing from "nothing to delete", and
+            // must not be reported as a clean result.
+            <p className="text-sm text-red-900">
+              Nothing verified for {statusLabel(deleteReview.statuses)} in this
+              pattern yet, so there is nothing to delete. Run Verify above first.
+            </p>
+          ) : (
+            <>
+              <ul className="max-h-48 space-y-1 overflow-y-auto" role="list">
+                {deleteReview.files.map((file) => (
+                  <li
+                    key={file.source_file}
+                    className="flex items-center justify-between gap-3 rounded bg-white/70 px-2 py-1 text-xs"
+                  >
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      <FileText
+                        className="h-3.5 w-3.5 shrink-0 text-red-500"
+                        aria-hidden="true"
+                      />
+                      <span
+                        className="truncate font-mono text-slate-700"
+                        title={file.source_file}
+                      >
+                        {file.source_file}
+                      </span>
+                    </span>
+                    <span className="shrink-0 font-semibold text-red-800">
+                      {formatNumber(file.urls)} URL
+                      {file.urls === 1 ? "" : "s"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+
+              {/* What survives matters as much as what goes. Answering it here
+                  stops it being guessed at over an irreversible action. */}
+              <p className="text-xs text-red-900/80">
+                Only these <code>&lt;loc&gt;</code> entries are removed — the
+                files themselves are kept and rewritten, and every other URL in
+                them is untouched. A file left with no URLs at all is dropped as
+                an empty sitemap.
+                {deleteReview.total_urls !==
+                deleteReview.files.reduce((sum, file) => sum + file.urls, 0) ? (
+                  <>
+                    {" "}
+                    The per-file counts add up to more than the total because a
+                    URL listed in several files is counted in each.
+                  </>
+                ) : null}
+              </p>
+
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  variant="destructive"
+                  size="sm"
+                  className="gap-1"
+                  disabled={deleting}
+                  onClick={() => void handleDelete()}
+                >
+                  {deleting ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Deleting…
+                    </>
+                  ) : (
+                    <>
+                      <Trash2 className="h-3.5 w-3.5" />
+                      Delete from {formatNumber(deleteReview.files.length)} file
+                      {deleteReview.files.length === 1 ? "" : "s"}
+                    </>
+                  )}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={deleting}
+                  onClick={() => setDeleteReview(null)}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </>
+          )}
+        </div>
+      ) : null}
 
       {/* Deletion is gated on a full verification, always. An estimate can be
           out by hundreds of URLs, and deleting a live page is not undoable from

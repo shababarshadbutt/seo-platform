@@ -31,3 +31,37 @@ export function showFixButton(row: { status: PatternStatus }): boolean {
 export function showCheckButton(row: { status: PatternStatus }): boolean {
   return row.status === "UNKNOWN";
 }
+
+// What the pattern table's action cell shows, as ONE answer instead of two
+// independent booleans.
+//
+// WHAT WAS WRONG. The two predicates above are exhaustive over status, and
+// neither of them has a state for "this one is done". A successful fix rewrites
+// the sampled rows in place (url becomes final_url, category becomes 'success' —
+// applyRedirectsJob) and the row is rescored, so a fixed pattern lands on GOOD
+// and its button disappears. That is indistinguishable from a pattern that was
+// healthy all along, and on a table of hundreds of rows it left reviewers
+// reopening patterns to find out whether they had already dealt with them.
+//
+// "fixed" therefore OUTRANKS both — it is a fact about what was done to the
+// pattern, not a reading of its current measurement, and it stays true whatever
+// a later re-check decides. A pattern that was fixed and has since gone Broken
+// again still shows "fixed": the useful thing to know at a glance is that a fix
+// was already attempted here, and the row's own Status cell is what reports the
+// current verdict. Conflating the two is what this whole state exists to stop.
+export type FixButtonState = "fix" | "fixed" | "check" | "none";
+
+export function fixButtonState(row: {
+  status: PatternStatus;
+  redirectsAppliedAt?: string | null;
+}): FixButtonState {
+  if (row.redirectsAppliedAt) {
+    return "fixed";
+  }
+
+  if (showFixButton(row)) {
+    return "fix";
+  }
+
+  return showCheckButton(row) ? "check" : "none";
+}

@@ -1,6 +1,7 @@
 "use client";
 
 import { ChangeEvent, DragEvent, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   AlertCircle,
   ArrowRight,
@@ -29,6 +30,7 @@ import {
   type CleanerSummary,
   type DownloadProgress
 } from "@/lib/api";
+import { siteDomainFromSftpDomain } from "@/lib/site-domain";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
@@ -44,6 +46,11 @@ import { Progress } from "@/components/ui/progress";
 type Phase = "idle" | "processing" | "done" | "error";
 
 const ACCEPTED = /\.(xml|zip)$/i;
+
+// How long the completion screen waits before carrying the run into Migration by
+// itself. Long enough to read the headline and reach for Cancel or a download;
+// short enough that the common case — clean, then analyse — needs no click.
+const AUTO_MIGRATION_SECONDS = 5;
 
 function formatNumber(value: number) {
   return new Intl.NumberFormat("en-US").format(value);
@@ -106,6 +113,14 @@ export default function CleanerPage() {
   }
 
   const [domain, setDomain] = useState("");
+  // Whether the user has typed in the Domain field themselves.
+  //
+  // Picking an SFTP domain auto-fills this field (siteDomainFromSftpDomain), but
+  // only while it is still untouched. A hand-typed domain is a deliberate choice
+  // — a client whose sitemaps live under one folder name but whose canonical
+  // origin is another — and silently overwriting it would change which URLs are
+  // KEPT without the user seeing that anything happened.
+  const [domainTouched, setDomainTouched] = useState(false);
   const [subfolder, setSubfolder] = useState("sitemaps");
   const [files, setFiles] = useState<File[]>([]);
   const [isDragging, setIsDragging] = useState(false);
@@ -127,6 +142,22 @@ export default function CleanerPage() {
   const [downloadProgress, setDownloadProgress] =
     useState<DownloadProgress | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Auto-shift to Migration once cleaning finishes and nobody does anything.
+  //
+  // Cleaning and migrating are one job in practice — the SEO team cleans a
+  // client's sitemaps in order to analyse them, and the handoff button was an
+  // extra click at the end of a run that had already taken minutes. The
+  // countdown is VISIBLE and cancellable rather than an instant redirect: a
+  // completion screen that navigates itself away with no warning is the same
+  // problem in the other direction, and this screen still holds the summary
+  // tiles and both downloads.
+  //
+  // null = not armed (never started, or cancelled). It never re-arms: the arming
+  // effect keys off the run finishing, which happens once.
+  const [autoMigrationIn, setAutoMigrationIn] = useState<number | null>(null);
+  const autoMigrationArmedRef = useRef(false);
+  const router = useRouter();
 
   const domainValid = isValidDomain(domain);
   const cleanBase = domain.trim().replace(/\/+$/, "");
@@ -305,6 +336,54 @@ export default function CleanerPage() {
       )}`
     : "";
 
+  // Cancelling is one function because it has several callers, and MISSING one
+  // of them is the only way this feature can hurt anybody: navigating away from
+  // a multi-GB ZIP download at t=4s would abort the transfer the user just
+  // asked for. Called from the Cancel button and from runDownload.
+  function cancelAutoMigration() {
+    setAutoMigrationIn(null);
+  }
+
+  // Arm the countdown when a run completes with a handoff token to carry.
+  //
+  // Not armed while a download is already in flight — that only happens if a
+  // download somehow outlives the run, but the check costs nothing and the
+  // failure it prevents is a cancelled transfer.
+  useEffect(() => {
+    if (
+      phase !== "done" ||
+      !downloadToken ||
+      downloading !== null ||
+      autoMigrationArmedRef.current
+    ) {
+      return;
+    }
+
+    autoMigrationArmedRef.current = true;
+    setAutoMigrationIn(AUTO_MIGRATION_SECONDS);
+  }, [phase, downloadToken, downloading]);
+
+  // Tick down, then go. One timeout per second rather than an interval, so a
+  // cancel between ticks cannot leave a scheduled navigation behind.
+  useEffect(() => {
+    if (autoMigrationIn === null) {
+      return;
+    }
+
+    if (autoMigrationIn <= 0) {
+      router.push(migrationHandoffUrl);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setAutoMigrationIn((remaining) =>
+        remaining === null ? null : remaining - 1
+      );
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [autoMigrationIn, migrationHandoffUrl, router]);
+
   // Which download is running, and how far along. A cleaned-sitemaps ZIP is
   // routinely multi-GB, so without this the button looked hung for the entire
   // transfer — the complaint that prompted this. `null` progress means the
@@ -314,6 +393,9 @@ export default function CleanerPage() {
     start: (onProgress: (progress: DownloadProgress) => void) => Promise<void>,
     failure: string
   ) {
+    // Downloading IS doing something, so it stops the auto-shift. Without this a
+    // user who clicks Download at t=4s is navigated away mid-transfer.
+    cancelAutoMigration();
     setDownloading(kind);
     setDownloadProgress(null);
     setError("");
@@ -436,7 +518,10 @@ export default function CleanerPage() {
               <Input
                 id="cleaner-domain"
                 value={domain}
-                onChange={(event) => setDomain(event.target.value)}
+                onChange={(event) => {
+                  setDomain(event.target.value);
+                  setDomainTouched(true);
+                }}
                 placeholder="https://www.integratedpartsprocurement.com"
                 className={cn(
                   domain && !domainValid && "border-red-400 focus-visible:ring-red-400"
@@ -561,7 +646,17 @@ export default function CleanerPage() {
                     <select
                       id="cleaner-sftp-domain"
                       value={sftpDomain}
-                      onChange={(event) => setSftpDomain(event.target.value)}
+                      onChange={(event) => {
+                        const nextSftpDomain = event.target.value;
+
+                        setSftpDomain(nextSftpDomain);
+
+                        // Fill the Domain field from the folder name. Skipped
+                        // once the user has typed their own — see domainTouched.
+                        if (!domainTouched) {
+                          setDomain(siteDomainFromSftpDomain(nextSftpDomain));
+                        }
+                      }}
                       className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
                     >
                       <option value="">Select a domain…</option>
@@ -577,8 +672,10 @@ export default function CleanerPage() {
                       </p>
                     ) : null}
                     <p className="text-sm text-slate-500">
-                      The Domain field above is still what the cleaned{" "}
-                      <code>&lt;loc&gt;</code> values are written against.
+                      The Domain field above is filled in from this folder name
+                      and is still what the cleaned <code>&lt;loc&gt;</code>{" "}
+                      values are written against — edit it if this client&rsquo;s
+                      canonical address differs.
                     </p>
                   </>
                 )}
@@ -938,22 +1035,57 @@ export default function CleanerPage() {
                     Cleaning complete — ready for migration?
                   </p>
                   <p className="mt-1 text-sm text-slate-600">
-                    Start the Sitemap Migration Health Checker with your{" "}
-                    {formatNumber(summary.files_kept)} cleaned file
-                    {summary.files_kept === 1 ? "" : "s"} and domain pre-filled.
+                    {autoMigrationIn === null ? (
+                      <>
+                        Start the Sitemap Migration Health Checker with your{" "}
+                        {formatNumber(summary.files_kept)} cleaned file
+                        {summary.files_kept === 1 ? "" : "s"} and domain
+                        pre-filled.
+                      </>
+                    ) : (
+                      <>
+                        Starting the migration analysis on your{" "}
+                        {formatNumber(summary.files_kept)} cleaned file
+                        {summary.files_kept === 1 ? "" : "s"} in{" "}
+                        <span
+                          className="font-semibold text-slate-900"
+                          data-testid="auto-migration-countdown"
+                        >
+                          {autoMigrationIn}s
+                        </span>
+                        . Download anything you need first — starting a download
+                        stops the timer.
+                      </>
+                    )}
                   </p>
-                  <Button asChild className="mt-3 gap-2">
-                    <a
-                      href={migrationHandoffUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      data-testid="start-migration-handoff"
-                    >
-                      <MapIcon className="h-4 w-4" />
-                      Start Migration Analysis
-                      <ArrowRight className="h-4 w-4" />
-                    </a>
-                  </Button>
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    {/* Same tab on purpose: this is now the continuation of one
+                        job, not a side trip, and the countdown navigates here
+                        anyway. The summary above stays reachable via History. */}
+                    <Button asChild className="gap-2">
+                      <a
+                        href={migrationHandoffUrl}
+                        data-testid="start-migration-handoff"
+                        onClick={cancelAutoMigration}
+                      >
+                        <MapIcon className="h-4 w-4" />
+                        {autoMigrationIn === null
+                          ? "Start Migration Analysis"
+                          : "Start Now"}
+                        <ArrowRight className="h-4 w-4" />
+                      </a>
+                    </Button>
+                    {autoMigrationIn !== null ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={cancelAutoMigration}
+                        data-testid="cancel-auto-migration"
+                      >
+                        Stay here
+                      </Button>
+                    ) : null}
+                  </div>
                 </div>
               ) : null}
             </CardContent>

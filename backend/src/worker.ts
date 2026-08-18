@@ -119,6 +119,7 @@ import {
 } from "./jobs/maintenanceJobs.js";
 import { destroyZipPool } from "./jobs/zipPool.js";
 import { destroyFileRewritePool } from "./jobs/fileRewritePool.js";
+import { destroyPatternPopulationPool } from "./jobs/patternPopulationPool.js";
 import { processVerifyUrlsJob } from "./jobs/verifyUrlsJob.js";
 import { processTriageSampleJob } from "./jobs/triageJob.js";
 import { processCleanupUploadsJob } from "./jobs/cleanupUploadsJob.js";
@@ -622,6 +623,7 @@ async function close() {
   await preGenerateZipWorker?.close();
   await destroyZipPool();
   await destroyFileRewritePool();
+  await destroyPatternPopulationPool();
   await closeSitemapQueue();
   await closeBulkReplaceQueue();
   await closePublishQueue();

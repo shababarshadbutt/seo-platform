@@ -455,6 +455,101 @@ export async function verificationRoutes(app: FastifyInstance) {
   // Delete the pattern's verified problem URLs (of the selected statuses) from
   // the sitemap files — the "act" of verify-then-act. Enqueues the SAME delete
   // job the sampled flow uses, in its use_verified mode.
+  // WHICH FILES the URLs about to be deleted actually live in, and how many are
+  // in each.
+  //
+  // The delete confirmation used to be a count and a verb: "Delete 2,300 URLs".
+  // That is enough to authorise the action but not enough to review it — a
+  // reviewer asked to sign off on removing thousands of <loc> entries has no way
+  // to tell whether they are spread thinly across the whole set or concentrated
+  // in one file that is itself the real problem. The SEO team asked for the
+  // breakdown by name for exactly that reason.
+  //
+  // No new analysis: verified_urls.source_files already records which display
+  // files each verified <loc> appears in, and the delete endpoint below already
+  // unnests the same column to decide which files to rewrite. This reports what
+  // that job is about to do, from the same rows, so the preview cannot disagree
+  // with the action.
+  //
+  // CONFIRMED ONLY, deliberately. These counts come from verified_urls, which is
+  // written by a full verification — not by sampling or triage. Deletion already
+  // requires that (see the panel's three-mode note), and a per-file number
+  // extrapolated from a ~1% draw would be a guess wearing the clothes of an
+  // exact count, immediately before an irreversible action.
+  app.get<{ Params: PatternParams; Querystring: { statuses?: string } }>(
+    "/api/sessions/:id/patterns/:patternId/status-file-breakdown",
+    async (request, reply) => {
+      const sessionId = request.params.id;
+      const patternId = request.params.patternId;
+
+      const requested = (request.query.statuses ?? "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .map((value) => Number(value));
+
+      if (requested.some((value) => !VERIFY_PROBLEM_STATUSES.includes(value))) {
+        return reply
+          .code(400)
+          .send(
+            badRequest(
+              `statuses must be a subset of ${VERIFY_PROBLEM_STATUSES.join(", ")}`
+            )
+          );
+      }
+
+      // Empty selection means every problem status — the same convention the
+      // status chips use, so the breakdown matches what the chips are showing.
+      const statuses =
+        requested.length > 0 ? requested : VERIFY_PROBLEM_STATUSES;
+
+      const breakdownResult = await pool.query<{
+        source_file: string;
+        urls: string;
+      }>(
+        `
+          SELECT unnest(source_files) AS source_file, count(*)::text AS urls
+          FROM verified_urls
+          WHERE session_id = $1
+            AND pattern_id = $2
+            AND is_deleted_from_sitemap = false
+            AND http_status = ANY($3::int[])
+          GROUP BY 1
+          ORDER BY count(*) DESC, 1 ASC
+        `,
+        [sessionId, patternId, statuses]
+      );
+
+      // The DISTINCT url count, which is NOT the sum of the per-file counts: one
+      // <loc> can appear in several sitemap files, and it is counted once per
+      // file above. Reported separately so the dialog can say "2,300 URLs across
+      // 7 files" without the two numbers appearing to contradict each other.
+      const totalResult = await pool.query<{ urls: string }>(
+        `
+          SELECT count(*)::text AS urls
+          FROM verified_urls
+          WHERE session_id = $1
+            AND pattern_id = $2
+            AND is_deleted_from_sitemap = false
+            AND http_status = ANY($3::int[])
+        `,
+        [sessionId, patternId, statuses]
+      );
+
+      return {
+        statuses,
+        // Zero files with a non-zero total is impossible; zero of both means the
+        // pattern has not been verified for these statuses yet, which the client
+        // renders as "run a check first" rather than as "nothing to delete".
+        total_urls: Number(totalResult.rows[0]?.urls ?? 0),
+        files: breakdownResult.rows.map((row) => ({
+          source_file: row.source_file,
+          urls: Number(row.urls)
+        }))
+      };
+    }
+  );
+
   app.post<{ Params: PatternParams; Body: { statuses?: unknown } }>(
     "/api/sessions/:id/patterns/:patternId/delete-verified-urls",
     async (request, reply) => {

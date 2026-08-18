@@ -149,6 +149,9 @@ export type Pattern = {
   redirect_pct: NumberLike;
   missing_in_current: boolean;
   source_file: string | null;
+  // When this pattern's redirect fixes were applied. Drives the grey "Fixed"
+  // chip; null means never fixed (see fix-visibility.ts).
+  redirects_applied_at?: string | null;
   original_template?: string | null;
   transform_original_template?: string | null;
 };
@@ -1464,6 +1467,34 @@ export async function deleteVerifiedUrls(
   return readJsonResponse<{ job_row_id: string }>(response);
 }
 
+export type StatusFileBreakdown = {
+  statuses: number[];
+  // DISTINCT URLs. Not the sum of the per-file counts below: one <loc> can sit in
+  // several sitemap files and is counted once in each.
+  total_urls: number;
+  files: Array<{ source_file: string; urls: number }>;
+};
+
+// Which files the URLs about to be deleted live in, and how many are in each.
+// Sourced from verified_urls — the same rows the delete job acts on — so the
+// preview and the action cannot disagree. Empty when the pattern has not been
+// verified for these statuses yet.
+export async function getStatusFileBreakdown(
+  sessionId: string,
+  patternId: string,
+  statuses: number[]
+): Promise<StatusFileBreakdown> {
+  const query = statuses.length > 0 ? `?statuses=${statuses.join(",")}` : "";
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/status-file-breakdown${query}`
+    ),
+    { cache: "no-store" }
+  );
+
+  return readJsonResponse<StatusFileBreakdown>(response);
+}
+
 export async function getMismatchedUrls(sessionId: string) {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/mismatched-urls`),
@@ -1795,13 +1826,18 @@ export async function undoPatternTransform(
 export type RedirectCandidate = {
   key: string;
   url: string;
-  final_url: string;
+  // Null when delete_only: a 404 has no destination to rewrite to.
+  final_url: string | null;
   is_sampled: boolean;
   sampled_url_id: string | null;
   http_status: NumberLike;
   // The destination itself looks like a not-found / soft-404 page (v1.42.1), so
   // the source URL is a delete candidate rather than a rewrite one.
   destination_not_found: boolean;
+  // No rewrite is possible at all — the PAGE is missing, not its destination.
+  // Sampled 404s were previously excluded from this list entirely, so selecting
+  // the 404 chip emptied it and the modal claimed "No redirect URLs remain".
+  delete_only?: boolean;
 };
 
 export type RedirectCandidatesResponse = {
@@ -1816,6 +1852,9 @@ export type RedirectCandidatesResponse = {
   // pool) — for messaging that separates "shown for review" from "will rewrite".
   preview_count?: number;
   sampled_redirect_count: number;
+  // Sampled 404s in the list — delete-only rows, counted apart from the
+  // redirects so the modal can say which of the two it is showing.
+  sampled_broken_count?: number;
   inferred_count: number;
   candidates: RedirectCandidate[];
 };

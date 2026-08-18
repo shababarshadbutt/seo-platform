@@ -184,6 +184,7 @@ import { cn } from "@/lib/utils";
 import { appliesPatternWide, fixAcceptCount } from "@/lib/fix-accept-count";
 import { findSegmentDuplication } from "@/lib/segment-duplication";
 import {
+  fixButtonState,
   showCheckButton,
   showFixButton,
   type PatternStatus
@@ -227,6 +228,11 @@ type PatternRow = {
   missingInCurrent: boolean;
   redirectArtifactSegment: string | null;
   sourceFile: string | null;
+  // When this pattern's redirect fixes were applied, or null if never. Drives the
+  // grey "Fixed" chip — see fixButtonState. Deliberately NOT derived from status:
+  // a successful fix rescores the row healthy, so status alone cannot tell a
+  // fixed pattern from one that never needed fixing.
+  redirectsAppliedAt: string | null;
   originalTemplate: string | null;
   transformOriginalTemplate: string | null;
   hasRedirects: boolean;
@@ -266,6 +272,13 @@ function formatBytes(bytes: number) {
 function defaultFixAction(candidate: RedirectCandidate): FixAction {
   if (!candidate.is_sampled) {
     return "skip";
+  }
+
+  // A sampled 404 has no destination to adopt, so Delete is the only action it
+  // has. Same outcome as destination_not_found below, reached for a different
+  // reason: there the redirect target is a dead end, here the page itself is.
+  if (candidate.delete_only) {
+    return "delete";
   }
 
   return candidate.destination_not_found ? "delete" : "fix";
@@ -609,6 +622,7 @@ function buildRows(
       missingInCurrent: pattern.missing_in_current,
       redirectArtifactSegment: redirectArtifactSegment(pattern.template, samples),
       sourceFile: pattern.source_file,
+      redirectsAppliedAt: pattern.redirects_applied_at ?? null,
       originalTemplate: pattern.original_template ?? null,
       transformOriginalTemplate: pattern.transform_original_template ?? null,
       hasRedirects: samples.some(
@@ -1551,7 +1565,38 @@ export default function ResultsDashboardPage({
         enableSorting: false,
         meta: { width: "60px" } satisfies PatternColumnMeta,
         cell: ({ row }) =>
-          showFixButton(row.original) ? (
+          fixButtonState(row.original) === "fixed" ? (
+            // Already fixed. Grey, not amber and not absent: amber asserts "a
+            // problem is confirmed here", and absent is what this chip exists to
+            // replace — a successful fix rescores the row healthy, so the button
+            // used to simply vanish and a dealt-with pattern became
+            // indistinguishable from one that never needed touching.
+            //
+            // Still a button, deliberately. It opens the same dialog, so a
+            // reviewer can go back and see what was applied without having to
+            // undo anything to get the panel back.
+            <button
+              type="button"
+              data-testid="pattern-fixed-chip"
+              aria-label={`Review the fix applied to ${row.original.template}`}
+              title={
+                row.original.redirectsAppliedAt
+                  ? `Redirects applied ${formatTimestamp(
+                      row.original.redirectsAppliedAt
+                    )} — open to review`
+                  : "Redirects applied — open to review"
+              }
+              className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500 hover:bg-slate-200"
+              onClick={(event) => {
+                event.stopPropagation();
+                setFindReplaceToast(null);
+                setFixRow(row.original);
+              }}
+            >
+              <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
+              Fixed
+            </button>
+          ) : showFixButton(row.original) ? (
             <button
               type="button"
               aria-label={`Fix redirects for ${row.original.template}`}
@@ -5005,6 +5050,25 @@ export default function ResultsDashboardPage({
                         are being probed again and the row rescored. Any redirects
                         found will appear here.
                       </p>
+                    ) : fixStatusFilter.size > 0 ? (
+                      // A CLEAN RESULT IS NOT WHAT AN EMPTY FILTERED LIST MEANS.
+                      // With a chip selected, "No redirect URLs remain" was
+                      // answering a question nobody asked: the user narrowed to
+                      // one status, and the honest answer is about that status,
+                      // not about the pattern as a whole. This is the branch the
+                      // 404 chip used to land in on a 1.3M-URL pattern.
+                      <p
+                        className="px-3 py-3 text-sm text-slate-500"
+                        data-testid="fix-empty-for-filter"
+                      >
+                        Nothing sampled for this pattern returned{" "}
+                        {Array.from(fixStatusFilter)
+                          .sort((a, b) => a - b)
+                          .join(" or ")}
+                        . Clear the status filter to see everything found here, or
+                        run a full check above to measure the URLs that were never
+                        sampled.
+                      </p>
                     ) : (
                       <p
                         className="px-3 py-3 text-sm text-slate-500"
@@ -5078,15 +5142,28 @@ export default function ResultsDashboardPage({
                                 </Badge>
                               )}
                             </div>
-                            <div className="flex min-w-0 items-center gap-2">
-                              <span aria-hidden="true">✅</span>
-                              <span
-                                className="min-w-0 flex-1 truncate font-mono text-xs text-emerald-700"
-                                title={candidate.final_url}
-                              >
-                                {candidate.final_url}
-                              </span>
-                            </div>
+                            {candidate.delete_only ? (
+                              // A 404 has no destination line to show. Saying so
+                              // is the point: the row is in the list precisely
+                              // because there is nothing to redirect it to.
+                              <div className="flex min-w-0 items-center gap-2">
+                                <span aria-hidden="true">🚫</span>
+                                <span className="min-w-0 flex-1 truncate text-xs text-red-700">
+                                  Page not found — no redirect target, so this URL
+                                  can only be removed.
+                                </span>
+                              </div>
+                            ) : (
+                              <div className="flex min-w-0 items-center gap-2">
+                                <span aria-hidden="true">✅</span>
+                                <span
+                                  className="min-w-0 flex-1 truncate font-mono text-xs text-emerald-700"
+                                  title={candidate.final_url ?? undefined}
+                                >
+                                  {candidate.final_url}
+                                </span>
+                              </div>
+                            )}
                           </div>
                           {/* Per-row Fix / Delete / Skip toggle. Delete is
                               disabled for inferred rows — the deletion engine can
@@ -5095,13 +5172,27 @@ export default function ResultsDashboardPage({
                           <div className="mt-0.5 flex shrink-0 overflow-hidden rounded-md border border-slate-300 text-xs font-semibold">
                             <button
                               type="button"
+                              // A 404 cannot be rewritten — there is no
+                              // destination. Offering Fix here would be an action
+                              // with nothing to apply.
+                              disabled={candidate.delete_only}
+                              title={
+                                candidate.delete_only
+                                  ? "This page returns 404 — there is no redirect target to apply"
+                                  : undefined
+                              }
                               className={cn(
                                 "px-2 py-1",
                                 fixActionFor(candidate) === "fix"
                                   ? "bg-indigo-600 text-white"
-                                  : "bg-white text-slate-600 hover:bg-slate-50"
+                                  : "bg-white text-slate-600 hover:bg-slate-50",
+                                candidate.delete_only &&
+                                  "cursor-not-allowed opacity-40 hover:bg-white"
                               )}
-                              onClick={() => setFixAction(candidate.key, "fix")}
+                              onClick={() =>
+                                !candidate.delete_only &&
+                                setFixAction(candidate.key, "fix")
+                              }
                             >
                               Fix
                             </button>

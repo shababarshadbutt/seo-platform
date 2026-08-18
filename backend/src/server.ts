@@ -10,6 +10,7 @@ import { initEventLog } from "./diagnostics/eventLog.js";
 import { logPrivateHostMapStatus } from "./http/privateHostMap.js";
 import { closeSitemapQueue } from "./queue/sitemapQueue.js";
 import { destroyCleanerPools } from "./jobs/cleanerPool.js";
+import { destroyPatternPopulationPool } from "./jobs/patternPopulationPool.js";
 import { closePool } from "./db/pool.js";
 import { runMigrations } from "./db/migrate.js";
 import { fsErrorResponse } from "./errors/fsErrors.js";
@@ -144,6 +145,10 @@ async function close() {
   await app.close();
   await closeSitemapQueue();
   await destroyCleanerPools();
+  // Enumeration runs in the WORKER, so this pool is normally never created here
+  // — but the module is loaded by the verification routes, and a pool that is
+  // never destroyed is a process that never exits if that ever changes.
+  await destroyPatternPopulationPool();
   await closePool();
 }
 

@@ -1,9 +1,27 @@
+import { createReadStream } from "node:fs";
+import { mkdir, rm, unlink } from "node:fs/promises";
+import path from "node:path";
+import { createInterface } from "node:readline";
+
 import type { FastifyBaseLogger } from "fastify";
 
+import { config } from "../config.js";
 import { pool } from "../db/pool.js";
+import {
+  POPULATION_PARALLEL_THRESHOLD,
+  runPatternPopulationScan
+} from "./patternPopulationPool.js";
 import { displaySourceFilename, isHttpUrl } from "../sitemaps/filenames.js";
 import { streamSitemapUrlLocs } from "../sitemaps/parser.js";
 import { pathMatchesTemplate } from "../sitemaps/rewriteLocs.js";
+
+// How many files are handed to the pool before their results are merged.
+//
+// Deliberately a small multiple of the pool size rather than "all of them":
+// piscina caps concurrency either way, but queueing every file up front keeps
+// every finished provisional path alive until the slowest finishes, so peak
+// bookkeeping would scale with the session instead of with the pool.
+const POPULATION_BATCH_SIZE = 8;
 
 // Enumerating a pattern's REAL URL population from the sitemap XML on disk.
 //
@@ -76,6 +94,13 @@ export async function enumeratePopulation(
   // the first (possibly large) file.
   onProgress?.(0, files.length);
 
+  // Offload the scan to worker threads once there are enough files to earn the
+  // setup cost. Identical result, produced off the main thread — see
+  // enumerateInWorkers.
+  if (files.length >= POPULATION_PARALLEL_THRESHOLD) {
+    return enumerateInWorkers(sessionId, patterns, files, logger, onProgress);
+  }
+
   let filesDone = 0;
 
   for (const file of files) {
@@ -135,4 +160,166 @@ export async function enumeratePopulation(
   }
 
   return population;
+}
+
+// The same enumeration, with the per-file scan on worker threads.
+//
+// THE TWO THINGS THIS HAS TO PRESERVE, both of which are order-dependent:
+//   * "first matching template wins" for a <loc> — handled inside the worker,
+//     which is given the patterns in the same order;
+//   * "the first FILE to claim a URL owns it, later files only add themselves to
+//     sourceFiles" — handled here, by merging strictly in file order.
+//
+// So results are merged in order even though they are produced out of order. The
+// files are processed in bounded batches rather than all at once: piscina caps
+// how many run concurrently either way, but queueing every file up front would
+// hold every completed provisional path (and its scan) alive until the slowest
+// one finished, which is a memory profile that scales with the session instead
+// of with the pool.
+//
+// Matches never cross the thread boundary — see patternPopulationWorker for why
+// that is the whole point.
+async function enumerateInWorkers(
+  sessionId: string,
+  patterns: PatternRow[],
+  files: Array<{ id: string; filename: string }>,
+  logger: FastifyBaseLogger,
+  onProgress?: EnumerateProgressFn
+): Promise<Map<string, EnumeratedUrl>> {
+  const population = new Map<string, EnumeratedUrl>();
+  const templateById = new Map(
+    patterns.map((pattern) => [pattern.id, pattern.template])
+  );
+  const workerPatterns = patterns.map((pattern) => ({
+    id: pattern.id,
+    template: pattern.template
+  }));
+
+  const scratchDir = path.join(
+    config.uploadDir,
+    sessionId,
+    ".population-scratch"
+  );
+  await mkdir(scratchDir, { recursive: true });
+
+  let filesDone = 0;
+
+  try {
+    for (let start = 0; start < files.length; start += POPULATION_BATCH_SIZE) {
+      const batch = files.slice(start, start + POPULATION_BATCH_SIZE);
+
+      const scanned = await Promise.all(
+        batch.map(async (file, offset) => {
+          const provisionalPath = path.join(
+            scratchDir,
+            `.p${start + offset}.provisional`
+          );
+
+          try {
+            await runPatternPopulationScan({
+              storedFilename: file.filename,
+              provisionalPath,
+              patterns: workerPatterns
+            });
+
+            return { file, provisionalPath, ok: true as const };
+          } catch (error) {
+            // Missing on disk (cleaned up) or unreadable — skip like the
+            // sequential path does, but say so: a silently skipped file shrinks
+            // the population.
+            logger.warn(
+              { session_id: sessionId, filename: file.filename, error },
+              "pattern population: could not scan file, skipping"
+            );
+
+            return { file, provisionalPath, ok: false as const };
+          }
+        })
+      );
+
+      // IN ORDER, always — this loop is what makes the parallel result identical
+      // to the sequential one.
+      for (const result of scanned) {
+        if (result.ok) {
+          const display = displaySourceFilename(
+            sessionId,
+            result.file.filename
+          );
+
+          await readProvisionalMatches(
+            result.provisionalPath,
+            (patternId, loc) => {
+              const existing = population.get(loc);
+
+              if (existing) {
+                existing.sourceFiles.add(display);
+                return;
+              }
+
+              const template = templateById.get(patternId);
+
+              if (!template) {
+                return;
+              }
+
+              population.set(loc, {
+                url: loc,
+                patternId,
+                template,
+                sourceFiles: new Set([display])
+              });
+            }
+          );
+        }
+
+        await unlink(result.provisionalPath).catch(() => {});
+
+        // Counted whether or not the scan succeeded, for the same reason the
+        // sequential path counts outside its try/catch: a file that could not be
+        // read is still a file the scan is done with, and stalling the bar below
+        // 100% reads as a hang.
+        filesDone += 1;
+        onProgress?.(filesDone, files.length);
+      }
+    }
+  } finally {
+    // Best effort: the scratch directory is inside the session's upload dir, so
+    // the existing session cleanup removes anything left behind by a crash.
+    await rm(scratchDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  return population;
+}
+
+// Read one worker's "<patternId>\t<loc>" lines back off disk.
+//
+// Streamed rather than readFile'd: a single sitemap can contribute a very large
+// number of matches, and this file exists specifically to keep them OUT of
+// memory all at once.
+async function readProvisionalMatches(
+  provisionalPath: string,
+  onMatch: (patternId: string, loc: string) => void
+): Promise<void> {
+  const lines = createInterface({
+    input: createReadStream(provisionalPath),
+    crlfDelay: Infinity
+  });
+
+  try {
+    for await (const line of lines) {
+      if (line.length === 0) {
+        continue;
+      }
+
+      const tab = line.indexOf("\t");
+
+      if (tab <= 0) {
+        continue;
+      }
+
+      onMatch(line.slice(0, tab), line.slice(tab + 1));
+    }
+  } finally {
+    lines.close();
+  }
 }

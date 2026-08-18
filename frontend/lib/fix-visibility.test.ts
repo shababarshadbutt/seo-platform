@@ -1,7 +1,11 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 
-import { showCheckButton, showFixButton } from "./fix-visibility";
+import {
+  fixButtonState,
+  showCheckButton,
+  showFixButton
+} from "./fix-visibility";
 
 // The regression this guards: /about-us-style patterns — total_urls = 1, the
 // single sampled URL is a 404, so no redirect ever lands in the sample. The
@@ -100,4 +104,69 @@ test("empty dialog for a scored pattern keeps the clean-result copy", () => {
   for (const status of ["GOOD", "WARNING", "BAD"] as const) {
     assert.equal(showCheckButton({ status }), false);
   }
+});
+
+// ---------------------------------------------------------------------------
+// fixButtonState — the grey "Fixed" chip
+// ---------------------------------------------------------------------------
+//
+// THE REGRESSION THIS GUARDS. Applying a fix rewrites the sampled rows in place
+// and the pattern is rescored, so a fixed pattern lands on GOOD and its button
+// disappears — identical to a pattern that was healthy all along. On a table of
+// hundreds of rows that left reviewers reopening patterns to find out whether
+// they had already dealt with them.
+
+const APPLIED = "2026-08-18T10:00:00.000Z";
+
+test("an unfixed row behaves exactly as the two old predicates did", () => {
+  assert.equal(fixButtonState({ status: "BAD" }), "fix");
+  assert.equal(fixButtonState({ status: "WARNING" }), "fix");
+  assert.equal(fixButtonState({ status: "UNKNOWN" }), "check");
+  assert.equal(fixButtonState({ status: "GOOD" }), "none");
+});
+
+test("a null stamp is the same as no stamp at all", () => {
+  // The column is nullable and older patterns predate it, so NULL must read as
+  // "never fixed" rather than as a value.
+  assert.equal(fixButtonState({ status: "BAD", redirectsAppliedAt: null }), "fix");
+  assert.equal(
+    fixButtonState({ status: "GOOD", redirectsAppliedAt: null }),
+    "none"
+  );
+});
+
+// The whole point: the chip must survive the rescore that follows a fix, which
+// is precisely when the row turns GOOD and the old rule rendered nothing.
+test("a fixed pattern reads as fixed once it is rescored healthy", () => {
+  assert.equal(
+    fixButtonState({ status: "GOOD", redirectsAppliedAt: APPLIED }),
+    "fixed"
+  );
+});
+
+// "fixed" is a fact about what was DONE to the pattern, not a reading of its
+// current measurement, so no status may override it. A pattern that was fixed
+// and has since gone Broken again still shows it was fixed — the row's own
+// Status cell reports the current verdict.
+test("fixed outranks every status, including a later regression to BAD", () => {
+  for (const status of ["GOOD", "WARNING", "BAD", "UNKNOWN"] as const) {
+    assert.equal(
+      fixButtonState({ status, redirectsAppliedAt: APPLIED }),
+      "fixed",
+      status
+    );
+  }
+});
+
+// showCheckButton drives autoStartRecheck and the modal's empty-state copy, so a
+// fixed-but-unscored row must not silently start probing the site again.
+test("fixed outranks check, so a fixed row does not auto-start a re-check", () => {
+  assert.equal(
+    fixButtonState({ status: "UNKNOWN", redirectsAppliedAt: APPLIED }),
+    "fixed"
+  );
+  assert.notEqual(
+    fixButtonState({ status: "UNKNOWN", redirectsAppliedAt: APPLIED }),
+    "check"
+  );
 });

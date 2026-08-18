@@ -2690,6 +2690,11 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             redirect_pct,
             missing_in_current,
             source_file,
+            -- Drives the grey "Fixed" chip in the results table (migration 046).
+            -- Without it a successfully fixed pattern is rescored healthy and its
+            -- button simply disappears, which reads identically to a pattern that
+            -- never needed fixing.
+            redirects_applied_at,
             (
               SELECT old_template
               FROM pattern_renames
@@ -3791,6 +3796,49 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         }
       }
 
+      // Sampled rows that are BROKEN rather than redirecting — in practice 404s.
+      //
+      // WHAT WAS WRONG. The query above is redirect-only by construction
+      // (http_status_category = 'redirect' AND a usable final_url), so a sampled
+      // 404 could never become a candidate. The modal's status chips include 404,
+      // so selecting it filtered a list that structurally could not contain one
+      // down to nothing — and the empty list then rendered "No redirect URLs
+      // remain for this pattern.", asserting a clean result about a pattern whose
+      // 404s were simply never eligible to be listed. Reported from a live run on
+      // a 1,328,197-URL pattern.
+      //
+      // These have no redirect target, so they are DELETE-ONLY: there is nothing
+      // to rewrite them to. They carry the same shape as the rows above so the
+      // list, the chips and the paging need no second code path.
+      const brokenResult = await pool.query<{
+        id: string;
+        url: string;
+        http_status: number | null;
+      }>(
+        `
+          SELECT id, url, http_status
+          FROM sampled_urls
+          WHERE pattern_id = $1
+            AND http_status = 404
+        `,
+        [request.params.patternId]
+      );
+
+      const brokenByPath = new Map<
+        string,
+        { id: string; http_status: number | null }
+      >();
+
+      for (const row of brokenResult.rows) {
+        const key = pathKey(row.url);
+
+        // A redirect verdict wins: the same path cannot be both, and the
+        // redirect row is the one that carries a rewrite target.
+        if (!sampledByPath.has(key) && !brokenByPath.has(key)) {
+          brokenByPath.set(key, { id: row.id, http_status: row.http_status });
+        }
+      }
+
       const urlsResult = await pool.query<{ source_url: string; path: string }>(
         "SELECT source_url, path FROM pattern_urls WHERE pattern_id = $1 ORDER BY source_url ASC",
         [request.params.patternId]
@@ -3799,7 +3847,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       const candidates: Array<{
         key: string;
         url: string;
-        final_url: string;
+        // Null for a delete-only row: a 404 has no destination to rewrite to.
+        final_url: string | null;
         is_sampled: boolean;
         sampled_url_id: string | null;
         http_status: number | null;
@@ -3807,6 +3856,10 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // — redirecting to it is useless, so the source URL is a delete
         // candidate rather than a rewrite one. (v1.42.1)
         destination_not_found: boolean;
+        // No rewrite is possible at all, as opposed to one that is possible but
+        // pointless (destination_not_found above). The UI offers Delete or Skip
+        // and never Fix.
+        delete_only: boolean;
       }> = [];
       const seen = new Set<string>();
 
@@ -3817,6 +3870,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
         seen.add(row.source_url);
         const sampled = sampledByPath.get(pathKey(row.path));
+        const broken = brokenByPath.get(pathKey(row.path));
 
         if (sampled) {
           candidates.push({
@@ -3826,7 +3880,20 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             is_sampled: true,
             sampled_url_id: sampled.id,
             http_status: sampled.http_status,
-            destination_not_found: looksLikeNotFoundUrl(sampled.final_url)
+            destination_not_found: looksLikeNotFoundUrl(sampled.final_url),
+            delete_only: false
+          });
+        } else if (broken) {
+          candidates.push({
+            key: broken.id,
+            url: row.source_url,
+            final_url: null,
+            is_sampled: true,
+            sampled_url_id: broken.id,
+            http_status: broken.http_status,
+            // Not the destination that is missing — the page itself is.
+            destination_not_found: true,
+            delete_only: true
           });
         } else if (rule) {
           const dest = applyRedirectRule(row.source_url, rule);
@@ -3839,7 +3906,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
               is_sampled: false,
               sampled_url_id: null,
               http_status: null,
-              destination_not_found: looksLikeNotFoundUrl(dest)
+              destination_not_found: looksLikeNotFoundUrl(dest),
+              delete_only: false
             });
           }
         }
@@ -3863,6 +3931,10 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // sample pool) — distinct from pattern_total_urls, the real rewrite scope.
         preview_count: candidates.length,
         sampled_redirect_count: sampledResult.rowCount ?? 0,
+        // Sampled 404s now in the list. Reported separately from the redirects so
+        // the modal can say what it is showing rather than lumping two different
+        // findings under one count.
+        sampled_broken_count: candidates.filter((c) => c.delete_only).length,
         inferred_count: candidates.filter((c) => !c.is_sampled).length,
         candidates
       };

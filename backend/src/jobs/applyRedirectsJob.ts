@@ -303,6 +303,19 @@ export async function processApplyRedirectsJob(
 
   await invalidateSessionZipCache(sessionId);
 
+  // Mark the pattern as fixed, which is what draws the grey "Fixed" chip in the
+  // results table (migration 046).
+  //
+  // Deliberately here and NOT on the "nothing to rewrite" path above: that path
+  // returns without changing a single URL, and claiming a pattern was fixed when
+  // nothing happened is the same lie in the other direction as the button
+  // vanishing. Reached whenever real work was done — a confirmed pair rewritten
+  // in the transaction above, a widened rule applied to the files, or both.
+  await pool.query(
+    "UPDATE patterns SET redirects_applied_at = now() WHERE id = $1",
+    [patternId]
+  );
+
   logger.info(
     {
       session_id: sessionId,

@@ -308,6 +308,11 @@ export default function Home() {
   } | null>(null);
   const [isLoadingHandoff, setIsLoadingHandoff] = useState(false);
   const handoffStartedRef = useRef(false);
+  // Set once a Cleaner handoff has loaded successfully; consumed by the
+  // auto-start effect below. The ref is what makes it fire exactly once even
+  // though its effect re-runs as canSubmit settles.
+  const [autoStartHandoff, setAutoStartHandoff] = useState(false);
+  const autoStartFiredRef = useRef(false);
 
   const trimmedSessionName = sessionName.trim();
   const trimmedBaseUrl = baseUrl.trim();
@@ -456,6 +461,11 @@ export default function Home() {
           fileCount: handoff.files.length,
           token: handoffToken
         });
+        // Ask for the analysis to start on its own. NOT started here: the state
+        // it depends on (base URL, session name, the handoff itself) has only
+        // just been queued, so canSubmit is still false in this closure. The
+        // effect below fires once React has applied it.
+        setAutoStartHandoff(true);
       } catch (nextError) {
         const status =
           nextError && typeof nextError === "object" && "status" in nextError
@@ -481,6 +491,44 @@ export default function Home() {
     // Strip the token from the visible URL once consumed (kept out of history).
     clearHandoffParams();
   }, []);
+
+  // Start the analysis for a Cleaner handoff without waiting for a click.
+  //
+  // Cleaning and migrating are one job: the Cleaner's completion screen now
+  // counts down and navigates here by itself, so stopping at a pre-filled form
+  // would just move the leftover click rather than remove it.
+  //
+  // Deliberately a separate effect keyed on canSubmit rather than a call inside
+  // loadHandoff. Every precondition is set by the handoff itself — session name
+  // ("Cleaned sitemaps — <host>"), base URL, and hasValidSource, which is
+  // satisfied by cleanerHandoff.token alone — but they are set as STATE, so the
+  // only correct moment to read them is a render after they land.
+  //
+  // NOTHING auto-starts on a failed handoff. loadHandoff's catch sets formError
+  // ("Cleaner session expired — please re-run the cleaner.") and clears
+  // cleanerHandoff; submitting on top of that would fail a second time and bury
+  // the message that actually says what to do.
+  useEffect(() => {
+    if (
+      !autoStartHandoff ||
+      autoStartFiredRef.current ||
+      isLoadingHandoff ||
+      !cleanerHandoff?.token ||
+      formError.length > 0 ||
+      !canSubmit
+    ) {
+      return;
+    }
+
+    autoStartFiredRef.current = true;
+    void startAnalysis();
+  }, [
+    autoStartHandoff,
+    isLoadingHandoff,
+    cleanerHandoff,
+    formError,
+    canSubmit
+  ]);
 
   // True when an SFTP-sourced session's Base URL has been edited to a host that
   // would NOT resolve to the same publish prefix as the SFTP folder. Not an error
@@ -916,9 +964,18 @@ export default function Home() {
     }
   }
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    void startAnalysis();
+  }
 
+  // The form's submit body, separated from the DOM event so it has a second
+  // caller: the Sitemap Cleaner handoff, which now starts the analysis itself
+  // rather than pre-filling the form and waiting for a click (see the handoff
+  // effect above). Nothing about the manual path changes — handleSubmit is still
+  // the only thing wired to onSubmit, and uploadStartedRef below is still what
+  // makes a second entry a no-op, whichever caller it came from.
+  async function startAnalysis() {
     if (uploadStartedRef.current) {
       return;
     }
@@ -1207,6 +1264,19 @@ export default function Home() {
                       <p className="break-all text-xs text-slate-600">
                         Domain: {cleanerHandoff.domain}
                       </p>
+                      {/* Say that the page is submitting itself. A form that
+                          starts without being clicked reads as a glitch unless
+                          it explains what it is doing. */}
+                      {autoStartHandoff && isSubmitting ? (
+                        <p
+                          className="flex items-center gap-2 text-xs font-medium text-indigo-700"
+                          data-testid="cleaner-handoff-autostart"
+                        >
+                          <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+                          Starting the analysis automatically — carried over from
+                          the Sitemap Cleaner.
+                        </p>
+                      ) : null}
                     </div>
                     <Button
                       type="button"
