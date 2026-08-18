@@ -277,6 +277,35 @@ export type SampleCheckOptions = {
   // Left OFF for pattern sampling, which stores response_ms per sampled URL and
   // whose 5-20 URLs per pattern make the saving irrelevant anyway.
   skipRedirectFollow?: boolean;
+  // Skip the soft-404 GET on a 2xx (v1.64).
+  //
+  // Same argument as skipRedirectFollow above, applied to the OTHER second
+  // request — and worth more, because 2xx is the common outcome. A healthy URL
+  // costs a HEAD plus a ranged 64KB GET purely to sniff the body for
+  // not-found wording, which is the single biggest multiplier on a large
+  // verification: at the WAF-imposed 5 requests/second it is the difference
+  // between ~2.5 and ~5 URLs checked per second.
+  //
+  // WHAT IT ACTUALLY COSTS on the verification path: nothing that is read.
+  // The sniff never touches http_status — the 2xx branch below sets
+  // `httpStatus: firstResult.statusCode` either way. What it does set is
+  // isSoft404, scoreWeight, responseMs and httpStatusCategory, and of those:
+  //
+  //   * verified_urls persists NONE of isSoft404, scoreWeight or responseMs;
+  //   * it does persist http_status_category — and nothing ever reads that
+  //     column back. Every consumer of verified_urls selects http_status, url,
+  //     final_url, source_files or checked_at (routes/verification.ts,
+  //     routes/sessions.ts, sitemaps/problemFiles.ts, jobs/maintenanceJobs.ts).
+  //
+  // Delete-by-status keys on http_status, so a soft-404 — HTTP 200 — was never
+  // in a delete set to begin with. Dropping the request changes the stored
+  // verdict for no row.
+  //
+  // Left OFF for pattern sampling, exactly like skipRedirectFollow: sampled_urls
+  // DOES persist is_soft_404, the score weighting reads it (a soft 404 counts
+  // 0.25, not 1), and the Fix modal shows it. Sampling probes 5-20 URLs per
+  // pattern, so the saving there would be invisible and the loss real.
+  skipSoft404Sniff?: boolean;
   // The profiles to try, in order. Absent = today's exact behaviour:
   // [caller's UA, BROWSER_FALLBACK_PROFILE].
   //
@@ -566,7 +595,11 @@ export async function runCheckWithProfile(
   logContext: Record<string, unknown>,
   options: SampleCheckOptions
 ): Promise<SampleCheckResult> {
-  const { beforeRequest, skipRedirectFollow = false } = options;
+  const {
+    beforeRequest,
+    skipRedirectFollow = false,
+    skipSoft404Sniff = false
+  } = options;
 
   // IDENTITY vs TRANSPORT, decided once, here.
   //
@@ -673,6 +706,29 @@ export async function runCheckWithProfile(
   let result: SampleCheckResult;
 
   if (firstResult.statusCode && firstResult.statusCode >= 200 && firstResult.statusCode <= 299) {
+    // The verification path never reads the sniff's output, so it does not pay
+    // for it — see skipSoft404Sniff. Everything below is derived from the HEAD
+    // that already happened; only isSoft404 and the category differ, and both
+    // take their not-soft answer.
+    if (skipSoft404Sniff) {
+      return {
+        url,
+        httpStatus: firstResult.statusCode,
+        responseMs: firstResult.responseMs,
+        isHit: true,
+        isSoft404: false,
+        finalUrl: null,
+        redirectCount: 0,
+        httpStatusCategory: "success",
+        scoreWeight: 1,
+        timedOut: firstResult.timedOut,
+        errorReason: null,
+        usedFallbackProfile: false,
+        edgeServer: firstResult.serverHeader,
+        viaPrivateRoute: routed.route !== null
+      };
+    }
+
     logger.info(logContext, "sample url soft-404 GET check started");
 
     const soft404Result = await checkSoft404Signals(

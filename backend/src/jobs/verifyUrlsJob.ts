@@ -1,5 +1,6 @@
 import type { FastifyBaseLogger } from "fastify";
 
+import { config } from "../config.js";
 import { pool } from "../db/pool.js";
 import { runWithBoundedConcurrency } from "../sitemaps/boundedConcurrency.js";
 import {
@@ -45,6 +46,29 @@ import type { VerifyUrlsJobData } from "../queue/verificationQueue.js";
 // The statuses the delete flow can act on; items_changed reports how many
 // verified URLs carry one of these.
 export const VERIFY_PROBLEM_STATUSES = [301, 302, 307, 308, 404];
+
+// "This stored verdict still describes what is in the files" — ONE definition,
+// used by the two queries that must agree about it.
+//
+// WHY IT IS SHARED AND NOT WRITTEN TWICE. The reuse filter uses it to decide
+// what NOT to re-probe, and the stale-row sweep below uses it to decide what NOT
+// to delete. If those two ever disagree, the run reuses a row and then deletes
+// it in the same pass — which is exactly what happened when reuse was first
+// added: the sweep keys on `checked_at < runStarted` on the assumption that
+// "every enumerated url just got checked_at reset", and a reused row by
+// definition did not. The result was a re-verify that wiped every verdict it had
+// just decided to trust and reported zero problems.
+//
+// $1 = session id, and the caller supplies the reuse window in hours as the
+// named parameter it interpolates. A window of 0 disables reuse, so the
+// predicate is false for every row and both queries revert to their old
+// behaviour exactly.
+const REUSABLE_VERDICT_SQL = `
+  $WINDOW$::int > 0
+  AND v.checked_at IS NOT NULL
+  AND v.checked_at > COALESCE(s.files_mutated_at, 'epoch'::timestamptz)
+  AND v.checked_at > now() - ($WINDOW$ || ' hours')::interval
+`;
 
 // Persist progress every N completed checks so the status endpoint has
 // something live without a DB write per URL.
@@ -287,8 +311,55 @@ export async function processVerifyUrlsJob(
     );
     const deletedUrls = new Set(deletedResult.rows.map((row) => row.url));
 
+    // URLs whose stored verdict is still good, so they need no request at all.
+    //
+    // At 5 requests/second the HTTP phase is the entire cost of a run, and a
+    // re-verify used to repeat all of it — including for URLs measured minutes
+    // earlier. Fix-then-recheck is the common workflow, so the run someone is
+    // actually waiting on was the one paying full price to re-confirm what it
+    // already knew.
+    //
+    // TWO CONDITIONS, and the first is correctness, not freshness:
+    //   * checked_at > sessions.files_mutated_at — the files have not changed
+    //     since the measurement. This is the SAME predicate the Fix modal calls
+    //     "stale", so an edit, a rename or an applied redirect invalidates the
+    //     cache automatically and no code has to remember to clear it.
+    //   * checked_at > now() - reuseWindowHours — the files may be untouched
+    //     while the SITE changed underneath us.
+    //
+    // A NULL files_mutated_at means nothing has ever been edited, which does not
+    // block reuse — hence the COALESCE to an always-older timestamp rather than
+    // letting the comparison go NULL and silently exclude every row.
+    const reuseWindowHours = config.verification.reuseWindowHours;
+    const reusableUrls = new Set<string>();
+
+    if (reuseWindowHours > 0) {
+      const reusableResult = await pool.query<{ url: string }>(
+        `
+          SELECT v.url
+          FROM verified_urls v
+          JOIN sessions s ON s.id = v.session_id
+          WHERE v.session_id = $1
+            AND v.is_deleted_from_sitemap = false
+            AND ${REUSABLE_VERDICT_SQL.replaceAll("$WINDOW$", "$2")}
+        `,
+        [sessionId, String(reuseWindowHours)]
+      );
+
+      for (const row of reusableResult.rows) {
+        reusableUrls.add(row.url);
+      }
+    }
+
     const entries = Array.from(population.values());
-    const notDeleted = entries.filter((entry) => !deletedUrls.has(entry.url));
+    const notDeleted = entries.filter(
+      (entry) => !deletedUrls.has(entry.url) && !reusableUrls.has(entry.url)
+    );
+    // Counted against the enumerated population, not against the query above:
+    // that query is session-wide, while this run may be scoped to one pattern.
+    const skippedReused = entries.filter(
+      (entry) => !deletedUrls.has(entry.url) && reusableUrls.has(entry.url)
+    ).length;
 
     // THE CIRCUIT BREAKER, on the path where it saves the most.
     //
@@ -349,7 +420,17 @@ export async function processVerifyUrlsJob(
       });
     }
 
-    const skippedDeleted = entries.length - toCheck.length;
+    // entries.length - toCheck.length now covers THREE different reasons, and
+    // they mean different things to whoever reads the logs: deleted, reused, and
+    // host-refused. Derive the deleted count directly rather than by subtraction,
+    // or adding a fourth skip reason later silently re-labels it as deleted.
+    const skippedDeleted = entries.filter((entry) =>
+      deletedUrls.has(entry.url)
+    ).length;
+    // Everything the run does not have to probe. This is what the progress row
+    // starts at, so a run that reuses most of its population shows real progress
+    // immediately instead of crawling up from zero.
+    const alreadyDone = entries.length - toCheck.length;
 
     // urls_total is the FULL deduped population (files_total column — URL
     // semantics for this kind); already-deleted URLs count as done up front.
@@ -361,9 +442,10 @@ export async function processVerifyUrlsJob(
     await pool.query(
       `UPDATE maintenance_jobs
          SET status = 'RUNNING', files_total = $2, files_done = $3,
+             urls_reused = $4,
              enum_files_total = NULL, enum_files_done = NULL
        WHERE id = $1`,
-      [jobRowId, entries.length, skippedDeleted]
+      [jobRowId, entries.length, alreadyDone, skippedReused]
     );
 
     logger.info(
@@ -374,6 +456,11 @@ export async function processVerifyUrlsJob(
         scope: patternIds ? "patterns" : "session",
         urls_total: entries.length,
         skipped_deleted: skippedDeleted,
+        // Reused from a previous run: same files, inside the freshness window.
+        // Logged separately because a run that suddenly reuses nothing is a
+        // signal (the files changed, or the window was set to 0), not noise.
+        skipped_reused: skippedReused,
+        reuse_window_hours: config.verification.reuseWindowHours,
         // Broken out from skipped_deleted because they mean different things: one is
         // "we deliberately do not check deleted URLs", the other is "this origin
         // refuses us and needs an allowlist".
@@ -478,13 +565,21 @@ export async function processVerifyUrlsJob(
     if (sweepPatternIds.length > 0) {
       const swept = await pool.query(
         `
-          DELETE FROM verified_urls
-          WHERE session_id = $1
-            AND pattern_id = ANY($2::uuid[])
-            AND is_deleted_from_sitemap = false
-            AND (checked_at IS NULL OR checked_at < $3::timestamptz)
+          DELETE FROM verified_urls v
+          USING sessions s
+          WHERE s.id = v.session_id
+            AND v.session_id = $1
+            AND v.pattern_id = ANY($2::uuid[])
+            AND v.is_deleted_from_sitemap = false
+            AND (v.checked_at IS NULL OR v.checked_at < $3::timestamptz)
+            -- ...unless it was REUSED this run. Its checked_at is older than
+            -- runStarted precisely because it was not re-probed, so the clause
+            -- above would otherwise delete the verdict this run just trusted.
+            -- A reusable row is one measured after the files last changed, so it
+            -- still describes them — which is exactly what the sweep is for.
+            AND NOT (${REUSABLE_VERDICT_SQL.replaceAll("$WINDOW$", "$4")})
         `,
-        [sessionId, sweepPatternIds, runStarted]
+        [sessionId, sweepPatternIds, runStarted, String(reuseWindowHours)]
       );
 
       if (swept.rowCount) {
@@ -540,6 +635,10 @@ export async function processVerifyUrlsJob(
         patterns: patterns.length,
         urls_total: entries.length,
         urls_checked: toCheck.length,
+        // The saving, stated so a run can be compared against its predecessor:
+        // a second verification of an unedited pattern should show almost all of
+        // its population here and take almost no time.
+        urls_reused: skippedReused,
         counted_statuses: countedStatuses,
         problem_urls: problemCount,
         // Which network path measured this sweep. Counted from results rather than from

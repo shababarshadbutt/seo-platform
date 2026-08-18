@@ -937,9 +937,13 @@ test("a browser-only host is learned once, then sampling and verification both l
       .map((hit) => `${hit.method} ${hit.url} ${hit.browser ? "browser" : "crawler"}`)
       .join(" | ")}`
   );
-  // 5 URLs, one HEAD each (verification skips the redirect follow-up and these are
-  // 2xx, so the soft-404 GET is the second request per URL).
-  assert.equal(verifyHits.length, 10, `verification requests: ${verifyHits.length}`);
+  // 5 URLs, ONE request each. Verification skips both of the second requests a
+  // check can make: the follow-up HEAD on a 3xx (it fed only responseMs) and,
+  // since v1.64, the soft-404 GET on a 2xx (its outputs are isSoft404 /
+  // scoreWeight / responseMs, none of which verified_urls stores, plus a status
+  // category nothing reads back). These URLs are 2xx, so that is the one that
+  // used to double this number — it was 10 before the sniff was dropped.
+  assert.equal(verifyHits.length, 5, `verification requests: ${verifyHits.length}`);
 
   const verified = await pool.query(
     "SELECT count(*)::int AS n FROM verified_urls WHERE session_id = $1 AND http_status = 200",

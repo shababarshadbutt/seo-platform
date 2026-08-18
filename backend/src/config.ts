@@ -245,6 +245,32 @@ export const config = {
       fallback: 10,
       min: 1,
       max: 100
+    }),
+    // How long a stored verdict may be reused instead of re-probed, in hours.
+    // 0 disables reuse entirely — every run re-measures everything, which is
+    // exactly what happened before this existed.
+    //
+    // WHY IT MATTERS. At 5 requests/second a large pattern takes hours, and a
+    // re-verify used to repeat all of it even for URLs measured minutes earlier.
+    // The common workflow is fix-then-recheck, so the second run — the one
+    // someone is actually waiting on — was paying full price to re-confirm what
+    // it already knew.
+    //
+    // REUSE IS GATED ON TWO CONDITIONS, and the first one is correctness rather
+    // than freshness: the row must have been checked AFTER the session's files
+    // last changed (sessions.files_mutated_at). That is the same rule the Fix
+    // modal already uses to call a verification "stale", so an edit, a rename or
+    // an applied redirect invalidates the cache automatically and nothing has to
+    // remember to clear it.
+    //
+    // The window is the SECOND condition and answers a different question: the
+    // files may be untouched while the SITE changed underneath us. 24h is short
+    // enough that a verdict is still a fair description of a live page and long
+    // enough to cover a working session.
+    reuseWindowHours: readNumber("VERIFY_REUSE_WINDOW_HOURS", {
+      fallback: 24,
+      min: 0,
+      max: 8760
     })
   },
 

@@ -24,7 +24,10 @@
 // Usage:
 //   npx tsx bench/verifyThroughput.ts [urls] [latencyMs] [mix]
 //     mix: "redirect" (default, 70% 301 + 25% 200 + 5% 404 — a redirect-fix
-//          pattern), "notfound" (90% 404, the cheap single-request case)
+//          pattern), "notfound" (90% 404, the cheap single-request case),
+//          "healthy" (90% 200 — a large working catalogue, and the only mix that
+//          can measure the soft-404 GET, since the other two are dominated by
+//          single-request outcomes)
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
@@ -56,6 +59,16 @@ const silentLogger: any = {
 function statusFor(index: number): number {
   if (mix === "notfound") {
     return index % 10 === 0 ? 200 : 404;
+  }
+
+  // 90% 200 — the shape of a large, mostly-working catalogue, and the ONLY mix
+  // that shows what the soft-404 GET costs. Both other mixes are dominated by
+  // single-request outcomes (a hard 404 always was one; a 3xx became one when
+  // skipRedirectFollow landed in v1.52), so neither can measure it.
+  if (mix === "healthy") {
+    const bucket = index % 20;
+
+    return bucket < 18 ? 200 : bucket < 19 ? 301 : 404;
   }
 
   const bucket = index % 20;

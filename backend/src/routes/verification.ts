@@ -283,6 +283,7 @@ export async function verificationRoutes(app: FastifyInstance) {
         pattern_ids: string[] | null;
         enum_files_total: number | null;
         enum_files_done: number | null;
+        urls_reused: number | null;
       }>(
         // A session-wide run (pattern_ids IS NULL) COVERS every pattern, so it
         // matches a pattern-scoped query too. Excluding it would tell a user
@@ -294,7 +295,7 @@ export async function verificationRoutes(app: FastifyInstance) {
         // pattern's — the confusion this release exists to remove.
         `
           SELECT id, status, files_total, files_done, items_changed, error, pattern_ids,
-                 enum_files_total, enum_files_done
+                 enum_files_total, enum_files_done, urls_reused
           FROM maintenance_jobs
           WHERE session_id = $1
             AND kind = 'verify-urls'
@@ -371,7 +372,11 @@ export async function verificationRoutes(app: FastifyInstance) {
               // enumerating; see migration 041 for why these are separate from
               // files_total/files_done rather than reusing them.
               enum_files_total: jobRow.enum_files_total,
-              enum_files_done: jobRow.enum_files_done
+              enum_files_done: jobRow.enum_files_done,
+              // URLs this run did not have to probe because a recent verdict was
+              // still good. Lets the panel explain a bar that starts near the end
+              // instead of it reading as work that was silently skipped.
+              urls_reused: jobRow.urls_reused
             }
           : null,
         // Echoes the request scope so a client can tell a pattern-scoped

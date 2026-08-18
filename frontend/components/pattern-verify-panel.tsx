@@ -764,6 +764,21 @@ export function PatternVerifyPanel({
               <div className="h-full w-1/3 animate-pulse rounded-full bg-indigo-500" />
             </div>
           )}
+          {/* Why the bar can open near the end. urls_done STARTS at the number
+              of URLs this run does not have to probe, so a re-verify of an
+              unedited pattern jumps straight to ~95% — correct, but it reads as
+              skipped work unless the reuse is named. */}
+          {(verifyJob?.urls_reused ?? 0) > 0 ? (
+            <p
+              className="text-xs text-indigo-800/80"
+              data-testid="verify-reused-note"
+            >
+              {formatNumber(verifyJob?.urls_reused ?? 0)} URL
+              {(verifyJob?.urls_reused ?? 0) === 1 ? "" : "s"} reused from the
+              last check — unchanged files, recent enough to still be true. Only
+              the rest are being re-probed.
+            </p>
+          ) : null}
           <p className="text-xs text-indigo-800/80">
             {etaSeconds !== null ? (
               <>

@@ -1185,6 +1185,13 @@ export type VerificationJob = {
   // "Verifying 0 of 0" confusion gets rebuilt. See migration 041.
   enum_files_total: number | null;
   enum_files_done: number | null;
+  // URLs this run reused from a previous verification instead of re-probing —
+  // same files, inside the freshness window. null for runs that predate reuse,
+  // which is different from 0 ("reuse was available and nothing qualified").
+  //
+  // Needed because urls_done STARTS at the reused count, so a mostly-reused run
+  // opens near 100%. Without saying why, that reads as skipped work.
+  urls_reused: number | null;
 };
 
 export type VerificationStatus = {

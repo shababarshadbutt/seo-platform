@@ -682,3 +682,132 @@ test("bare root '/' with a trailing-slash base URL still probes exactly '/'", as
 
   assert.equal(result.httpStatusCategory, "success");
 });
+
+// --- skipSoft404Sniff: the verification path's request cost -----------------
+//
+// THE PROBLEM IT SOLVES. Verification is rate-limited to 5 requests/second per
+// host (config.ts, lowered from 50 after a confirmed AWS WAF captcha incident),
+// and the limiter is charged PER REQUEST. A healthy URL cost two — a HEAD plus a
+// 64KB ranged GET to sniff the body for not-found wording — so a healthy pattern
+// ran at ~2.5 URLs/second and a 1.3M-URL pattern took days.
+//
+// The saving is only legitimate if the STORED verdict is unchanged, because
+// delete-by-status acts on it. These tests assert both halves: one request, and
+// the same http_status.
+
+function checkWith(
+  baseUrl: string,
+  options: Parameters<typeof checkSampleUrl>[6],
+  path = "/thing/one"
+) {
+  return checkSampleUrl(baseUrl, path, null, UA, silentLogger, CONTEXT, options);
+}
+
+const HEALTHY_BODY = "healthy fixture product page content. ".repeat(60);
+
+test("a 2xx costs TWO requests by default — the sniff is still there", async () => {
+  const { result, requests } = await withServer(
+    (_method, _url, res) => {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end(HEALTHY_BODY);
+    },
+    async (baseUrl, counts) => ({
+      result: await checkWith(baseUrl, {}),
+      requests: counts.requests
+    })
+  );
+
+  assert.deepEqual(requests, ["HEAD /thing/one", "GET /thing/one"]);
+  assert.equal(result.httpStatus, 200);
+  assert.equal(result.httpStatusCategory, "success");
+});
+
+test("skipSoft404Sniff makes a 2xx cost ONE request", async () => {
+  const { result, requests } = await withServer(
+    (_method, _url, res) => {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end(HEALTHY_BODY);
+    },
+    async (baseUrl, counts) => ({
+      result: await checkWith(baseUrl, { skipSoft404Sniff: true }),
+      requests: counts.requests
+    })
+  );
+
+  assert.deepEqual(requests, ["HEAD /thing/one"]);
+  // The half that makes the saving safe: http_status is what delete-by-status
+  // reads, and it comes from the HEAD either way.
+  assert.equal(result.httpStatus, 200);
+  assert.equal(result.httpStatusCategory, "success");
+  assert.equal(result.isHit, true);
+});
+
+// A page that WOULD sniff as a soft 404 keeps its real HTTP status. It loses the
+// soft_404 label, which is the documented trade: nothing reads
+// verified_urls.http_status_category, and a soft 404 is HTTP 200, so it was
+// never in a delete set to begin with.
+test("a soft-404 body still reports its real 200 when the sniff is skipped", async () => {
+  const softBody = "<html><body><h1>Page Not Found</h1></body></html>";
+
+  const sniffed = await withServer(
+    (_method, _url, res) => {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end(softBody);
+    },
+    (baseUrl) => checkWith(baseUrl, {})
+  );
+
+  const skipped = await withServer(
+    (_method, _url, res) => {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end(softBody);
+    },
+    (baseUrl) => checkWith(baseUrl, { skipSoft404Sniff: true })
+  );
+
+  // Sniffing still works when it is asked for — sampling depends on this.
+  assert.equal(sniffed.httpStatusCategory, "soft_404");
+  assert.equal(sniffed.isSoft404, true);
+
+  // Skipped: the status delete-by-status reads is IDENTICAL.
+  assert.equal(skipped.httpStatus, sniffed.httpStatus);
+  assert.equal(skipped.httpStatus, 200);
+  assert.equal(skipped.isSoft404, false);
+});
+
+// The flag must not leak into the outcomes that are already one request, or into
+// the ones that are not 2xx at all.
+test("skipSoft404Sniff changes nothing about a 404 or a 301", async () => {
+  const notFound = await withServer(
+    (_method, _url, res) => {
+      res.writeHead(404);
+      res.end();
+    },
+    async (baseUrl, counts) => ({
+      result: await checkWith(baseUrl, { skipSoft404Sniff: true }),
+      requests: [...counts.requests]
+    })
+  );
+
+  assert.equal(notFound.result.httpStatus, 404);
+  assert.equal(notFound.result.httpStatusCategory, "failure");
+
+  const moved = await withServer(
+    (_method, url, res) => {
+      if (url === "/thing/one") {
+        res.writeHead(301, { location: "/thing/two" });
+        res.end();
+        return;
+      }
+
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("ok");
+    },
+    (baseUrl) =>
+      checkWith(baseUrl, { skipSoft404Sniff: true, skipRedirectFollow: true })
+  );
+
+  assert.equal(moved.httpStatus, 301);
+  assert.equal(moved.httpStatusCategory, "redirect");
+  assert.match(moved.finalUrl ?? "", /\/thing\/two$/);
+});

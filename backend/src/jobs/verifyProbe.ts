@@ -140,6 +140,17 @@ export async function probeUrl(
     // only responseMs, which verified_urls does not store — finalUrl comes from
     // the first response's Location header either way. Skipping it halves the
     // request cost of a redirect-heavy pattern with byte-identical results.
-    skipRedirectFollow: true
+    skipRedirectFollow: true,
+    // And the other second request. A 2xx otherwise costs a HEAD plus a 64KB
+    // ranged GET to sniff for not-found wording, whose only outputs are
+    // isSoft404 / scoreWeight / responseMs — none of which verified_urls stores
+    // — and http_status_category, which nothing ever reads back. http_status is
+    // taken from the HEAD either way, and delete-by-status keys on http_status,
+    // so a soft 404 (HTTP 200) was never in a delete set.
+    //
+    // This is the biggest single lever on a large run: at the WAF-imposed 5
+    // requests/second it takes a healthy-majority pattern from ~2.5 to ~5 URLs
+    // checked per second. See skipSoft404Sniff in sampleUrlCheck.ts.
+    skipSoft404Sniff: true
   });
 }

@@ -63,16 +63,25 @@ const REQUESTS_PER_404_CHECK = 2;
 // fail and say so.
 const NEGOTIATION_REQUESTS = 1;
 const URL_COUNT = 60;
-// The SECOND fixture deliberately does the opposite: every URL answers 200, so
-// each check costs TWO requests — the HEAD plus the soft-404 GET. That is the
-// case the original limiter got wrong.
+// The SECOND fixture deliberately does the opposite: every URL costs TWO
+// requests, which is the case the original limiter got wrong.
 //
-// It used to use REDIRECTS for the two-request case, which stopped working when
-// verification began skipping the follow-up HEAD on a 3xx destination (that
-// request fed only responseMs, which verified_urls never stored). A 2xx is now
-// the only shape that still costs two requests on this path, which is exactly
-// why the test has to use it: the assertion below checks the PREMISE, so the
-// test failed loudly rather than silently passing on a one-request fixture.
+// WHICH SHAPE THAT IS HAS CHANGED TWICE, and both times this test caught it
+// rather than passing quietly — because the assertion below checks the PREMISE
+// (>= 1.9 requests per check) before it checks the rate:
+//
+//   * originally a REDIRECT (HEAD + follow-up HEAD). Stopped costing two when
+//     verification began skipping the follow-up — it fed only responseMs, which
+//     verified_urls never stored.
+//   * then a 2xx (HEAD + soft-404 GET). Stopped costing two when verification
+//     began skipping the sniff — its only outputs are isSoft404 / scoreWeight /
+//     responseMs, none of which verified_urls stores, plus a status category
+//     nothing reads back.
+//   * now a METHOD REJECTION: HEAD answers 405, so the checker re-probes with
+//     GET and classifies on that. Both requests are real measurements the
+//     verification path genuinely needs, so unlike the two above this one cannot
+//     be optimised away — which is what makes it the right fixture to pin a
+//     PER-REQUEST metering rule to.
 const TWO_REQUEST_URL_COUNT = 40;
 // Long enough to clear the soft-404 short-body heuristic (1000 bytes).
 const LONG_BODY = "healthy fixture product page content. ".repeat(60);
@@ -352,9 +361,18 @@ test("the rate ceiling counts REQUESTS, not checks, when a check costs two", asy
   const arrivals: number[] = [];
   const server = createServer((req, res) => {
     arrivals.push(Date.now());
+
+    // 405 to HEAD, 200 to GET: the checker re-probes with GET and judges the
+    // page on that, so every check is exactly two requests. See the note on
+    // TWO_REQUEST_URL_COUNT for why this shape and not a 2xx or a redirect.
+    if (req.method === "HEAD") {
+      res.writeHead(405);
+      res.end();
+      return;
+    }
+
     res.writeHead(200, { "content-type": "text/html" });
-    // HEAD gets no body; the soft-404 GET that follows gets the long one.
-    res.end(req.method === "HEAD" ? undefined : LONG_BODY);
+    res.end(LONG_BODY);
   });
 
   await new Promise<void>((resolve) =>
