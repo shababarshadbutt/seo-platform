@@ -110,11 +110,87 @@ services:
       # hand-crafted request cannot reach an unverified AWS path even when the
       # UI happens to be showing the control.
       AWS_PUBLISH_ENABLED: ${AWS_PUBLISH_ENABLED:-false}
+
+      # --- Phase 1: SFTP input (AWS Transfer Family) ---
+      #
+      # These were MISSING from this file while AWS_PUBLISH_ENABLED was present,
+      # which is a worse failure than the v1.63-Live one described at the top.
+      # There the flag was absent too, so the "From SFTP" tab simply vanished
+      # (fail-closed). Here the flag arrived without the config it needs, so the
+      # tab APPEARED and every pull answered 503 "SFTP is not configured on this
+      # deployment (SFTP_HOST is unset)" — a control the UI offered and the API
+      # refused. :-defaults, per this file's convention, so the stack still comes
+      # up with no .env at all; an unset SFTP_HOST then reads as "SFTP off" and
+      # the endpoint says exactly that.
+      SFTP_HOST: ${SFTP_HOST:-}
+      SFTP_PORT: ${SFTP_PORT:-22}
+      SFTP_USERNAME: ${SFTP_USERNAME:-}
+      SFTP_PRIVATE_KEY_PATH: ${SFTP_PRIVATE_KEY_PATH:-/run/secrets/sftp_private_key}
+      SFTP_PASSWORD: ${SFTP_PASSWORD:-}
+      SFTP_BASE_PATH: ${SFTP_BASE_PATH:-sftp-sitemaps-asapsmei}
+      SFTP_MAX_CONCURRENT_CONNECTIONS: ${SFTP_MAX_CONCURRENT_CONNECTIONS:-4}
+
+      # --- Phase 1: S3 output (no access keys — IAM instance role only) ---
+      S3_BUCKET: ${S3_BUCKET:-asap-cms-prod}
+      # Where objects LIVE in the bucket. Independent of the public url below.
+      S3_SITEMAPS_PREFIX_TEMPLATE: ${S3_SITEMAPS_PREFIX_TEMPLATE:-sites/{domain}/sitemaps/}
+      # Where CloudFront SERVES them — what goes in the sitemap index's <loc>, and
+      # what a CDN invalidation path is derived from. Set by the distribution, not
+      # by our uploader, so it is a SEPARATE knob.
+      PUBLIC_SITEMAP_URL_TEMPLATE: ${PUBLIC_SITEMAP_URL_TEMPLATE:-https://{domain}/sitemaps/{file}}
+      # Unset here rather than defaulted to a region: publishConfigError() refuses
+      # with a 503 naming this variable, which beats writing to a guessed region.
+      AWS_REGION: ${AWS_REGION:-}
+      # Publish never issues DeleteObject calls (explicit decision — removed
+      # sitemap files become absent from the regenerated index, not deleted from
+      # the bucket, since versioning is off and there's no undo).
+      S3_PUBLISH_ALLOW_DELETE: "false"
+
+      # --- Phase 1: CloudFront invalidation ---
+      # Empty means "skip invalidation", which the publish reports as a skipped
+      # stage rather than treating as a failure.
+      CLOUDFRONT_DISTRIBUTION_ID: ${CLOUDFRONT_DISTRIBUTION_ID:-}
+      # Above this many changed files, one scoped wildcard replaces the per-file
+      # path list: CloudFront caps a request at 3,000 paths and bills per path
+      # beyond 1,000/month. Never a distribution-wide "/*", which would evict
+      # every other client site — see .env.example.
+      CLOUDFRONT_WILDCARD_THRESHOLD: ${CLOUDFRONT_WILDCARD_THRESHOLD:-200}
+      CLOUDFRONT_MAX_PATHS_PER_REQUEST: ${CLOUDFRONT_MAX_PATHS_PER_REQUEST:-1000}
+
+      # --- Phase 1: per-domain publish lock (Redis-backed, TTL'd) ---
+      PUBLISH_LOCK_TTL_SECONDS: ${PUBLISH_LOCK_TTL_SECONDS:-300}
+
+      # --- Private-VPC routing for URL health checks (default OFF) ---
+      #
+      # Same contract as docker-compose.aws.yml, where the reasoning is spelled
+      # out at length. OFF by default in both: with it on, a health check for a
+      # mapped host goes to a private VPC address, and ~93 vhosts share each IP,
+      # so a misconfigured map produces a plausible-looking measurement of the
+      # WRONG server. Locally the map file is absent, so nothing is routed.
+      PRIVATE_ROUTE_ENABLED: ${PRIVATE_ROUTE_ENABLED:-false}
+      PRIVATE_HOST_MAP_FILE: /etc/sitemap/private-hosts.conf
+      PRIVATE_ROUTE_SCHEME: ${PRIVATE_ROUTE_SCHEME:-http}
+      PRIVATE_HOST_MAP_RELOAD_SECONDS: ${PRIVATE_HOST_MAP_RELOAD_SECONDS:-60}
+      PRIVATE_MAX_REQUESTS_PER_SECOND: ${PRIVATE_MAX_REQUESTS_PER_SECOND:-5}
+      PRIVATE_RATE_LIMIT_BURST: ${PRIVATE_RATE_LIMIT_BURST:-10}
+      PRIVATE_MAX_CONCURRENCY: ${PRIVATE_MAX_CONCURRENCY:-16}
+      PRIVATE_ROUTE_FAILURE_STREAK: ${PRIVATE_ROUTE_FAILURE_STREAK:-3}
     ports:
       - "${BACKEND_PORT:-3001}:3001"
     volumes:
       - uploads:/uploads
       - exports:/exports
+      # Bind mounts, matching docker-compose.aws.yml. The env vars added above
+      # are useless without the files they point at: SFTP_PRIVATE_KEY_PATH with
+      # nothing mounted at it means key auth cannot work, and the code's only
+      # fallback is SFTP_PASSWORD.
+      #
+      # /etc/sitemap is a DIRECTORY mount on purpose — docker creates a directory
+      # at any missing bind-mount source, so mounting the map file directly turns
+      # a missing file into an EISDIR the app can never read.
+      - ${DIAGNOSTICS_HOST_PATH:-./diagnostics}:/diagnostics
+      - ${PRIVATE_ROUTES_HOST_PATH:-./private-routes}:/etc/sitemap:ro
+      - ${SFTP_PRIVATE_KEY_HOST_PATH:-./secrets/sftp_private_key}:/run/secrets/sftp_private_key:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -155,9 +231,85 @@ services:
       # start, so a job queued while it was on cannot still run after it is
       # turned off.
       AWS_PUBLISH_ENABLED: ${AWS_PUBLISH_ENABLED:-false}
+
+      # --- Phase 1: SFTP input (AWS Transfer Family) ---
+      #
+      # These were MISSING from this file while AWS_PUBLISH_ENABLED was present,
+      # which is a worse failure than the v1.63-Live one described at the top.
+      # There the flag was absent too, so the "From SFTP" tab simply vanished
+      # (fail-closed). Here the flag arrived without the config it needs, so the
+      # tab APPEARED and every pull answered 503 "SFTP is not configured on this
+      # deployment (SFTP_HOST is unset)" — a control the UI offered and the API
+      # refused. :-defaults, per this file's convention, so the stack still comes
+      # up with no .env at all; an unset SFTP_HOST then reads as "SFTP off" and
+      # the endpoint says exactly that.
+      SFTP_HOST: ${SFTP_HOST:-}
+      SFTP_PORT: ${SFTP_PORT:-22}
+      SFTP_USERNAME: ${SFTP_USERNAME:-}
+      SFTP_PRIVATE_KEY_PATH: ${SFTP_PRIVATE_KEY_PATH:-/run/secrets/sftp_private_key}
+      SFTP_PASSWORD: ${SFTP_PASSWORD:-}
+      SFTP_BASE_PATH: ${SFTP_BASE_PATH:-sftp-sitemaps-asapsmei}
+      SFTP_MAX_CONCURRENT_CONNECTIONS: ${SFTP_MAX_CONCURRENT_CONNECTIONS:-4}
+
+      # --- Phase 1: S3 output (no access keys — IAM instance role only) ---
+      S3_BUCKET: ${S3_BUCKET:-asap-cms-prod}
+      # Where objects LIVE in the bucket. Independent of the public url below.
+      S3_SITEMAPS_PREFIX_TEMPLATE: ${S3_SITEMAPS_PREFIX_TEMPLATE:-sites/{domain}/sitemaps/}
+      # Where CloudFront SERVES them — what goes in the sitemap index's <loc>, and
+      # what a CDN invalidation path is derived from. Set by the distribution, not
+      # by our uploader, so it is a SEPARATE knob.
+      PUBLIC_SITEMAP_URL_TEMPLATE: ${PUBLIC_SITEMAP_URL_TEMPLATE:-https://{domain}/sitemaps/{file}}
+      # Unset here rather than defaulted to a region: publishConfigError() refuses
+      # with a 503 naming this variable, which beats writing to a guessed region.
+      AWS_REGION: ${AWS_REGION:-}
+      # Publish never issues DeleteObject calls (explicit decision — removed
+      # sitemap files become absent from the regenerated index, not deleted from
+      # the bucket, since versioning is off and there's no undo).
+      S3_PUBLISH_ALLOW_DELETE: "false"
+
+      # --- Phase 1: CloudFront invalidation ---
+      # Empty means "skip invalidation", which the publish reports as a skipped
+      # stage rather than treating as a failure.
+      CLOUDFRONT_DISTRIBUTION_ID: ${CLOUDFRONT_DISTRIBUTION_ID:-}
+      # Above this many changed files, one scoped wildcard replaces the per-file
+      # path list: CloudFront caps a request at 3,000 paths and bills per path
+      # beyond 1,000/month. Never a distribution-wide "/*", which would evict
+      # every other client site — see .env.example.
+      CLOUDFRONT_WILDCARD_THRESHOLD: ${CLOUDFRONT_WILDCARD_THRESHOLD:-200}
+      CLOUDFRONT_MAX_PATHS_PER_REQUEST: ${CLOUDFRONT_MAX_PATHS_PER_REQUEST:-1000}
+
+      # --- Phase 1: per-domain publish lock (Redis-backed, TTL'd) ---
+      PUBLISH_LOCK_TTL_SECONDS: ${PUBLISH_LOCK_TTL_SECONDS:-300}
+
+      # --- Private-VPC routing for URL health checks (default OFF) ---
+      #
+      # Same contract as docker-compose.aws.yml, where the reasoning is spelled
+      # out at length. OFF by default in both: with it on, a health check for a
+      # mapped host goes to a private VPC address, and ~93 vhosts share each IP,
+      # so a misconfigured map produces a plausible-looking measurement of the
+      # WRONG server. Locally the map file is absent, so nothing is routed.
+      PRIVATE_ROUTE_ENABLED: ${PRIVATE_ROUTE_ENABLED:-false}
+      PRIVATE_HOST_MAP_FILE: /etc/sitemap/private-hosts.conf
+      PRIVATE_ROUTE_SCHEME: ${PRIVATE_ROUTE_SCHEME:-http}
+      PRIVATE_HOST_MAP_RELOAD_SECONDS: ${PRIVATE_HOST_MAP_RELOAD_SECONDS:-60}
+      PRIVATE_MAX_REQUESTS_PER_SECOND: ${PRIVATE_MAX_REQUESTS_PER_SECOND:-5}
+      PRIVATE_RATE_LIMIT_BURST: ${PRIVATE_RATE_LIMIT_BURST:-10}
+      PRIVATE_MAX_CONCURRENCY: ${PRIVATE_MAX_CONCURRENCY:-16}
+      PRIVATE_ROUTE_FAILURE_STREAK: ${PRIVATE_ROUTE_FAILURE_STREAK:-3}
     volumes:
       - uploads:/uploads
       - exports:/exports
+      # Bind mounts, matching docker-compose.aws.yml. The env vars added above
+      # are useless without the files they point at: SFTP_PRIVATE_KEY_PATH with
+      # nothing mounted at it means key auth cannot work, and the code's only
+      # fallback is SFTP_PASSWORD.
+      #
+      # /etc/sitemap is a DIRECTORY mount on purpose — docker creates a directory
+      # at any missing bind-mount source, so mounting the map file directly turns
+      # a missing file into an EISDIR the app can never read.
+      - ${DIAGNOSTICS_HOST_PATH:-./diagnostics}:/diagnostics
+      - ${PRIVATE_ROUTES_HOST_PATH:-./private-routes}:/etc/sitemap:ro
+      - ${SFTP_PRIVATE_KEY_HOST_PATH:-./secrets/sftp_private_key}:/run/secrets/sftp_private_key:ro
     depends_on:
       postgres:
         condition: service_healthy
