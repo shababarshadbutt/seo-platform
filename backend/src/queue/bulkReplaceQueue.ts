@@ -23,6 +23,10 @@ export const APPLY_REDIRECTS_JOB = "apply-redirects" as const;
 export const PATTERN_RENAME_JOB = "pattern-rename" as const;
 export const PATTERN_TRANSFORM_JOB = "pattern-transform" as const;
 export const PATTERN_TRANSFORM_UNDO_JOB = "pattern-transform-undo" as const;
+// Read-only full-population measurement of a transform. Shares the queue, the
+// job row and the one-per-pattern guard with the operations it measures, so a
+// dry run and an apply can never be in flight for the same pattern at once.
+export const PATTERN_TRANSFORM_DRY_RUN_JOB = "pattern-transform-dry-run" as const;
 
 export type BulkReplaceJobData = {
   session_id: string;
@@ -72,7 +76,8 @@ export type BulkReplaceJobName =
   | typeof APPLY_REDIRECTS_JOB
   | typeof PATTERN_RENAME_JOB
   | typeof PATTERN_TRANSFORM_JOB
-  | typeof PATTERN_TRANSFORM_UNDO_JOB;
+  | typeof PATTERN_TRANSFORM_UNDO_JOB
+  | typeof PATTERN_TRANSFORM_DRY_RUN_JOB;
 
 export const bulkReplaceQueue = new Queue<
   BulkReplaceQueueData,
@@ -161,11 +166,17 @@ export async function enqueueApplyRedirectsJob(data: ApplyRedirectsJobData) {
 // pattern+kind): a rename, a transform and an undo all rewrite the same files, so
 // only one may be queued for a pattern at a time. The authoritative guard is the
 // partial unique index in migration 037 — this just avoids duplicate BullMQ jobs.
+//
+// The dry run is on this list even though it writes nothing: measuring a
+// transform while another operation is rewriting the same files would measure a
+// moving target, and applying while a measurement is still running would make
+// the measurement it is gated on describe the wrong state.
 export async function enqueuePatternStructureJob(
   name:
     | typeof PATTERN_RENAME_JOB
     | typeof PATTERN_TRANSFORM_JOB
-    | typeof PATTERN_TRANSFORM_UNDO_JOB,
+    | typeof PATTERN_TRANSFORM_UNDO_JOB
+    | typeof PATTERN_TRANSFORM_DRY_RUN_JOB,
   data: PatternStructureJobData
 ) {
   const jobId = `pattern-structure-${data.pattern_id}`;

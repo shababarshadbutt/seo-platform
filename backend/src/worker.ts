@@ -4,7 +4,7 @@ import { Worker } from "bullmq";
 // Install the TLS policy (corporate SSL-proxy handling) before anything makes
 // an outbound request. (v1.39 Fix 1)
 import "./http/tlsDispatcher.js";
-import { config } from "./config.js";
+import { awsConfigStatus, config } from "./config.js";
 import { initEventLog } from "./diagnostics/eventLog.js";
 import { logPrivateHostMapStatus } from "./http/privateHostMap.js";
 import { closePool } from "./db/pool.js";
@@ -50,6 +50,7 @@ import {
   PATTERN_RENAME_JOB,
   PATTERN_TRANSFORM_JOB,
   PATTERN_TRANSFORM_UNDO_JOB,
+  PATTERN_TRANSFORM_DRY_RUN_JOB,
   closeBulkReplaceQueue,
   type ApplyRedirectsJobData,
   type BulkReplaceJobData,
@@ -105,7 +106,8 @@ import { processApplyRedirectsJob } from "./jobs/applyRedirectsJob.js";
 import {
   processPatternRenameJob,
   processPatternTransformJob,
-  processPatternTransformUndoJob
+  processPatternTransformUndoJob,
+  processPatternTransformDryRunJob
 } from "./jobs/patternStructureJob.js";
 import {
   processCleanupZipsJob,
@@ -119,6 +121,7 @@ import {
 } from "./jobs/maintenanceJobs.js";
 import { destroyZipPool } from "./jobs/zipPool.js";
 import { destroyFileRewritePool } from "./jobs/fileRewritePool.js";
+import { destroyDryRunScanPool } from "./jobs/dryRunScanPool.js";
 import { destroyPatternPopulationPool } from "./jobs/patternPopulationPool.js";
 import { processVerifyUrlsJob } from "./jobs/verifyUrlsJob.js";
 import { processTriageSampleJob } from "./jobs/triageJob.js";
@@ -155,6 +158,12 @@ logPrivateHostMapStatus(app.log, {
   file: config.privateRoute.mapFile,
   reloadSeconds: config.privateRoute.mapReloadSeconds
 });
+
+// Same line the backend logs at boot. Logged SEPARATELY rather than assumed to
+// match: the worker is a different container with its own environment, and it is
+// the one that runs the SFTP pull and the S3 publish jobs, so a deploy that
+// recreated only one of the two would otherwise be invisible until a job failed.
+app.log.info(awsConfigStatus(), "deployment config");
 
 let parseWorker: Worker<
   SitemapJobData,
@@ -216,11 +225,16 @@ function jobDataContext(data: SitemapJobData | undefined) {
   };
 }
 
+// Same names-and-booleans config block as the backend's /health. The worker runs
+// the SFTP pull and the S3 publish JOBS, so it has its own copy of that config
+// and can disagree with the backend about what it has — which is precisely the
+// kind of drift a plain `docker compose up` on the wrong file produces.
 app.get("/health", async () => ({
   ok: true,
   service: "worker",
   status: parseWorker ? "running" : "starting",
-  redisUrl: config.redisUrl.replace(/\/\/.*@/, "//***@")
+  redisUrl: config.redisUrl.replace(/\/\/.*@/, "//***@"),
+  config: awsConfigStatus()
 }));
 
 async function start() {
@@ -342,6 +356,14 @@ async function start() {
 
         if (job.name === PATTERN_TRANSFORM_UNDO_JOB) {
           await processPatternTransformUndoJob(
+            job.data as PatternStructureJobData,
+            app.log
+          );
+          return;
+        }
+
+        if (job.name === PATTERN_TRANSFORM_DRY_RUN_JOB) {
+          await processPatternTransformDryRunJob(
             job.data as PatternStructureJobData,
             app.log
           );
@@ -623,6 +645,7 @@ async function close() {
   await preGenerateZipWorker?.close();
   await destroyZipPool();
   await destroyFileRewritePool();
+  await destroyDryRunScanPool();
   await destroyPatternPopulationPool();
   await closeSitemapQueue();
   await closeBulkReplaceQueue();

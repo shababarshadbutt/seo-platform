@@ -55,9 +55,11 @@ import {
   enqueuePatternStructureJob,
   PATTERN_RENAME_JOB,
   PATTERN_TRANSFORM_JOB,
-  PATTERN_TRANSFORM_UNDO_JOB
+  PATTERN_TRANSFORM_UNDO_JOB,
+  PATTERN_TRANSFORM_DRY_RUN_JOB
 } from "../queue/bulkReplaceQueue.js";
 import {
+  authorisingDryRun,
   claimPatternStructureJob,
   describeKind,
   latestPatternStructureJob,
@@ -172,10 +174,17 @@ import { looksLikeNotFoundUrl } from "../sitemaps/softNotFound.js";
 import {
   parseStructure,
   StructureSyntaxError,
+  transformUrl,
   validateStructures,
   type ParsedStructure
 } from "../sitemaps/transformStructure.js";
 import {
+  buildTransformSampleFile,
+  transformSamplePath
+} from "../sitemaps/transformSampleFile.js";
+import { resolvePatternScanTargets } from "../sitemaps/patternFileScan.js";
+import {
+  applyStructureFilterToRewriter,
   detectPatternStructures,
   parseStructureFilters,
   resolveStructureFilters,
@@ -1118,10 +1127,155 @@ async function scopedPatternSourceFileBreakdown(
   );
 }
 
+// Everything the three transform endpoints (apply, dry run, sample file) agree
+// on about a request: both structures parse, they are consistent with the
+// pattern's {param} count, and the structure scope resolves against the current
+// structure.
+//
+// Extracted rather than copied because a dry run or a sample built under
+// LOOSER validation than the apply would be measuring or showing something the
+// apply would refuse — which is worse than not offering them at all.
+type ResolvedTransformRequest = {
+  current: ParsedStructure;
+  next: ParsedStructure;
+  currentStructureRaw: string;
+  newStructureRaw: string;
+  template: string;
+  sourceRole: string;
+  totalUrls: number;
+  sourceFile: string | null;
+  structureFilters: StructureFilter[];
+  resolvedFilters: ResolvedStructureFilter[];
+};
+
+async function resolveTransformRequest(
+  sessionId: string,
+  patternId: string,
+  body: TransformBody | undefined
+): Promise<
+  | { ok: true; value: ResolvedTransformRequest }
+  | { ok: false; status: number; message: string }
+> {
+  const currentStructureRaw = body?.current_structure;
+  const newStructureRaw = body?.new_structure;
+
+  if (
+    typeof currentStructureRaw !== "string" ||
+    currentStructureRaw.trim().length === 0
+  ) {
+    return { ok: false, status: 400, message: "current_structure is required" };
+  }
+
+  if (
+    typeof newStructureRaw !== "string" ||
+    newStructureRaw.trim().length === 0
+  ) {
+    return { ok: false, status: 400, message: "new_structure is required" };
+  }
+
+  let current: ParsedStructure;
+  let next: ParsedStructure;
+
+  try {
+    current = parseStructure(currentStructureRaw);
+    next = parseStructure(newStructureRaw);
+  } catch (error) {
+    if (error instanceof StructureSyntaxError) {
+      return { ok: false, status: 400, message: error.message };
+    }
+
+    throw error;
+  }
+
+  const patternResult = await pool.query<{
+    template: string;
+    total_urls: string;
+    source_file: string | null;
+    source_role: string;
+  }>(
+    "SELECT template, total_urls, source_file, source_role FROM patterns WHERE session_id = $1 AND id = $2",
+    [sessionId, patternId]
+  );
+
+  if (patternResult.rowCount === 0) {
+    return { ok: false, status: 404, message: "pattern not found" };
+  }
+
+  const template = patternResult.rows[0].template;
+  const validationError = validateStructures(
+    current,
+    next,
+    countTemplateParams(template)
+  );
+
+  if (validationError) {
+    return { ok: false, status: 400, message: validationError };
+  }
+
+  const parsedFilters = parseStructureFilters(body?.structure_filter);
+
+  if (parsedFilters === null) {
+    return { ok: false, status: 400, message: STRUCTURE_FILTER_SHAPE_ERROR };
+  }
+
+  // Resolved against the CURRENT STRUCTURE string, not the pattern template: a
+  // transform addresses named {A}/{B} slots, and the param count has already
+  // been checked against the pattern's.
+  const resolvedFilters = resolveStructureFilters(
+    parsedFilters,
+    currentStructureRaw
+  );
+
+  if (resolvedFilters === null) {
+    return {
+      ok: false,
+      status: 400,
+      message: `structure_filter param_index ${parsedFilters
+        .map((filter) => filter.param_index)
+        .join(", ")} does not all exist in ${currentStructureRaw}`
+    };
+  }
+
+  return {
+    ok: true,
+    value: {
+      current,
+      next,
+      currentStructureRaw,
+      newStructureRaw,
+      template,
+      sourceRole: patternResult.rows[0].source_role,
+      totalUrls: Number(patternResult.rows[0].total_urls),
+      sourceFile: patternResult.rows[0].source_file,
+      structureFilters: parsedFilters,
+      resolvedFilters
+    }
+  };
+}
+
+// The fingerprint a dry run and the apply it authorises must agree on. Keyed on
+// the inputs that change what would be WRITTEN — the structures, the file
+// selection and the scope — and deliberately NOT on new_template, which only
+// renames the pattern's label and cannot change a single <loc>.
+function transformMeasurementFingerprint(options: {
+  currentStructure: string;
+  newStructure: string;
+  sourceFiles: string[];
+  structureFilters: StructureFilter[];
+}): string {
+  return patternStructureFingerprint("TRANSFORM_DRY_RUN", {
+    current_structure: options.currentStructure,
+    new_structure: options.newStructure,
+    source_files: options.sourceFiles,
+    structure_filter: fingerprintFilters(options.structureFilters)
+  });
+}
+
 const PATTERN_STRUCTURE_JOB_NAMES = {
   RENAME: PATTERN_RENAME_JOB,
   TRANSFORM: PATTERN_TRANSFORM_JOB,
-  TRANSFORM_UNDO: PATTERN_TRANSFORM_UNDO_JOB
+  TRANSFORM_UNDO: PATTERN_TRANSFORM_UNDO_JOB,
+  TRANSFORM_DRY_RUN: PATTERN_TRANSFORM_DRY_RUN_JOB
 } as const;
 
 // Start a pattern rename / transform / transform-undo as a background job, and
@@ -3215,6 +3369,53 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           ? sourceFiles
           : breakdown.map((entry) => entry.source_file);
 
+      // GATE: a transform whose population is bigger than the preview pool must
+      // be measured before it is applied.
+      //
+      // The Update Pattern preview is computed from `pattern_urls`, a reservoir
+      // sample capped at PATTERN_URL_POOL_MIN_SIZE (~1,000) rows. When the
+      // pattern holds more URLs than that, the preview has PROVABLY not seen
+      // every value the rule will meet — a split position that suits every
+      // sampled value can still be wrong for a longer one the sample never
+      // contained, and the first anyone would know is the rewritten file.
+      //
+      // So the gate is on exactly that condition, and not on size in the
+      // abstract: when the pool IS the population the preview is already
+      // complete and a second full read would be pure ceremony.
+      const poolSize = await pool.query<{ count: string }>(
+        "SELECT COUNT(*) AS count FROM pattern_urls WHERE pattern_id = $1",
+        [request.params.patternId]
+      );
+      const populationExceedsPool =
+        Number(patternResult.rows[0].total_urls) >
+        Number(poolSize.rows[0].count);
+
+      if (populationExceedsPool) {
+        const measured = await authorisingDryRun(
+          request.params.patternId,
+          transformMeasurementFingerprint({
+            currentStructure: currentStructureRaw,
+            newStructure: newStructureRaw,
+            sourceFiles: selectedFiles,
+            structureFilters
+          })
+        );
+
+        if (!measured) {
+          return reply.code(409).send({
+            error: "Conflict",
+            message:
+              `this pattern holds ${Number(
+                patternResult.rows[0].total_urls
+              ).toLocaleString("en-US")} URLs but the preview only sees ${Number(
+                poolSize.rows[0].count
+              ).toLocaleString("en-US")} of them — ` +
+              "run the full check first, then apply",
+            needs_dry_run: true
+          });
+        }
+      }
+
       return startPatternStructureJob(reply, {
         sessionId: request.params.id,
         patternId: request.params.patternId,
@@ -3239,6 +3440,247 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         },
         filesTotal: selectedFiles.length
       });
+    }
+  );
+
+  // Measure what a transform WOULD do to the whole population, writing nothing.
+  //
+  // This is the answer to "the preview only ever saw ~1,000 sampled URLs". It
+  // reads every file the apply would rewrite and reports the counts, a bounded
+  // histogram of result shapes, and the specific anomalies worth refusing over.
+  // Runs as a background job for the same reason the apply does — same files,
+  // same scale.
+  app.post<{ Params: PatternParams; Body: TransformBody }>(
+    "/api/sessions/:id/patterns/:patternId/transform-dry-run",
+    async (request, reply) => {
+      const resolved = await resolveTransformRequest(
+        request.params.id,
+        request.params.patternId,
+        request.body
+      );
+
+      if (!resolved.ok) {
+        return reply
+          .code(resolved.status)
+          .send(
+            resolved.status === 404
+              ? { error: "Not Found", message: resolved.message }
+              : badRequest(resolved.message)
+          );
+      }
+
+      const sourceFiles = Array.isArray(request.body?.source_files)
+        ? request.body!.source_files.filter(
+            (file): file is string => typeof file === "string"
+          )
+        : [];
+      const breakdown = await patternSourceFileBreakdown(
+        request.params.patternId,
+        resolved.value.totalUrls,
+        resolved.value.sourceFile
+      );
+      const selectedFiles =
+        sourceFiles.length > 0
+          ? sourceFiles
+          : breakdown.map((entry) => entry.source_file);
+
+      return startPatternStructureJob(reply, {
+        sessionId: request.params.id,
+        patternId: request.params.patternId,
+        kind: "TRANSFORM_DRY_RUN",
+        // The SAME fingerprint the apply gate looks for, so a completed dry run
+        // authorises exactly the apply it measured and no other.
+        fingerprint: transformMeasurementFingerprint({
+          currentStructure: resolved.value.currentStructureRaw,
+          newStructure: resolved.value.newStructureRaw,
+          sourceFiles: selectedFiles,
+          structureFilters: resolved.value.structureFilters
+        }),
+        params: {
+          current_structure: resolved.value.currentStructureRaw,
+          new_structure: resolved.value.newStructureRaw,
+          source_files: selectedFiles,
+          structure_filter: resolved.value.structureFilters
+        },
+        filesTotal: selectedFiles.length
+      });
+    }
+  );
+
+  // Build ONE transformed sitemap file the user can download and read, without
+  // changing anything in the session.
+  //
+  // Synchronous, unlike the dry run and the apply: this streams a SINGLE file,
+  // which is seconds even for the largest sitemaps in the fleet, and the user is
+  // waiting on the result to decide whether to continue.
+  app.post<{
+    Params: PatternParams;
+    Body: TransformBody & { source_file?: string };
+  }>(
+    "/api/sessions/:id/patterns/:patternId/transform-sample-file",
+    async (request, reply) => {
+      const resolved = await resolveTransformRequest(
+        request.params.id,
+        request.params.patternId,
+        request.body
+      );
+
+      if (!resolved.ok) {
+        return reply
+          .code(resolved.status)
+          .send(
+            resolved.status === 404
+              ? { error: "Not Found", message: resolved.message }
+              : badRequest(resolved.message)
+          );
+      }
+
+      // The caller normally names the file — the modal already loaded the
+      // occurrence breakdown and knows which one holds the most matches, so
+      // re-deriving it here would repeat a full scan the client already paid
+      // for. Falling back to that scan keeps the endpoint usable on its own.
+      const requestedFile =
+        typeof request.body?.source_file === "string"
+          ? request.body.source_file
+          : null;
+      let displayName = requestedFile;
+
+      if (!displayName) {
+        const breakdown =
+          resolved.value.resolvedFilters.length > 0
+            ? await scopedPatternSourceFileBreakdown(
+                request.params.patternId,
+                request.params.id,
+                resolved.value.sourceRole,
+                resolved.value.template,
+                resolved.value.resolvedFilters
+              )
+            : await patternSourceFileBreakdown(
+                request.params.patternId,
+                resolved.value.totalUrls,
+                resolved.value.sourceFile
+              );
+
+        displayName = breakdown[0]?.source_file ?? null;
+      }
+
+      if (!displayName) {
+        return reply
+          .code(404)
+          .send({
+            error: "Not Found",
+            message: "this pattern has no source file to sample"
+          });
+      }
+
+      const targets = await resolvePatternScanTargets({
+        patternId: request.params.patternId,
+        sessionId: request.params.id,
+        sourceRole: resolved.value.sourceRole,
+        displayNames: [displayName]
+      });
+
+      if (targets.length === 0) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: `${displayName} is no longer available to sample`
+        });
+      }
+
+      // The guard runs FIRST, exactly as in the apply: URLs outside the scoped
+      // structure return null before transformUrl sees them.
+      const rewriteUrl = applyStructureFilterToRewriter(
+        (url: string) =>
+          transformUrl(url, resolved.value.current, resolved.value.next),
+        resolved.value.resolvedFilters
+      );
+
+      let sample;
+
+      try {
+        sample = await buildTransformSampleFile({
+          sessionId: request.params.id,
+          inputPath: targets[0].inputPath,
+          isGzip: targets[0].isGzip,
+          rewriteUrl
+        });
+      } catch (error) {
+        request.log.error(
+          { session_id: request.params.id, file: displayName, error },
+          "transform sample build failed"
+        );
+
+        return reply.code(500).send({
+          error: "Internal Server Error",
+          message: `could not build a sample from ${displayName}`
+        });
+      }
+
+      return reply.send({
+        token: sample.token,
+        source_file: displayName,
+        download_name: `sample-${displayName}`,
+        total_locs: sample.totalLocs,
+        rewritten: sample.rewritten,
+        bytes: sample.bytes,
+        is_gzip: targets[0].isGzip,
+        samples: sample.samples
+      });
+    }
+  );
+
+  // Download a built sample. Session-scoped so a token alone cannot reach
+  // another session's file, and the name is rebuilt from the two ids rather
+  // than taken from the request.
+  app.get<{
+    Params: { id: string; token: string };
+    Querystring: { gzip?: string; name?: string };
+  }>(
+    "/api/sessions/:id/transform-sample/:token",
+    async (request, reply) => {
+      const isGzip = request.query.gzip === "true";
+      const samplePath = transformSamplePath(
+        request.params.id,
+        request.params.token,
+        isGzip
+      );
+
+      if (!samplePath) {
+        return reply
+          .code(400)
+          .send(badRequest("malformed session id or sample token"));
+      }
+
+      try {
+        await access(samplePath);
+      } catch {
+        // Samples are swept on the same age rule as the pre-generated ZIPs, so
+        // "gone" is an ordinary outcome rather than an error worth alarming
+        // about — say what to do instead.
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "this sample has expired — build it again from the modal"
+        });
+      }
+
+      // Sanitised because it reaches a response header: a display filename comes
+      // from an uploaded file's name and is not trusted to be header-safe.
+      const requested =
+        typeof request.query.name === "string" ? request.query.name : "sample";
+      const downloadName = `${sanitizeUploadedFilename(requested)}${
+        isGzip ? ".gz" : ""
+      }`;
+
+      reply.header(
+        "content-type",
+        isGzip ? "application/gzip" : "application/xml; charset=utf-8"
+      );
+      reply.header(
+        "content-disposition",
+        `attachment; filename="${downloadName}"`
+      );
+
+      return reply.send(createReadStream(samplePath));
     }
   );
 

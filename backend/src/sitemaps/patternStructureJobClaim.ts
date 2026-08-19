@@ -41,7 +41,11 @@ export const PATTERN_STRUCTURE_ACTIVE_STATUSES = ["PENDING", "RUNNING"] as const
 // transform later still works.
 const RETRY_WINDOW_MINUTES = 15;
 
-export type PatternStructureKind = "RENAME" | "TRANSFORM" | "TRANSFORM_UNDO";
+export type PatternStructureKind =
+  | "RENAME"
+  | "TRANSFORM"
+  | "TRANSFORM_UNDO"
+  | "TRANSFORM_DRY_RUN";
 
 export type PatternStructureJobRow = {
   id: string;
@@ -59,7 +63,8 @@ export type PatternStructureJobRow = {
 const KIND_LABELS: Record<string, string> = {
   RENAME: "a pattern rename",
   TRANSFORM: "a structure transform",
-  TRANSFORM_UNDO: "a transform undo"
+  TRANSFORM_UNDO: "a transform undo",
+  TRANSFORM_DRY_RUN: "a transform dry run"
 };
 
 export function describeKind(kind: string): string {
@@ -158,6 +163,54 @@ export async function recentlyCompletedJobOfKind(
   );
 
   return result.rowCount === 0 ? null : result.rows[0];
+}
+
+// The dry run that authorises an apply, or null when there isn't one.
+//
+// DELIBERATELY "THE MOST RECENT COMPLETED JOB", not "a completed job within N
+// minutes". A dry run measures the files as they were when it ran, so what
+// invalidates it is not age but any operation that touched those files
+// afterwards — a rename, another transform, an undo. Checking recency instead
+// would happily authorise an apply using numbers taken before an intervening
+// rewrite, which is exactly the stale-measurement class this gate exists to
+// prevent. The fingerprint then confirms it measured THESE structures.
+//
+// The corollary is that a user who reviews for an hour is not punished for it:
+// as long as nothing else ran on the pattern, the measurement still describes
+// the files the apply is about to rewrite.
+export async function authorisingDryRun(
+  patternId: string,
+  fingerprint: string
+): Promise<PatternStructureJobRow | null> {
+  const result = await pool.query<
+    PatternStructureJobRow & { request_fingerprint: string }
+  >(
+    `
+      SELECT id, kind, status, files_total, files_done, urls_rewritten, result,
+             error, started_at, completed_at, request_fingerprint
+      FROM pattern_structure_jobs
+      WHERE pattern_id = $1
+        AND status = 'COMPLETE'
+      ORDER BY completed_at DESC
+      LIMIT 1
+    `,
+    [patternId]
+  );
+
+  if (result.rowCount === 0) {
+    return null;
+  }
+
+  const latest = result.rows[0];
+
+  if (
+    latest.kind !== "TRANSFORM_DRY_RUN" ||
+    latest.request_fingerprint !== fingerprint
+  ) {
+    return null;
+  }
+
+  return latest;
 }
 
 export type ClaimOutcome =

@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  candidateTransforms,
   captureStructureValues,
+  formatStructure,
+  inferNewStructure,
   StructureSyntaxError,
   parseStructure,
   structureParamNames,
@@ -414,4 +417,305 @@ test("a backslash separator silently becomes a slash — verified limitation", (
     ),
     "https://e.com/nsn/2/4"
   );
+});
+
+// --- inferNewStructure ------------------------------------------------------
+// By-example inference: the user retypes a real URL and the rule is derived.
+
+// The two examples the feature was requested for, verbatim.
+
+test("infers a positional split from /nspart/part-720/ to /nsnpart/part-7-20/", () => {
+  const current = parseStructure("/nspart/{A}/");
+  const result = inferNewStructure(
+    "https://nsnstocks.com/nspart/part-720/",
+    "https://nsnstocks.com/nsnpart/part-7-20/",
+    current
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(
+    result.ok && result.structure,
+    "/nsnpart/{A|split|6|-|}/"
+  );
+});
+
+test("infers an added static segment alongside the split", () => {
+  const current = parseStructure("/nspart/{A}/");
+  const result = inferNewStructure(
+    "https://nsnstocks.com/nspart/part-720/",
+    "https://nsnstocks.com/nsnpart/niinpart/part-7-20/",
+    current
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(
+    result.ok && result.structure,
+    "/nsnpart/niinpart/{A|split|6|-|}/"
+  );
+});
+
+// The ambiguity that matters at scale.
+
+test("prefers the positional split over a replace that also fits the example", () => {
+  // "part-720" -> "part-7-20" is equally explained by {A|split|6|-|} and by
+  // {A|7|7-|}. The second changes MORE urls, and turns "part-777" into
+  // "part-7-7-7-", so "more general" must not win.
+  const current = parseStructure("/nspart/{A}/");
+  const result = inferNewStructure(
+    "https://x.com/nspart/part-720/",
+    "https://x.com/nspart/part-7-20/",
+    current
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.structure, "/nspart/{A|split|6|-|}/");
+  // The replace reading is still offered, so a user who wants it can say so.
+  assert.ok(
+    result.ok &&
+      result.alternatives.some((entry) => entry.segment === "{A|7|7-|}"),
+    "the replace reading should be offered as an alternative"
+  );
+});
+
+test("a replace candidate that would fire twice is not offered", () => {
+  // Every reading of "a-b" -> "a-b-b" that uses `replace` hits both halves or
+  // fails to reproduce the example, so only the positional one survives.
+  const current = parseStructure("/p/{A}/");
+  const result = inferNewStructure(
+    "https://x.com/p/a-b/",
+    "https://x.com/p/a-b-b/",
+    current
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.structure, "/p/{A|split|3|-b|}/");
+});
+
+// Alignment, not greedy matching.
+
+test("a new static segment that prefixes the param value does not steal it", () => {
+  // Greedy left-to-right binds {A} to "niin-parts" as {A|-503|} and leaves the
+  // real value as a literal — correct for this one URL, wrong for every other.
+  const current = parseStructure("/nsn/{A}/");
+  const result = inferNewStructure(
+    "https://nsnstocks.com/nsn/niin-parts-503/",
+    "https://nsnstocks.com/nsn/niin-parts/niin-parts-503/",
+    current
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.structure, "/nsn/niin-parts/{A}/");
+});
+
+test("keeps two params in order across an inserted static segment", () => {
+  const current = parseStructure("/a/{A}/{B}/");
+  const result = inferNewStructure(
+    "https://x.com/a/one/two/",
+    "https://x.com/a/one/mid/two/",
+    current
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.structure, "/a/{A}/mid/{B}/");
+});
+
+// The other operators.
+
+test("infers a strip", () => {
+  const current = parseStructure("/manufacturer/{A}/");
+  const result = inferNewStructure(
+    "https://x.com/manufacturer/acme-parts-catalog/",
+    "https://x.com/manufacturer/acme/",
+    current
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(
+    result.ok && result.structure,
+    "/manufacturer/{A|-parts-catalog|}/"
+  );
+});
+
+test("infers lowercasing", () => {
+  const current = parseStructure("/p/{A}/");
+  const result = inferNewStructure(
+    "https://x.com/p/ACME/",
+    "https://x.com/p/acme/",
+    current
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.structure, "/p/{A|lower|}/");
+});
+
+test("infers a dropped trailing slash", () => {
+  const current = parseStructure("/p/{A}/");
+  const result = inferNewStructure(
+    "https://x.com/p/acme/",
+    "https://x.com/p/acme",
+    current
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.structure, "/p/{A}");
+});
+
+test("accepts a bare path as the new URL and inherits the host", () => {
+  const current = parseStructure("/nspart/{A}/");
+  const result = inferNewStructure(
+    "https://nsnstocks.com/nspart/part-720/",
+    "/nsnpart/part-7-20/",
+    current
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.structure, "/nsnpart/{A|split|6|-|}/");
+});
+
+// Refusals. Each of these must fail rather than guess, because the rule is
+// about to be applied to every URL in the pattern.
+
+test("refuses when the new URL drops the varying part entirely", () => {
+  const current = parseStructure("/nspart/{A}/");
+  const result = inferNewStructure(
+    "https://x.com/nspart/part-720/",
+    "https://x.com/nsnpart/fixed/",
+    current
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(
+    (result.ok ? "" : result.error) as string,
+    /collapse to the same literal/
+  );
+});
+
+test("refuses when the new URL reorders the params", () => {
+  const current = parseStructure("/a/{A}/{B}/");
+  const result = inferNewStructure(
+    "https://x.com/a/one/two/",
+    "https://x.com/a/two/one/",
+    current
+  );
+
+  assert.equal(result.ok, false);
+});
+
+test("refuses when nothing changed", () => {
+  const current = parseStructure("/p/{A}/");
+  const result = inferNewStructure(
+    "https://x.com/p/acme/",
+    "https://x.com/p/acme/",
+    current
+  );
+
+  assert.equal(result.ok, false);
+  assert.match((result.ok ? "" : result.error) as string, /identical/);
+});
+
+test("refuses when the example does not match the current structure", () => {
+  const current = parseStructure("/other/{A}/");
+  const result = inferNewStructure(
+    "https://x.com/nspart/part-720/",
+    "https://x.com/nsnpart/part-7-20/",
+    current
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(
+    (result.ok ? "" : result.error) as string,
+    /does not match the current structure/
+  );
+});
+
+test("warns, but still infers, when the host differs", () => {
+  const current = parseStructure("/nspart/{A}/");
+  const result = inferNewStructure(
+    "https://nsnstocks.com/nspart/part-720/",
+    "https://elsewhere.com/nsnpart/part-7-20/",
+    current
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.structure, "/nsnpart/{A|split|6|-|}/");
+  assert.ok(
+    result.ok && result.warnings.some((note) => /host/.test(note)),
+    "a host change should be called out"
+  );
+});
+
+// Whatever the inference returns must survive the round trip through the same
+// gates a hand-typed structure goes through — that is the property the apply
+// path depends on.
+
+test("every inferred structure re-parses and reproduces the example", () => {
+  const cases: Array<[string, string, string]> = [
+    ["/nspart/{A}/", "https://x.com/nspart/part-720/", "https://x.com/nsnpart/part-7-20/"],
+    ["/nspart/{A}/", "https://x.com/nspart/part-720/", "https://x.com/a/b/part-7-20/"],
+    ["/nsn/{A}/", "https://x.com/nsn/niin-parts-503/", "https://x.com/nsn/niin-parts/niin-parts-503/"],
+    ["/m/{A}/", "https://x.com/m/acme-parts-catalog/", "https://x.com/m/acme"],
+    ["/a/{A}/{B}/", "https://x.com/a/one/two/", "https://x.com/a/one/mid/two/"]
+  ];
+
+  for (const [currentRaw, oldUrl, newUrl] of cases) {
+    const current = parseStructure(currentRaw);
+    const result = inferNewStructure(oldUrl, newUrl, current);
+
+    assert.equal(result.ok, true, `${oldUrl} -> ${newUrl} should infer`);
+
+    if (!result.ok) {
+      continue;
+    }
+
+    const next = parseStructure(result.structure);
+
+    assert.equal(
+      validateStructures(current, next, structureParamNames(current).length),
+      null,
+      `${result.structure} should validate`
+    );
+    assert.equal(
+      new URL(transformUrl(oldUrl, current, next) as string).pathname,
+      new URL(newUrl, oldUrl).pathname,
+      `${result.structure} should reproduce the example`
+    );
+  }
+});
+
+// --- candidateTransforms ----------------------------------------------------
+
+test("candidateTransforms returns an exact match alone", () => {
+  assert.deepEqual(candidateTransforms("acme", "acme"), [{ kind: "none" }]);
+});
+
+test("candidateTransforms offers nothing for an unrelated literal", () => {
+  // No shared material at either end: the user typed a static segment, not a
+  // transform of the value.
+  assert.deepEqual(candidateTransforms("part-720", "nsnpart"), []);
+});
+
+test("candidateTransforms puts the positional reading first", () => {
+  const candidates = candidateTransforms("part-720", "part-7-20");
+
+  assert.deepEqual(candidates[0], {
+    kind: "insertAt",
+    position: 6,
+    separator: "-"
+  });
+});
+
+// --- formatStructure --------------------------------------------------------
+
+test("formatStructure is the inverse of parseStructure", () => {
+  for (const raw of [
+    "/nsnpart/{A|split|6|-|}/",
+    "/manufacturer/{A|-parts-catalog|}/{B}",
+    "/p/{A|upper|}/",
+    "/p/{A|old|new|}/",
+    "/a/b/c/"
+  ]) {
+    const parsed = parseStructure(raw);
+
+    assert.equal(formatStructure(parsed.segments, parsed.trailingSlash), raw);
+  }
 });

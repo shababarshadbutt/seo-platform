@@ -470,30 +470,30 @@ export async function rewriteSpecificLocs(options: {
   });
 }
 
-// Count <loc> URLs in a sitemap file that satisfy `matchesUrl`, WITHOUT writing
-// anything anywhere — a read-only sibling of rewriteSitemapLocFile for
-// previewing how many URLs an edit would touch before it runs. Built on the
-// exact same LocRewriteTransform (CDATA-aware, chunk-boundary-safe <loc>
+// Stream every <loc> URL in a sitemap file past `visit`, WITHOUT writing
+// anything anywhere — the read-only sibling of rewriteSitemapLocFile. Built on
+// the exact same LocRewriteTransform (CDATA-aware, chunk-boundary-safe <loc>
 // parsing) that the real rewrite uses, by giving it a rewriter that always
-// returns null (never rewrites) but tallies a match first — so a preview count
+// returns null (never rewrites) but reports the URL first — so a read-only pass
 // can never disagree with the real rewrite about what counts as a <loc>, or
 // about which URLs inside one are well-formed.
-export async function countSitemapLocMatches(options: {
+//
+// `visit` is called once per <loc>, in file order, and its return value is
+// ignored. It must not throw: a throw destroys the pipeline mid-file and the
+// caller cannot tell a parse failure from a visitor bug.
+export async function scanSitemapLocs(options: {
   inputPath: string;
   isGzip: boolean;
-  matchesUrl: (url: string) => boolean;
-}): Promise<number> {
-  let matched = 0;
-  const countOnly: LocUrlRewriter = (url) => {
-    if (options.matchesUrl(url)) {
-      matched += 1;
-    }
+  visit: (url: string) => void;
+}): Promise<void> {
+  const observeOnly: LocUrlRewriter = (url) => {
+    options.visit(url);
 
     return null;
   };
-  const transform = new LocRewriteTransform(countOnly);
+  const transform = new LocRewriteTransform(observeOnly);
   const readable = createReadStream(options.inputPath);
-  // Discards output — this call exists only for its side effect on `matched`.
+  // Discards output — this call exists only for the visitor's side effects.
   const sink = new Writable({
     write(_chunk, _encoding, callback) {
       callback();
@@ -504,6 +504,30 @@ export async function countSitemapLocMatches(options: {
     : [readable, transform, sink];
 
   await pipeline(stages);
+}
+
+// How many <loc> URLs in a sitemap file satisfy `matchesUrl` — for previewing
+// how many URLs an edit would touch before it runs.
+//
+// A thin wrapper over scanSitemapLocs rather than its own pipeline, so the
+// counting pass and the richer dry-run pass cannot drift on what they consider
+// a <loc>.
+export async function countSitemapLocMatches(options: {
+  inputPath: string;
+  isGzip: boolean;
+  matchesUrl: (url: string) => boolean;
+}): Promise<number> {
+  let matched = 0;
+
+  await scanSitemapLocs({
+    inputPath: options.inputPath,
+    isGzip: options.isGzip,
+    visit: (url) => {
+      if (options.matchesUrl(url)) {
+        matched += 1;
+      }
+    }
+  });
 
   return matched;
 }

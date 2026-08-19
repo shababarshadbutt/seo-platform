@@ -10,6 +10,7 @@ import { isZipCacheFresh } from "../exports/sessionZipCache.js";
 import { resolveSessionZipPlan } from "../routes/sessions.js";
 import { runZipJob } from "./zipPool.js";
 import { sweepStaleArtifacts } from "../sitemaps/staleArtifactSweep.js";
+import { isTransformSampleName } from "../sitemaps/transformSampleFile.js";
 import {
   ZIP_MAX_AGE_MS,
   type PreGenerateZipJobData
@@ -178,7 +179,12 @@ export async function processCleanupZipsJob(logger: FastifyBaseLogger) {
   const entries = await readdir(config.exportDir).catch(() => [] as string[]);
 
   for (const name of entries) {
-    if (!PRE_GEN_ZIP_NAME.test(name)) {
+    // Transform sample files are swept on the same age rule as the ZIPs. They
+    // need a durable sweep for the same reason the Cleaner run dirs did: nothing
+    // in the database records that a sample exists, so an API restart between
+    // building one and the user downloading it would otherwise orphan it
+    // permanently.
+    if (!PRE_GEN_ZIP_NAME.test(name) && !isTransformSampleName(name)) {
       continue; // leave other exports (CSV/XLSX/PDF) alone
     }
 

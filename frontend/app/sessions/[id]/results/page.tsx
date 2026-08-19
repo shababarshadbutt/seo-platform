@@ -115,11 +115,17 @@ import {
   getRuntimeConfig,
   publishSession,
   type PublishPreview,
+  buildTransformSample,
+  downloadTransformSample,
+  runTransformDryRun,
+  type TransformDryRunResult,
+  type TransformSampleResult,
   type PublishProgressEvent
 } from "@/lib/api";
 import {
   convertParamToABC,
   countTemplateParams,
+  inferNewStructure,
   parseStructure,
   StructureSyntaxError,
   structureParamNames,
@@ -134,6 +140,10 @@ import {
 import { DeleteUrlDialog } from "@/components/delete-url-dialog";
 import { ProblemUrlsDialog } from "@/components/problem-urls-dialog";
 import { PatternVerifyPanel } from "@/components/pattern-verify-panel";
+import {
+  TransformDryRunPanel,
+  TransformSamplePanel
+} from "@/components/transform-verify-panel";
 import {
   resolveStructureFilters,
   urlMatchesStructureFilters
@@ -251,6 +261,12 @@ type FixAction = "fix" | "delete" | "skip";
 //     deleted anyway, so it's excluded from both actions until reviewed;
 //   • verified + not-found destination → Delete;
 //   • verified + normal → Fix.
+// Before/after pairs shown in the sampled preview. Ten, matching the number the
+// sample FILE carries, so a user comparing the two lists is comparing like with
+// like. (Was three until the by-example flow made this the first place a rule is
+// judged.)
+const TRANSFORM_PREVIEW_SAMPLES = 10;
+
 // Human byte size for the publish preview's "how much am I overwriting" line.
 function formatBytes(bytes: number) {
   if (bytes < 1024) {
@@ -895,6 +911,28 @@ export default function ResultsDashboardPage({
   const [transformStep, setTransformStep] = useState<"form" | "preview">(
     "form"
   );
+  // BY EXAMPLE is the default way in (v1.65): the modal shows a real URL from
+  // the selected structure and the user retypes it as the URL they want, rather
+  // than composing {A|split|6|-|} by hand. The token fields still exist behind
+  // "Advanced" — they express rules the example form cannot state unambiguously,
+  // and every existing test and habit depends on them.
+  const [transformMode, setTransformMode] = useState<"example" | "expression">(
+    "example"
+  );
+  // The real URL the example is edited FROM. Held in state rather than read
+  // straight from the scoped pool so it cannot change under the user mid-edit;
+  // it is re-seeded when the pattern or the structure scope changes.
+  const [transformOldExample, setTransformOldExample] = useState("");
+  const [transformNewExample, setTransformNewExample] = useState("");
+  const [transformSample, setTransformSample] =
+    useState<TransformSampleResult | null>(null);
+  const [isBuildingSample, setIsBuildingSample] = useState(false);
+  const [isDownloadingSample, setIsDownloadingSample] = useState(false);
+  const [sampleError, setSampleError] = useState<string | null>(null);
+  const [transformDryRun, setTransformDryRun] =
+    useState<TransformDryRunResult | null>(null);
+  const [isRunningDryRun, setIsRunningDryRun] = useState(false);
+  const [dryRunError, setDryRunError] = useState<string | null>(null);
   const [isTransforming, setIsTransforming] = useState(false);
   const [undoingTransformId, setUndoingTransformId] = useState<string | null>(
     null
@@ -2163,7 +2201,7 @@ export default function ResultsDashboardPage({
         {
           newTemplate: renameValue,
           currentStructure: transformCurrentStructure,
-          newStructure: transformNewStructure,
+          newStructure: effectiveNewStructure,
           sourceFiles: Array.from(selectedRenameFiles),
           structureFilters: renameStructureFilters
         },
@@ -2202,6 +2240,100 @@ export default function ResultsDashboardPage({
       });
     } finally {
       setIsTransforming(false);
+      setStructureProgress(null);
+    }
+  }
+
+  // Build a corrected copy of ONE file. Writes nothing to the session, so it is
+  // safe to click repeatedly while tuning the rule.
+  async function handleBuildSample() {
+    if (!renameRow || isBuildingSample) {
+      return;
+    }
+
+    setIsBuildingSample(true);
+    setSampleError(null);
+
+    try {
+      const result = await buildTransformSample(params.id, renameRow.id, {
+        currentStructure: transformCurrentStructure,
+        newStructure: effectiveNewStructure,
+        sourceFiles: Array.from(selectedRenameFiles),
+        // The modal already loaded the occurrence breakdown, ordered by how many
+        // of this pattern's URLs each file holds, so naming a file here saves the
+        // server re-deriving it with a second full scan.
+        //
+        // The first SELECTED one, not simply the first: sampling a file the user
+        // has unticked would show them a change that is not going to happen to
+        // it, which is worse than sampling a smaller file that is.
+        sourceFile:
+          renameSourceFiles.find((file) =>
+            selectedRenameFiles.has(file.source_file)
+          )?.source_file ?? null,
+        structureFilters: renameStructureFilters
+      });
+
+      setTransformSample(result);
+    } catch (error) {
+      setTransformSample(null);
+      setSampleError(
+        friendlyApiErrorMessage(error, "Unable to build a sample file.")
+      );
+    } finally {
+      setIsBuildingSample(false);
+    }
+  }
+
+  async function handleDownloadSample() {
+    if (!transformSample || isDownloadingSample) {
+      return;
+    }
+
+    setIsDownloadingSample(true);
+    setSampleError(null);
+
+    try {
+      await downloadTransformSample(params.id, transformSample);
+    } catch (error) {
+      setSampleError(
+        friendlyApiErrorMessage(error, "Unable to download the sample file.")
+      );
+    } finally {
+      setIsDownloadingSample(false);
+    }
+  }
+
+  // Read every file the apply would touch and report what it WOULD produce.
+  async function handleRunDryRun() {
+    if (!renameRow || isRunningDryRun) {
+      return;
+    }
+
+    setIsRunningDryRun(true);
+    setDryRunError(null);
+    setStructureProgress(null);
+
+    try {
+      const result = await runTransformDryRun(
+        params.id,
+        renameRow.id,
+        {
+          currentStructure: transformCurrentStructure,
+          newStructure: effectiveNewStructure,
+          sourceFiles: Array.from(selectedRenameFiles),
+          structureFilters: renameStructureFilters
+        },
+        setStructureProgress
+      );
+
+      setTransformDryRun(result);
+    } catch (error) {
+      setTransformDryRun(null);
+      setDryRunError(
+        friendlyApiErrorMessage(error, "Unable to check every URL.")
+      );
+    } finally {
+      setIsRunningDryRun(false);
       setStructureProgress(null);
     }
   }
@@ -2849,6 +2981,55 @@ export default function ResultsDashboardPage({
   // Optional URL-structure transformation, entered below the label rename.
   // Empty "current structure" => label-only rename (backward compatible).
   const wantsTransform = transformCurrentStructure.trim().length > 0;
+
+  // The rule derived from the before/after example pair. Recomputed as the user
+  // types, entirely client-side — inferNewStructure is byte-mirrored from the
+  // backend copy (see the sync-guard test), so what is shown here is what the
+  // API will re-derive and apply.
+  const exampleInference = useMemo(() => {
+    if (
+      transformMode !== "example" ||
+      transformOldExample.length === 0 ||
+      transformNewExample.trim().length === 0 ||
+      transformCurrentStructure.trim().length === 0
+    ) {
+      return null;
+    }
+
+    try {
+      return inferNewStructure(
+        transformOldExample,
+        transformNewExample,
+        parseStructure(transformCurrentStructure)
+      );
+    } catch (error) {
+      return {
+        ok: false as const,
+        error:
+          error instanceof StructureSyntaxError
+            ? error.message
+            : "Invalid current structure"
+      };
+    }
+  }, [
+    transformMode,
+    transformOldExample,
+    transformNewExample,
+    transformCurrentStructure
+  ]);
+
+  // ONE source of truth for everything downstream — validation, preview, the
+  // sample, the dry run and the apply all read this. In example mode it is
+  // derived; in expression mode it is what was typed. Deriving rather than
+  // writing the inferred rule back into transformNewStructure keeps the two
+  // modes from fighting over the same state.
+  const effectiveNewStructure =
+    transformMode === "example"
+      ? exampleInference?.ok
+        ? exampleInference.structure
+        : ""
+      : transformNewStructure;
+
   let transformError: string | null = null;
   // True when the current structure has no {A} placeholders at all while the
   // pattern does have changing segments — i.e. a literal example URL was typed
@@ -2859,12 +3040,20 @@ export default function ResultsDashboardPage({
     null;
 
   if (wantsTransform) {
-    if (transformNewStructure.trim().length === 0) {
-      transformError = "Enter the new URL structure";
+    if (exampleInference && !exampleInference.ok) {
+      // The inference refuses rather than guesses — surface its reason, which is
+      // specific about what the example did not keep, instead of a generic
+      // "enter a structure".
+      transformError = exampleInference.error;
+    } else if (effectiveNewStructure.trim().length === 0) {
+      transformError =
+        transformMode === "example"
+          ? "Enter the URL you want instead"
+          : "Enter the new URL structure";
     } else {
       try {
         const current = parseStructure(transformCurrentStructure);
-        const next = parseStructure(transformNewStructure);
+        const next = parseStructure(effectiveNewStructure);
         const patternParamCount = countTemplateParams(renameRow?.template ?? "");
         const validation = validateStructures(
           current,
@@ -3029,7 +3218,9 @@ export default function ResultsDashboardPage({
             (entry): entry is { before: string; after: string } =>
               entry !== null
           )
-          .slice(0, 3)
+          // Ten, matching the sample file's ten, so the two lists are directly
+          // comparable when both are on screen.
+          .slice(0, TRANSFORM_PREVIEW_SAMPLES)
       : [];
 
   // How many of the scoped URLs the transform would actually rewrite — the
@@ -3127,6 +3318,55 @@ export default function ResultsDashboardPage({
   // A real URL from the chosen combination, shown under "Current URL structure"
   // so the user edits against something concrete rather than a placeholder.
   const scopedExampleUrl = scopedPoolUrls[0] ?? null;
+
+  // Seed the by-example pair whenever the URL it should be edited FROM changes
+  // — a different pattern, or a different structure scope within one. The new
+  // field starts as a copy of the old, which is the whole interaction: edit the
+  // URL into the URL you want.
+  //
+  // Keyed on the URL itself rather than on "the modal opened", because the
+  // scoped pool arrives asynchronously and the dropdowns can narrow it later;
+  // both cases must re-seed, and neither should overwrite the user's typing
+  // while the source URL is unchanged.
+  useEffect(() => {
+    setTransformOldExample(scopedExampleUrl ?? "");
+    setTransformNewExample(scopedExampleUrl ?? "");
+  }, [scopedExampleUrl]);
+
+  // A sample file and a full-population check describe ONE rule. The moment the
+  // rule changes they describe something that is no longer on screen, and a
+  // stale "6.5M URLs would change" next to an edited rule is worse than no
+  // number at all. (The server enforces the same thing for the apply gate via
+  // the measurement fingerprint; this is the visible half.)
+  useEffect(() => {
+    setTransformSample(null);
+    setTransformDryRun(null);
+    setSampleError(null);
+    setDryRunError(null);
+  }, [transformCurrentStructure, effectiveNewStructure, renameRow?.id]);
+
+  // The full check is REQUIRED when the pattern holds more URLs than the
+  // preview pool: the preview has then provably not seen every value the rule
+  // will meet, so "it looked right in the samples" is not evidence about the
+  // population. The server enforces the same condition; this only decides what
+  // the button says. Mirrors the backend gate in POST .../transform.
+  const previewPoolSize = renameStructures?.url_pool_size ?? 0;
+  const dryRunRequired =
+    renameRow !== null &&
+    previewPoolSize > 0 &&
+    renameRow.totalUrls > previewPoolSize;
+
+  // Why Apply is disabled, in the user's terms, or null when it is not. Stated
+  // once here rather than duplicated between the button's disabled prop and the
+  // sentence above it, so the two can never disagree about the reason.
+  const applyBlockedReason =
+    dryRunRequired && transformDryRun === null
+      ? `This pattern holds ${formatNumber(
+          renameRow?.totalUrls ?? 0
+        )} URLs but the preview above only sees ${formatNumber(
+          previewPoolSize
+        )} of them. Run the full check before applying.`
+      : null;
 
   // "niin-parts-{var} + {var}-parts-catalog" — reads the same order as the
   // dropdowns above it.
@@ -5598,95 +5838,207 @@ export default function ResultsDashboardPage({
                 </div>
 
                 <div className="space-y-3 rounded-md border border-dashed border-slate-300 p-3">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                    URL Structure Transformation (optional)
-                  </p>
-                  <div className="space-y-1">
-                    <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
-                      <label
-                        htmlFor="transform-current"
-                        className="text-sm font-semibold text-slate-700"
-                      >
-                        Current URL structure
-                      </label>
-                      {/* Always-available recovery, not just an error-state
-                          affordance: the field is pre-filled on open, so the
-                          only way to reach the 0-param dead end is to type over
-                          it — and then there was no way back without knowing
-                          the {A} syntax. One click restores a structure that is
-                          valid for this pattern BY CONSTRUCTION. (v1.52) */}
-                      {structureStarterUsable ? (
-                        <button
-                          type="button"
-                          data-testid="use-pattern-structure"
-                          className="min-w-0 max-w-full truncate rounded border border-indigo-200 bg-indigo-50 px-2 py-0.5 font-mono text-xs text-indigo-800 hover:bg-indigo-100"
-                          title={`Use ${structureStarter}`}
-                          onClick={() =>
-                            setTransformCurrentStructure(structureStarter)
-                          }
-                        >
-                          Use {structureStarter}
-                        </button>
-                      ) : null}
-                    </div>
-                    <Input
-                      id="transform-current"
-                      value={transformCurrentStructure}
-                      onChange={(event) =>
-                        setTransformCurrentStructure(event.target.value)
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                      URL Structure Transformation (optional)
+                    </p>
+                    <button
+                      type="button"
+                      data-testid="toggle-transform-mode"
+                      className="rounded border border-slate-200 px-2 py-0.5 text-xs text-slate-600 hover:bg-slate-50"
+                      onClick={() =>
+                        setTransformMode(
+                          transformMode === "example" ? "expression" : "example"
+                        )
                       }
-                      placeholder="/manufacturer/{A}/{B}"
-                      autoComplete="off"
-                      className="font-mono text-sm"
-                      aria-invalid={transformNeedsPlaceholders}
-                    />
-                    {/* A REAL URL from the selected combination (v1.51), so the
-                        structure above is edited against something concrete
-                        rather than a generic placeholder. */}
-                    {scopedExampleUrl ? (
-                      <p
-                        className="break-all text-xs text-slate-500"
-                        data-testid="scoped-example-url"
-                      >
-                        <span className="text-slate-400">Matching URL: </span>
-                        <span className="font-mono">{scopedExampleUrl}</span>
-                      </p>
-                    ) : null}
-                  </div>
-                  <div className="space-y-1">
-                    <label
-                      htmlFor="transform-new"
-                      className="text-sm font-semibold text-slate-700"
                     >
-                      New URL structure
-                    </label>
-                    <Input
-                      id="transform-new"
-                      value={transformNewStructure}
-                      onChange={(event) =>
-                        setTransformNewStructure(event.target.value)
-                      }
-                      placeholder="/manufacturer/{A|-parts-catalog|}/{B}/"
-                      autoComplete="off"
-                      className="font-mono text-sm"
-                      aria-invalid={Boolean(transformError)}
-                    />
-                    {renameStripNote ? (
-                      <p className="text-xs text-indigo-700">
-                        ℹ️ {renameStripNote}
-                      </p>
-                    ) : null}
+                      {transformMode === "example"
+                        ? "Advanced: write the rule"
+                        : "Back to editing a URL"}
+                    </button>
                   </div>
-                  <p className="text-xs text-slate-500">
-                    Use {"{A}"}, {"{B}"}, {"{C}"}… to name each segment. You can
-                    modify the values — e.g. if {"{A}"} contains
-                    &quot;-parts-catalog&quot;, write{" "}
-                    <code className="rounded bg-slate-100 px-1 font-mono">
-                      {"{A|-parts-catalog|}"}
-                    </code>{" "}
-                    to strip it. Static segments and trailing slashes can be
-                    added or removed.
-                  </p>
+
+                  {transformMode === "example" ? (
+                    <>
+                      {/* BY EXAMPLE. The old URL is real and read-only; the new
+                          one starts as a copy of it and is edited into the URL
+                          the user wants. The rule is derived from the pair. */}
+                      <div className="space-y-1">
+                        <p className="text-sm font-semibold text-slate-700">
+                          A URL in this pattern now
+                        </p>
+                        {transformOldExample ? (
+                          <p
+                            className="break-all rounded-md bg-slate-50 px-3 py-2 font-mono text-sm text-slate-700"
+                            data-testid="transform-old-example"
+                          >
+                            {transformOldExample}
+                          </p>
+                        ) : (
+                          <p className="rounded-md bg-slate-50 px-3 py-2 text-sm text-slate-500">
+                            No matching URL is available for this
+                            {hasStructureScope ? " combination" : " pattern"}
+                            {scopeMatchesNothing
+                              ? " — change the dropdowns above."
+                              : "."}
+                          </p>
+                        )}
+                      </div>
+
+                      <div className="space-y-1">
+                        <label
+                          htmlFor="transform-new-example"
+                          className="text-sm font-semibold text-slate-700"
+                        >
+                          What it should be
+                        </label>
+                        <Input
+                          id="transform-new-example"
+                          data-testid="transform-new-example"
+                          value={transformNewExample}
+                          onChange={(event) =>
+                            setTransformNewExample(event.target.value)
+                          }
+                          disabled={!transformOldExample}
+                          placeholder="https://example.com/nsnpart/part-7-20/"
+                          autoComplete="off"
+                          className="font-mono text-sm"
+                          aria-invalid={Boolean(transformError)}
+                        />
+                        <p className="text-xs text-slate-500">
+                          Edit the URL above into the one you want. The same
+                          change is worked out for every URL in this pattern —
+                          you never type {"{A}"} yourself.
+                        </p>
+                      </div>
+
+                      {exampleInference?.ok ? (
+                        <div
+                          className="space-y-1 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2"
+                          data-testid="inferred-rule"
+                        >
+                          <p className="text-xs font-semibold text-emerald-900">
+                            Rule worked out from your example
+                          </p>
+                          <p className="break-all font-mono text-xs text-emerald-800">
+                            {transformCurrentStructure} →{" "}
+                            {exampleInference.structure}
+                          </p>
+                          {exampleInference.warnings.map((warning) => (
+                            <p
+                              key={warning}
+                              className="text-xs text-amber-800"
+                            >
+                              ⚠️ {warning}
+                            </p>
+                          ))}
+                          {exampleInference.alternatives.length > 0 ? (
+                            <p className="text-xs text-emerald-900">
+                              Another reading of the same example is{" "}
+                              <code className="break-all font-mono">
+                                {exampleInference.alternatives[0].segment}
+                              </code>
+                              . Use Advanced if that is the one you meant.
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    <>
+                      <div className="space-y-1">
+                        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+                          <label
+                            htmlFor="transform-current"
+                            className="text-sm font-semibold text-slate-700"
+                          >
+                            Current URL structure
+                          </label>
+                          {/* Always-available recovery, not just an error-state
+                              affordance: the field is pre-filled on open, so the
+                              only way to reach the 0-param dead end is to type
+                              over it — and then there was no way back without
+                              knowing the {A} syntax. One click restores a
+                              structure that is valid for this pattern BY
+                              CONSTRUCTION. (v1.52) */}
+                          {structureStarterUsable ? (
+                            <button
+                              type="button"
+                              data-testid="use-pattern-structure"
+                              className="min-w-0 max-w-full truncate rounded border border-indigo-200 bg-indigo-50 px-2 py-0.5 font-mono text-xs text-indigo-800 hover:bg-indigo-100"
+                              title={`Use ${structureStarter}`}
+                              onClick={() =>
+                                setTransformCurrentStructure(structureStarter)
+                              }
+                            >
+                              Use {structureStarter}
+                            </button>
+                          ) : null}
+                        </div>
+                        <Input
+                          id="transform-current"
+                          value={transformCurrentStructure}
+                          onChange={(event) =>
+                            setTransformCurrentStructure(event.target.value)
+                          }
+                          placeholder="/manufacturer/{A}/{B}"
+                          autoComplete="off"
+                          className="font-mono text-sm"
+                          aria-invalid={transformNeedsPlaceholders}
+                        />
+                        {/* A REAL URL from the selected combination (v1.51), so
+                            the structure above is edited against something
+                            concrete rather than a generic placeholder. */}
+                        {scopedExampleUrl ? (
+                          <p
+                            className="break-all text-xs text-slate-500"
+                            data-testid="scoped-example-url"
+                          >
+                            <span className="text-slate-400">
+                              Matching URL:{" "}
+                            </span>
+                            <span className="font-mono">
+                              {scopedExampleUrl}
+                            </span>
+                          </p>
+                        ) : null}
+                      </div>
+                      <div className="space-y-1">
+                        <label
+                          htmlFor="transform-new"
+                          className="text-sm font-semibold text-slate-700"
+                        >
+                          New URL structure
+                        </label>
+                        <Input
+                          id="transform-new"
+                          value={transformNewStructure}
+                          onChange={(event) =>
+                            setTransformNewStructure(event.target.value)
+                          }
+                          placeholder="/manufacturer/{A|-parts-catalog|}/{B}/"
+                          autoComplete="off"
+                          className="font-mono text-sm"
+                          aria-invalid={Boolean(transformError)}
+                        />
+                        {renameStripNote ? (
+                          <p className="text-xs text-indigo-700">
+                            ℹ️ {renameStripNote}
+                          </p>
+                        ) : null}
+                      </div>
+                      <p className="text-xs text-slate-500">
+                        Use {"{A}"}, {"{B}"}, {"{C}"}… to name each segment. You
+                        can modify the values — e.g. if {"{A}"} contains
+                        &quot;-parts-catalog&quot;, write{" "}
+                        <code className="rounded bg-slate-100 px-1 font-mono">
+                          {"{A|-parts-catalog|}"}
+                        </code>{" "}
+                        to strip it. Static segments and trailing slashes can be
+                        added or removed.
+                      </p>
+                    </>
+                  )}
                   {transformError ? (
                     <div className="min-w-0 space-y-1" role="alert">
                       <p className="break-words text-sm text-red-500">
@@ -5919,11 +6271,40 @@ export default function ResultsDashboardPage({
                     </ul>
                   )}
                 </div>
+                {/* Neither of these writes anything. They sit between the
+                    sampled preview above and the irreversible-ish apply below,
+                    because the preview can only ever speak for the ~1,000 URLs
+                    it was computed from. */}
+                <TransformSamplePanel
+                  sample={transformSample}
+                  isBuilding={isBuildingSample}
+                  isDownloading={isDownloadingSample}
+                  error={sampleError}
+                  onBuild={() => void handleBuildSample()}
+                  onDownload={() => void handleDownloadSample()}
+                />
+                <TransformDryRunPanel
+                  result={transformDryRun}
+                  isRunning={isRunningDryRun}
+                  progressLabel={structureProgressLabel}
+                  error={dryRunError}
+                  required={dryRunRequired}
+                  onRun={() => void handleRunDryRun()}
+                />
+
                 <p className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">
                   ⚠️ This will rewrite {formatNumber(selectedRenameFiles.size)}{" "}
                   XML file{selectedRenameFiles.size === 1 ? "" : "s"} on disk. A
                   backup is kept for undo.
                 </p>
+                {applyBlockedReason ? (
+                  <p
+                    className="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-700"
+                    data-testid="apply-blocked-reason"
+                  >
+                    {applyBlockedReason}
+                  </p>
+                ) : null}
                 <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
                   <Button
                     type="button"
@@ -5935,7 +6316,12 @@ export default function ResultsDashboardPage({
                   </Button>
                   <Button
                     type="button"
-                    disabled={isTransforming}
+                    disabled={
+                      isTransforming ||
+                      isRunningDryRun ||
+                      isBuildingSample ||
+                      applyBlockedReason !== null
+                    }
                     onClick={() => void handleApplyTransform()}
                   >
                     {isTransforming ? (

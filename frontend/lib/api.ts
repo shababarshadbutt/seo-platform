@@ -3442,3 +3442,144 @@ export function followSftpPullProgress(
 
   return source;
 }
+
+// --- by-example transform: sample file + full-population check ---------------
+
+export type TransformSamplePair = { before: string; after: string };
+
+export type TransformSampleResult = {
+  token: string;
+  source_file: string;
+  download_name: string;
+  total_locs: number;
+  rewritten: number;
+  bytes: number;
+  is_gzip: boolean;
+  samples: TransformSamplePair[];
+};
+
+export type TransformDryRunShape = {
+  shape: string;
+  count: number;
+  before: string;
+  after: string;
+};
+
+export type TransformDryRunResult = {
+  total_locs: number;
+  matched: number;
+  rewritten: number;
+  unchanged: number;
+  skipped: number;
+  shapes: TransformDryRunShape[];
+  shapes_truncated: boolean;
+  clamped_split: number;
+  clamped_split_example: string | null;
+  double_slash: number;
+  collisions: number;
+  collision_example: string | null;
+  collision_scan_truncated: boolean;
+  files_scanned: number;
+  files_skipped: number;
+  current_structure: string;
+  new_structure: string;
+};
+
+// Build ONE transformed file the user can read before authorising anything.
+// Nothing in the session changes; the result is a disposable copy plus the ten
+// before/after pairs taken from that same file.
+export async function buildTransformSample(
+  sessionId: string,
+  patternId: string,
+  input: {
+    currentStructure: string;
+    newStructure: string;
+    sourceFiles: string[];
+    sourceFile?: string | null;
+    structureFilters?: StructureFilter[] | null;
+  }
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/transform-sample-file`
+    ),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        current_structure: input.currentStructure,
+        new_structure: input.newStructure,
+        source_files: input.sourceFiles,
+        source_file: input.sourceFile ?? undefined,
+        structure_filter: input.structureFilters ?? null
+      })
+    }
+  );
+
+  return readJsonResponse<TransformSampleResult>(response);
+}
+
+// Read every file the apply would rewrite and report what it WOULD produce.
+// Runs as a background job with the same progress plumbing as the apply.
+export async function runTransformDryRun(
+  sessionId: string,
+  patternId: string,
+  input: {
+    currentStructure: string;
+    newStructure: string;
+    sourceFiles: string[];
+    structureFilters?: StructureFilter[] | null;
+  },
+  onProgress?: (progress: PatternStructureProgress) => void
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/transform-dry-run`
+    ),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        current_structure: input.currentStructure,
+        new_structure: input.newStructure,
+        source_files: input.sourceFiles,
+        structure_filter: input.structureFilters ?? null
+      })
+    }
+  );
+  const kickoff = await readJsonResponse<PatternStructureKickoff>(response);
+
+  return awaitPatternStructureJob<TransformDryRunResult>(
+    sessionId,
+    patternId,
+    kickoff,
+    onProgress
+  );
+}
+
+// Save a built sample to disk. Goes through the same blob path as every other
+// download here, so it inherits the stall timeout and the proxy handling.
+export async function downloadTransformSample(
+  sessionId: string,
+  sample: TransformSampleResult
+) {
+  const query = new URLSearchParams({
+    gzip: String(sample.is_gzip),
+    name: sample.download_name
+  });
+  const { blob, response } = await downloadToBlob(
+    backendUrl(
+      `/api/sessions/${sessionId}/transform-sample/${sample.token}?${query.toString()}`
+    ),
+    { cache: "no-store" }
+  );
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = objectUrl;
+  link.download = downloadFilename(response, sample.download_name);
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}

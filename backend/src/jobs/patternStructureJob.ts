@@ -19,10 +19,13 @@ import {
   transformUrl,
   type ParsedStructure
 } from "../sitemaps/transformStructure.js";
+import { resolvePatternScanTargets } from "../sitemaps/patternFileScan.js";
+import { scanTransformDryRun } from "./transformDryRunScan.js";
 import {
   applyStructureFilterToRewriter,
   parseStructureFilters,
   resolveStructureFilters,
+  urlMatchesStructureFilters,
   type StructureFilter
 } from "../sitemaps/structureClusters.js";
 import type { PatternStructureJobData } from "../queue/bulkReplaceQueue.js";
@@ -925,5 +928,160 @@ export async function processPatternTransformUndoJob(
     throw error;
   } finally {
     client.release();
+  }
+}
+
+// ---- Transform dry run ----------------------------------------------------
+
+// What the transform WOULD do to the whole population, measured by reading every
+// file and writing nothing.
+//
+// WHY IT IS A JOB AND NOT A REQUEST. It reads the same files the apply rewrites —
+// 823 files / 6.58M URLs on the session that forced the transform itself into the
+// background. A synchronous route would hit the client's 180s timeout for exactly
+// the reasons migration 037 documents. Sharing pattern_structure_jobs gets it the
+// progress bar, the retry-after-timeout fingerprint and the one-in-flight-per-
+// pattern index for free.
+//
+// NO TRANSACTION, deliberately. Every other kind here opens one because it
+// mutates; this one only reads, and holding a connection open for the length of a
+// full-population scan would pin a pool slot for minutes to protect nothing.
+export async function processPatternTransformDryRunJob(
+  data: PatternStructureJobData,
+  logger: FastifyBaseLogger
+) {
+  const { job_row_id: jobRowId } = data;
+  const job = await loadJob(jobRowId, logger);
+
+  if (!job) {
+    return;
+  }
+
+  const sessionId = job.session_id;
+  const patternId = job.pattern_id;
+  const currentStructureRaw = job.params.current_structure as string;
+  const newStructureRaw = job.params.new_structure as string;
+  const selectedFiles = job.params.source_files ?? [];
+  const progress = progressPublisher(jobRowId);
+
+  try {
+    // Parsed here ONLY to validate, then thrown away: the scan re-parses the raw
+    // strings, in the worker thread when there is one, because closures do not
+    // cross a thread boundary. Doing it up front anyway means a malformed
+    // structure fails the job with the syntax error that explains it, rather
+    // than surfacing as an opaque worker crash. (The route already rejects these,
+    // so this only catches a hand-edited params blob.)
+    try {
+      parseStructure(currentStructureRaw);
+      parseStructure(newStructureRaw);
+    } catch (error) {
+      await markFailed(
+        jobRowId,
+        error instanceof Error ? error.message : String(error)
+      );
+
+      return;
+    }
+
+    const patternResult = await pool.query<{
+      template: string;
+      source_role: string;
+      // Decides inline vs pooled scan — see DRY_RUN_PARALLEL_THRESHOLD.
+      total_urls: string;
+    }>(
+      "SELECT template, source_role, total_urls FROM patterns WHERE id = $1",
+      [patternId]
+    );
+
+    if (patternResult.rowCount === 0) {
+      await markFailed(jobRowId, "pattern not found");
+
+      return;
+    }
+
+    const template = patternResult.rows[0].template;
+    const sourceRole = patternResult.rows[0].source_role;
+    const structureFilters = jobStructureFilters(job.params);
+    const resolvedFilters = resolveStructureFilters(
+      structureFilters,
+      currentStructureRaw
+    );
+
+    // ALL-OR-NOTHING, same as the apply: a partially-resolved scope would make
+    // the dry run measure a WIDER edit than the one that would actually run,
+    // which is worse than no measurement at all.
+    if (resolvedFilters === null) {
+      await markFailed(
+        jobRowId,
+        `structure filter params ${structureFilters
+          .map((filter) => `#${filter.param_index}`)
+          .join(", ")} do not all exist in structure ${currentStructureRaw}`
+      );
+
+      return;
+    }
+
+    const targets = await resolvePatternScanTargets({
+      patternId,
+      sessionId,
+      sourceRole,
+      displayNames: selectedFiles
+    });
+
+    await progress.setTotal(targets.length);
+
+    logger.info(
+      {
+        session_id: sessionId,
+        pattern_id: patternId,
+        job_row_id: jobRowId,
+        files: targets.length
+      },
+      "pattern transform dry run started"
+    );
+
+    const scan = await scanTransformDryRun({
+      targets,
+      currentStructure: currentStructureRaw,
+      newStructure: newStructureRaw,
+      template,
+      structureFilters: resolvedFilters,
+      totalUrls: Number(patternResult.rows[0].total_urls),
+      onFileDone: (done) => progress.onFileDone(done)
+    });
+    const totals = scan.totals;
+
+    await progress.finish(targets.length, totals.rewritten);
+    await markComplete(jobRowId, {
+      ...totals,
+      files_scanned: scan.filesScanned,
+      files_skipped: scan.filesSkipped,
+      // Echoed back so the apply gate can confirm the dry run it is about to
+      // trust measured THESE structures and not an earlier pair.
+      current_structure: currentStructureRaw,
+      new_structure: newStructureRaw
+    });
+
+    logger.info(
+      {
+        session_id: sessionId,
+        pattern_id: patternId,
+        job_row_id: jobRowId,
+        files_scanned: scan.filesScanned,
+        files_skipped: scan.filesSkipped,
+        matched: totals.matched,
+        would_rewrite: totals.rewritten,
+        skipped_urls: totals.skipped,
+        parallel: scan.parallel,
+        distinct_shapes: totals.shapes.length
+      },
+      "pattern transform dry run complete"
+    );
+  } catch (error) {
+    await markFailed(
+      jobRowId,
+      error instanceof Error ? error.message : String(error)
+    );
+    throw error;
   }
 }
