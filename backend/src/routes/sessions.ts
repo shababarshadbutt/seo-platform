@@ -102,6 +102,11 @@ import {
   PublishLockedError,
   type PublishLock
 } from "../publish/publishLock.js";
+import {
+  cdnPathForFile,
+  encodeCdnPath,
+  wildcardPathFor
+} from "../publish/cdnPaths.js";
 import { buildPublishPlan } from "../publish/s3Publish.js";
 import {
   PublishTargetError,
@@ -6020,6 +6025,30 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
       const plan = await buildPublishPlan(request.params.id, target);
 
+      // Which filenames CloudFront will not accept as invalidation paths, and
+      // which strategy this publish would use. Surfaced BEFORE the button is
+      // clicked: an unsanitized SFTP filename (a space, a stray "%", a non-ASCII
+      // byte) is invisible in a list of 2,650 names, and it used to be discovered
+      // only as a post-upload CloudFront rejection reported as total failure.
+      // A WARNING, never a refusal — such a file publishes fine, it just cannot
+      // have its edge cache purged by path.
+      const uninvalidatable = plan.files
+        .filter(
+          (file) =>
+            encodeCdnPath(
+              cdnPathForFile(target.publicHost, file.displayName) ?? ""
+            ) === null
+        )
+        .map((file) => ({
+          filename: file.displayName,
+          reason:
+            "contains characters CloudFront cannot express in an invalidation path"
+        }));
+
+      const wouldUseWildcard =
+        plan.files.length + 1 > config.cloudfrontWildcardThreshold &&
+        wildcardPathFor(target.publicHost, plan.indexFilename) !== null;
+
       return {
         domain: target.prefixDomain,
         // Where the prefix host came from, so the dialog states it as a fact
@@ -6043,6 +6072,18 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // Deleted files are dropped from the regenerated index, never deleted
         // from the bucket — surfaced so the UI can say so plainly.
         deletes_objects: false,
+        // Capped like `files` above, with the true total alongside, so a domain
+        // with thousands of odd names does not return thousands of rows.
+        uninvalidatable: uninvalidatable.slice(0, 50),
+        uninvalidatable_count: uninvalidatable.length,
+        // "wildcard" means one scoped path covers the whole sitemap folder
+        // instead of listing every file — cheaper and immune to a single bad
+        // name, and the reason a 2,650-file publish is not 2,651 billable paths.
+        invalidation_strategy: !config.cloudfrontDistributionId
+          ? "skipped"
+          : wouldUseWildcard
+            ? "wildcard"
+            : "exact",
         // Locked on the resolved prefix domain, so a www and a non-www session
         // for the same site now collide on the lock instead of racing each other
         // into two different prefixes.
@@ -6276,6 +6317,16 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
                   uploaded?: number;
                   omitted_deleted?: string[];
                   invalidation_id?: string | null;
+                  failed_files?: {
+                    filename: string;
+                    reason: string;
+                    still_indexed: boolean;
+                  }[];
+                  invalidation?: {
+                    strategy?: string;
+                    paths_requested?: number;
+                    error?: string | null;
+                  };
                 }
               | undefined;
 
@@ -6289,6 +6340,29 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
                 type: "error",
                 message:
                   "The publish job finished but reported no uploaded files. Do not assume production was updated — check the worker logs for 's3 publish complete' and the publish_runs table before re-running.",
+                result: returned
+              });
+              break;
+            }
+
+            // A THIRD terminal frame, between done and error: objects were
+            // written to production, but not everything the publish set out to
+            // do finished. Previously there was no such frame, so a publish that
+            // wrote all 2,651 objects and then had its CloudFront invalidation
+            // rejected surfaced as a red "Publish failed" — telling the SEO team
+            // nothing had shipped when in fact everything had.
+            const failedFiles = returned.failed_files ?? [];
+            const invalidationError = returned.invalidation?.error ?? null;
+
+            if (failedFiles.length > 0 || invalidationError) {
+              send({
+                type: "partial",
+                // The uploaded count leads, always. Whatever else went wrong,
+                // the first thing the user needs to know is what DID publish.
+                message:
+                  failedFiles.length > 0
+                    ? `Published ${returned.uploaded} file(s) — ${failedFiles.length} could not be published`
+                    : `Published ${returned.uploaded} file(s) — CDN invalidation incomplete`,
                 result: returned
               });
               break;

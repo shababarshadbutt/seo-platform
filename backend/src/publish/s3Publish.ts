@@ -6,11 +6,21 @@ import {
   CloudFrontClient,
   CreateInvalidationCommand
 } from "@aws-sdk/client-cloudfront";
-import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import {
+  HeadObjectCommand,
+  PutObjectCommand,
+  S3Client
+} from "@aws-sdk/client-s3";
 
 import { config, publicSitemapUrl, s3PrefixForDomain } from "../config.js";
 import { pool } from "../db/pool.js";
 import { isHttpUrl, productionFilename } from "../sitemaps/filenames.js";
+import {
+  buildInvalidationBatches,
+  cdnPathForFile,
+  wildcardPathFor,
+  type RejectedPath
+} from "./cdnPaths.js";
 import type { PublishTarget } from "./publishTarget.js";
 
 // Publish a session's corrected sitemaps to the live S3 bucket, then invalidate
@@ -75,6 +85,35 @@ export type PublishPlan = {
   missingLocal: string[];
 };
 
+// One file the publish could not write, after retries. Reported rather than
+// fatal: a handful of bad files must not strand the other 2,600.
+export type PublishFailedFile = {
+  filename: string;
+  reason: string;
+  // Whether the regenerated index still references it. True when an OLDER
+  // version of the object is already live in the bucket, so keeping the entry
+  // serves a stale sitemap instead of de-indexing live URLs. False means the
+  // object does not exist at all and the entry would have pointed at a 404.
+  still_indexed: boolean;
+};
+
+// What the CloudFront stage did. Always returned, never thrown — see invalidateCdn.
+export type InvalidationOutcome = {
+  // "wildcard": one scoped path covering the whole sitemap folder.
+  // "exact": one request per batch of individual paths.
+  // "skipped": no distribution configured, or nothing to invalidate.
+  strategy: "wildcard" | "exact" | "skipped";
+  invalidation_ids: string[];
+  paths_requested: number;
+  batches_requested: number;
+  batches_failed: number;
+  // Paths that could not be encoded, or whose batch CloudFront rejected.
+  failed_paths: RejectedPath[];
+  // Set when the stage did not fully succeed. The publish itself has already
+  // succeeded by this point, so this is a WARNING, never a failure.
+  error: string | null;
+};
+
 export type PublishResult = {
   domain: string;
   bucket: string;
@@ -83,6 +122,11 @@ export type PublishResult = {
   bytes: number;
   index_key: string;
   omitted_deleted: string[];
+  // Files that could not be uploaded even after retries. Empty on a clean run.
+  failed_files: PublishFailedFile[];
+  invalidation: InvalidationOutcome;
+  // Kept for compatibility with existing readers (the audit row, the SSE
+  // payload). Derived from `invalidation` — the first id and the path count.
   invalidation_id: string | null;
   invalidated_paths: number;
   // Every key actually PUT, in order. Logged (a bounded sample) by the job so
@@ -272,11 +316,144 @@ export class PublishFileError extends Error {
   }
 }
 
+// Too many files failed to upload for "carry on and report them" to be honest.
+//
+// A handful of bad files is a reportable partial success. A wholesale failure is
+// a broken credential, a wrong bucket policy or a dead network, and grinding
+// through 2,600 more doomed PUTs to prove it helps nobody — it just delays the
+// error and leaves production maximally mixed. So the per-file tolerance is
+// bounded and crossing it is fatal.
+export class PublishAbortedError extends Error {
+  readonly failedFiles: PublishFailedFile[];
+  readonly uploaded: number;
+  readonly plannedTotal: number;
+
+  constructor(options: {
+    failedFiles: PublishFailedFile[];
+    uploaded: number;
+    plannedTotal: number;
+    tolerance: number;
+  }) {
+    const sample = options.failedFiles
+      .slice(0, 3)
+      .map((file) => `${file.filename} (${file.reason})`)
+      .join("; ");
+
+    super(
+      `Publish aborted: ${options.failedFiles.length} of the first ${
+        options.uploaded + options.failedFiles.length
+      } file(s) failed to upload, over the tolerance of ${options.tolerance}. ` +
+        `Examples: ${sample}. ` +
+        `${options.uploaded} object(s) were already overwritten and the sitemap index was NOT updated — production is in a mixed state. ` +
+        `This many failures means a credential, bucket-policy or network problem rather than bad files: fix that, then re-run the publish.`
+    );
+    this.name = "PublishAbortedError";
+    this.failedFiles = options.failedFiles;
+    this.uploaded = options.uploaded;
+    this.plannedTotal = options.plannedTotal;
+  }
+}
+
+// How many failed files are tolerated before the whole publish aborts. A floor
+// of 10 so a small session is not aborted by one flaky PUT, and 2% so a large
+// one is not allowed to fail by the hundred.
+export function uploadFailureTolerance(plannedTotal: number): number {
+  return Math.max(10, Math.ceil(plannedTotal * 0.02));
+}
+
+// Retries between attempts. Two retries, short backoff: an S3 PUT failure is
+// usually a transient 500/503 or a throttle, and the publish holds a per-domain
+// lock so it cannot sit here indefinitely.
+const PUT_RETRY_DELAYS_MS = [250, 1000];
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+// PUT one object, retrying transient failures.
+//
+// The stream is created INSIDE the loop, once per attempt. This is the sharpest
+// edge in this file: a Node read stream cannot be replayed, so retrying with the
+// handle from the failed attempt would send a consumed (empty) body and silently
+// overwrite a live sitemap with a zero-byte object — in a bucket with no
+// versioning. ContentLength is re-sent per attempt for the same reason.
+async function putObjectWithRetry(
+  s3: S3Client,
+  params: { key: string; localPath: string; size: number; contentType: string }
+): Promise<void> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= PUT_RETRY_DELAYS_MS.length; attempt += 1) {
+    if (attempt > 0) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, PUT_RETRY_DELAYS_MS[attempt - 1])
+      );
+    }
+
+    try {
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: config.s3.bucket,
+          Key: params.key,
+          // Fresh handle per attempt — see the note above.
+          Body: createReadStream(params.localPath),
+          ContentLength: params.size,
+          ContentType: params.contentType
+        })
+      );
+
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError;
+}
+
+// Does this key already hold an object? Decides whether a file we FAILED to
+// upload stays in the regenerated index.
+//
+// A Head failure that is not a clean 404 is treated as "exists". Guessing that
+// way keeps a stale sitemap referenced; guessing the other way de-indexes live
+// URLs, which is the strictly worse error and exactly what the missingLocal
+// guard above exists to prevent. It also means a deployment whose IAM role has
+// not yet been granted HeadObject degrades to "keep everything indexed" instead
+// of breaking publishes.
+async function objectExists(s3: S3Client, key: string): Promise<boolean> {
+  try {
+    await s3.send(
+      new HeadObjectCommand({ Bucket: config.s3.bucket, Key: key })
+    );
+
+    return true;
+  } catch (error) {
+    const name =
+      error instanceof Error ? error.name : String((error as { name?: string })?.name);
+
+    if (name === "NotFound" || name === "NoSuchKey") {
+      return false;
+    }
+
+    return true;
+  }
+}
+
 // Execute a plan: upload every child file, then the regenerated index, then
 // invalidate exactly those paths.
 export async function executePublish(
   plan: PublishPlan,
-  options: { today: string; onProgress?: PublishProgress } = {
+  options: {
+    today: string;
+    onProgress?: PublishProgress;
+    // Test seam ONLY. Production passes nothing and both clients are built here
+    // from the default AWS provider chain (the instance role) — see the module
+    // note; no credential is ever read from config. Injecting them lets the
+    // upload-failure, retry and invalidation paths be asserted without AWS,
+    // which is what left the CloudFront call with zero coverage until it broke
+    // a real 2,650-file publish.
+    clients?: { s3?: S3Client; cloudfront?: CloudFrontClient };
+  } = {
     today: new Date().toISOString().slice(0, 10)
   }
 ): Promise<PublishResult> {
@@ -312,8 +489,11 @@ export async function executePublish(
     );
   }
 
-  const s3 = new S3Client({ region: config.s3.region });
+  const s3 = options.clients?.s3 ?? new S3Client({ region: config.s3.region });
   const writtenKeys: string[] = [];
+  const uploadedNames: string[] = [];
+  const failedFiles: PublishFailedFile[] = [];
+  const tolerance = uploadFailureTolerance(plan.files.length);
   let bytes = 0;
 
   try {
@@ -326,30 +506,50 @@ export async function executePublish(
       // Stream from disk — a large child sitemap is never read into the heap.
       // ContentLength is required because a stream body has no known length.
       //
-      // Deliberately NOT a try/continue: one failed PUT aborts the whole
-      // publish. A per-file "log and carry on" would leave the index claiming
-      // files that were never written, which is the failure this whole path
-      // must not have. The catch only ATTACHES CONTEXT and rethrows.
+      // A file that still fails after retries is RECORDED AND SKIPPED rather
+      // than aborting the run. This used to throw: one unwritable file out of
+      // 2,650 stranded the other 2,649, which is a worse outcome than publishing
+      // them and naming the one that did not make it. What made the old
+      // behaviour necessary — never letting the index claim a file that was
+      // never written — is preserved below by checking whether the object
+      // already exists before deciding whether it stays in the index.
       try {
-        await s3.send(
-          new PutObjectCommand({
-            Bucket: config.s3.bucket,
-            Key: key,
-            Body: createReadStream(file.localPath),
-            ContentLength: file.size,
-            ContentType: contentTypeFor(file.displayName)
-          })
-        );
-      } catch (error) {
-        throw new PublishFileError({
+        await putObjectWithRetry(s3, {
           key,
-          uploadedBefore: writtenKeys.length,
-          plannedTotal: plan.files.length,
-          cause: error
+          localPath: file.localPath,
+          size: file.size,
+          contentType: contentTypeFor(file.displayName)
         });
+      } catch (error) {
+        failedFiles.push({
+          filename: file.displayName,
+          reason: errorMessage(error),
+          // Resolved after the loop, with one HeadObject per failed file.
+          still_indexed: false
+        });
+
+        // Bounded tolerance: past this it is a systemic failure, not bad files.
+        if (failedFiles.length > tolerance) {
+          throw new PublishAbortedError({
+            failedFiles,
+            uploaded: writtenKeys.length,
+            plannedTotal: plan.files.length,
+            tolerance
+          });
+        }
+
+        // Still reported, so the progress bar reaches `total` rather than
+        // stalling short and looking hung.
+        await options.onProgress?.({
+          current: index,
+          total: plan.files.length + 1,
+          filename: file.displayName
+        });
+        continue;
       }
 
       writtenKeys.push(key);
+      uploadedNames.push(file.displayName);
       bytes += file.size;
       await options.onProgress?.({
         current: index,
@@ -357,6 +557,35 @@ export async function executePublish(
         filename: file.displayName
       });
     }
+
+    if (uploadedNames.length === 0) {
+      // Every file failed. Writing an index of only-stale entries (or an empty
+      // one) over the live index would be the silent-success failure this module
+      // refuses everywhere else.
+      throw new PublishAbortedError({
+        failedFiles,
+        uploaded: 0,
+        plannedTotal: plan.files.length,
+        tolerance
+      });
+    }
+
+    // Decide index membership for the files that failed. An older version of
+    // the object may well be live — this publish overwrites existing sitemaps —
+    // and dropping it from the index would de-index live URLs over a transient
+    // upload error. So: object exists => keep the entry (stale but served);
+    // absent => omit it, and say so in the report.
+    for (const failed of failedFiles) {
+      failed.still_indexed = await objectExists(
+        s3,
+        `${plan.prefix}${failed.filename}`
+      );
+    }
+
+    const indexedNames = [
+      ...uploadedNames,
+      ...failedFiles.filter((file) => file.still_indexed).map((file) => file.filename)
+    ].sort();
 
     // plan.prefix is deliberately NOT passed: the index's public urls come from
     // the template, the keys below come from the prefix.
@@ -366,7 +595,7 @@ export async function executePublish(
     // www.example.com must not have the www stripped out of its <loc> values.
     const indexXml = buildPublishIndexXml(
       plan.publicHost,
-      plan.files.map((file) => file.displayName),
+      indexedNames,
       options.today
     );
     const indexKey = `${plan.prefix}${plan.indexFilename}`;
@@ -396,7 +625,19 @@ export async function executePublish(
       filename: plan.indexFilename
     });
 
-    const invalidation = await invalidatePaths(writtenKeys);
+    // Never throws. The bytes are already on production by this point, so a
+    // CloudFront rejection is a stale-edge-cache warning — not a failed publish.
+    // It used to be an uncaught await here, which turned a fully successful
+    // 2,651-file publish into a red "Publish failed" and an audit row reading
+    // FAILED with no upload count.
+    // Only what actually CHANGED: the files written plus the regenerated index.
+    // A file that failed to upload still holds its previous bytes, so
+    // invalidating it would spend a billable path to re-fetch identical content.
+    const invalidation = await invalidateCdn(
+      plan,
+      [...uploadedNames, plan.indexFilename],
+      options.clients?.cloudfront
+    );
 
     return {
       domain: plan.domain,
@@ -406,44 +647,190 @@ export async function executePublish(
       bytes,
       index_key: indexKey,
       omitted_deleted: plan.omittedDeleted,
-      invalidation_id: invalidation,
-      invalidated_paths: writtenKeys.length,
+      failed_files: failedFiles,
+      invalidation,
+      invalidation_id: invalidation.invalidation_ids[0] ?? null,
+      invalidated_paths: invalidation.paths_requested,
       written_keys: writtenKeys
     };
   } finally {
     // Release the SDK's sockets as soon as this publish is done rather than
-    // letting them idle — 10+ concurrent users on one VM.
-    s3.destroy();
+    // letting them idle — 10+ concurrent users on one VM. Only a client we
+    // constructed: tearing down a caller's is not ours to do.
+    if (!options.clients?.s3) {
+      s3.destroy();
+    }
   }
 }
 
-// Invalidate exactly the paths written. Deliberately NOT "/*": that would evict
-// every other client site's cached content from the shared distribution and
-// cost far more per invalidation.
-async function invalidatePaths(keys: string[]): Promise<string | null> {
-  if (!config.cloudfrontDistributionId || keys.length === 0) {
-    return null;
+// Invalidate what was published, and NEVER throw.
+//
+// Two things changed here after a 2,650-file publish that fully succeeded was
+// reported to the user as a total failure:
+//
+// 1. It no longer throws. Every object is already written when this runs, so a
+//    CloudFront error means "the edge may serve stale sitemaps until their TTL
+//    lapses", not "the publish failed". The outcome is returned and reported.
+//
+// 2. It invalidates the paths CloudFront actually SERVES, derived through
+//    cdnPathForFile, rather than the S3 keys. Sending "/sites/<domain>/sitemaps/x.xml"
+//    at a distribution serving "/sitemaps/x.xml" evicted nothing even on success.
+//
+// Still deliberately not "/*": the distribution is shared with every other client
+// site, and "/*" would evict all of them. The wildcard used for large publishes
+// is scoped to this domain's sitemap directory, and wildcardPathFor refuses to
+// return a distribution-wide one.
+async function invalidateCdn(
+  plan: PublishPlan,
+  filenames: string[],
+  injectedClient?: CloudFrontClient
+): Promise<InvalidationOutcome> {
+  const skipped: InvalidationOutcome = {
+    strategy: "skipped",
+    invalidation_ids: [],
+    paths_requested: 0,
+    batches_requested: 0,
+    batches_failed: 0,
+    failed_paths: [],
+    error: null
+  };
+
+  if (!config.cloudfrontDistributionId || filenames.length === 0) {
+    return skipped;
   }
 
-  const client = new CloudFrontClient({ region: config.s3.region });
-
   try {
-    const response = await client.send(
-      new CreateInvalidationCommand({
-        DistributionId: config.cloudfrontDistributionId,
-        InvalidationBatch: {
-          // Unique per call; CloudFront dedupes retries on this.
-          CallerReference: `publish-${Date.now()}-${Math.round(keys.length)}`,
-          Paths: {
-            Quantity: keys.length,
-            Items: keys.map((key) => (key.startsWith("/") ? key : `/${key}`))
+    const rejected: RejectedPath[] = [];
+    const paths: string[] = [];
+
+    for (const filename of filenames) {
+      const cdnPath = cdnPathForFile(plan.publicHost, filename);
+
+      if (!cdnPath) {
+        rejected.push({
+          path: filename,
+          reason:
+            "PUBLIC_SITEMAP_URL_TEMPLATE did not resolve this file to a fetchable url"
+        });
+        continue;
+      }
+
+      paths.push(cdnPath);
+    }
+
+    // Above the threshold, one scoped wildcard replaces thousands of exact
+    // paths: CloudFront caps a non-wildcard request at 3,000 and bills per path
+    // beyond 1,000/month. Falls through to exact paths when the template serves
+    // sitemaps from the site root, where the only covering wildcard would be the
+    // distribution-wide "/*".
+    const wildcard =
+      paths.length > config.cloudfrontWildcardThreshold
+        ? wildcardPathFor(plan.publicHost, plan.indexFilename)
+        : null;
+
+    let batches: string[][];
+    let pathCount: number;
+
+    if (wildcard) {
+      batches = [[wildcard]];
+      pathCount = 1;
+    } else {
+      const built = buildInvalidationBatches(paths);
+
+      batches = built.batches;
+      pathCount = built.pathCount;
+      rejected.push(...built.rejected);
+    }
+
+    if (batches.length === 0) {
+      return {
+        ...skipped,
+        strategy: wildcard ? "wildcard" : "exact",
+        failed_paths: rejected,
+        error:
+          rejected.length > 0
+            ? `No valid CloudFront invalidation path could be built for any of ${rejected.length} file(s).`
+            : null
+      };
+    }
+
+    const client =
+      injectedClient ?? new CloudFrontClient({ region: config.s3.region });
+    const invalidationIds: string[] = [];
+    const failedPaths: RejectedPath[] = [...rejected];
+    let batchesFailed = 0;
+    let lastError: string | null = null;
+
+    try {
+      let batchIndex = 0;
+
+      for (const batch of batches) {
+        batchIndex += 1;
+
+        // Per batch, so one rejected path costs its own batch rather than every
+        // path in the publish.
+        try {
+          const response = await client.send(
+            new CreateInvalidationCommand({
+              DistributionId: config.cloudfrontDistributionId,
+              InvalidationBatch: {
+                // Unique per request; CloudFront dedupes retries on this.
+                CallerReference: `publish-${Date.now()}-${batchIndex}-${batch.length}`,
+                Paths: { Quantity: batch.length, Items: batch }
+              }
+            })
+          );
+
+          if (response.Invalidation?.Id) {
+            invalidationIds.push(response.Invalidation.Id);
+          }
+        } catch (error) {
+          batchesFailed += 1;
+          lastError = errorMessage(error);
+
+          for (const rejectedPath of batch) {
+            failedPaths.push({ path: rejectedPath, reason: lastError });
           }
         }
-      })
-    );
+      }
+    } finally {
+      // Release the SDK's sockets promptly — 10+ concurrent users on one VM.
+      // Only a client we constructed: tearing down a caller's is not ours to do.
+      if (!injectedClient) {
+        client.destroy();
+      }
+    }
 
-    return response.Invalidation?.Id ?? null;
-  } finally {
-    client.destroy();
+    const strategy = wildcard ? "wildcard" : "exact";
+    const errors: string[] = [];
+
+    if (batchesFailed > 0) {
+      errors.push(
+        `CloudFront rejected ${batchesFailed} of ${batches.length} invalidation request(s): ${lastError}`
+      );
+    }
+
+    if (rejected.length > 0) {
+      errors.push(
+        `${rejected.length} file(s) could not be turned into a valid invalidation path`
+      );
+    }
+
+    return {
+      strategy,
+      invalidation_ids: invalidationIds,
+      paths_requested: pathCount,
+      batches_requested: batches.length,
+      batches_failed: batchesFailed,
+      failed_paths: failedPaths,
+      error: errors.length > 0 ? errors.join(". ") : null
+    };
+  } catch (error) {
+    // Anything unforeseen — a client constructor throw, a config surprise —
+    // still cannot fail a publish whose bytes are already live.
+    return {
+      ...skipped,
+      error: `CDN invalidation could not be requested: ${errorMessage(error)}`
+    };
   }
 }

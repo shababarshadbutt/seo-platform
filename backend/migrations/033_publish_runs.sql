@@ -28,8 +28,9 @@ CREATE TABLE IF NOT EXISTS publish_runs (
   bucket TEXT NOT NULL,
   prefix TEXT NOT NULL,
   job_id TEXT,
-  -- STARTED | COMPLETE | FAILED. A row stuck on STARTED means the worker died
-  -- mid-publish, which is itself the answer to "why is production half updated".
+  -- STARTED | COMPLETE | PARTIAL | FAILED (PARTIAL added in migration 048). A row
+  -- stuck on STARTED means the worker died mid-publish, which is itself the
+  -- answer to "why is production half updated".
   status TEXT NOT NULL,
   -- What the plan intended to upload vs. what actually got a successful PUT.
   -- planned > uploaded on a FAILED row bounds the partial overwrite.

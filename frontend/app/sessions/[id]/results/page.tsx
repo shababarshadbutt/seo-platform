@@ -829,7 +829,10 @@ export default function ResultsDashboardPage({
   const [isUndoing, setIsUndoing] = useState(false);
   const [isUndoConfirmOpen, setIsUndoConfirmOpen] = useState(false);
   const [findReplaceToast, setFindReplaceToast] = useState<{
-    tone: "success" | "error";
+    // "warning" is for an action that DID take effect but not completely — a
+    // partial publish. Rendering that as an error tells the user nothing
+    // shipped, which is the opposite of what happened.
+    tone: "success" | "warning" | "error";
     message: string;
   } | null>(null);
   const [renameRow, setRenameRow] = useState<PatternRow | null>(null);
@@ -2434,26 +2437,50 @@ export default function ResultsDashboardPage({
       publishStreamRef.current = followPublishProgress(params.id, (event) => {
         setPublishProgress(event);
 
-        if (event.type === "done" || event.type === "error") {
+        if (
+          event.type === "done" ||
+          event.type === "partial" ||
+          event.type === "error"
+        ) {
           publishStreamRef.current?.close();
           publishStreamRef.current = null;
           setIsPublishing(false);
 
-          if (event.type === "done") {
+          if (event.type === "done" || event.type === "partial") {
+            // A "partial" frame is a SUCCESS for everything downstream of it:
+            // objects were written to production, so the results must refresh
+            // exactly as they do on a clean publish.
             void loadResults({ silent: true });
+
+            const failedCount = event.result?.failed_files?.length ?? 0;
+            const invalidationError = event.result?.invalidation?.error ?? null;
+
             setFindReplaceToast({
-              tone: "success",
+              tone: event.type === "partial" ? "warning" : "success",
               message: `${event.message ?? "Publish complete."}${
-                event.result?.invalidation_id
-                  ? " CDN invalidation requested."
-                  : ""
+                failedCount > 0
+                  ? " See the dialog for the files that were not published."
+                  : invalidationError
+                    ? " Uploads succeeded; the CDN cache purge did not."
+                    : event.result?.invalidation_id
+                      ? " CDN invalidation requested."
+                      : ""
               }`
             });
+
             // Offer to reclaim this session's disk space — only now that the
             // files are safely on production, and only as an OFFER. Fully
             // automatic deletion is what produced the silent partial publish this
             // session already fixed, so the user has to choose it.
-            void openCleanupPrompt();
+            //
+            // Gated on failedCount: files that still need re-publishing need
+            // their local bytes to re-publish FROM. Offering to delete them here
+            // would turn a recoverable partial publish into an unrecoverable one.
+            // An invalidation-only failure needs no re-upload, so it does not
+            // suppress the offer.
+            if (failedCount === 0) {
+              void openCleanupPrompt();
+            }
           } else {
             // A failed publish used to produce NO toast at all, and its message
             // landed in the same indigo panel a successful one uses — so a
@@ -5979,6 +6006,17 @@ export default function ResultsDashboardPage({
                       ? "Prefix taken from the SFTP folder these sitemaps were pulled from."
                       : "Prefix taken from this session's base URL host (normalized — www and non-www resolve to the same prefix)."}
                   </p>
+                  {/* Stated up front so "one wildcard for 2,650 files" is not a
+                      surprise after the fact. CloudFront bills per invalidation
+                      path, so the difference between the two strategies is real
+                      money as well as a different blast radius. */}
+                  <p className="text-xs text-slate-500">
+                    {publishPreview.invalidation_strategy === "wildcard"
+                      ? "CDN purge: one wildcard path covering this domain's sitemap folder (cheaper than listing every file, and scoped to this domain only)."
+                      : publishPreview.invalidation_strategy === "exact"
+                        ? "CDN purge: one invalidation path per changed file."
+                        : "CDN purge: none — no CloudFront distribution is configured on this deployment."}
+                  </p>
                   {publishPreview.public_host !== publishPreview.domain ? (
                     <p className="break-all text-xs text-slate-500">
                       <span className="text-slate-500">
@@ -6111,6 +6149,33 @@ export default function ResultsDashboardPage({
                   </div>
                 ) : null}
 
+                {publishPreview.uninvalidatable_count > 0 ? (
+                  <div className="space-y-1 rounded-md bg-amber-50 px-3 py-2">
+                    <p className="text-sm font-medium text-amber-900">
+                      {formatNumber(publishPreview.uninvalidatable_count)} filename
+                      {publishPreview.uninvalidatable_count === 1 ? "" : "s"}{" "}
+                      cannot be purged from the CDN by path
+                    </p>
+                    <p className="text-xs text-amber-800">
+                      These publish normally — the characters in their names are
+                      just not valid in a CloudFront invalidation path. Their edge
+                      caches refresh when their TTL expires. This is a warning, not
+                      a blocker.
+                    </p>
+                    <ul className="max-h-[90px] overflow-y-auto pt-1">
+                      {publishPreview.uninvalidatable.map((file) => (
+                        <li
+                          key={file.filename}
+                          className="truncate font-mono text-xs text-amber-900"
+                          title={`${file.filename} — ${file.reason}`}
+                        >
+                          {file.filename}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
                 {publishPreview.locked ? (
                   <p className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">
                     Someone is already publishing this domain. Wait for that to
@@ -6122,21 +6187,37 @@ export default function ResultsDashboardPage({
 
             {/* Tone follows the frame type. An error frame used to render in the
                 same indigo panel as progress and success, so "nothing was
-                published" looked identical to "published 1,600 files". */}
+                published" looked identical to "published 1,600 files".
+
+                Three-way now, because there is a third outcome: "partial" means
+                the objects ARE on production but something after that did not
+                finish. Amber is this dialog's established colour for
+                reported-but-not-fatal (see the omitted_deleted block above), and
+                red here would repeat the exact bug being fixed — a fully
+                successful 2,651-file publish shown as a failure. */}
             {publishProgress ? (
               <div
                 className={`space-y-2 rounded-md border px-3 py-2 ${
                   publishProgress.type === "error"
                     ? "border-red-200 bg-red-50"
-                    : "border-indigo-100 bg-indigo-50"
+                    : publishProgress.type === "partial"
+                      ? "border-amber-200 bg-amber-50"
+                      : "border-indigo-100 bg-indigo-50"
                 }`}
-                role={publishProgress.type === "error" ? "alert" : undefined}
+                role={
+                  publishProgress.type === "error" ||
+                  publishProgress.type === "partial"
+                    ? "alert"
+                    : undefined
+                }
               >
                 <p
                   className={`flex items-center gap-2 text-sm font-medium ${
                     publishProgress.type === "error"
                       ? "text-red-800"
-                      : "text-indigo-900"
+                      : publishProgress.type === "partial"
+                        ? "text-amber-900"
+                        : "text-indigo-900"
                   }`}
                 >
                   {publishProgress.type === "progress" ? (
@@ -6167,15 +6248,120 @@ export default function ResultsDashboardPage({
                     />
                   </div>
                 ) : null}
-                {publishProgress.type === "done" &&
+                {/* The written-objects count, on BOTH terminal outcomes. It was
+                    previously gated on type === "done", so the one line that
+                    would have told the SEO team their 2,651 objects were live was
+                    unreachable in exactly the situation where they needed it. */}
+                {(publishProgress.type === "done" ||
+                  publishProgress.type === "partial") &&
                 publishProgress.result?.uploaded ? (
-                  <p className="text-xs text-indigo-800">
+                  <p
+                    className={`text-xs ${
+                      publishProgress.type === "partial"
+                        ? "text-amber-900"
+                        : "text-indigo-800"
+                    }`}
+                  >
                     {formatNumber(publishProgress.result.uploaded)} object
-                    {publishProgress.result.uploaded === 1 ? "" : "s"} written
-                    {publishProgress.result.invalidation_id
-                      ? " · CDN invalidation requested"
-                      : " · no CDN invalidation (distribution id not configured)"}
+                    {publishProgress.result.uploaded === 1 ? "" : "s"} written to{" "}
+                    {publishPreview?.bucket ?? "the bucket"}
+                    {publishProgress.result.invalidation?.error
+                      ? null
+                      : publishProgress.result.invalidation?.strategy ===
+                          "wildcard"
+                        ? ` · CDN purged with one wildcard path (${formatNumber(
+                            publishProgress.result.invalidation.paths_requested
+                          )} billable path)`
+                        : publishProgress.result.invalidation_id
+                          ? ` · CDN invalidation requested (${formatNumber(
+                              publishProgress.result.invalidation
+                                ?.paths_requested ?? 0
+                            )} paths)`
+                          : " · no CDN invalidation (distribution id not configured)"}
                   </p>
+                ) : null}
+
+                {/* Uploads-succeeded FIRST, then the CDN caveat. This ordering is
+                    the entire point: the failure the SEO team hit was a rejected
+                    invalidation on a publish where every byte had already landed,
+                    and the old UI led with "Publish failed". A stale edge cache
+                    self-heals at TTL; a needless 8 GB re-upload does not. */}
+                {publishProgress.result?.invalidation?.error ? (
+                  <div className="space-y-1 rounded-md border border-amber-300 bg-amber-100/60 px-2 py-1.5">
+                    <p className="text-xs font-medium text-amber-900">
+                      The files are live. The CDN cache purge did not complete.
+                    </p>
+                    <p className="text-xs text-amber-800">
+                      {publishProgress.result.invalidation.error}
+                    </p>
+                    <p className="text-xs text-amber-800">
+                      No re-publish is needed — the objects are already on
+                      production. Edge caches will pick them up when their TTL
+                      expires, or someone can invalidate manually in CloudFront.
+                    </p>
+                  </div>
+                ) : null}
+
+                {/* Named, copyable, and explicit about whether the previous
+                    version is still being served. "Some files failed" without the
+                    list is not actionable. */}
+                {publishProgress.result?.failed_files &&
+                publishProgress.result.failed_files.length > 0 ? (
+                  <div className="space-y-1 rounded-md border border-amber-300 bg-amber-100/60 px-2 py-1.5">
+                    <div className="flex items-start justify-between gap-2">
+                      <p className="text-xs font-medium text-amber-900">
+                        {formatNumber(
+                          publishProgress.result.failed_files.length
+                        )}{" "}
+                        file
+                        {publishProgress.result.failed_files.length === 1
+                          ? ""
+                          : "s"}{" "}
+                        could not be published
+                      </p>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-6 shrink-0 px-2 text-xs"
+                        onClick={() => {
+                          void navigator.clipboard?.writeText(
+                            (publishProgress.result?.failed_files ?? [])
+                              .map((file) => file.filename)
+                              .join("\n")
+                          );
+                        }}
+                      >
+                        Copy filenames
+                      </Button>
+                    </div>
+                    <p className="text-xs text-amber-800">
+                      Everything else published. Re-run the publish for these once
+                      the cause is fixed — this session&apos;s local files have
+                      been kept so you can.
+                    </p>
+                    <ul className="max-h-[120px] space-y-0.5 overflow-y-auto pt-1">
+                      {publishProgress.result.failed_files.map((file) => (
+                        <li key={file.filename} className="text-xs">
+                          <span
+                            className="font-mono text-amber-900"
+                            title={file.filename}
+                          >
+                            {file.filename}
+                          </span>
+                          <span className="text-amber-800">
+                            {" — "}
+                            {file.reason}
+                          </span>
+                          <span className="text-amber-700">
+                            {file.still_indexed
+                              ? " (previous version still live and indexed)"
+                              : " (not on production; left out of the index)"}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
                 ) : null}
               </div>
             ) : null}
@@ -6196,7 +6382,10 @@ export default function ResultsDashboardPage({
                 disabled={isPublishing}
                 onClick={() => setPublishOpen(false)}
               >
-                {publishProgress?.type === "done" ? "Close" : "Cancel"}
+                {publishProgress?.type === "done" ||
+                publishProgress?.type === "partial"
+                  ? "Close"
+                  : "Cancel"}
               </Button>
               <Button
                 type="button"
@@ -6204,6 +6393,11 @@ export default function ResultsDashboardPage({
                   isPublishing ||
                   publishLoading ||
                   publishProgress?.type === "done" ||
+                  // A partial publish is terminal too: the objects are written,
+                  // so re-clicking would republish everything rather than the
+                  // few files that failed. Without this the dialog sat on an
+                  // enabled Publish button after a finished run.
+                  publishProgress?.type === "partial" ||
                   !publishPreview ||
                   publishPreview.file_count === 0 ||
                   // The backend refuses this case too; disabling here means the
@@ -6518,7 +6712,9 @@ export default function ResultsDashboardPage({
               "fixed bottom-4 right-4 z-50 max-w-sm rounded-md border bg-background px-4 py-3 text-sm shadow-lg",
               findReplaceToast.tone === "success"
                 ? "border-emerald-300"
-                : "border-destructive/30"
+                : findReplaceToast.tone === "warning"
+                  ? "border-amber-300"
+                  : "border-destructive/30"
             )}
             role="status"
           >
@@ -6527,7 +6723,9 @@ export default function ResultsDashboardPage({
                 "flex items-start gap-2",
                 findReplaceToast.tone === "success"
                   ? "text-emerald-700"
-                  : "text-destructive"
+                  : findReplaceToast.tone === "warning"
+                    ? "text-amber-700"
+                    : "text-destructive"
               )}
             >
               {findReplaceToast.tone === "success" ? (

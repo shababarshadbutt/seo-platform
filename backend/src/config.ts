@@ -487,6 +487,31 @@ export const config = {
 
   cloudfrontDistributionId: process.env.CLOUDFRONT_DISTRIBUTION_ID ?? "",
 
+  // Above this many exact paths, one publish invalidates a single scoped
+  // wildcard (".../sitemaps/*") instead of listing every file.
+  //
+  // Two reasons, and the second is the one that bites. CloudFront caps a
+  // non-wildcard request at 3,000 paths, so a large domain cannot be invalidated
+  // path-by-path at all. And it bills PER PATH beyond the first 1,000 a month: a
+  // 2,650-sitemap domain costs roughly $13 in invalidation every time it
+  // publishes, versus one billable path for the wildcard. Exact paths stay the
+  // default for small publishes because they are the narrower blast radius, and
+  // the wildcard is always scoped to one domain's sitemap folder — never "/*",
+  // which would evict every other client site on the shared distribution.
+  cloudfrontWildcardThreshold: readNumber("CLOUDFRONT_WILDCARD_THRESHOLD", {
+    fallback: 200,
+    min: 1,
+    max: 3000
+  }),
+
+  // Paths per CreateInvalidation request. Below CloudFront's 3,000 hard cap so a
+  // rejected batch costs one batch rather than the whole publish.
+  cloudfrontMaxPathsPerRequest: readNumber("CLOUDFRONT_MAX_PATHS_PER_REQUEST", {
+    fallback: 1000,
+    min: 1,
+    max: 3000
+  }),
+
   // Per-domain publish lock TTL. A crashed publish's lock expires rather than
   // wedging that domain forever; the happy path releases it in a finally.
   publishLockTtlSeconds: readNumber("PUBLISH_LOCK_TTL_SECONDS", {

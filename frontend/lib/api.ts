@@ -3245,6 +3245,17 @@ export type PublishPreview = {
   // folder. The folder wins; this is what was overridden.
   base_url_host_ignored: string | null;
   deletes_objects: boolean;
+  // Filenames CloudFront cannot express as an invalidation path (an unsanitized
+  // SFTP name with a space, a stray "%", a non-ASCII byte). A WARNING, not a
+  // blocker: the file publishes fine, its edge cache just cannot be purged by
+  // path. Capped at 50; `uninvalidatable_count` is the true total.
+  uninvalidatable: { filename: string; reason: string }[];
+  uninvalidatable_count: number;
+  // How this publish would invalidate the CDN. "wildcard" = one scoped path for
+  // the whole sitemap folder (used for large publishes: CloudFront caps a
+  // request at 3,000 paths and bills per path); "exact" = one path per file;
+  // "skipped" = no distribution configured.
+  invalidation_strategy: "wildcard" | "exact" | "skipped";
   // Another publish of this same domain is already running.
   locked: boolean;
 };
@@ -3322,8 +3333,37 @@ export async function startSftpPull(sessionId: string, domain: string) {
   );
 }
 
+// One file the publish could not write. Follows the {filename, reason} shape the
+// Cleaner's dropped_files already uses.
+export type PublishFailedFile = {
+  filename: string;
+  reason: string;
+  // The regenerated index still references it because an older version of the
+  // object is live in the bucket — deliberately kept, since dropping it would
+  // de-index live URLs over a transient upload error. False means the file is
+  // not on production at all and is not referenced.
+  still_indexed: boolean;
+};
+
+export type PublishInvalidation = {
+  strategy: "wildcard" | "exact" | "skipped";
+  invalidation_ids: string[];
+  paths_requested: number;
+  batches_requested: number;
+  batches_failed: number;
+  failed_paths: { path: string; reason: string }[];
+  // Set when the CDN purge did not fully succeed. This NEVER means the publish
+  // failed — every object is already written by the time this runs. It means the
+  // edge may serve stale sitemaps until their TTL lapses.
+  error: string | null;
+};
+
 export type PublishProgressEvent = {
-  type: "progress" | "done" | "error";
+  // "partial" sits between done and error: objects WERE written to production,
+  // but some files were skipped or the CDN purge did not complete. Without it a
+  // fully successful 2,651-file publish whose invalidation was rejected rendered
+  // as a red "Publish failed", which is the opposite of what happened.
+  type: "progress" | "done" | "partial" | "error";
   stage?: string;
   current?: number;
   total?: number;
@@ -3334,6 +3374,8 @@ export type PublishProgressEvent = {
     index_key?: string;
     omitted_deleted?: string[];
     invalidation_id?: string | null;
+    failed_files?: PublishFailedFile[];
+    invalidation?: PublishInvalidation;
   };
 };
 

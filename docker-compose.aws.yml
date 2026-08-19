@@ -210,6 +210,12 @@ services:
 
       # --- Phase 1: CloudFront invalidation ---
       CLOUDFRONT_DISTRIBUTION_ID: ${CLOUDFRONT_DISTRIBUTION_ID:?CLOUDFRONT_DISTRIBUTION_ID must be set in .env}
+      # Above this many changed files, one scoped wildcard replaces the
+      # per-file path list: CloudFront caps a request at 3,000 paths and bills
+      # per path beyond 1,000/month. Never a distribution-wide "/*", which would
+      # evict every other client site — see .env.example.
+      CLOUDFRONT_WILDCARD_THRESHOLD: ${CLOUDFRONT_WILDCARD_THRESHOLD:-200}
+      CLOUDFRONT_MAX_PATHS_PER_REQUEST: ${CLOUDFRONT_MAX_PATHS_PER_REQUEST:-1000}
 
       # --- Phase 1: per-domain publish lock (Redis-backed, TTL'd) ---
       PUBLISH_LOCK_TTL_SECONDS: ${PUBLISH_LOCK_TTL_SECONDS:-300}
@@ -338,6 +344,12 @@ services:
       AWS_REGION: ${AWS_REGION:?AWS_REGION must be set in .env}
       S3_PUBLISH_ALLOW_DELETE: "false"
       CLOUDFRONT_DISTRIBUTION_ID: ${CLOUDFRONT_DISTRIBUTION_ID:?CLOUDFRONT_DISTRIBUTION_ID must be set in .env}
+      # Above this many changed files, one scoped wildcard replaces the
+      # per-file path list: CloudFront caps a request at 3,000 paths and bills
+      # per path beyond 1,000/month. Never a distribution-wide "/*", which would
+      # evict every other client site — see .env.example.
+      CLOUDFRONT_WILDCARD_THRESHOLD: ${CLOUDFRONT_WILDCARD_THRESHOLD:-200}
+      CLOUDFRONT_MAX_PATHS_PER_REQUEST: ${CLOUDFRONT_MAX_PATHS_PER_REQUEST:-1000}
       PUBLISH_LOCK_TTL_SECONDS: ${PUBLISH_LOCK_TTL_SECONDS:-300}
 
       # --- Private-VPC routing for URL health checks (default OFF) ---

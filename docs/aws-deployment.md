@@ -119,12 +119,23 @@ when the key file is absent), `SFTP_BASE_PATH` (`sftp-sitemaps-asapsmei`),
 `S3_SITEMAPS_PREFIX_TEMPLATE` (`sites/{domain}/sitemaps/`),
 `PUBLIC_SITEMAP_URL_TEMPLATE` (`https://{domain}/sitemaps/{file}`),
 `S3_PUBLISH_ALLOW_DELETE` (`false`), `PUBLISH_LOCK_TTL_SECONDS` (300),
+`CLOUDFRONT_WILDCARD_THRESHOLD` (200), `CLOUDFRONT_MAX_PATHS_PER_REQUEST`
+(1000),
 `NODE_TLS_REJECT_UNAUTHORIZED` (1), `FRONTEND_PORT` (3000), `SEO_DESK_PORT`
 (4000).
 
 **No AWS access keys anywhere.** S3 and CloudFront use the default provider
 chain, which resolves the EC2 instance role. If IAM-role auth is not wired up on
 first deploy that is a blocker to fix, not a reason to add keys.
+
+**The instance role needs `s3:GetObject` (for `HeadObject`) on the sitemaps
+prefix**, not only `s3:PutObject`. When a file fails to upload, the publish heads
+its key to decide whether the regenerated index should still reference it: an
+older version of the object being live means keeping the entry serves a stale
+sitemap, whereas dropping it would de-index live URLs over what is usually a
+transient error. A role without the permission is not fatal — a Head that fails
+for any reason other than a clean 404 is treated as "exists", so the publish
+degrades to keeping every entry indexed rather than breaking.
 
 ---
 
