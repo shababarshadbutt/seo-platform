@@ -64,6 +64,12 @@ services:
         # below which are read at runtime so one image works anywhere.
         NEXT_PUBLIC_APP_VERSION: ${APP_VERSION}
     environment:
+      # Identifies WHICH COMPOSE FILE started this container. A literal, never a
+      # ${...} substitution: it names the file, so .env must not be able to
+      # change it. Reported on /health and appended to the AWS 503 messages, so
+      # "which stack is actually serving this?" is one request rather than an SSH
+      # session. See the note in docker-compose.yml for the incident behind it.
+      DEPLOYMENT_PROFILE: aws
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: "1"
       # Plain (non-public) — read server-side at request time, exposed to the
@@ -130,6 +136,12 @@ services:
     build:
       context: ./backend
     environment:
+      # Identifies WHICH COMPOSE FILE started this container. A literal, never a
+      # ${...} substitution: it names the file, so .env must not be able to
+      # change it. Reported on /health and appended to the AWS 503 messages, so
+      # "which stack is actually serving this?" is one request rather than an SSH
+      # session. See the note in docker-compose.yml for the incident behind it.
+      DEPLOYMENT_PROFILE: aws
       NODE_ENV: production
       PORT: "3001"
       # V8 heap ceiling for the API. 12 GiB, derived — not a round fraction of
@@ -313,6 +325,12 @@ services:
       context: ./backend
     command: npm run start:worker
     environment:
+      # Identifies WHICH COMPOSE FILE started this container. A literal, never a
+      # ${...} substitution: it names the file, so .env must not be able to
+      # change it. Reported on /health and appended to the AWS 503 messages, so
+      # "which stack is actually serving this?" is one request rather than an SSH
+      # session. See the note in docker-compose.yml for the incident behind it.
+      DEPLOYMENT_PROFILE: aws
       NODE_ENV: production
       WORKER_HEALTH_PORT: "3002"
       NODE_TLS_REJECT_UNAUTHORIZED: "${NODE_TLS_REJECT_UNAUTHORIZED:-1}"

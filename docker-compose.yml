@@ -41,6 +41,17 @@ services:
     build:
       context: ./frontend
     environment:
+      # Identifies WHICH COMPOSE FILE started this container. A literal, never a
+      # ${...} substitution: it names the file, so .env must not be able to
+      # change it. Reported on /health and appended to the AWS 503 messages.
+      #
+      # Both files default to the same compose project name (the directory), so
+      # `docker compose up` without -f on the deployed VM REPLACES the production
+      # containers with these dev-file ones. That happened, and the only symptom
+      # was /api/sftp/* answering 503 "SFTP_HOST is unset" on a box whose .env
+      # plainly set SFTP_HOST — indistinguishable, from outside, from a genuine
+      # config mistake. Now the error says which file it came from.
+      DEPLOYMENT_PROFILE: dev
       NEXT_TELEMETRY_DISABLED: "1"
       # Plain (non-NEXT_PUBLIC_) server-side vars, read per request by
       # lib/runtime-config.ts. NEXT_PUBLIC_* is inlined at BUILD time and is NOT
@@ -89,6 +100,17 @@ services:
     build:
       context: ./backend
     environment:
+      # Identifies WHICH COMPOSE FILE started this container. A literal, never a
+      # ${...} substitution: it names the file, so .env must not be able to
+      # change it. Reported on /health and appended to the AWS 503 messages.
+      #
+      # Both files default to the same compose project name (the directory), so
+      # `docker compose up` without -f on the deployed VM REPLACES the production
+      # containers with these dev-file ones. That happened, and the only symptom
+      # was /api/sftp/* answering 503 "SFTP_HOST is unset" on a box whose .env
+      # plainly set SFTP_HOST — indistinguishable, from outside, from a genuine
+      # config mistake. Now the error says which file it came from.
+      DEPLOYMENT_PROFILE: dev
       NODE_ENV: development
       PORT: "3001"
       NODE_OPTIONS: "--max-old-space-size=4096"
@@ -216,6 +238,17 @@ services:
       context: ./backend
     command: npm run worker
     environment:
+      # Identifies WHICH COMPOSE FILE started this container. A literal, never a
+      # ${...} substitution: it names the file, so .env must not be able to
+      # change it. Reported on /health and appended to the AWS 503 messages.
+      #
+      # Both files default to the same compose project name (the directory), so
+      # `docker compose up` without -f on the deployed VM REPLACES the production
+      # containers with these dev-file ones. That happened, and the only symptom
+      # was /api/sftp/* answering 503 "SFTP_HOST is unset" on a box whose .env
+      # plainly set SFTP_HOST — indistinguishable, from outside, from a genuine
+      # config mistake. Now the error says which file it came from.
+      DEPLOYMENT_PROFILE: dev
       NODE_ENV: development
       WORKER_HEALTH_PORT: "3002"
       # Accept corporate SSL-inspection proxy certificates (v1.39). The worker

@@ -74,6 +74,24 @@ export function readBooleanFlag(
 
 export const config = {
   nodeEnv: process.env.NODE_ENV ?? "development",
+
+  // WHICH COMPOSE FILE STARTED THIS CONTAINER. Set as a LITERAL in each file —
+  // "dev" in docker-compose.yml, "aws" in docker-compose.aws.yml — never a
+  // ${...} substitution, because it identifies the FILE and must not be
+  // overridable from .env.
+  //
+  // Why it exists: the two files default to the same compose project name (the
+  // directory), so `docker compose up` without -f on the deployed VM silently
+  // REPLACES the production containers with dev-file ones. That happened, and
+  // the only symptom was /api/sftp/* answering 503 "SFTP_HOST is unset" while
+  // .env plainly had SFTP_HOST — because the dev file did not pass it. Nothing
+  // the deployment reported could distinguish "variable missing from .env" from
+  // "container built from the wrong file", and it took three rounds to tell
+  // apart. Reported on /health and appended to the *ConfigError messages so it
+  // takes one look now.
+  //
+  // "unknown" means neither file started it, which is itself the answer.
+  deploymentProfile: process.env.DEPLOYMENT_PROFILE ?? "unknown",
   port: readNumber("PORT", { fallback: 3001, min: 1, max: 65535 }),
   workerHealthPort: readNumber("WORKER_HEALTH_PORT", {
     fallback: 3002,
@@ -531,6 +549,95 @@ function awsFeatureDisabledError(): string | null {
     : "This feature is disabled on this deployment (AWS_PUBLISH_ENABLED is not true): the SFTP pull and S3 publish paths are unverified against real AWS infrastructure";
 }
 
+// Every AWS-gated variable, and whether this container HAS it. Names and
+// booleans only — never a value, so this is safe on the unauthenticated /health
+// and safe to append to a 503 body. The names are already public in the repo,
+// .env.example and docs/aws-deployment.md; what was missing was any way to see
+// which of them a RUNNING container actually got.
+export function awsConfigStatus() {
+  return {
+    profile: config.deploymentProfile,
+    node_env: config.nodeEnv,
+    publish_enabled: config.awsPublishEnabled,
+    sftp: {
+      SFTP_HOST: config.sftp.host !== "",
+      SFTP_USERNAME: config.sftp.username !== "",
+      SFTP_BASE_PATH: config.sftp.basePath !== ""
+    },
+    s3: {
+      AWS_REGION: config.s3.region !== "",
+      S3_BUCKET: config.s3.bucket !== "",
+      PUBLIC_SITEMAP_URL_TEMPLATE: config.publicSitemapUrlTemplate !== ""
+    },
+    cdn: {
+      CLOUDFRONT_DISTRIBUTION_ID: config.cloudfrontDistributionId !== ""
+    }
+  };
+}
+
+// The names of every AWS-gated variable this container is missing.
+function unsetAwsVariables(): string[] {
+  const status = awsConfigStatus();
+
+  return [
+    ...Object.entries(status.sftp),
+    ...Object.entries(status.s3),
+    ...Object.entries(status.cdn)
+  ]
+    .filter(([, isSet]) => !isSet)
+    .map(([name]) => name);
+}
+
+// Diagnostic context appended to a *ConfigError message.
+//
+// The leading sentence of those messages is deliberately NOT touched: tests
+// match on it and the frontend renders it verbatim. This only ADDS what the bare
+// sentence could never say — which compose file produced this container, and
+// what else is missing — because "SFTP_HOST is unset" on a box whose .env plainly
+// sets SFTP_HOST reads as a bug in the app rather than a container built from
+// the wrong file.
+function configDiagnostics(exclude: string): string {
+  const parts: string[] = [];
+
+  if (config.deploymentProfile === "unknown") {
+    parts.push(
+      "This container reports no DEPLOYMENT_PROFILE, so it was not started by either compose file — check how it was launched"
+    );
+  } else {
+    const startedFrom =
+      config.deploymentProfile === "aws"
+        ? "docker-compose.aws.yml"
+        : config.deploymentProfile === "dev"
+          ? "docker-compose.yml"
+          : null;
+
+    parts.push(
+      `This container reports DEPLOYMENT_PROFILE=${config.deploymentProfile}` +
+        (startedFrom ? `, so it was started from ${startedFrom}` : "")
+    );
+
+    // The actionable half. Both files default to the same compose project name,
+    // so `docker compose up` without -f on the deployed VM replaces the
+    // production containers with dev-file ones — which is exactly how a
+    // correctly-configured .env ends up serving an unconfigured backend.
+    if (config.deploymentProfile === "dev") {
+      parts.push(
+        "On the deployed box, bring it up with `docker compose -f docker-compose.aws.yml up -d --force-recreate` instead"
+      );
+    }
+  }
+
+  const alsoUnset = unsetAwsVariables().filter((name) => name !== exclude);
+
+  if (alsoUnset.length > 0) {
+    parts.push(`Also unset here: ${alsoUnset.join(", ")}`);
+  }
+
+  parts.push("See /health for the full picture");
+
+  return ` ${parts.join(". ")}.`;
+}
+
 // Why the SFTP feature can't run, or null when it is usable. Checked by the
 // routes so a missing deployment env var is a clear 503 rather than a stack
 // trace from deep inside the ssh2 client.
@@ -541,12 +648,20 @@ export function sftpConfigError(): string | null {
     return disabled;
   }
 
+  // The leading sentence is unchanged and must stay so — tests match on it and
+  // the frontend shows it verbatim. configDiagnostics only appends.
   if (!config.sftp.host) {
-    return "SFTP is not configured on this deployment (SFTP_HOST is unset)";
+    return (
+      "SFTP is not configured on this deployment (SFTP_HOST is unset)" +
+      configDiagnostics("SFTP_HOST")
+    );
   }
 
   if (!config.sftp.username) {
-    return "SFTP is not configured on this deployment (SFTP_USERNAME is unset)";
+    return (
+      "SFTP is not configured on this deployment (SFTP_USERNAME is unset)" +
+      configDiagnostics("SFTP_USERNAME")
+    );
   }
 
   return null;
@@ -560,12 +675,19 @@ export function publishConfigError(): string | null {
     return disabled;
   }
 
+  // Leading sentences unchanged, for the same reason as sftpConfigError above.
   if (!config.s3.region) {
-    return "S3 publishing is not configured on this deployment (AWS_REGION is unset)";
+    return (
+      "S3 publishing is not configured on this deployment (AWS_REGION is unset)" +
+      configDiagnostics("AWS_REGION")
+    );
   }
 
   if (!config.s3.bucket) {
-    return "S3 publishing is not configured on this deployment (S3_BUCKET is unset)";
+    return (
+      "S3 publishing is not configured on this deployment (S3_BUCKET is unset)" +
+      configDiagnostics("S3_BUCKET")
+    );
   }
 
   // A template without {file} would resolve every child sitemap to the SAME

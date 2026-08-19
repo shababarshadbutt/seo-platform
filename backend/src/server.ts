@@ -5,7 +5,7 @@ import multipart from "@fastify/multipart";
 // Install the TLS policy (corporate SSL-proxy handling) before anything makes
 // an outbound request. (v1.39 Fix 1)
 import "./http/tlsDispatcher.js";
-import { config } from "./config.js";
+import { awsConfigStatus, config } from "./config.js";
 import { initEventLog } from "./diagnostics/eventLog.js";
 import { logPrivateHostMapStatus } from "./http/privateHostMap.js";
 import { closeSitemapQueue } from "./queue/sitemapQueue.js";
@@ -46,6 +46,15 @@ logPrivateHostMapStatus(app.log, {
   file: config.privateRoute.mapFile,
   reloadSeconds: config.privateRoute.mapReloadSeconds
 });
+
+// Which compose file started this container, and which AWS-gated variables it
+// actually received. Said once at boot, for the same reason the private-host map
+// says its contents once: a container built from the wrong compose file is an ops
+// mistake, and the restart is the moment to surface it — not, hours later, as a
+// 503 naming one variable that the operator can plainly see set in .env.
+//
+// Names and booleans only, so this line is safe to paste into a ticket.
+app.log.info(awsConfigStatus(), "deployment config");
 
 await app.register(cors, {
   origin: true,
@@ -105,12 +114,19 @@ await app.register(sessionRoutes);
 await app.register(verificationRoutes);
 await app.register(cleanerRoutes);
 
+// `config` here is names-and-booleans only, never a value, so this stays safe on
+// an unauthenticated endpoint. It exists because a 503 naming one variable could
+// not distinguish "missing from .env" from "container started from the wrong
+// compose file" — the two look identical from outside, and telling them apart
+// otherwise needs SSH. Reachable through the frontend proxy at
+// /api/backend/health, so one browser request answers it.
 app.get("/health", async () => ({
   ok: true,
   service: "backend",
   mode: config.nodeEnv,
   uploadDir: config.uploadDir,
-  exportDir: config.exportDir
+  exportDir: config.exportDir,
+  config: awsConfigStatus()
 }));
 
 app.get("/", async () => ({

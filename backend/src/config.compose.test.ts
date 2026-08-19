@@ -41,7 +41,50 @@ const APP_SERVICES = ["frontend", "backend", "worker"];
 // Keys allowed to differ, with the reason. NODE_ENV is the environment's own
 // identity — "development" in the dev file, "production" in the aws one — so
 // requiring it to match would be requiring the two files to be the same file.
-const ALLOWED_TO_DIFFER = new Set(["NODE_ENV"]);
+const ALLOWED_TO_DIFFER = new Set(["NODE_ENV", "DEPLOYMENT_PROFILE"]);
+
+// The literal value of one env var in one service, or null when absent. Used by
+// the DEPLOYMENT_PROFILE tests, which are about the VALUE rather than the key.
+function envValue(
+  composePath: string,
+  service: string,
+  key: string
+): string | null {
+  const lines = readFileSync(composePath, "utf8").split(/\r?\n/);
+  let current: string | null = null;
+  let inEnvironment = false;
+
+  for (const line of lines) {
+    if (!line.trim() || line.trim().startsWith("#")) {
+      continue;
+    }
+
+    const serviceMatch = /^ {2}([A-Za-z0-9_-]+):\s*$/.exec(line);
+
+    if (serviceMatch) {
+      current = serviceMatch[1];
+      inEnvironment = false;
+      continue;
+    }
+
+    const sectionMatch = /^ {4}([A-Za-z0-9_-]+):/.exec(line);
+
+    if (sectionMatch) {
+      inEnvironment = sectionMatch[1] === "environment";
+      continue;
+    }
+
+    if (inEnvironment && current === service) {
+      const varMatch = new RegExp(`^ {6}${key}:\\s*(.*)$`).exec(line);
+
+      if (varMatch) {
+        return varMatch[1].trim();
+      }
+    }
+  }
+
+  return null;
+}
 
 // Env keys declared per service, keyed by service name.
 function envKeysByService(composePath: string): Map<string, Set<string>> {
@@ -200,6 +243,63 @@ test("the AWS feature flag never ships without the config it enables", () => {
             `while the endpoints answer 503 naming this variable.`
         );
       }
+    }
+  }
+});
+
+// DEPLOYMENT_PROFILE is the one variable whose whole job is to DIFFER between the
+// two files, so the contract tests above exempt it — which means it needs its own
+// assertions or it would be the least-checked variable in the file.
+//
+// It exists because both compose files default to the same compose project name
+// (the directory), so `docker compose up` without -f on the deployed VM replaces
+// the production containers with dev-file ones. The only symptom was
+// /api/sftp/* answering 503 "SFTP_HOST is unset" on a box whose .env plainly set
+// SFTP_HOST, and nothing the deployment reported could tell that apart from a
+// genuine config mistake.
+test("both compose files stamp a DEPLOYMENT_PROFILE on every app service", () => {
+  for (const [label, parsed] of [
+    ["docker-compose.yml", dev],
+    ["docker-compose.aws.yml", aws]
+  ] as const) {
+    for (const service of APP_SERVICES) {
+      assert.ok(
+        (parsed.get(service) ?? new Set()).has("DEPLOYMENT_PROFILE"),
+        `${label}: ${service} has no DEPLOYMENT_PROFILE, so a container built from it cannot say which file it came from`
+      );
+    }
+  }
+});
+
+test("the two files report DIFFERENT profiles, as literals", () => {
+  const devPath = path.join(REPO_ROOT, "docker-compose.yml");
+  const awsPath = path.join(REPO_ROOT, "docker-compose.aws.yml");
+
+  for (const service of APP_SERVICES) {
+    const devProfile = envValue(devPath, service, "DEPLOYMENT_PROFILE");
+    const awsProfile = envValue(awsPath, service, "DEPLOYMENT_PROFILE");
+
+    assert.equal(devProfile, "dev", `docker-compose.yml ${service}`);
+    assert.equal(awsProfile, "aws", `docker-compose.aws.yml ${service}`);
+
+    // The point of the whole marker: the two can never claim the same identity.
+    assert.notEqual(
+      devProfile,
+      awsProfile,
+      `${service}: both files report the same profile, so the marker cannot distinguish them`
+    );
+
+    // A LITERAL, not a ${...} substitution. It names the FILE, so allowing .env
+    // to override it would let a dev-file container claim to be the aws one —
+    // which is exactly the confusion it was added to end.
+    for (const [label, value] of [
+      ["docker-compose.yml", devProfile],
+      ["docker-compose.aws.yml", awsProfile]
+    ] as const) {
+      assert.ok(
+        value !== null && !value.includes("$"),
+        `${label}: ${service}'s DEPLOYMENT_PROFILE is ${value} — it must be a literal, not overridable from .env`
+      );
     }
   }
 });
