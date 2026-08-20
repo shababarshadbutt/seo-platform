@@ -176,6 +176,7 @@ import {
   lowCoverageMessage,
   measureTransformCoverage
 } from "../sitemaps/transformCoverage.js";
+import { parseShapeFilter } from "../sitemaps/shapeFilter.js";
 import { looksLikeNotFoundUrl } from "../sitemaps/softNotFound.js";
 import {
   parseStructure,
@@ -279,6 +280,9 @@ type TransformBody = {
   // refuses a structure whose param transform leaves most matching URLs
   // untouched — see sitemaps/transformCoverage.ts.
   force_low_coverage?: unknown;
+  // Selected source SHAPES (v1.69): the ticked rows of the dry run's histogram.
+  // Absent/[] = every shape, the pre-v1.69 behaviour. See sitemaps/shapeFilter.ts.
+  shape_filter?: unknown;
   // One filter object (pre-v1.51) or an ARRAY of them, ANDed across {param}
   // positions. null / [] / absent = whole-pattern.
   structure_filter?: unknown;
@@ -3361,6 +3365,27 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         }
       }
 
+      // Selected source shapes (v1.69). A checkbox per row of the dry run's
+      // shape histogram, so the SEO team narrows a rule to the URLs it is
+      // actually for instead of hand-writing a pattern.
+      const shapeFilter = parseShapeFilter(request.body?.shape_filter);
+
+      if (shapeFilter === null) {
+        return reply
+          .code(400)
+          .send(badRequest("shape_filter must be an array of shape strings"));
+      }
+
+      // NOT part of transformMeasurementFingerprint, deliberately, even though it
+      // changes what gets written — which is the rule that fingerprint states.
+      //
+      // The selection is drawn FROM the authorising dry run's own histogram and
+      // can only ever NARROW what that run measured, so the measurement remains
+      // valid evidence for the subset; its per-shape counts are precisely the
+      // evidence for it. Including it would invalidate the measurement the moment
+      // a box was unticked and demand a re-run to authorise a strictly smaller
+      // edit — a re-measure that could only confirm what the first one already
+      // itemised.
       // The label rename is optional; default to the existing template so a
       // structure-only transform leaves the pattern name untouched. A SCOPED
       // transform never moves the label — the template still describes the
@@ -3476,7 +3501,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           new_structure: newStructureRaw,
           new_template: newTemplate,
           source_files: selectedFiles,
-          structure_filter: structureFilters
+          structure_filter: structureFilters,
+          shape_filter: shapeFilter
         },
         filesTotal: selectedFiles.length
       });

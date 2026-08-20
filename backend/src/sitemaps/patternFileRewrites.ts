@@ -313,6 +313,10 @@ export async function transformPatternSourceFilesOnDisk(
     // caller; this field only rides along for the parallel pool's spec so the
     // worker threads apply the same guard.
     structureFilters?: ResolvedStructureFilter[] | null;
+    // Selected source SHAPES (v1.69). Same arrangement as structureFilters
+    // above: the inline rewriteUrl is already wrapped by the caller, and this
+    // rides along so the worker threads apply the identical guard.
+    shapeFilter?: string[] | null;
     onFileDone?: (filesDone: number) => void | Promise<void>;
     onFilesTotal?: (filesTotal: number) => void | Promise<void>;
   }
@@ -334,7 +338,8 @@ export async function transformPatternSourceFilesOnDisk(
       kind: "structureTransform",
       currentStructure: options.currentStructure,
       newStructure: options.newStructure,
-      structureFilters: options.structureFilters ?? []
+      structureFilters: options.structureFilters ?? [],
+      shapeFilter: options.shapeFilter ?? []
     },
     inlineRewriter: options.rewriteUrl,
     buildStoredName: (sessionId, displayName) =>

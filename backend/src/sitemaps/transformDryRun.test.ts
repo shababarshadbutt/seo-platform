@@ -201,3 +201,50 @@ test("a clean transform reports no anomalies", () => {
   assert.equal(totals.shapes_truncated, false);
   assert.equal(totals.collision_scan_truncated, false);
 });
+
+// --- source shapes, for the Update Pattern checkboxes (v1.69) ----------------
+
+test("every shape bucket reports the SOURCE shape it came from", () => {
+  // beforeShape is what the modal's checkboxes select on: the user is choosing
+  // which INPUT URLs a rule is for, not which outputs they like the look of.
+  const totals = run("/nspart/{A}/", "/nsnpart/{A|split|6|-|}/", [
+    "https://x.com/nspart/part-720/",
+    "https://x.com/nspart/part-72000/"
+  ]);
+
+  assert.deepEqual(
+    totals.shapes.map((entry) => [entry.beforeShape, entry.shape, entry.count]),
+    [
+      ["/a/a-999/", "/a/a-9-99/", 1],
+      ["/a/a-99999/", "/a/a-9-9999/", 1]
+    ]
+  );
+});
+
+test("one SOURCE shape splitting into two results stays two buckets", () => {
+  // The reason the histogram keys on the source->result PAIR rather than on the
+  // source alone. valueShape collapses any letter run to a single "a", so
+  // "aaa-1" and "bb-2" share the source shape /a/a-9/ — but a POSITIONAL split
+  // lands differently inside each, so they diverge on the way out. Keying on the
+  // source would merge these rows and hide the fact that the rule treats them
+  // differently, which is the one thing this histogram exists to show.
+  const totals = run(
+    "/p/{A}/",
+    "/p/{A|split|2|-|}/",
+    ["https://x.com/p/aaa-1/", "https://x.com/p/bb-2/"],
+    "/p/{param}"
+  );
+
+  assert.equal(totals.rewritten, 2);
+
+  const rows = totals.shapes.map((entry) => [entry.beforeShape, entry.shape]);
+
+  assert.equal(rows.length, 2);
+  // Same source shape...
+  assert.deepEqual(
+    rows.map((row) => row[0]),
+    ["/a/a-9/", "/a/a-9/"]
+  );
+  // ...two different results.
+  assert.notEqual(rows[0][1], rows[1][1]);
+});

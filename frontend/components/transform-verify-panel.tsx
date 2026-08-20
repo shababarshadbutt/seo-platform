@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import { AlertTriangle, Download, Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -168,7 +169,9 @@ export function TransformDryRunPanel({
   progressLabel,
   error,
   required,
-  onRun
+  onRun,
+  selectedShapes,
+  onToggleShape
 }: {
   result: TransformDryRunResult | null;
   isRunning: boolean;
@@ -178,7 +181,51 @@ export function TransformDryRunPanel({
   // is not optional.
   required: boolean;
   onRun: () => void;
+  // Ticked SOURCE shapes (v1.69). Owned by the parent because the apply request
+  // carries them; this panel only renders and toggles.
+  selectedShapes: Set<string>;
+  onToggleShape: (shape: string) => void;
 }) {
+  // One row per SOURCE shape, which is what a checkbox selects.
+  //
+  // The histogram arrives keyed on the source->result PAIR, because one source
+  // shape can produce several results (valueShape collapses any letter run to a
+  // single "a", so a literal rule can match one member of a shape and miss
+  // another). That distinction matters for reading what a rule does, but a
+  // checkbox cannot half-select a shape — the filter is applied to the INPUT —
+  // so the rows are folded back down here, summing counts and keeping the first
+  // example. Folding in the UI rather than server-side keeps the pair detail
+  // available for the "→" preview on each row.
+  const shapeRows = useMemo(() => {
+    const rows = new Map<
+      string,
+      { beforeShape: string; count: number; before: string; after: string }
+    >();
+
+    for (const entry of result?.shapes ?? []) {
+      const existing = rows.get(entry.beforeShape);
+
+      if (existing) {
+        existing.count += entry.count;
+      } else {
+        rows.set(entry.beforeShape, {
+          beforeShape: entry.beforeShape,
+          count: entry.count,
+          before: entry.before,
+          after: entry.after
+        });
+      }
+    }
+
+    return Array.from(rows.values()).sort((a, b) => b.count - a.count);
+  }, [result]);
+
+  const totalCount = shapeRows.reduce((sum, row) => sum + row.count, 0);
+  const selectedCount = shapeRows.reduce(
+    (sum, row) => (selectedShapes.has(row.beforeShape) ? sum + row.count : sum),
+    0
+  );
+
   const anomalies = result
     ? [
         result.clamped_split > 0
@@ -315,35 +362,86 @@ export function TransformDryRunPanel({
             </ul>
           ) : null}
 
-          {result.shapes.length > 0 ? (
+          {shapeRows.length > 0 ? (
             <div className="space-y-1">
               <p className="text-xs font-semibold text-slate-600">
-                Result shapes
-                {result.shapes_truncated ? " (first 25)" : ""} — digits shown as
-                9, letters as a
+                Which URLs should this rule change?
               </p>
-              <ul className="space-y-1" data-testid="transform-dry-run-shapes">
-                {result.shapes.map((entry) => (
-                  <li
-                    key={entry.shape}
-                    className="flex flex-wrap items-baseline justify-between gap-2 rounded border border-slate-200 px-2 py-1 text-xs"
-                  >
-                    <span className="break-all font-mono text-slate-800">
-                      {entry.shape}
-                    </span>
-                    <span className="shrink-0 text-slate-500">
-                      {formatNumber(entry.count)}
-                    </span>
-                    <span className="w-full break-all font-mono text-[11px] text-slate-400">
-                      {entry.after}
-                    </span>
-                  </li>
-                ))}
+              {/* CHECKBOXES, NOT A REGEX (v1.69). A pattern usually mixes several
+                  value shapes — nsn-parts-12191, nsn-parts-6492, page-1-34 — and
+                  one rule rarely serves all of them, which is what the v1.68
+                  coverage gate keeps refusing. The gate says a rule is wrong; it
+                  cannot say which URLs it is FOR. This can.
+
+                  Shapes are already a canonical form (digit runs to 9xlength,
+                  letter runs to a), so selecting them is exact string equality —
+                  no pattern to write, nothing to compile, and nothing that can
+                  backtrack over millions of URLs. */}
+              <p className="text-xs text-slate-500">
+                Digits shown as 9, letters as a. Unticked shapes are left exactly
+                as they are.
+              </p>
+              <ul
+                className="space-y-1"
+                data-testid="transform-dry-run-shapes"
+              >
+                {shapeRows.map((row) => {
+                  const ticked = selectedShapes.has(row.beforeShape);
+
+                  return (
+                    <li
+                      key={row.beforeShape}
+                      className="rounded border border-slate-200 px-2 py-1 text-xs"
+                    >
+                      <label className="flex flex-wrap items-baseline gap-2">
+                        <input
+                          type="checkbox"
+                          className="mt-0.5 h-3.5 w-3.5 shrink-0 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                          checked={ticked}
+                          onChange={() => onToggleShape(row.beforeShape)}
+                        />
+                        <span className="break-all font-mono text-slate-800">
+                          {row.beforeShape}
+                        </span>
+                        <span className="shrink-0 text-slate-500">
+                          {formatNumber(row.count)}
+                        </span>
+                        <span className="w-full break-all pl-6 font-mono text-[11px] text-slate-400">
+                          {row.before}
+                          <span className="text-slate-300"> → </span>
+                          {row.after}
+                        </span>
+                      </label>
+                    </li>
+                  );
+                })}
               </ul>
-              {result.shapes.length > 1 ? (
-                <p className="text-xs text-slate-500">
-                  More than one shape means the rule does not treat every URL the
-                  same way. Check each one is what you intended.
+              <p className="text-xs text-slate-600">
+                {formatNumber(selectedCount)} of {formatNumber(totalCount)} URLs
+                selected
+                {selectedShapes.size < shapeRows.length
+                  ? ` · ${formatNumber(
+                      shapeRows.length - selectedShapes.size
+                    )} shape${
+                      shapeRows.length - selectedShapes.size === 1 ? "" : "s"
+                    } left untouched`
+                  : ""}
+              </p>
+              {/* The histogram is capped at 25 shapes. Past that the list is
+                  INCOMPLETE, and a class the user could not see must never be
+                  rewritten by a selection they could not make — so unlisted
+                  shapes count as unticked and the copy says so. */}
+              {result.shapes_truncated ? (
+                <p className="rounded-md bg-amber-50 px-2 py-1 text-xs text-amber-800">
+                  More than 25 shapes — only the first 25 are listed. Shapes not
+                  shown here will NOT be changed. Narrow the pattern (or scope by
+                  structure above) to see the rest.
+                </p>
+              ) : null}
+              {selectedCount === 0 ? (
+                <p className="rounded-md bg-red-50 px-2 py-1 text-xs text-red-800">
+                  Nothing is selected, so applying would change no URLs. Tick at
+                  least one shape.
                 </p>
               ) : null}
             </div>

@@ -11,6 +11,7 @@ import {
   parseStructure,
   transformUrl
 } from "../sitemaps/transformStructure.js";
+import { applyShapeFilterToRewriter } from "../sitemaps/shapeFilter.js";
 import {
   applyStructureFilterToRewriter,
   type ResolvedStructureFilter
@@ -65,11 +66,17 @@ export type FileRewriteSpec =
   // thread edge, not the parsed form — parseStructure is cheap, deterministic and
   // total on strings the route already validated, so re-parsing per worker is
   // simpler than keeping ParsedStructure structured-clone-safe.
+  // shapeFilter (v1.69) is a SECOND, independent scope: structureFilters is
+  // token-boundary prefix/suffix matching ("only nsn-parts-*"), shapeFilter is
+  // value shape ("only the 5-digit ones"). Neither can express the other, and
+  // both can apply at once. Plain strings, so nothing has to be resolved before
+  // crossing the thread edge.
   | {
       kind: "structureTransform";
       currentStructure: string;
       newStructure: string;
       structureFilters?: ResolvedStructureFilter[] | null;
+      shapeFilter?: string[] | null;
     };
 
 export type FileRewriteInput = {
@@ -107,9 +114,14 @@ function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
     const current = parseStructure(spec.currentStructure);
     const next = parseStructure(spec.newStructure);
 
-    return applyStructureFilterToRewriter(
-      (url) => transformUrl(url, current, next),
-      spec.structureFilters ?? null
+    // Both guards, outermost first: a URL of an unselected shape returns null
+    // before the structure guard or transformUrl ever see it.
+    return applyShapeFilterToRewriter(
+      applyStructureFilterToRewriter(
+        (url) => transformUrl(url, current, next),
+        spec.structureFilters ?? null
+      ),
+      spec.shapeFilter ?? null
     );
   }
 

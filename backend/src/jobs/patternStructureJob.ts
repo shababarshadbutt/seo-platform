@@ -22,6 +22,10 @@ import {
 import { resolvePatternScanTargets } from "../sitemaps/patternFileScan.js";
 import { scanTransformDryRun } from "./transformDryRunScan.js";
 import {
+  applyShapeFilterToRewriter,
+  parseShapeFilter
+} from "../sitemaps/shapeFilter.js";
+import {
   applyStructureFilterToRewriter,
   parseStructureFilters,
   resolveStructureFilters,
@@ -96,6 +100,8 @@ type JobRow = {
     // LIST since v1.51, ANDed across {param} positions). Absent/null/[] =
     // whole-pattern, the pre-v1.49 behaviour.
     structure_filter?: unknown;
+    // Selected source shapes (v1.69) — see sitemaps/shapeFilter.ts.
+    shape_filter?: unknown;
   };
 };
 
@@ -106,6 +112,18 @@ type JobRow = {
 // A params blob that is present but INVALID throws rather than falling back to
 // unscoped: silently widening is the failure this whole guard exists to
 // prevent, and an edit over the wrong URLs is worse than a failed job.
+// Selected source shapes from the job params (v1.69). Absent = unscoped, the
+// pre-v1.69 behaviour, so an older queued job replays unchanged.
+function jobShapeFilter(params: JobRow["params"]): string[] {
+  const shapes = parseShapeFilter(params.shape_filter);
+
+  if (shapes === null) {
+    throw new Error("job params carry an invalid shape_filter");
+  }
+
+  return shapes;
+}
+
 function jobStructureFilters(params: JobRow["params"]): StructureFilter[] {
   const filters = parseStructureFilters(params.structure_filter);
 
@@ -546,11 +564,16 @@ export async function processPatternTransformJob(
     }
   }
 
-  // The guard runs FIRST: URLs outside the scoped structure return null before
-  // transformUrl sees them, in files and in the DB-sample rewrites alike.
-  const rewriteUrl = applyStructureFilterToRewriter(
-    (url: string) => transformUrl(url, current, next),
-    resolvedFilters
+  // The guards run FIRST: a URL outside the selected shapes or the scoped
+  // structure returns null before transformUrl sees it, in files and in the
+  // DB-sample rewrites alike. Shape is outermost — it is the coarser question.
+  const shapeFilter = jobShapeFilter(job.params);
+  const rewriteUrl = applyShapeFilterToRewriter(
+    applyStructureFilterToRewriter(
+      (url: string) => transformUrl(url, current, next),
+      resolvedFilters
+    ),
+    shapeFilter
   );
   const client = await pool.connect();
   // New files are removed on ROLLBACK; pre-transform originals are KEPT (undo
@@ -576,6 +599,7 @@ export async function processPatternTransformJob(
       newStructure: newStructureRaw,
       rewriteUrl,
       structureFilters: resolvedFilters,
+      shapeFilter,
       onFilesTotal: (total) => progress.setTotal(total),
       onFileDone: (done) => progress.onFileDone(done)
     });

@@ -149,6 +149,7 @@ import {
   urlMatchesStructureFilters
 } from "@/lib/structure-filter";
 import { filterByStatus } from "@/lib/fix-status-filter";
+import { urlShape } from "@/lib/value-shape";
 import {
   fixScopeLabel,
   fixScopeMatchesNothing,
@@ -2267,7 +2268,12 @@ export default function ResultsDashboardPage({
           structureFilters: renameStructureFilters,
           // Only ever true after the user pressed "Override and apply anyway"
           // on the coverage warning, and it resets on any structure edit.
-          forceLowCoverage
+          forceLowCoverage,
+          // Ticked source shapes (v1.69). ALL ticked is sent as [] rather than
+          // the full list: the two mean the same thing to the server, and an
+          // empty filter keeps an unscoped apply on exactly the pre-v1.69 code
+          // path instead of a shape guard that happens to admit everything.
+          shapeFilter: shapeFilterForApply
         },
         setStructureProgress
       );
@@ -2391,6 +2397,13 @@ export default function ResultsDashboardPage({
       );
 
       setTransformDryRun(result);
+      // Every shape starts TICKED (v1.69): before this control existed a
+      // transform touched everything, so the default has to be "everything" and
+      // the checkboxes can only ever narrow it. Folded to source shapes, matching
+      // how the panel renders them.
+      setSelectedShapes(
+        new Set(result.shapes.map((entry) => entry.beforeShape))
+      );
     } catch (error) {
       setTransformDryRun(null);
       setDryRunError(
@@ -3541,6 +3554,23 @@ export default function ResultsDashboardPage({
     );
   }, [transformPreviewSource, transformParsed]);
 
+  // Ticked SOURCE shapes for the transform (v1.69). Empty set = every shape,
+  // which is also what an unticked-nothing state would mean, so the two are kept
+  // apart by only ever seeding this FROM a completed dry run: until one exists
+  // there are no shapes to choose between and the apply is unscoped.
+  const [selectedShapes, setSelectedShapes] = useState<Set<string>>(new Set());
+  // Source shapes present in the authorising measurement, so "did the user
+  // untick anything?" is answerable without reaching into the panel.
+  const dryRunShapeCount = useMemo(
+    () => new Set((transformDryRun?.shapes ?? []).map((e) => e.beforeShape)).size,
+    [transformDryRun]
+  );
+  // [] when every shape is ticked — see the comment at the call site.
+  const shapeFilterForApply =
+    dryRunShapeCount > 0 && selectedShapes.size < dryRunShapeCount
+      ? Array.from(selectedShapes)
+      : [];
+
   // Does the rule actually generalise, or does it only fit the example it was
   // inferred from? (v1.68)
   //
@@ -3555,12 +3585,29 @@ export default function ResultsDashboardPage({
       return null;
     }
 
+    // Measured INSIDE the selected shapes (v1.69). Without this, narrowing a
+    // transform to one shape would still be blocked by the coverage gate for
+    // "ignoring" the shapes the user deliberately unticked — the gate would fight
+    // the control that exists to satisfy it.
+    //
+    // Only narrows when a real selection is active (shapeFilterForApply is []
+    // when everything is ticked), so an unscoped transform is measured exactly as
+    // it was in v1.68.
+    const scoped =
+      shapeFilterForApply.length === 0
+        ? transformPreviewSource
+        : transformPreviewSource.filter((url) => {
+            const shape = urlShape(url);
+
+            return shape !== null && shapeFilterForApply.includes(shape);
+          });
+
     return measureTransformCoverage(
-      transformPreviewSource,
+      scoped,
       transformParsed.current,
       transformParsed.next
     );
-  }, [transformPreviewSource, transformParsed]);
+  }, [transformPreviewSource, transformParsed, shapeFilterForApply]);
   const transformLowCoverage =
     transformCoverage !== null && isLowCoverage(transformCoverage);
   // A gate, not a wall (v1.68). A deliberately narrow rule is unusual but not
@@ -3677,6 +3724,9 @@ export default function ResultsDashboardPage({
     // edit would silently re-arm the block's escape hatch for a rule nobody
     // looked at. (v1.68)
     setForceLowCoverage(false);
+    // Same reasoning for the shape selection (v1.69): it describes the shapes of
+    // ONE measurement, and the measurement is discarded above.
+    setSelectedShapes(new Set());
   }, [transformCurrentStructure, effectiveNewStructure, renameRow?.id]);
 
   // The full check is REQUIRED when the pattern holds more URLs than the
@@ -6965,6 +7015,20 @@ export default function ResultsDashboardPage({
                   error={dryRunError}
                   required={dryRunRequired}
                   onRun={() => void handleRunDryRun()}
+                  selectedShapes={selectedShapes}
+                  onToggleShape={(shape) =>
+                    setSelectedShapes((current) => {
+                      const next = new Set(current);
+
+                      if (next.has(shape)) {
+                        next.delete(shape);
+                      } else {
+                        next.add(shape);
+                      }
+
+                      return next;
+                    })
+                  }
                 />
 
                 <p className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">

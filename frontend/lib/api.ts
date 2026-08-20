@@ -1795,6 +1795,9 @@ export async function transformPatternStructure(
     // transform leaves most matching URLs untouched while still re-parenting
     // them. Set only from the modal's explicit "Override and apply anyway".
     forceLowCoverage?: boolean;
+    // Ticked source shapes (v1.69). Empty/omitted = every shape, so a caller
+    // that never touches the checkboxes behaves exactly as before.
+    shapeFilter?: string[] | null;
   },
   onProgress?: (progress: PatternStructureProgress) => void
 ) {
@@ -1809,7 +1812,10 @@ export async function transformPatternStructure(
         new_structure: input.newStructure,
         source_files: input.sourceFiles,
         structure_filter: input.structureFilters ?? null,
-        ...(input.forceLowCoverage ? { force_low_coverage: true } : {})
+        ...(input.forceLowCoverage ? { force_low_coverage: true } : {}),
+        ...(input.shapeFilter && input.shapeFilter.length > 0
+          ? { shape_filter: input.shapeFilter }
+          : {})
       })
     }
   );
@@ -3509,7 +3515,12 @@ export type TransformSampleResult = {
 };
 
 export type TransformDryRunShape = {
+  // Shape of the RESULT path — what these URLs become.
   shape: string;
+  // Shape of the SOURCE path (v1.69). What the checkboxes select on: the user is
+  // choosing which INPUT URLs a rule is for. Several rows can share this when one
+  // source shape produces more than one result.
+  beforeShape: string;
   count: number;
   before: string;
   after: string;
