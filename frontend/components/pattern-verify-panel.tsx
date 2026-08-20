@@ -213,7 +213,7 @@ export function PatternVerifyPanel({
   // modal on a run already in flight starts a fresh measurement instead of
   // dividing by the whole elapsed time of a run it did not watch — and so
   // crossing from the file scan to probing re-measures rather than predicting URL
-  // throughput from a file rate. (v1.69.1)
+  // throughput from a file rate. (v1.70)
   const progressAnchor = useRef<{
     key: string;
     at: number;
@@ -252,7 +252,7 @@ export function PatternVerifyPanel({
     (verifyJob?.urls_total ?? 0) === 0 &&
     enumFilesTotal !== null &&
     enumFilesTotal > 0;
-  // QUEUED, not working (v1.69.1). The verification queue is concurrency 1, so a
+  // QUEUED, not working (v1.70). The verification queue is concurrency 1, so a
   // second request waits. This state had no rendering at all, which is why a
   // queued "Check by shape" looked identical to a hung one for 15 minutes.
   const isQueued = verifyJob?.status === "PENDING" && !isEnumerating;
@@ -315,7 +315,7 @@ export function PatternVerifyPanel({
     // the same request budget. Measuring beats predicting.
     const job = nextVerification.job;
 
-    // ONE anchor, EITHER phase (v1.69.1). It used to key on urls_total > 0, so an
+    // ONE anchor, EITHER phase (v1.70). It used to key on urls_total > 0, so an
     // ETA existed only while probing — which is why a run sitting in the file scan
     // showed no timeline at all, and a queued one showed nothing whatsoever.
     //
@@ -847,7 +847,7 @@ export function PatternVerifyPanel({
                 ·{" "}
               </>
             ) : null}
-            {/* Phase-accurate (v1.69.1). "Rate-limited" is only true of the
+            {/* Phase-accurate (v1.70). "Rate-limited" is only true of the
                 HTTP phase — saying it while the job is queued or reading files
                 off disk explains the wrong thing, and during a queue wait it
                 actively misdirects: the run is not slow, it has not started. */}

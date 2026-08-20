@@ -488,7 +488,7 @@ export async function verificationRoutes(app: FastifyInstance) {
               urls_reused: jobRow.urls_reused
             }
           : null,
-        // WHAT A QUEUED JOB IS WAITING BEHIND (v1.69.1).
+        // WHAT A QUEUED JOB IS WAITING BEHIND (v1.70).
         //
         // The verification queue is concurrency 1, so a second request sits
         // PENDING until the first finishes. Nothing said so: the panel had no

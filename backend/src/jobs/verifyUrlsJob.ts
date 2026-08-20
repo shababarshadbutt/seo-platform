@@ -303,7 +303,7 @@ export async function processVerifyUrlsJob(
       flushEnumProgress(filesDone, filesTotal);
     };
 
-    // STRATIFIED RUNS DO NOT ENUMERATE (v1.69.1).
+    // STRATIFIED RUNS DO NOT ENUMERATE (v1.70).
     //
     // enumeratePopulation reads every sitemap file in the SESSION and builds a
     // Map of the whole population. Once probing is cut to ~50 URLs per shape that
@@ -573,7 +573,7 @@ export async function processVerifyUrlsJob(
     // Sampling already happened, BEFORE any probing — see the sampled path where
     // the population would otherwise have been enumerated. Nothing narrows
     // toCheck here any more: it arrives holding only the reservoir's URLs, which
-    // is why the circuit breaker above still gets to run on them first. (v1.69.1)
+    // is why the circuit breaker above still gets to run on them first. (v1.70)
 
     // Probed redirect pairs per shape, for the per-shape rule. Only collected in
     // stratified mode, where it is bounded by shapes x shapeSample (~1,150 on the
@@ -755,7 +755,7 @@ export async function processVerifyUrlsJob(
     // table mirrors reality. Keyed on checked_at (every enumerated url just got
     // it reset) rather than a giant NOT IN url array. Deleted-from-sitemap rows
     // are kept: restore needs them.
-    // A STRATIFIED RUN MUST NOT SWEEP (v1.69.1).
+    // A STRATIFIED RUN MUST NOT SWEEP (v1.70).
     //
     // The sweep's premise is "this run enumerated the whole population, so a row
     // it did not touch describes a URL that is no longer in the files". A

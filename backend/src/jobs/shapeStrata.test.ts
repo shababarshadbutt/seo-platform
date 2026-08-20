@@ -173,7 +173,7 @@ test("the default sample is a flat count, not a percentage", () => {
   assert.equal(sampleStratum({ shape: "s", urls: urls(500000, (i) => `https://x.com/p/a-${i}/`) }).length, 50);
 });
 
-// --- the sweep guard (v1.69.1) -----------------------------------------------
+// --- the sweep guard (v1.70) -----------------------------------------------
 // The only defect in this area that DESTROYS data, so it gets the first test.
 
 test("a stratified run sweeps NOTHING", () => {
@@ -196,7 +196,7 @@ test("a full run still sweeps its patterns", () => {
   );
 });
 
-// --- the streaming reservoir (v1.69.1) --------------------------------------
+// --- the streaming reservoir (v1.70) --------------------------------------
 
 // Deterministic source so Algorithm R's behaviour is pinned rather than sampled.
 function cyclingRandom(values: number[]): () => number {
