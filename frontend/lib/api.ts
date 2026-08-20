@@ -1149,6 +1149,48 @@ export type PatternStructuresResponse = {
   urls: string[];
 };
 
+// How many URLs each rule would ACTUALLY rewrite, counted over the pattern's
+// files rather than estimated from the ten confirmed redirects (v1.72).
+//
+// On demand: this streams the pattern's files, which is tens of seconds on a
+// 187-file pattern, so the shortlist renders without it and the operator asks
+// for the numbers when they want them.
+export type RedirectRuleImpactResponse = {
+  perRule: Array<{ ruleIndex: number; matches: number }>;
+  scanned: number;
+  // Distinct URLs at least one rule would rewrite.
+  anyRule: number;
+  // URLs more than one rule matches. Expected 0 for category-per-rule
+  // shortlists; reported so a summed label can never silently over-count.
+  overlapping: number;
+  files_scanned: number;
+  files_skipped: number;
+};
+
+export async function getRedirectRuleImpact(
+  sessionId: string,
+  patternId: string,
+  rules: RedirectRuleCandidate["rule"][],
+  structureFilters?: StructureFilter[] | null
+): Promise<RedirectRuleImpactResponse> {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/redirect-rule-impact`
+    ),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rules,
+        structure_filter: structureFilters ?? null
+      })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<RedirectRuleImpactResponse>(response);
+}
+
 export async function getPatternStructures(
   sessionId: string,
   patternId: string
@@ -2008,13 +2050,17 @@ export async function applyPatternRedirects(
   // A rule the operator picked from rule_candidates (v1.71). The server
   // re-derives its own candidates and refuses anything not among them, so this
   // is a CHOICE, never an injected rewrite.
-  approvedRule?: RedirectRuleCandidate["rule"] | null
+  // Rules the operator ticked (v1.72). A LIST because a pattern's redirects
+  // usually decompose into one literal rule per category, so no single option
+  // fits them all. The server validates EVERY entry against the candidates it
+  // derived itself, so this is a selection, never an injected rewrite.
+  approvedRules?: RedirectRuleCandidate["rule"][] | null
 ) {
   const body: {
     url_ids?: string[];
     inferred_urls?: string[];
     structure_filter?: StructureFilter[];
-    approved_rule?: RedirectRuleCandidate["rule"];
+    approved_rules?: RedirectRuleCandidate["rule"][];
   } = {};
 
   if (urlIds) {
@@ -2029,8 +2075,8 @@ export async function applyPatternRedirects(
     body.structure_filter = structureFilters;
   }
 
-  if (approvedRule) {
-    body.approved_rule = approvedRule;
+  if (approvedRules && approvedRules.length > 0) {
+    body.approved_rules = approvedRules;
   }
 
   const response = await fetchWithTimeout(

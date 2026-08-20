@@ -59,7 +59,10 @@ export type FileRewriteSpec =
   | {
       kind: "redirectApply";
       replacements: [string, string][];
-      rule: RedirectRule | null;
+      // One derived rule, or the LIST a human approved (v1.72) — applied in
+      // order, first match winning. Plain objects either way, so the array
+      // crosses the thread edge unchanged.
+      rule: RedirectRule | RedirectRule[] | null;
       structureFilters?: ResolvedStructureFilter[] | null;
     }
   // Pattern structure transform (v1.48). The RAW structure strings cross the

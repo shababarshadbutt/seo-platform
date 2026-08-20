@@ -182,6 +182,7 @@ import {
   parseRedirectRule,
   redirectRuleCandidates
 } from "../sitemaps/redirectRuleCandidates.js";
+import { RedirectRuleImpact } from "../sitemaps/redirectRuleImpact.js";
 import { looksLikeNotFoundUrl } from "../sitemaps/softNotFound.js";
 import {
   parseStructure,
@@ -194,7 +195,10 @@ import {
   buildTransformSampleFile,
   transformSamplePath
 } from "../sitemaps/transformSampleFile.js";
-import { resolvePatternScanTargets } from "../sitemaps/patternFileScan.js";
+import {
+  resolvePatternScanTargets,
+  scanPatternFiles
+} from "../sitemaps/patternFileScan.js";
 import {
   applyStructureFilterToRewriter,
   detectPatternStructures,
@@ -4253,6 +4257,158 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
   // the single rewrite rule distilled from the confirmed samples. The modal
   // shows both, distinguishing verified from inferred; apply-redirects then
   // rewrites the whole selected set.
+  // How many URLs each candidate rule would ACTUALLY rewrite (v1.72).
+  //
+  // The shortlist reports "fits 3 of 10", which is about the ten confirmed
+  // redirects. Before pressing a button that rewrites files an operator needs the
+  // real number over the pattern — "2,300 URLs" — and scaling the sample fit up
+  // to the population would be a pooled estimate, the class of number that
+  // produced the 28,546-vs-10 complaint.
+  //
+  // ON DEMAND, not on modal open: this streams the pattern's files, which is tens
+  // of seconds on a 187-file pattern. The shortlist renders instantly without it
+  // and the operator asks for the count when they want it.
+  //
+  // Reads only the files the pattern's URLs live in, via the same
+  // resolvePatternScanTargets/scanPatternFiles the occurrence breakdown and the
+  // shape sampler use — and which resolves to the CORRECTED copy of each file, so
+  // the count describes what is on disk now rather than what was uploaded.
+  app.post<{
+    Params: PatternParams;
+    Body: { rules?: unknown; structure_filter?: unknown };
+  }>(
+    "/api/sessions/:id/patterns/:patternId/redirect-rule-impact",
+    async (request, reply) => {
+      const patternResult = await pool.query<{
+        template: string;
+        source_role: string;
+      }>(
+        "SELECT template, source_role FROM patterns WHERE session_id = $1 AND id = $2",
+        [request.params.id, request.params.patternId]
+      );
+
+      if (patternResult.rowCount === 0) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "pattern not found"
+        });
+      }
+
+      const { template, source_role: sourceRole } = patternResult.rows[0];
+
+      if (!Array.isArray(request.body?.rules)) {
+        return reply
+          .code(400)
+          .send(badRequest("rules must be an array of rewrite rules"));
+      }
+
+      const rules: RedirectRule[] = [];
+
+      for (const entry of request.body.rules) {
+        const parsed = parseRedirectRule(entry);
+
+        if (!parsed) {
+          return reply
+            .code(400)
+            .send(badRequest("rules contains an invalid rewrite rule"));
+        }
+
+        rules.push(parsed);
+      }
+
+      // Counting is read-only, so an unvalidated rule cannot damage anything —
+      // but it could still make the UI quote a number for a rewrite the apply
+      // would then refuse. Same check, same reason, so the count and the apply
+      // agree about what is on offer.
+      const evidence = await pool.query<{ url: string; final_url: string }>(
+        `
+          SELECT url, final_url FROM verified_urls
+          WHERE session_id = $1
+            AND pattern_id = $2
+            AND http_status_category = 'redirect'
+            AND final_url IS NOT NULL
+            AND final_url <> url
+            AND is_deleted_from_sitemap = false
+          UNION
+          SELECT url, final_url FROM sampled_urls
+          WHERE pattern_id = $2
+            AND http_status_category = 'redirect'
+            AND final_url IS NOT NULL
+            AND final_url <> url
+        `,
+        [request.params.id, request.params.patternId]
+      );
+      const pairs = evidence.rows.map((row) => ({
+        source: row.url,
+        dest: row.final_url
+      }));
+
+      for (const candidate of rules) {
+        if (!isOfferedRule(candidate, pairs)) {
+          return reply
+            .code(400)
+            .send(
+              badRequest(
+                "rules contains a rule that is not one of those derived from this pattern's confirmed redirects — reload the pattern and choose again"
+              )
+            );
+        }
+      }
+
+      const parsedImpactFilters = parseStructureFilters(
+        request.body?.structure_filter
+      );
+
+      if (parsedImpactFilters === null) {
+        return reply.code(400).send(badRequest(STRUCTURE_FILTER_SHAPE_ERROR));
+      }
+
+      const resolvedImpactFilters =
+        resolveStructureFilters(parsedImpactFilters, template) ?? [];
+
+      const targets = await resolvePatternScanTargets({
+        patternId: request.params.patternId,
+        sessionId: request.params.id,
+        sourceRole
+      });
+      const impact = new RedirectRuleImpact(rules);
+
+      const scan = await scanPatternFiles({
+        targets,
+        visit: (url) => {
+          let pathname: string;
+
+          try {
+            pathname = new URL(url).pathname;
+          } catch {
+            return;
+          }
+
+          // pattern_file_occurrences says the FILE carries some of the pattern;
+          // it says nothing about an individual <loc>.
+          if (!pathMatchesTemplate(pathname, template)) {
+            return;
+          }
+
+          if (
+            resolvedImpactFilters.length > 0 &&
+            !urlMatchesStructureFilters(url, resolvedImpactFilters)
+          ) {
+            return;
+          }
+
+          impact.offer(url);
+        }
+      });
+
+      return {
+        ...impact.totals(),
+        files_scanned: scan.filesScanned,
+        files_skipped: scan.filesSkipped
+      };
+    }
+  );
+
   app.get<{
     Params: PatternParams;
     Querystring: { structure_filter?: string };
@@ -4712,10 +4868,12 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       url_ids?: unknown[];
       inferred_urls?: unknown[];
       structure_filter?: unknown;
-      // A rewrite rule a human picked from the shortlist redirect-candidates
-      // offered (v1.71). Validated against the server's own candidates before
-      // use — see the check in the handler.
-      approved_rule?: unknown;
+      // Rewrite rules a human picked from the shortlist redirect-candidates
+      // offered. Each is validated against the server's own candidates before
+      // use — see the check in the handler. A LIST since v1.72: a pattern's
+      // redirects usually decompose into one literal rule per category, so no
+      // single option fits them all.
+      approved_rules?: unknown;
     };
   }>(
     "/api/sessions/:id/patterns/:patternId/apply-redirects",
@@ -4799,7 +4957,39 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // event loop / trip the request timeout — the failure mode that hit the
       // ZIP path (v1.27) and Cleaner (v1.38). The job re-derives everything
       // server-side and rewrites via the piscina pool.
-      if (inferredUrls.length > 0) {
+      const rawApproved = request.body?.approved_rules;
+      const approvedRules: RedirectRule[] = [];
+
+      if (rawApproved !== undefined) {
+        if (!Array.isArray(rawApproved)) {
+          return reply
+            .code(400)
+            .send(badRequest("approved_rules must be an array of rewrite rules"));
+        }
+
+        for (const entry of rawApproved) {
+          const parsed = parseRedirectRule(entry);
+
+          if (!parsed) {
+            return reply
+              .code(400)
+              .send(badRequest("approved_rules contains an invalid rewrite rule"));
+          }
+
+          approvedRules.push(parsed);
+        }
+      }
+
+      // APPROVED RULES QUEUE TOO (v1.72 — fixing v1.71).
+      //
+      // This gate used to be `inferredUrls.length > 0`, from when a widened apply
+      // could only be requested by listing URLs. v1.71 deliberately stopped
+      // requiring that for an approved rule — so an approved rule on a wide
+      // pattern skipped the queue and rewrote inline, on the API event loop.
+      // That is exactly what this routing exists to prevent, and the comment
+      // below names the two incidents it came from. It had not bitten only
+      // because the reported pattern spans 3 files, under the threshold.
+      if (approvedRules.length > 0 || inferredUrls.length > 0) {
         const fileSpanResult = await pool.query<{ n: string }>(
           "SELECT COUNT(DISTINCT source_file)::bigint AS n FROM pattern_file_occurrences WHERE pattern_id = $1",
           [request.params.patternId]
@@ -4812,7 +5002,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             pattern_id: request.params.patternId,
             url_ids: urlIds,
             inferred_urls: inferredUrls,
-            structure_filters: redirectStructureFilters
+            structure_filters: redirectStructureFilters,
+            approved_rules: approvedRules.length > 0 ? approvedRules : null
           });
 
           return reply.send({
@@ -4824,7 +5015,9 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
       // Derive the rule BEFORE the UPDATE below flips the selected redirect rows
       // to 'success' (which would erase the evidence).
-      let inferredRule: RedirectRule | null = null;
+      // One derived rule, or the list a human approved. The rewriter takes
+      // either, applying a list in order with the first match winning.
+      let inferredRule: RedirectRule | RedirectRule[] | null = null;
 
       // A HUMAN-APPROVED RULE (v1.71), and why it is re-derived rather than
       // trusted.
@@ -4836,15 +5029,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // pairs — the same set redirect-candidates put on screen — and anything
       // else is refused. A caller can pick among readings of the evidence; it
       // cannot invent a rewrite for 579,034 URLs.
-      const approvedRule = parseRedirectRule(request.body?.approved_rule);
-
-      if (request.body?.approved_rule !== undefined && !approvedRule) {
-        return reply
-          .code(400)
-          .send(badRequest("approved_rule is not a valid rewrite rule"));
-      }
-
-      if (approvedRule) {
+      if (approvedRules.length > 0) {
         // Evidence = every confirmed redirect for this pattern, from BOTH tables,
         // matching what the review list showed. verified_urls is where a
         // "Check by shape" run banks its destinations, and it is usually the only
@@ -4872,17 +5057,22 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           dest: row.final_url
         }));
 
-        if (!isOfferedRule(approvedRule, pairs)) {
-          return reply
-            .code(400)
-            .send(
-              badRequest(
-                "approved_rule is not one of the rules derived from this pattern's confirmed redirects — reload the pattern and choose again"
-              )
-            );
+        // EVERY rule is checked, not just the first: the authority guarantee is
+        // per-rule, and a list is exactly where "we validated it" quietly
+        // becomes "we validated one of them".
+        for (const candidate of approvedRules) {
+          if (!isOfferedRule(candidate, pairs)) {
+            return reply
+              .code(400)
+              .send(
+                badRequest(
+                  "approved_rules contains a rule that is not one of those derived from this pattern's confirmed redirects — reload the pattern and choose again"
+                )
+              );
+          }
         }
 
-        inferredRule = approvedRule;
+        inferredRule = approvedRules;
       } else if (inferredUrls.length > 0) {
         const ruleSamples = await pool.query<{ url: string; final_url: string }>(
           `
@@ -5070,7 +5260,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // client to also list inferred_urls — which it can only draw from the
         // capped preview — would cap the very thing being approved.
         const widen =
-          inferredRule !== null && (approvedRule !== null || inferredUrls.length > 0);
+          inferredRule !== null &&
+          (approvedRules.length > 0 || inferredUrls.length > 0);
 
         // A per-shape rule widens the same way a whole-pattern rule does: it is
         // a pure per-URL transform, so it reaches occurrences in files no sampled

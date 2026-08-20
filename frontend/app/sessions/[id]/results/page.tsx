@@ -59,6 +59,7 @@ import {
 import {
   applyPatternRedirects,
   getRedirectCandidates,
+  getRedirectRuleImpact,
   deleteRedirectUrls,
   chooseDownloadFolder,
   downloadCorrectedSitemap,
@@ -83,6 +84,7 @@ import {
   getProblemUrlCount,
   type PatternStructuresResponse,
   type RedirectRuleCandidate,
+  type RedirectRuleImpactResponse,
   type StructureFilter,
   getSession,
   getDeleteProblemUrlsStatus,
@@ -1035,9 +1037,19 @@ export default function ResultsDashboardPage({
   const [fixRuleCandidates, setFixRuleCandidates] = useState<
     RedirectRuleCandidate[]
   >([]);
-  const [fixApprovedRule, setFixApprovedRule] = useState<
-    RedirectRuleCandidate["rule"] | null
-  >(null);
+  // Indices into fixRuleCandidates that the operator ticked (v1.72). A SET
+  // because a pattern's redirects usually decompose into one literal rule per
+  // category — /product/{cat}/rfq -> /rfq/product/{cat} appears once per {cat} —
+  // so no single option fits them all and the answer is to tick several.
+  const [fixApprovedRuleIndexes, setFixApprovedRuleIndexes] = useState<
+    Set<number>
+  >(new Set());
+  // Real per-rule URL counts from the on-demand scan, or null before it has run.
+  // "fits 3 of 10" is about the SAMPLE; this is the number that goes on a button
+  // which rewrites files.
+  const [fixRuleImpact, setFixRuleImpact] =
+    useState<RedirectRuleImpactResponse | null>(null);
+  const [isCountingRuleImpact, setIsCountingRuleImpact] = useState(false);
   // Verify-then-act for the Fix modal now lives in PatternVerifyPanel (v1.50),
   // which owns its own pattern-scoped verification/triage state. It used to be
   // eight pieces of state here driving a SESSION-wide verify from inside a
@@ -2815,8 +2827,10 @@ export default function ResultsDashboardPage({
     setFixExtrapolatedCount(0);
     setFixRuleCandidates([]);
     // An approval is for ONE pattern's evidence; carrying it across would apply
-    // a rule nobody reviewed here.
-    setFixApprovedRule(null);
+    // a rule nobody reviewed here. Same for the counts, which describe this
+    // pattern's files.
+    setFixApprovedRuleIndexes(new Set());
+    setFixRuleImpact(null);
     setFixPage(0);
     // Opening a different pattern must not inherit the previous one's chips.
     setFixStatusFilter(new Set());
@@ -2955,6 +2969,40 @@ export default function ResultsDashboardPage({
     }));
   }
 
+  // Count how many URLs each candidate rule really changes (v1.72).
+  //
+  // Streams the pattern's files server-side, so it is asked for rather than run
+  // on modal open. Counts EVERY candidate, not just the ticked ones, so ticking
+  // another afterwards does not need a second scan.
+  async function handleCountRuleImpact() {
+    if (!fixRow || fixRuleCandidates.length === 0 || isCountingRuleImpact) {
+      return;
+    }
+
+    setIsCountingRuleImpact(true);
+
+    try {
+      const impact = await getRedirectRuleImpact(
+        params.id,
+        fixRow.id,
+        fixRuleCandidates.map((candidate) => candidate.rule),
+        fixStructureFilters
+      );
+
+      setFixRuleImpact(impact);
+    } catch (nextError) {
+      setFindReplaceToast({
+        tone: "error",
+        message: friendlyApiErrorMessage(
+          nextError,
+          "Unable to count how many URLs these rules affect."
+        )
+      });
+    } finally {
+      setIsCountingRuleImpact(false);
+    }
+  }
+
   async function handleAcceptFixes() {
     if (!fixRow || fixCount === 0 || isFixing || isDeletingRedirects) {
       return;
@@ -2995,7 +3043,7 @@ export default function ResultsDashboardPage({
         acceptEverythingInScope ? undefined : sampledIds,
         inferredUrls,
         fixStructureFilters,
-        fixApprovedRule
+        fixApprovedRules
       );
 
       setFixRow(null);
@@ -3244,7 +3292,8 @@ export default function ResultsDashboardPage({
     // URL exactly as a derived one does — which is what makes "579,034 of
     // 579,034" true rather than a promise. Until one is approved this stays as
     // v1.68 left it: only URLs with a fetched destination. (v1.71)
-    inferredWithoutRule: fixInferredWithoutRule && fixApprovedRule === null,
+    inferredWithoutRule:
+      fixInferredWithoutRule && fixApprovedRuleIndexes.size === 0,
     allInPattern: fixAllInPattern,
     confirmedRedirectCount: fixConfirmedCount,
     shapeExtrapolatedCount: fixExtrapolatedCount
@@ -3263,6 +3312,22 @@ export default function ResultsDashboardPage({
   // The "of N" half of "Accept Selected Changes (10 of 28,546)" — null once the
   // count already covers the whole scope. (v1.68)
   const fixAcceptContext = fixAcceptContextTotal({ fixCount, ...fixScope });
+  // The ticked rules, in shortlist order — the order the rewriter applies them
+  // in, so what is counted is what will happen.
+  const fixApprovedRules = fixRuleCandidates
+    .filter((_, index) => fixApprovedRuleIndexes.has(index))
+    .map((candidate) => candidate.rule);
+  // Summed impact of the ticked rules, or null when the scan has not run. Summing
+  // is exact only because the scan reports `overlapping` and it is 0 for these
+  // category-per-rule shortlists; when it is not, the UI says so rather than
+  // quietly over-reporting.
+  const fixApprovedImpact =
+    fixRuleImpact === null
+      ? null
+      : fixRuleImpact.perRule
+          .filter((entry) => fixApprovedRuleIndexes.has(entry.ruleIndex))
+          .reduce((sum, entry) => sum + entry.matches, 0);
+
   // measured vs inferred, or null when there is nothing inferred to name. (v1.69)
   const fixAcceptSplit = fixAcceptBreakdown({ fixCount, ...fixScope });
   const deleteCount = scopedFixCandidates.filter(
@@ -5725,37 +5790,46 @@ export default function ResultsDashboardPage({
                     Review the confirmed redirects, then approve a rule
                   </p>
                   <p className="text-xs text-indigo-800">
-                    No single rule explains every confirmed redirect, so nothing
-                    is applied beyond them automatically. Pick the rewrite you
-                    can see is intended and it will be applied to all{" "}
-                    {formatNumber(fixEffectiveTotal)} URLs in this pattern.
+                    No single rule explains every confirmed redirect — these
+                    usually split one per category, so tick every rewrite you can
+                    see is intended. Unticked categories are left untouched.
                   </p>
                   <ul className="space-y-1.5">
                     {fixRuleCandidates.map((candidate, index) => {
-                      const selected =
-                        fixApprovedRule !== null &&
-                        JSON.stringify(fixApprovedRule) ===
-                          JSON.stringify(candidate.rule);
+                      const ticked = fixApprovedRuleIndexes.has(index);
                       const complete = candidate.fits === candidate.total;
+                      const impact =
+                        fixRuleImpact?.perRule.find(
+                          (entry) => entry.ruleIndex === index
+                        )?.matches ?? null;
 
                       return (
                         <li
                           key={index}
                           className={cn(
                             "rounded border px-2 py-1.5 text-xs",
-                            selected
+                            ticked
                               ? "border-indigo-500 bg-white"
                               : "border-indigo-200 bg-white/60"
                           )}
                         >
                           <label className="flex cursor-pointer items-start gap-2">
                             <input
-                              type="radio"
-                              name="fix-approved-rule"
-                              className="mt-0.5 h-3.5 w-3.5 shrink-0 border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                              checked={selected}
+                              type="checkbox"
+                              className="mt-0.5 h-3.5 w-3.5 shrink-0 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                              checked={ticked}
                               onChange={() =>
-                                setFixApprovedRule(candidate.rule)
+                                setFixApprovedRuleIndexes((current) => {
+                                  const next = new Set(current);
+
+                                  if (next.has(index)) {
+                                    next.delete(index);
+                                  } else {
+                                    next.add(index);
+                                  }
+
+                                  return next;
+                                })
                               }
                             />
                             <span className="min-w-0 space-y-1">
@@ -5764,17 +5838,30 @@ export default function ResultsDashboardPage({
                                   ? `replace "${candidate.rule.find}" with "${candidate.rule.replace}"`
                                   : `insert "${candidate.rule.insert}" after "${candidate.rule.prefix}"`}
                               </span>
-                              <span
-                                className={cn(
-                                  "block font-semibold",
-                                  complete
-                                    ? "text-emerald-700"
-                                    : "text-amber-700"
-                                )}
-                              >
-                                fits {formatNumber(candidate.fits)} of{" "}
-                                {formatNumber(candidate.total)} confirmed
-                                redirects
+                              <span className="block">
+                                {/* The REAL number when we have it, and the
+                                    sample fit always. They answer different
+                                    questions and the population one is the only
+                                    one safe to put on a button. */}
+                                {impact !== null ? (
+                                  <span className="font-semibold text-indigo-900">
+                                    {formatNumber(impact)} URL
+                                    {impact === 1 ? "" : "s"} in this pattern
+                                    {" · "}
+                                  </span>
+                                ) : null}
+                                <span
+                                  className={cn(
+                                    "font-semibold",
+                                    complete
+                                      ? "text-emerald-700"
+                                      : "text-amber-700"
+                                  )}
+                                >
+                                  fits {formatNumber(candidate.fits)} of{" "}
+                                  {formatNumber(candidate.total)} sampled
+                                  redirects
+                                </span>
                               </span>
                               {candidate.example ? (
                                 <span className="block break-all font-mono text-[11px] text-slate-500">
@@ -5805,7 +5892,39 @@ export default function ResultsDashboardPage({
                       );
                     })}
                   </ul>
-                  {fixApprovedRule ? (
+                  {/* Counting streams the pattern's files, so it is asked for
+                      rather than run on every open — tens of seconds on a
+                      187-file pattern. Until it runs, a ticked rule contributes
+                      an unknown and the button says so instead of guessing. */}
+                  {fixRuleImpact === null ? (
+                    <button
+                      type="button"
+                      className="rounded border border-indigo-300 bg-white px-2 py-1 text-xs font-semibold text-indigo-700 hover:bg-indigo-100 disabled:opacity-50"
+                      disabled={isCountingRuleImpact}
+                      onClick={() => void handleCountRuleImpact()}
+                    >
+                      {isCountingRuleImpact
+                        ? "Counting…"
+                        : "Count exactly how many URLs each rule changes"}
+                    </button>
+                  ) : (
+                    <p className="text-xs text-indigo-800">
+                      Counted {formatNumber(fixRuleImpact.scanned)} URLs across{" "}
+                      {formatNumber(fixRuleImpact.files_scanned)} file
+                      {fixRuleImpact.files_scanned === 1 ? "" : "s"}.
+                      {fixRuleImpact.overlapping > 0 ? (
+                        <span className="text-amber-800">
+                          {" "}
+                          {formatNumber(fixRuleImpact.overlapping)} URL
+                          {fixRuleImpact.overlapping === 1 ? " is" : "s are"}{" "}
+                          matched by more than one rule, so each is rewritten
+                          once by whichever ticked rule comes first — the total
+                          below is lower than the per-rule numbers added up.
+                        </span>
+                      ) : null}
+                    </p>
+                  )}
+                  {fixApprovedRuleIndexes.size > 0 ? (
                     /* The point of no return. Undo is the entire backstop and it
                        is SESSION-wide, so that is said here rather than
                        discovered afterwards. */
@@ -5813,24 +5932,27 @@ export default function ResultsDashboardPage({
                       className="rounded-md bg-amber-50 px-2 py-1.5 text-xs text-amber-900"
                       data-testid="fix-rule-approved-warning"
                     >
-                      This will rewrite{" "}
-                      <strong>{formatNumber(fixEffectiveTotal)} URLs</strong>{" "}
-                      using a rule approved from{" "}
-                      {formatNumber(fixRuleCandidates[0]?.total ?? 0)} reviewed
-                      redirects — including URLs that were never checked. Undo
-                      restores <strong>every</strong> redirect fix in this
-                      session, not only this pattern.
+                      {fixApprovedImpact === null ? (
+                        <>
+                          {formatNumber(fixApprovedRuleIndexes.size)} rule
+                          {fixApprovedRuleIndexes.size === 1 ? "" : "s"} ticked.
+                          Count the impact above to see how many URLs that is
+                          before applying.
+                        </>
+                      ) : (
+                        <>
+                          This will rewrite{" "}
+                          <strong>
+                            {formatNumber(fixApprovedImpact)} URL
+                            {fixApprovedImpact === 1 ? "" : "s"}
+                          </strong>{" "}
+                          — including URLs that were never checked. Undo restores{" "}
+                          <strong>every</strong> redirect fix in this session, not
+                          only this pattern.
+                        </>
+                      )}
                     </p>
-                  ) : (
-                    <button
-                      type="button"
-                      className="text-xs font-semibold text-indigo-700 underline hover:text-indigo-900"
-                      onClick={() => setFixApprovedRule(null)}
-                      disabled
-                    >
-                      Select a rule to enable Accept for the whole pattern
-                    </button>
-                  )}
+                  ) : null}
                 </div>
               ) : null}
               {/* Per-position structure scope (v1.66) — the same control, state

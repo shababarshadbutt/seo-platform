@@ -60,7 +60,15 @@ export function buildLocMapRewriter(
 // exactly buildLocMapRewriter over the confirmed exact pairs.
 export function buildRedirectApplyRewriter(
   exactReplacements: Map<string, string>,
-  rule: RedirectRule | null,
+  // One rule, or SEVERAL (v1.72). A pattern's redirects often decompose into one
+  // literal edit per category — /product/{cat}/rfq -> /rfq/product/{cat} shows up
+  // as a separate replace per {cat}, because diffPair can only express literal
+  // string edits. No single rule can fit them all, so an operator ticks the ones
+  // that apply and they are tried IN ORDER, first match winning.
+  //
+  // Ordered rather than "best match" on purpose: deterministic, and it lets the
+  // impact counter reproduce exactly what the rewrite will do.
+  rule: RedirectRule | RedirectRule[] | null,
   // PER-SHAPE rules (v1.69), from a stratified verification. Keyed on
   // valueShape(pathname). Consulted only when there is no exact replacement and
   // no single whole-pattern rule applies to this URL.
@@ -74,6 +82,7 @@ export function buildRedirectApplyRewriter(
   shapeRules?: Map<string, RedirectRule> | null
 ): LocUrlRewriter {
   const byShape = shapeRules ?? null;
+  const rules = rule === null ? [] : Array.isArray(rule) ? rule : [rule];
 
   return (url: string) => {
     const exact = exactReplacements.get(url);
@@ -85,8 +94,8 @@ export function buildRedirectApplyRewriter(
     // A confirmed exact destination outranks any rule; a whole-pattern rule
     // outranks a per-shape one, because it was distilled from every sample
     // rather than from one stratum.
-    if (rule) {
-      const applied = applyRedirectRule(url, rule);
+    for (const candidate of rules) {
+      const applied = applyRedirectRule(url, candidate);
 
       if (applied) {
         return applied;

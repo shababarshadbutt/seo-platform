@@ -1,5 +1,6 @@
 import { Queue } from "bullmq";
 
+import type { RedirectRule } from "../sitemaps/redirectRule.js";
 import type { ResolvedStructureFilter } from "../sitemaps/structureClusters.js";
 
 import { redisConnectionOptions } from "./redisConnection.js";
@@ -58,6 +59,12 @@ export type ApplyRedirectsJobData = {
   // Structure scope (v1.66), already RESOLVED against the pattern template by
   // the route so the worker never parses a template. null → whole pattern.
   structure_filters?: ResolvedStructureFilter[] | null;
+  // Rules a human approved (v1.72), already validated by the route against the
+  // candidates the server derived from its own confirmed pairs. The job applies
+  // these INSTEAD of deriving its own — deriveRedirectRule returns null for
+  // exactly the disagreeing pairs that make an approval necessary, so a job that
+  // re-derived would silently do nothing.
+  approved_rules?: RedirectRule[] | null;
 };
 
 // Pattern structure operations. Everything the worker needs is in the

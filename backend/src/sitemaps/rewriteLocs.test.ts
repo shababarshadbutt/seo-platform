@@ -241,3 +241,88 @@ test("no shape rules means the pre-v1.69 rewriter, unchanged", () => {
     assert.equal(rewrite(FIVE_DIGIT), null);
   }
 });
+
+// --- several approved rules at once (v1.72) ----------------------------------
+// The live shortlist on internetofindustrials.com was one rule per CATEGORY —
+// /product/{cat}/rfq -> /rfq/product/{cat} decomposes that way because diffPair
+// only expresses literal edits. No single option fits all ten confirmed
+// redirects, so the operator ticks several and they are applied together.
+
+const CATEGORY_RULES: RedirectRule[] = [
+  {
+    kind: "replace",
+    find: "product/material-handling/rfq",
+    replace: "rfq/product/material-handling"
+  },
+  {
+    kind: "replace",
+    find: "product/safety/rfq",
+    replace: "rfq/product/safety"
+  }
+];
+
+test("each ticked rule rewrites its own category", () => {
+  const rewrite = buildRedirectApplyRewriter(new Map(), CATEGORY_RULES);
+
+  assert.equal(
+    rewrite("https://x.com/product/material-handling/rfq/cotterman/20z380/"),
+    "https://x.com/rfq/product/material-handling/cotterman/20z380/"
+  );
+  assert.equal(
+    rewrite("https://x.com/product/safety/rfq/3m-dbi-sala/1112475/"),
+    "https://x.com/rfq/product/safety/3m-dbi-sala/1112475/"
+  );
+});
+
+test("a category nobody ticked is left byte-identical", () => {
+  // The core promise of the multi-select: unticked means untouched. Abrasives is
+  // in the shortlist but not in this selection.
+  const rewrite = buildRedirectApplyRewriter(new Map(), CATEGORY_RULES);
+
+  assert.equal(
+    rewrite("https://x.com/product/abrasives/rfq/3m/60650024015/"),
+    null
+  );
+});
+
+test("first matching rule wins, in list order", () => {
+  // Overlap is not expected between category needles, but the order has to be
+  // defined anyway so the rewrite is deterministic and the impact count can
+  // reproduce it.
+  const broad: RedirectRule = { kind: "replace", find: "product", replace: "A" };
+  const narrow: RedirectRule = { kind: "replace", find: "product/safety", replace: "B" };
+
+  assert.equal(
+    buildRedirectApplyRewriter(new Map(), [broad, narrow])("https://x.com/product/safety/x/"),
+    "https://x.com/A/safety/x/"
+  );
+  assert.equal(
+    buildRedirectApplyRewriter(new Map(), [narrow, broad])("https://x.com/product/safety/x/"),
+    "https://x.com/B/x/"
+  );
+});
+
+test("a confirmed destination still outranks every rule", () => {
+  // The v1.68 invariant, now with more rules to outrank: measurement beats
+  // inference, however many inferences there are.
+  const url = "https://x.com/product/safety/rfq/a/1/";
+  const exact = new Map([[url, "https://x.com/confirmed/"]]);
+
+  assert.equal(
+    buildRedirectApplyRewriter(exact, CATEGORY_RULES)(url),
+    "https://x.com/confirmed/"
+  );
+});
+
+test("an empty rule list behaves exactly like no rule", () => {
+  // Nothing ticked must mean nothing rewritten by inference — the pre-v1.72
+  // no-rule path, unchanged.
+  for (const rules of [[], null]) {
+    assert.equal(
+      buildRedirectApplyRewriter(new Map(), rules)(
+        "https://x.com/product/safety/rfq/a/1/"
+      ),
+      null
+    );
+  }
+});

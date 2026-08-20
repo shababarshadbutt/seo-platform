@@ -142,8 +142,26 @@ export async function processApplyRedirectsJob(
   // came from the capped pattern_urls pool and covered only the sample. The
   // confirmed sampled pairs (`replacements`) still win per-URL. inferred_urls is
   // now only a "widen requested" signal; its contents are not used to rewrite.
-  const widen = inferredUrls.length > 0 && rule !== null;
-  const effectiveRule = widen ? rule : null;
+  // APPROVED RULES BEAT THE DERIVED ONE (v1.72).
+  //
+  // The job used to derive its own rule and widen only when inferred_urls was
+  // non-empty. Both are wrong for a human-approved apply: deriveRedirectRule
+  // returns null for precisely the disagreeing pairs that make an approval
+  // necessary, so a re-deriving job would silently rewrite nothing — and the
+  // operator would see a queued job complete having changed no files.
+  //
+  // The route has already validated each of these against the candidates it
+  // derived from its own confirmed pairs, so they are as authoritative here as
+  // the derived rule was.
+  const approvedRules = data.approved_rules ?? null;
+  const widen =
+    (approvedRules !== null && approvedRules.length > 0) ||
+    (inferredUrls.length > 0 && rule !== null);
+  const effectiveRule = !widen
+    ? null
+    : approvedRules && approvedRules.length > 0
+      ? approvedRules
+      : rule;
 
   // Nothing to do only when there is neither a confirmed pair nor a rule to
   // widen with (a rule can rewrite files even with zero confirmed pairs).
