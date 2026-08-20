@@ -204,6 +204,11 @@ import {
 } from "@/lib/fix-accept-count";
 import { findSegmentDuplication } from "@/lib/segment-duplication";
 import {
+  classifyTransform,
+  isLowCoverage,
+  measureTransformCoverage
+} from "@/lib/transform-coverage";
+import {
   fixButtonState,
   showCheckButton,
   showFixButton,
@@ -2259,7 +2264,10 @@ export default function ResultsDashboardPage({
           currentStructure: transformCurrentStructure,
           newStructure: effectiveNewStructure,
           sourceFiles: Array.from(selectedRenameFiles),
-          structureFilters: renameStructureFilters
+          structureFilters: renameStructureFilters,
+          // Only ever true after the user pressed "Override and apply anyway"
+          // on the coverage warning, and it resets on any structure edit.
+          forceLowCoverage
         },
         setStructureProgress
       );
@@ -3485,6 +3493,33 @@ export default function ResultsDashboardPage({
             (entry): entry is { before: string; after: string } =>
               entry !== null
           )
+          // FAILURES FIRST (v1.67). This used to be the first ten of the pool,
+          // which is exactly how the reported bug stayed hidden: the two URLs the
+          // rule did transform happened to sort first, so the preview opened with
+          // two correct rows and the five duplicated ones sat below the fold. A
+          // bad rule should be the first thing on screen.
+          //
+          // Classified ONCE per entry and then sorted on the stored flag, rather
+          // than calling classifyTransform inside the comparator. This whole
+          // expression is not memoised and re-runs on every render, and a
+          // comparator would call it ~2·n·log n times over a ~1,000-URL pool,
+          // each call parsing two URLs.
+          //
+          // Stable within each group — the pool's own order is preserved — so the
+          // list does not reshuffle as the user types.
+          .map((entry) => ({
+            entry,
+            keptValue:
+              classifyTransform(
+                entry.before,
+                transformParsed!.current,
+                transformParsed!.next
+              ) === "kept-value"
+          }))
+          .sort((left, right) =>
+            left.keptValue === right.keptValue ? 0 : left.keptValue ? -1 : 1
+          )
+          .map(({ entry }) => entry)
           // Ten, matching the sample file's ten, so the two lists are directly
           // comparable when both are on screen.
           .slice(0, TRANSFORM_PREVIEW_SAMPLES)
@@ -3505,6 +3540,34 @@ export default function ResultsDashboardPage({
       0
     );
   }, [transformPreviewSource, transformParsed]);
+
+  // Does the rule actually generalise, or does it only fit the example it was
+  // inferred from? (v1.67)
+  //
+  // The reported case: one by-example pair inferred
+  // {A|nsn-parts-1000|page-1-|} — a needle carrying the example's own digits —
+  // so two of the previewed URLs transformed and the rest kept their value while
+  // still gaining the new static segment, yielding
+  // /nsn/nsn-parts/nsn-parts-10062/. Measured against the same real URLs the
+  // preview samples from, so the warning quotes what the user would really get.
+  const transformCoverage = useMemo(() => {
+    if (!transformParsed) {
+      return null;
+    }
+
+    return measureTransformCoverage(
+      transformPreviewSource,
+      transformParsed.current,
+      transformParsed.next
+    );
+  }, [transformPreviewSource, transformParsed]);
+  const transformLowCoverage =
+    transformCoverage !== null && isLowCoverage(transformCoverage);
+  // A gate, not a wall (v1.67). A deliberately narrow rule is unusual but not
+  // wrong, so the block is overridable — the same reasoning the duplication
+  // warning uses for staying non-blocking. Reset whenever the structures change,
+  // so an override can never outlive the rule it was granted for.
+  const [forceLowCoverage, setForceLowCoverage] = useState(false);
 
   // Does the new structure add a static segment that is ALREADY the prefix or
   // suffix of an adjacent param's real value? ("/nsn/niin-parts/{A}/" where {A}
@@ -3610,6 +3673,10 @@ export default function ResultsDashboardPage({
     setTransformDryRun(null);
     setSampleError(null);
     setDryRunError(null);
+    // A low-coverage override was granted for ONE rule; carrying it across an
+    // edit would silently re-arm the block's escape hatch for a rule nobody
+    // looked at. (v1.67)
+    setForceLowCoverage(false);
   }, [transformCurrentStructure, effectiveNewStructure, renameRow?.id]);
 
   // The full check is REQUIRED when the pattern holds more URLs than the
@@ -3627,7 +3694,13 @@ export default function ResultsDashboardPage({
   // once here rather than duplicated between the button's disabled prop and the
   // sentence above it, so the two can never disagree about the reason.
   const applyBlockedReason =
-    dryRunRequired && transformDryRun === null
+    transformLowCoverage && !forceLowCoverage
+      ? `This rule only transforms ${formatNumber(
+          transformCoverage?.transformed ?? 0
+        )} of the ${formatNumber(
+          transformCoverage?.matched ?? 0
+        )} sampled URLs it matches. The rest would keep their current value under the new path — check the preview above.`
+      : dryRunRequired && transformDryRun === null
       ? `This pattern holds ${formatNumber(
           renameRow?.totalUrls ?? 0
         )} URLs but the preview above only sees ${formatNumber(
@@ -6617,6 +6690,59 @@ export default function ResultsDashboardPage({
                           .
                         </p>
                       ) : null}
+                    </div>
+                  ) : null}
+                  {/* Coverage gate (v1.67). RED, not amber: amber in this modal
+                      is the established "informational, Apply stays enabled"
+                      tone, and this one blocks. It names the real numbers and
+                      quotes a URL the user would actually get, because "2 of 880"
+                      is an abstraction until you see
+                      /nsn/nsn-parts/nsn-parts-10062/. */}
+                  {transformLowCoverage && transformCoverage ? (
+                    <div
+                      className="space-y-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800"
+                      data-testid="transform-coverage-warning"
+                    >
+                      <p>
+                        This rule transforms only{" "}
+                        <strong>
+                          {formatNumber(transformCoverage.transformed)} of{" "}
+                          {formatNumber(transformCoverage.matched)}
+                        </strong>{" "}
+                        sampled URLs. The other{" "}
+                        {formatNumber(transformCoverage.untransformed)} would keep
+                        their current value under the new path, for example:
+                      </p>
+                      {transformCoverage.examples.length > 0 ? (
+                        <ul className="space-y-0.5">
+                          {transformCoverage.examples.map((example) => (
+                            <li
+                              key={example}
+                              className="break-all font-mono text-[11px]"
+                            >
+                              {example}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                      <p>
+                        That usually means the rule was inferred from one example
+                        and carries values specific to it. Adjust the new
+                        structure, or override if this narrow edit is intended.
+                      </p>
+                      {forceLowCoverage ? (
+                        <p className="font-semibold">
+                          Overridden — Apply is enabled.
+                        </p>
+                      ) : (
+                        <button
+                          type="button"
+                          className="rounded border border-red-300 bg-white px-2 py-1 font-semibold text-red-700 hover:bg-red-100"
+                          onClick={() => setForceLowCoverage(true)}
+                        >
+                          Override and apply anyway
+                        </button>
+                      )}
                     </div>
                   ) : null}
                   {/* Duplicate-segment heads-up (v1.53). Amber, matching the

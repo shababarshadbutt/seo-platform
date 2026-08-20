@@ -1791,6 +1791,10 @@ export async function transformPatternStructure(
     newStructure: string;
     sourceFiles: string[];
     structureFilters?: StructureFilter[] | null;
+    // Apply a rule that the coverage gate refuses (v1.67): one whose param
+    // transform leaves most matching URLs untouched while still re-parenting
+    // them. Set only from the modal's explicit "Override and apply anyway".
+    forceLowCoverage?: boolean;
   },
   onProgress?: (progress: PatternStructureProgress) => void
 ) {
@@ -1804,7 +1808,8 @@ export async function transformPatternStructure(
         current_structure: input.currentStructure,
         new_structure: input.newStructure,
         source_files: input.sourceFiles,
-        structure_filter: input.structureFilters ?? null
+        structure_filter: input.structureFilters ?? null,
+        ...(input.forceLowCoverage ? { force_low_coverage: true } : {})
       })
     }
   );

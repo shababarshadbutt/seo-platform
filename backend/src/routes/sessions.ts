@@ -171,6 +171,11 @@ import {
   rewriteRedirectSourceFilesOnDisk,
   revertRedirectSourceFilesOnDisk
 } from "../sitemaps/redirectApply.js";
+import {
+  isLowCoverage,
+  lowCoverageMessage,
+  measureTransformCoverage
+} from "../sitemaps/transformCoverage.js";
 import { looksLikeNotFoundUrl } from "../sitemaps/softNotFound.js";
 import {
   parseStructure,
@@ -270,6 +275,10 @@ type TransformBody = {
   current_structure?: string;
   new_structure?: string;
   source_files?: unknown[];
+  // Override the coverage gate (v1.67) for a deliberately narrow rule. The gate
+  // refuses a structure whose param transform leaves most matching URLs
+  // untouched — see sitemaps/transformCoverage.ts.
+  force_low_coverage?: unknown;
   // One filter object (pre-v1.51) or an ARRAY of them, ANDed across {param}
   // positions. null / [] / absent = whole-pattern.
   structure_filter?: unknown;
@@ -3321,6 +3330,36 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       }
 
       const structureFilters = parsedFilters;
+
+      // COVERAGE GATE (v1.67). Refuse a rule that fits almost nothing.
+      //
+      // The reported bug: one by-example pair inferred a `replace` needle
+      // carrying the example's own digits, so two URLs transformed and the rest
+      // kept their value while still gaining the new static segment —
+      // /nsn/nsn-parts/nsn-parts-10062/, the literal twice over. The modal warns
+      // about this now, but a warning the server does not enforce is decoration:
+      // this endpoint re-infers and applies on its own, so an API caller or a
+      // client that skipped the warning would still write the mangled rewrite.
+      //
+      // Measured against pattern_urls — the same real pool the modal previews
+      // from, so the client's warning and this refusal quote the same numbers.
+      // Only gates the APPLY: transform-dry-run and transform-sample-file stay
+      // open, because measuring a bad rule is how the user finds out it is bad.
+      if (request.body?.force_low_coverage !== true) {
+        const poolResult = await pool.query<{ source_url: string }>(
+          "SELECT source_url FROM pattern_urls WHERE pattern_id = $1",
+          [request.params.patternId]
+        );
+        const coverage = measureTransformCoverage(
+          poolResult.rows.map((row) => row.source_url),
+          current,
+          next
+        );
+
+        if (isLowCoverage(coverage)) {
+          return reply.code(400).send(badRequest(lowCoverageMessage(coverage)));
+        }
+      }
 
       // The label rename is optional; default to the existing template so a
       // structure-only transform leaves the pattern name untouched. A SCOPED
