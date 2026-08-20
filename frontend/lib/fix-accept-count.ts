@@ -12,19 +12,25 @@
 // reason fix-visibility.ts and fix-status-filter.ts are: results/page.tsx has no
 // test file, so logic left in the component is logic nothing can assert.
 //
-// WHY THE !inferredWithoutRule GUARD WAS RELAXED (v1.66). It used to suppress
-// the pattern-wide number outright: accepting applies a single inferred rewrite
-// rule to every matching URL on disk, so with no rule to infer there is nothing
-// to apply beyond the reviewed rows and the big number overstated the click.
-// That reasoning still holds — what changed is where the caveat lives. The
-// header control is now an explicit "Set all to Fix" toggle, pressed by default,
-// and a toggle whose number does not move when you press it is exactly the
-// control users could not read. So the button now states the scope the toggle
-// ASKS FOR, and the shortfall is stated in words: fixModalBanner() below picks a
-// banner that names both the target and the reviewable subset, and the success
-// toast reports the server's authoritative rewritten_loc_count afterwards.
-// inferredWithoutRule therefore no longer gates the count — it only picks the
-// banner.
+// WHY THE COUNT IS NOT THE PATTERN TOTAL (v1.67, reversing v1.66).
+//
+// v1.66 made this report the scope the "Set all to Fix" toggle ASKS FOR, on the
+// reasoning that a toggle whose number does not move when pressed is a toggle
+// users cannot read. The caveat went into a banner and the toast.
+//
+// That was wrong, and production showed exactly how: the button said 28,546, the
+// click succeeded, the toast said 10, and ten <loc> entries changed. A number
+// that needs a banner next to it explaining that it will not happen is not a
+// label, it is a promise the code cannot keep. The toggle still moves the
+// number — just between two numbers that are both true.
+//
+// A URL can only be rewritten if its destination is KNOWN. Two ways to know it:
+//
+//   * a derived rule — a pure per-URL transform, so it reaches every occurrence
+//     on disk and the total genuinely is the answer;
+//   * a confirmed final_url, from verified_urls or the sampled preview. That
+//     count is what redirect-candidates now returns as confirmed_redirect_count,
+//     and it climbs as the user verifies more of the pattern.
 //
 // ONE SOURCE OF TRUTH, deliberately. These conditions drive things that sit
 // inches apart in the modal: the scope banner, the caption under the toggle, and
@@ -44,6 +50,10 @@ type ScopeInput = {
   // The header "Set all to Fix" toggle. Pressed means the user is targeting
   // every URL in the pattern; released means only the rows they selected.
   allInPattern: boolean;
+  // URLs with a confirmed destination in the current scope, from the server
+  // (confirmed_redirect_count). The ceiling on what an accept can rewrite when
+  // no rule could be derived.
+  confirmedRedirectCount: number;
 };
 
 // Does accepting target more than the rows on screen?
@@ -57,7 +67,29 @@ export function fixAcceptCount(
     fixCount: number;
   }
 ): number {
-  return appliesPatternWide(input) ? input.fixPatternTotal : input.fixCount;
+  if (!appliesPatternWide(input)) {
+    return input.fixCount;
+  }
+
+  // Pressed. With a rule the transform reaches every occurrence in scope; with
+  // no rule it reaches exactly the URLs whose destination is confirmed. Capped
+  // at the scope total for the defensive case where the confirmed set somehow
+  // exceeds it (both numbers are fetched separately, so a stale one is possible
+  // and over-reporting is the direction that lies).
+  return input.inferredWithoutRule
+    ? Math.min(input.confirmedRedirectCount, input.fixPatternTotal)
+    : input.fixPatternTotal;
+}
+
+// The "of N" half of "Accept Selected Changes (10 of 28,546)". Null when there
+// is nothing extra to say — the count already IS the whole scope, so printing
+// "28,546 of 28,546" would only add noise.
+export function fixAcceptContextTotal(
+  input: ScopeInput & { fixCount: number }
+): number | null {
+  const count = fixAcceptCount(input);
+
+  return count < input.fixPatternTotal ? input.fixPatternTotal : null;
 }
 
 // Which banner the modal shows above the URL list. One function rather than two

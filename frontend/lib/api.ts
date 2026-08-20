@@ -1876,6 +1876,12 @@ export type RedirectCandidatesResponse = {
   // pool) — for messaging that separates "shown for review" from "will rewrite".
   preview_count?: number;
   sampled_redirect_count: number;
+  // URLs with a CONFIRMED destination in the requested structure scope (v1.67):
+  // verified_urls UNION the sampled preview, deduplicated. This is the ceiling on
+  // what an accept can rewrite when `rule` is null, and it climbs as the user
+  // verifies more of the pattern. Optional so a client talking to an older
+  // backend degrades to 0 rather than NaN.
+  confirmed_redirect_count?: number;
   // Sampled 404s in the list — delete-only rows, counted apart from the
   // redirects so the modal can say which of the two it is showing.
   sampled_broken_count?: number;
@@ -1885,11 +1891,19 @@ export type RedirectCandidatesResponse = {
 
 export async function getRedirectCandidates(
   sessionId: string,
-  patternId: string
+  patternId: string,
+  // Scopes confirmed_redirect_count only — the candidate LIST comes back
+  // unscoped and is narrowed client-side, so changing a dropdown does not have
+  // to refetch it.
+  structureFilters?: StructureFilter[] | null
 ) {
+  const query =
+    structureFilters && structureFilters.length > 0
+      ? `?structure_filter=${encodeURIComponent(JSON.stringify(structureFilters))}`
+      : "";
   const response = await fetchWithTimeout(
     backendUrl(
-      `/api/sessions/${sessionId}/patterns/${patternId}/redirect-candidates`
+      `/api/sessions/${sessionId}/patterns/${patternId}/redirect-candidates${query}`
     ),
     { method: "GET" },
     EXPORT_API_TIMEOUT_MS

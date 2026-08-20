@@ -246,3 +246,69 @@ export async function revertRedirectSourceFilesOnDisk(
 
   return { oldFilePaths };
 }
+
+// Merge the VERIFIED redirect population into a replacement map already built
+// from the sampled preview (v1.67).
+//
+// THE BUG THIS CLOSES. apply-redirects built its map only from sampled_urls rows
+// the client named by id, and the candidate list those ids come from is capped at
+// ~1,000 server-side. "Verify all in this pattern" writes a different table,
+// verified_urls, one row per URL with its own confirmed final_url — and nothing
+// in the apply path read it. So a user who verified all 28,546 URLs of a pattern
+// and pressed Accept still got ~10 rewrites: the button said 28,546, the toast
+// said 10, and the toast was right.
+//
+// Extracted as a pure function rather than left inline in the route for the same
+// reason lib/fix-accept-count.ts exists on the client: routes/sessions.ts is
+// exercised only by DB-backed integration tests, so merge rules left in the
+// handler are rules nothing cheap can assert. The three that matter are the
+// three below.
+export function mergeVerifiedReplacements(options: {
+  // Already populated from sampled_urls, and MUTATED in place — the caller's map
+  // is the one the rewrite uses.
+  replacements: Map<string, string>;
+  // Also mutated: display filenames to narrow the disk scan to.
+  candidateFiles: Set<string>;
+  verified: Array<{
+    url: string;
+    final_url: string;
+    source_files: string[] | null;
+  }>;
+  // Structure scope, resolved. Null/empty = whole pattern.
+  matchesScope?: (url: string) => boolean;
+}): { added: number; skippedOutOfScope: number } {
+  let added = 0;
+  let skippedOutOfScope = 0;
+
+  for (const row of options.verified) {
+    // 1. STRUCTURE SCOPE. This is a second source of replacements, so the guard
+    // inside the rewriter is the backstop, not the only line of defence — a URL
+    // outside "Limit this edit to" must never enter the map at all.
+    if (options.matchesScope && !options.matchesScope(row.url)) {
+      skippedOutOfScope += 1;
+      continue;
+    }
+
+    // 2. A destination that is not a change is not a replacement.
+    if (!row.final_url || row.final_url === row.url) {
+      continue;
+    }
+
+    // 3. SAMPLED WINS. Its row already had its stats recomputed and its undo
+    // snapshot written in this transaction, so its destination is the one the
+    // rest of the transaction is consistent with. A verified row for the same
+    // URL must not overwrite it.
+    if (!options.replacements.has(row.url)) {
+      options.replacements.set(row.url, row.final_url);
+      added += 1;
+    }
+
+    for (const name of row.source_files ?? []) {
+      if (name.length > 0) {
+        options.candidateFiles.add(name);
+      }
+    }
+  }
+
+  return { added, skippedOutOfScope };
+}

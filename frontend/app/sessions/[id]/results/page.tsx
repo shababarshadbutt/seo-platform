@@ -198,6 +198,7 @@ import { cn } from "@/lib/utils";
 
 import {
   appliesPatternWide,
+  fixAcceptContextTotal,
   fixAcceptCount,
   fixModalBanner
 } from "@/lib/fix-accept-count";
@@ -1011,6 +1012,11 @@ export default function ResultsDashboardPage({
   const [fixScopedOccurrences, setFixScopedOccurrences] = useState<
     number | null
   >(null);
+  // URLs with a CONFIRMED destination in the current scope (v1.67), from
+  // redirect-candidates' confirmed_redirect_count. The ceiling on what an accept
+  // can rewrite when no rule could be derived — the number whose absence let the
+  // button claim 28,546 while the toast reported 10.
+  const [fixConfirmedCount, setFixConfirmedCount] = useState(0);
   // Verify-then-act for the Fix modal now lives in PatternVerifyPanel (v1.50),
   // which owns its own pattern-scoped verification/triage state. It used to be
   // eight pieces of state here driving a SESSION-wide verify from inside a
@@ -2769,6 +2775,7 @@ export default function ResultsDashboardPage({
     setFixStructures(null);
     setFixScopedFiles(null);
     setFixScopedOccurrences(null);
+    setFixConfirmedCount(0);
     setFixPage(0);
     // Opening a different pattern must not inherit the previous one's chips.
     setFixStatusFilter(new Set());
@@ -2781,6 +2788,7 @@ export default function ResultsDashboardPage({
 
         setFixCandidates(data.candidates);
         setFixPatternTotal(data.pattern_total_urls);
+        setFixConfirmedCount(data.confirmed_redirect_count ?? 0);
         // Seeded through canBulkFix rather than defaultFixAction alone, because
         // the header toggle opens PRESSED (v1.66) and the rows have to agree with
         // it on the first render. What the toggle may not claim keeps its
@@ -2927,10 +2935,21 @@ export default function ResultsDashboardPage({
     setIsFixing(true);
 
     try {
+      // url_ids OMITTED means "every confirmed redirect in the pattern" server
+      // side — including the verified_urls rows the client cannot enumerate,
+      // because the candidate list is capped at ~1,000. That cap is why an
+      // accept used to rewrite ~10 URLs however much the user had verified, so
+      // taking it off is the fix (v1.67).
+      //
+      // Only safe when nothing was deviated from Fix: url_ids: null ignores
+      // per-row choices by design, so a single Skip or Delete anywhere in scope
+      // sends the explicit list instead and keeps that choice honoured.
+      const acceptEverythingInScope =
+        fixAllInPattern && deleteCount === 0 && skipCount === 0;
       const result = await applyPatternRedirects(
         params.id,
         fixRow.id,
-        sampledIds,
+        acceptEverythingInScope ? undefined : sampledIds,
         inferredUrls,
         fixStructureFilters
       );
@@ -3083,6 +3102,20 @@ export default function ResultsDashboardPage({
       return;
     }
 
+    // Two requests, one guard: the scoped file/occurrence numbers AND the scoped
+    // confirmed-destination count, which is what the Accept button reports.
+    // Narrowing the scope narrows both, and they must not land out of step.
+    void getRedirectCandidates(params.id, fixRow.id, fixStructureFilters)
+      .then((data) => {
+        if (fixScopeRequestIdRef.current === requestId) {
+          setFixConfirmedCount(data.confirmed_redirect_count ?? 0);
+        }
+      })
+      .catch(() => {
+        // Leave the previous count rather than zeroing it: 0 disables Accept,
+        // and a failed count request is not evidence that nothing can be fixed.
+      });
+
     getPatternSourceFiles(params.id, fixRow.id, fixStructureFilters)
       .then((files) => {
         if (fixScopeRequestIdRef.current !== requestId) {
@@ -3163,7 +3196,8 @@ export default function ResultsDashboardPage({
     fixPatternTotal: fixEffectiveTotal,
     fixCandidateCount: scopedFixCandidates.length,
     inferredWithoutRule: fixInferredWithoutRule,
-    allInPattern: fixAllInPattern
+    allInPattern: fixAllInPattern,
+    confirmedRedirectCount: fixConfirmedCount
   };
   const fixAppliesPatternWide = appliesPatternWide(fixScope);
   // Which banner qualifies the scope, chosen by one function rather than two
@@ -3176,6 +3210,9 @@ export default function ResultsDashboardPage({
   // rows are selected — the banner above the button already said so and the
   // button disagreed with it. See lib/fix-accept-count.ts. (v1.53)
   const fixAcceptLabelCount = fixAcceptCount({ fixCount, ...fixScope });
+  // The "of N" half of "Accept Selected Changes (10 of 28,546)" — null once the
+  // count already covers the whole scope. (v1.67)
+  const fixAcceptContext = fixAcceptContextTotal({ fixCount, ...fixScope });
   const deleteCount = scopedFixCandidates.filter(
     (candidate) => fixActionFor(candidate) === "delete"
   ).length;
@@ -5724,6 +5761,18 @@ export default function ResultsDashboardPage({
                             fixCount === 1 ? "" : "s"
                           } only`}
                     </span>
+                    {/* Why the Accept count can be smaller than the scope, said
+                        where the gap is visible. A URL is only rewritable if its
+                        destination has been fetched; verifying more of the
+                        pattern raises the count. (v1.67) */}
+                    {fixAcceptContext !== null && fixAllInPattern ? (
+                      <span className="text-xs text-amber-700">
+                        {formatNumber(fixAcceptLabelCount)} of{" "}
+                        {formatNumber(fixAcceptContext)} have a confirmed
+                        destination — use &ldquo;Verify all in this
+                        pattern&rdquo; above to raise this.
+                      </span>
+                    ) : null}
                   </div>
                   <span className="shrink-0 text-xs text-slate-500">
                     {/* Counted against the SCOPED pool (v1.66), so "10 of 613
@@ -6079,7 +6128,16 @@ export default function ResultsDashboardPage({
                       Applying
                     </>
                   ) : (
-                    `Accept Selected Changes (${formatNumber(fixAcceptLabelCount)})`
+                    // "10 of 28,546" when the accept cannot reach the whole
+                    // scope, so the gap is on the button rather than in a banner
+                    // beside it. (v1.67)
+                    `Accept Selected Changes (${formatNumber(
+                      fixAcceptLabelCount
+                    )}${
+                      fixAcceptContext === null
+                        ? ""
+                        : ` of ${formatNumber(fixAcceptContext)}`
+                    })`
                   )}
                 </Button>
               </div>

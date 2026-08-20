@@ -166,6 +166,7 @@ import {
   type RedirectRule
 } from "../sitemaps/redirectRule.js";
 import {
+  mergeVerifiedReplacements,
   recomputePatternStatsSql,
   rewriteRedirectSourceFilesOnDisk,
   revertRedirectSourceFilesOnDisk
@@ -4182,14 +4183,18 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
   // the single rewrite rule distilled from the confirmed samples. The modal
   // shows both, distinguishing verified from inferred; apply-redirects then
   // rewrites the whole selected set.
-  app.get<{ Params: PatternParams }>(
+  app.get<{
+    Params: PatternParams;
+    Querystring: { structure_filter?: string };
+  }>(
     "/api/sessions/:id/patterns/:patternId/redirect-candidates",
     async (request, reply) => {
       const patternResult = await pool.query<{
         id: string;
         total_urls: string;
+        template: string;
       }>(
-        "SELECT id, total_urls FROM patterns WHERE session_id = $1 AND id = $2",
+        "SELECT id, total_urls, template FROM patterns WHERE session_id = $1 AND id = $2",
         [request.params.id, request.params.patternId]
       );
 
@@ -4199,6 +4204,39 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           message: "pattern not found"
         });
       }
+
+      // Structure scope (v1.67), encoded like the source-files endpoint's:
+      // JSON in the query string, the same {param_index, anchor, value} shape
+      // the rename/apply bodies carry. Only confirmed_redirect_count below reads
+      // it — the candidate LIST stays unscoped and is narrowed client-side, so
+      // changing a dropdown does not refetch it.
+      const rawCandidateFilter = request.query?.structure_filter;
+      let parsedCandidateFilters: StructureFilter[] | null = [];
+
+      if (
+        typeof rawCandidateFilter === "string" &&
+        rawCandidateFilter.length > 0
+      ) {
+        try {
+          parsedCandidateFilters = parseStructureFilters(
+            JSON.parse(rawCandidateFilter)
+          );
+        } catch {
+          parsedCandidateFilters = null;
+        }
+      }
+
+      if (parsedCandidateFilters === null) {
+        return reply.code(400).send(badRequest(STRUCTURE_FILTER_SHAPE_ERROR));
+      }
+
+      // All-or-nothing, as everywhere else: a partially resolved scope would
+      // count a wider set than the accept touches.
+      const resolvedCandidateFilters =
+        resolveStructureFilters(
+          parsedCandidateFilters,
+          patternResult.rows[0].template
+        ) ?? [];
 
       // Confirmed redirect samples — the evidence for the rule and the set of
       // HTTP-verified rows.
@@ -4371,9 +4409,102 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // confirmed rule to all pattern_total_urls matching URLs (v1.45.1).
       const patternTotalUrls = Number(patternResult.rows[0].total_urls) || 0;
 
+      // WHAT ACCEPTING WILL ACTUALLY CHANGE (v1.67).
+      //
+      // The bug this closes: the Accept button reported pattern_total_urls
+      // (28,546) whenever the pattern had unsampled URLs, the click succeeded,
+      // and the toast said 10 — because the rewrite can only reach URLs with a
+      // KNOWN destination, and 28,536 of them had never been fetched.
+      //
+      // Reported as TWO plain facts rather than one pre-combined number, so the
+      // client composes them with the scoped total it already has and nothing
+      // has to decode a sentinel:
+      //
+      //   * `rule` (already returned) — non-null means a pure per-URL transform
+      //     that reaches every occurrence on disk, so the scope total IS the
+      //     answer and always was.
+      //   * confirmed_redirect_count — with no rule, only URLs with a confirmed
+      //     final_url can be rewritten. That is verified_urls (the full
+      //     population, written by "Verify all in this pattern") UNION the
+      //     sampled preview: the two tables overlap, and a URL in both must
+      //     count once. This is the number that climbs as the user verifies.
+      //
+      // See lib/fix-accept-count.ts for the composition.
+      const confirmedSql = `
+        SELECT url FROM verified_urls
+        WHERE session_id = $1
+          AND pattern_id = $2
+          AND http_status_category = 'redirect'
+          AND final_url IS NOT NULL
+          AND final_url <> url
+          AND is_deleted_from_sitemap = false
+        UNION
+        SELECT url FROM sampled_urls
+        WHERE pattern_id = $2
+          AND http_status_category = 'redirect'
+          AND final_url IS NOT NULL
+          AND final_url <> url
+      `;
+      let confirmedRedirectCount = 0;
+
+      if (resolvedCandidateFilters.length > 0) {
+        // Scoped: the URLs themselves are needed to apply the structure test,
+        // which SQL cannot express — it is token-boundary matching on path
+        // segments (segmentMatchesAnchor), and re-expressing that in SQL would
+        // fork the one definition the preview and the rewrite already share.
+        //
+        // KEYSET-BATCHED, not one big SELECT. A fully verified pattern can hold
+        // over a million rows, and materialising every URL here to call .filter
+        // on is a Node-side memory profile that scales with the session — the
+        // failure mode this project already hit in the ZIP path and the Cleaner.
+        // Keyset (url > last) rather than OFFSET, which re-scans on every page.
+        const BATCH = 20000;
+        let lastUrl: string | null = null;
+
+        for (;;) {
+          // Annotated because the keyset assignment at the bottom of the
+          // loop feeds lastUrl back into this call's params, which TS
+          // reads as a circular inference (TS7022) without it.
+          const batch: { rows: Array<{ url: string }> } =
+            await pool.query<{ url: string }>(
+              `
+                SELECT url FROM (${confirmedSql}) AS confirmed
+                WHERE ($3::text IS NULL OR url > $3)
+                ORDER BY url
+                LIMIT ${BATCH}
+              `,
+              [request.params.id, request.params.patternId, lastUrl]
+            );
+
+          for (const row of batch.rows) {
+            if (urlMatchesStructureFilters(row.url, resolvedCandidateFilters)) {
+              confirmedRedirectCount += 1;
+            }
+          }
+
+          if (batch.rows.length < BATCH) {
+            break;
+          }
+
+          lastUrl = batch.rows[batch.rows.length - 1].url;
+        }
+      } else {
+        // Unscoped: count in the database rather than shipping up to a whole
+        // pattern's worth of URLs back here to call .length on.
+        const counted = await pool.query<{ n: string }>(
+          `SELECT COUNT(*)::bigint AS n FROM (${confirmedSql}) AS confirmed`,
+          [request.params.id, request.params.patternId]
+        );
+
+        confirmedRedirectCount = Number(counted.rows[0]?.n ?? 0);
+      }
+
       return {
         rule: rule ?? null,
         pattern_total_urls: patternTotalUrls,
+        // URLs with a confirmed destination, in the CURRENT structure scope —
+        // what an accept rewrites when no single rule could be derived.
+        confirmed_redirect_count: confirmedRedirectCount,
         // How many rows the review preview holds (bounded by the pattern_urls
         // sample pool) — distinct from pattern_total_urls, the real rewrite scope.
         preview_count: candidates.length,
@@ -4587,6 +4718,70 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             }
           }
         }
+
+        // THE FULL VERIFIED POPULATION (v1.67). Everything above comes from
+        // sampled_urls — the small HTTP-checked preview, and the rows the client
+        // can name by id. "Verify all in this pattern" writes verified_urls
+        // instead, one row per URL with its own confirmed final_url, and until
+        // now NOTHING in this endpoint read it. So a user who verified all
+        // 28,546 URLs of a pattern and pressed Accept still got ~10 rewrites,
+        // because the only paths to the rest were the ≤1,000-row preview and an
+        // inferred rule. That is the bug this closes: the button said 28,546,
+        // the toast said 10, and the toast was right.
+        //
+        // Confirmed destinations, not inference — every row here was actually
+        // fetched. That makes this strictly better than the rule-based widening
+        // below, and it is why these are merged BEFORE the rule is considered.
+        //
+        // READ-ONLY on verified_urls, deliberately. The undo path restores files
+        // from the preserved originals and rolls back sampled_urls.original_url;
+        // snapshotting verified_urls too would need a second column and a
+        // matching revert for no gain, since a stale verdict is simply re-probed
+        // on the next verify.
+        const verifiedResult = await client.query<{
+          url: string;
+          final_url: string;
+          source_files: string[] | null;
+        }>(
+          `
+            SELECT url, final_url, source_files
+            FROM verified_urls
+            WHERE session_id = $1
+              AND pattern_id = $2
+              AND http_status_category = 'redirect'
+              AND final_url IS NOT NULL
+              AND final_url <> url
+              AND is_deleted_from_sitemap = false
+              AND ($3::text[] IS NULL OR url = ANY($3::text[]))
+          `,
+          [
+            request.params.id,
+            request.params.patternId,
+            // Mirrors the sampled path's ($2 IS NULL OR id = ANY($2)): null =
+            // every verified redirect in the pattern, which is what the pressed
+            // "Set all to Fix" toggle means.
+            //
+            // Otherwise narrow to inferred_urls — the non-sampled URLs the user
+            // ticked. Those used to be rewritten by the derived RULE; if any of
+            // them has been verified, this now gives it its own confirmed
+            // destination instead, which is strictly better than an inference.
+            // Sampled selections need no entry here: the UPDATE above already
+            // put them in `replacements`.
+            urlIds === null ? null : inferredUrls
+          ]
+        );
+
+        // Merge rules (scope guard, no-op destinations, sampled-wins) live in
+        // mergeVerifiedReplacements so they are unit-testable — see its comment.
+        mergeVerifiedReplacements({
+          replacements,
+          candidateFiles,
+          verified: verifiedResult.rows,
+          matchesScope: redirectStructureFilters
+            ? (url) =>
+                urlMatchesStructureFilters(url, redirectStructureFilters)
+            : undefined
+        });
 
         // Whole-pattern widening (v1.42, fixed v1.45.1): when the client opted
         // into the unsampled URLs AND the confirmed samples distil into a single
