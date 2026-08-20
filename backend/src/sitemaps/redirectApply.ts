@@ -15,6 +15,10 @@ import {
   rewriteSitemapLocFile
 } from "./rewriteLocs.js";
 import type { RedirectRule } from "./redirectRule.js";
+import {
+  applyStructureFilterToRewriter,
+  type ResolvedStructureFilter
+} from "./structureClusters.js";
 
 // Shared "apply redirects" disk + stats logic, used by BOTH the synchronous
 // apply-redirects route (small patterns) and the background apply-redirects job
@@ -111,11 +115,15 @@ export async function rewriteRedirectSourceFilesOnDisk(
     // pattern_urls sample. `replacements` (confirmed sampled pairs) still wins
     // per-URL. Null (or omitted) = exact-map-only, unchanged prior behaviour.
     rule?: RedirectRule | null;
+    // Scope the widening to one detected structure (v1.55). Resolved filters —
+    // path-segment indexes, not param ordinals. Empty/omitted = whole pattern,
+    // unchanged prior behaviour. See applyStructureFilterToRewriter.
+    structureFilters?: ResolvedStructureFilter[] | null;
   }
 ): Promise<RedirectFileRewrite> {
-  const rewriteUrl = buildRedirectApplyRewriter(
-    options.replacements,
-    options.rule ?? null
+  const rewriteUrl = applyStructureFilterToRewriter(
+    buildRedirectApplyRewriter(options.replacements, options.rule ?? null),
+    options.structureFilters ?? null
   );
   const selectedSet = new Set(options.selectedDisplayFiles);
   const filesResult = await client.query<{

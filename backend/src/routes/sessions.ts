@@ -4390,12 +4390,22 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
   app.post<{
     Params: PatternParams;
-    Body: { url_ids?: unknown[]; inferred_urls?: unknown[] };
+    Body: {
+      url_ids?: unknown[];
+      inferred_urls?: unknown[];
+      structure_filter?: unknown;
+    };
   }>(
     "/api/sessions/:id/patterns/:patternId/apply-redirects",
     async (request, reply) => {
-      const patternResult = await pool.query<{ source_role: string }>(
-        "SELECT source_role FROM patterns WHERE session_id = $1 AND id = $2",
+      // template joins the select for v1.55: a structure filter arrives as
+      // {param} ORDINALS and has to be resolved to path-segment indexes before
+      // anything downstream can apply it.
+      const patternResult = await pool.query<{
+        source_role: string;
+        template: string;
+      }>(
+        "SELECT source_role, template FROM patterns WHERE session_id = $1 AND id = $2",
         [request.params.id, request.params.patternId]
       );
 
@@ -4407,6 +4417,40 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       }
 
       const sourceRole = patternResult.rows[0].source_role;
+      const patternTemplate = patternResult.rows[0].template;
+
+      // Optional structure scope (v1.55): "Limit this edit to" in the Fix
+      // Redirect URLs modal. Same wire shape and the same all-or-nothing
+      // resolution the transform endpoints use — a partially-resolved scope
+      // would silently widen the edit to the position that dropped out, which
+      // for a redirect fix means rewriting the structures the user excluded.
+      const parsedRedirectFilters = parseStructureFilters(
+        request.body?.structure_filter
+      );
+
+      if (parsedRedirectFilters === null) {
+        return reply.code(400).send({
+          error: "Bad Request",
+          message: "structure_filter is malformed"
+        });
+      }
+
+      const resolvedRedirectFilters = resolveStructureFilters(
+        parsedRedirectFilters,
+        patternTemplate
+      );
+
+      if (!resolvedRedirectFilters) {
+        return reply.code(400).send({
+          error: "Bad Request",
+          message: `structure_filter param_index ${parsedRedirectFilters
+            .map((filter) => filter.param_index)
+            .join(", ")} does not resolve against ${patternTemplate}`
+        });
+      }
+
+      const redirectStructureFilters =
+        resolvedRedirectFilters.length > 0 ? resolvedRedirectFilters : null;
 
       // Optional: restrict to specific sampled_url rows. Omit → all redirects.
       const urlIds = Array.isArray(request.body?.url_ids)
@@ -4445,7 +4489,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             session_id: request.params.id,
             pattern_id: request.params.patternId,
             url_ids: urlIds,
-            inferred_urls: inferredUrls
+            inferred_urls: inferredUrls,
+            structure_filters: redirectStructureFilters
           });
 
           return reply.send({
@@ -4585,7 +4630,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             sourceRole,
             replacements,
             selectedDisplayFiles,
-            rule: widen ? inferredRule : null
+            rule: widen ? inferredRule : null,
+            structureFilters: redirectStructureFilters
           });
 
           filesToDeleteOnError = rewrite.newFilePaths;

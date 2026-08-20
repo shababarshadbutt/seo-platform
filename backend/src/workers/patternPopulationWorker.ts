@@ -3,6 +3,10 @@ import { once } from "node:events";
 
 import { streamSitemapUrlLocs } from "../sitemaps/parser.js";
 import { pathMatchesTemplate } from "../sitemaps/rewriteLocs.js";
+import {
+  urlMatchesStructureFilters,
+  type ResolvedStructureFilter
+} from "../sitemaps/structureClusters.js";
 
 // piscina worker: scan ONE sitemap file for the URLs belonging to a set of
 // patterns, and write the matches to a provisional file on disk.
@@ -34,7 +38,17 @@ export type PatternPopulationInput = {
   // Where to write the matches for this file.
   provisionalPath: string;
   // The patterns being enumerated, in the caller's priority order.
-  patterns: Array<{ id: string; template: string }>;
+  //
+  // structureFilters (v1.55) narrows a pattern to one of its detected
+  // sub-structures, so "Verify all in this pattern" verifies only the structure
+  // the user limited the dialog to. RESOLVED filters cross the thread edge
+  // (path-segment indexes, not param ordinals), same as every other worker
+  // spec, so no template parsing happens here.
+  patterns: Array<{
+    id: string;
+    template: string;
+    structureFilters?: ResolvedStructureFilter[] | null;
+  }>;
 };
 
 export type PatternPopulationResult = {
@@ -59,8 +73,12 @@ export default async function scan(
     }
 
     // First matching pattern wins, matching the sequential enumerator exactly.
-    const matched = input.patterns.find((pattern) =>
-      pathMatchesTemplate(pathname, pattern.template)
+    // A pattern whose structure scope excludes this loc does not match at all —
+    // it must not shadow a later pattern that would have claimed it.
+    const matched = input.patterns.find(
+      (pattern) =>
+        pathMatchesTemplate(pathname, pattern.template) &&
+        urlMatchesStructureFilters(loc, pattern.structureFilters ?? [])
     );
 
     if (!matched) {

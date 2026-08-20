@@ -14,6 +14,12 @@ import {
 } from "../queue/sitemapQueue.js";
 import { enqueueTriageSampleJob } from "../queue/triageQueue.js";
 import { enqueueVerifyUrlsJob } from "../queue/verificationQueue.js";
+import {
+  parseStructureFilters,
+  resolveStructureFilters,
+  urlMatchesStructureFilters,
+  type ResolvedStructureFilter
+} from "../sitemaps/structureClusters.js";
 
 // Full-population verification routes (verify-then-act, migration 038).
 //
@@ -165,7 +171,11 @@ export async function verificationRoutes(app: FastifyInstance) {
   // pattern_ids to verify a subset; absent → every current pattern.
   app.post<{
     Params: SessionParams;
-    Body: { pattern_ids?: unknown; target_statuses?: unknown };
+    Body: {
+      pattern_ids?: unknown;
+      target_statuses?: unknown;
+      structure_filter?: unknown;
+    };
   }>(
     "/api/sessions/:id/verify-urls",
     async (request, reply) => {
@@ -196,6 +206,67 @@ export async function verificationRoutes(app: FastifyInstance) {
         return reply.code(400).send(badRequest(targetStatuses.message));
       }
 
+      // Structure scope (v1.55): "Limit this edit to" in the Fix modal. Only
+      // meaningful for a single-pattern request — the filters are {param}
+      // ordinals against ONE template, so resolving them against several
+      // patterns at once would mean different things per pattern. Rejected
+      // rather than silently applied to the first, because a scope that half
+      // applies is the one failure mode a scoped run must not have.
+      const parsedFilters = parseStructureFilters(request.body?.structure_filter);
+
+      if (parsedFilters === null) {
+        return reply.code(400).send(badRequest("structure_filter is malformed"));
+      }
+
+      let structureFilters: ResolvedStructureFilter[] | null = null;
+
+      if (parsedFilters.length > 0) {
+        if (patternIds === null || patternIds.length !== 1) {
+          return reply
+            .code(400)
+            .send(
+              badRequest(
+                "structure_filter requires exactly one pattern_id to resolve against"
+              )
+            );
+        }
+
+        const templateResult = await pool.query<{ template: string }>(
+          "SELECT template FROM patterns WHERE session_id = $1 AND id = $2",
+          [sessionId, patternIds[0]]
+        );
+
+        if (templateResult.rowCount === 0) {
+          return reply.code(404).send({
+            error: "Not Found",
+            message: "pattern not found"
+          });
+        }
+
+        const template = templateResult.rows[0].template;
+        const resolved = resolveStructureFilters(parsedFilters, template);
+
+        if (!resolved) {
+          return reply
+            .code(400)
+            .send(
+              badRequest(
+                `structure_filter param_index ${parsedFilters
+                  .map((filter) => filter.param_index)
+                  .join(", ")} does not resolve against ${template}`
+              )
+            );
+        }
+
+        structureFilters = resolved;
+      }
+
+      // Serialised once and used for BOTH the attach comparison and the insert,
+      // so "same scope?" is asked of exactly the value that gets stored.
+      const structureFiltersJson = structureFilters
+        ? JSON.stringify(structureFilters)
+        : null;
+
       // Attach semantics: a verification can run for a long time, so a re-POST
       // (page reload, second tab) joins the in-flight job instead of stacking a
       // second population check behind it.
@@ -225,10 +296,19 @@ export async function verificationRoutes(app: FastifyInstance) {
                 )
               )
             )
+            -- Structure scope is part of the identity of a run (v1.55), for the
+            -- same reason pattern_ids is: without this, a request to verify
+            -- nsn-parts-{var} attaches to a running whole-pattern verification
+            -- of the same pattern — same session, same pattern_ids — reports its
+            -- 28,413-URL progress as the 613-URL run's, and leaves the caller
+            -- treating a whole-pattern verdict set as the scoped one. Compared
+            -- as jsonb of the RESOLVED filters, so representation cannot make
+            -- two identical scopes look different.
+            AND structure_filters IS NOT DISTINCT FROM $3::jsonb
           ORDER BY started_at DESC
           LIMIT 1
         `,
-        [sessionId, patternIds]
+        [sessionId, patternIds, structureFiltersJson]
       );
 
       if (active.rows[0]) {
@@ -237,11 +317,11 @@ export async function verificationRoutes(app: FastifyInstance) {
 
       const jobRow = await pool.query<{ id: string }>(
         `
-          INSERT INTO maintenance_jobs (session_id, kind, pattern_ids)
-          VALUES ($1, 'verify-urls', $2::uuid[])
+          INSERT INTO maintenance_jobs (session_id, kind, pattern_ids, structure_filters)
+          VALUES ($1, 'verify-urls', $2::uuid[], $3::jsonb)
           RETURNING id
         `,
-        [sessionId, patternIds]
+        [sessionId, patternIds, structureFiltersJson]
       );
       const jobRowId = jobRow.rows[0].id;
 
@@ -249,7 +329,8 @@ export async function verificationRoutes(app: FastifyInstance) {
         session_id: sessionId,
         job_row_id: jobRowId,
         pattern_ids: patternIds,
-        target_statuses: targetStatuses
+        target_statuses: targetStatuses,
+        structure_filters: structureFilters
       });
 
       return reply.code(202).send({ job_row_id: jobRowId });
@@ -555,7 +636,10 @@ export async function verificationRoutes(app: FastifyInstance) {
     }
   );
 
-  app.post<{ Params: PatternParams; Body: { statuses?: unknown } }>(
+  app.post<{
+    Params: PatternParams;
+    Body: { statuses?: unknown; structure_filter?: unknown };
+  }>(
     "/api/sessions/:id/patterns/:patternId/delete-verified-urls",
     async (request, reply) => {
       const sessionId = request.params.id;
@@ -581,21 +665,104 @@ export async function verificationRoutes(app: FastifyInstance) {
           );
       }
 
-      // The delete job restricts to (and rebuilds) exactly these files; the
-      // verified rows already know which display files their <loc> appears in,
-      // so the file scope is the union of the target rows' source_files.
-      const filesResult = await pool.query<{ display: string }>(
-        `
-          SELECT DISTINCT unnest(source_files) AS display
-          FROM verified_urls
-          WHERE session_id = $1
-            AND pattern_id = $2
-            AND is_deleted_from_sitemap = false
-            AND http_status = ANY($3::int[])
-        `,
-        [sessionId, patternId, statuses]
-      );
-      const fileDisplays = filesResult.rows.map((row) => row.display);
+      // Structure scope (v1.55): "Limit this edit to" in the Fix modal governs
+      // this delete too. It cannot be a filter on the status query alone,
+      // because verified_urls ACCUMULATES across runs — a whole-pattern
+      // verification from before the user narrowed the dialog leaves rows
+      // outside the chosen structure, and they would be deleted by a request
+      // that says it is limited to one structure.
+      //
+      // So a scoped request resolves to an EXPLICIT url list, which the delete
+      // job already supports (DeleteProblemUrlsJobData.urls) — no job change,
+      // and the file scope is derived from the surviving rows rather than from
+      // the whole status match.
+      const parsedFilters = parseStructureFilters(request.body?.structure_filter);
+
+      if (parsedFilters === null) {
+        return reply.code(400).send(badRequest("structure_filter is malformed"));
+      }
+
+      let scopedUrls: string[] | undefined;
+      let fileDisplays: string[];
+
+      if (parsedFilters.length > 0) {
+        const patternResult = await pool.query<{ template: string }>(
+          "SELECT template FROM patterns WHERE session_id = $1 AND id = $2",
+          [sessionId, patternId]
+        );
+
+        if (patternResult.rowCount === 0) {
+          return reply.code(404).send({
+            error: "Not Found",
+            message: "pattern not found"
+          });
+        }
+
+        const template = patternResult.rows[0].template;
+        const resolved = resolveStructureFilters(parsedFilters, template);
+
+        if (!resolved) {
+          return reply
+            .code(400)
+            .send(
+              badRequest(
+                `structure_filter param_index ${parsedFilters
+                  .map((filter) => filter.param_index)
+                  .join(", ")} does not resolve against ${template}`
+              )
+            );
+        }
+
+        const rowsResult = await pool.query<{
+          url: string;
+          source_files: string[];
+        }>(
+          `
+            SELECT url, source_files
+            FROM verified_urls
+            WHERE session_id = $1
+              AND pattern_id = $2
+              AND is_deleted_from_sitemap = false
+              AND http_status = ANY($3::int[])
+          `,
+          [sessionId, patternId, statuses]
+        );
+        const inScope = rowsResult.rows.filter((row) =>
+          urlMatchesStructureFilters(row.url, resolved)
+        );
+
+        scopedUrls = inScope.map((row) => row.url);
+        fileDisplays = Array.from(
+          new Set(inScope.flatMap((row) => row.source_files ?? []))
+        );
+
+        if (scopedUrls.length === 0) {
+          return reply
+            .code(400)
+            .send(
+              badRequest(
+                "no verified URLs with the selected statuses inside the selected structure"
+              )
+            );
+        }
+      } else {
+        // The delete job restricts to (and rebuilds) exactly these files; the
+        // verified rows already know which display files their <loc> appears in,
+        // so the file scope is the union of the target rows' source_files.
+        const filesResult = await pool.query<{ display: string }>(
+          `
+            SELECT DISTINCT unnest(source_files) AS display
+            FROM verified_urls
+            WHERE session_id = $1
+              AND pattern_id = $2
+              AND is_deleted_from_sitemap = false
+              AND http_status = ANY($3::int[])
+          `,
+          [sessionId, patternId, statuses]
+        );
+
+        fileDisplays = filesResult.rows.map((row) => row.display);
+      }
 
       if (fileDisplays.length === 0) {
         return reply
@@ -618,6 +785,7 @@ export async function verificationRoutes(app: FastifyInstance) {
         job_row_id: jobRowId,
         file_displays: fileDisplays,
         statuses,
+        ...(scopedUrls ? { urls: scopedUrls } : {}),
         use_verified: true,
         pattern_id: patternId
       });

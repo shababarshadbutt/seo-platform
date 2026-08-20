@@ -51,10 +51,15 @@ export type FileRewriteSpec =
   // Whole-pattern redirect widening (v1.45.1): confirmed exact pairs PLUS a
   // general derived rule applied to every matching <loc>. The rule is a plain
   // structured-clone-friendly object; `replacements` win per-URL.
+  // structureFilters (v1.55) scopes the widening to one detected structure, the
+  // same way patternTemplate and structureTransform above are scoped. Without
+  // it a derived rule sweeps EVERY <loc> it can transform, so a fix reviewed on
+  // one structure rewrote every other structure under the pattern too.
   | {
       kind: "redirectApply";
       replacements: [string, string][];
       rule: RedirectRule | null;
+      structureFilters?: ResolvedStructureFilter[] | null;
     }
   // Pattern structure transform (v1.48). The RAW structure strings cross the
   // thread edge, not the parsed form — parseStructure is cheap, deterministic and
@@ -89,7 +94,13 @@ function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
   }
 
   if (spec.kind === "redirectApply") {
-    return buildRedirectApplyRewriter(new Map(spec.replacements), spec.rule);
+    // Guard wraps the WHOLE rewriter, exact replacements included: an
+    // out-of-scope URL must pass through even if it happens to be one of the
+    // confirmed sampled pairs, or "limit this edit to" would leak.
+    return applyStructureFilterToRewriter(
+      buildRedirectApplyRewriter(new Map(spec.replacements), spec.rule),
+      spec.structureFilters ?? null
+    );
   }
 
   if (spec.kind === "structureTransform") {

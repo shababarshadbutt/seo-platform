@@ -14,6 +14,10 @@ import {
 import { displaySourceFilename, isHttpUrl } from "../sitemaps/filenames.js";
 import { streamSitemapUrlLocs } from "../sitemaps/parser.js";
 import { pathMatchesTemplate } from "../sitemaps/rewriteLocs.js";
+import {
+  urlMatchesStructureFilters,
+  type ResolvedStructureFilter
+} from "../sitemaps/structureClusters.js";
 
 // How many files are handed to the pool before their results are merged.
 //
@@ -44,6 +48,10 @@ const POPULATION_BATCH_SIZE = 8;
 export type PatternRow = {
   id: string;
   template: string;
+  // Structure scope (v1.55): when set, only URLs inside these detected
+  // sub-structures belong to the pattern's population. Resolved against the
+  // template by the caller. Absent/empty = the whole pattern, unchanged.
+  structureFilters?: ResolvedStructureFilter[] | null;
 };
 
 export type EnumeratedUrl = {
@@ -125,9 +133,12 @@ export async function enumeratePopulation(
         }
 
         // First matching selected template wins; a loc matching none is not
-        // part of the population.
-        const matched = patterns.find((pattern) =>
-          pathMatchesTemplate(pathname, pattern.template)
+        // part of the population. A structure-scoped pattern only claims locs
+        // inside its scope, so it cannot shadow a later pattern.
+        const matched = patterns.find(
+          (pattern) =>
+            pathMatchesTemplate(pathname, pattern.template) &&
+            urlMatchesStructureFilters(loc, pattern.structureFilters ?? [])
         );
 
         if (!matched) {
@@ -192,7 +203,8 @@ async function enumerateInWorkers(
   );
   const workerPatterns = patterns.map((pattern) => ({
     id: pattern.id,
-    template: pattern.template
+    template: pattern.template,
+    structureFilters: pattern.structureFilters ?? null
   }));
 
   const scratchDir = path.join(

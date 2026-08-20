@@ -27,6 +27,7 @@ import {
   type PatternRecheckStatus,
   type RefusedHost,
   type StatusFileBreakdown,
+  type StructureFilter,
   type TriageRun,
   type VerificationStatus
 } from "@/lib/api";
@@ -99,6 +100,14 @@ type Props = {
   // and a never-attempted one look identical in the data, so the reason has to be
   // passed in.
   hostRefused?: RefusedHost | null;
+  // "Limit this edit to" from the Fix modal above (v1.55). Every action this
+  // panel starts narrows to the chosen structure(s): verification probes only
+  // that structure's URLs, and the delete removes only its verified rows. Passed
+  // in rather than owned here because the dropdowns live in the parent dialog,
+  // where they also scope the URL list and the Accept button.
+  //
+  // Empty/absent = the whole pattern, exactly the pre-v1.55 behaviour.
+  structureFilters?: StructureFilter[] | null;
 };
 
 function formatNumber(value: number) {
@@ -157,7 +166,8 @@ export function PatternVerifyPanel({
   onSelectedStatusesChange,
   onRescored,
   autoStartRecheck = false,
-  hostRefused = null
+  hostRefused = null,
+  structureFilters = null
 }: Props) {
   const [verification, setVerification] = useState<VerificationStatus | null>(
     null
@@ -508,7 +518,8 @@ export function PatternVerifyPanel({
       await startUrlVerification(
         sessionId,
         [patternId],
-        selected.size > 0 ? effectiveStatuses : undefined
+        selected.size > 0 ? effectiveStatuses : undefined,
+        structureFilters
       );
       await refresh();
     } catch (nextError) {
@@ -554,7 +565,12 @@ export function PatternVerifyPanel({
     setError("");
 
     try {
-      await deleteVerifiedUrls(sessionId, patternId, effectiveStatuses);
+      await deleteVerifiedUrls(
+        sessionId,
+        patternId,
+        effectiveStatuses,
+        structureFilters
+      );
 
       for (;;) {
         const { job } = await getDeleteProblemUrlsStatus(sessionId);

@@ -1216,7 +1216,11 @@ export type VerificationStatus = {
 export async function startUrlVerification(
   sessionId: string,
   patternIds?: string[],
-  targetStatuses?: number[]
+  targetStatuses?: number[],
+  // Structure scope (v1.55). The server requires exactly one pattern_id to
+  // resolve it against, and records it on the job row so a scoped run can never
+  // attach to an unscoped one and report its progress.
+  structureFilters?: StructureFilter[] | null
 ): Promise<{ job_row_id: string }> {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/verify-urls`),
@@ -1227,6 +1231,9 @@ export async function startUrlVerification(
         ...(patternIds ? { pattern_ids: patternIds } : {}),
         ...(targetStatuses && targetStatuses.length > 0
           ? { target_statuses: targetStatuses }
+          : {}),
+        ...(structureFilters && structureFilters.length > 0
+          ? { structure_filter: structureFilters }
           : {})
       })
     }
@@ -1458,7 +1465,12 @@ export async function getVerifiedUrls(
 export async function deleteVerifiedUrls(
   sessionId: string,
   patternId: string,
-  statuses: number[]
+  statuses: number[],
+  // Structure scope (v1.55). The server resolves a scoped request to an explicit
+  // URL list rather than filtering by status alone — verified_urls accumulates
+  // across runs, so an earlier whole-pattern verification leaves rows outside
+  // the chosen structure that a status-only filter would delete.
+  structureFilters?: StructureFilter[] | null
 ): Promise<{ job_row_id: string }> {
   const response = await fetchWithTimeout(
     backendUrl(
@@ -1467,7 +1479,12 @@ export async function deleteVerifiedUrls(
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ statuses })
+      body: JSON.stringify({
+        statuses,
+        ...(structureFilters && structureFilters.length > 0
+          ? { structure_filter: structureFilters }
+          : {})
+      })
     }
   );
 
@@ -1908,9 +1925,19 @@ export async function applyPatternRedirects(
   sessionId: string,
   patternId: string,
   urlIds?: string[],
-  inferredUrls?: string[]
+  inferredUrls?: string[],
+  // "Limit this edit to" in the Fix modal (v1.55). Sent as {param} ORDINALS —
+  // the server resolves them against the pattern template and refuses the whole
+  // request if any one fails, so a scope can never half-apply. Without it the
+  // derived rule sweeps every <loc> it can transform, i.e. the pattern's other
+  // structures too.
+  structureFilters?: StructureFilter[] | null
 ) {
-  const body: { url_ids?: string[]; inferred_urls?: string[] } = {};
+  const body: {
+    url_ids?: string[];
+    inferred_urls?: string[];
+    structure_filter?: StructureFilter[];
+  } = {};
 
   if (urlIds) {
     body.url_ids = urlIds;
@@ -1918,6 +1945,10 @@ export async function applyPatternRedirects(
 
   if (inferredUrls && inferredUrls.length > 0) {
     body.inferred_urls = inferredUrls;
+  }
+
+  if (structureFilters && structureFilters.length > 0) {
+    body.structure_filter = structureFilters;
   }
 
   const response = await fetchWithTimeout(

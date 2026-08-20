@@ -18,6 +18,7 @@ import {
 } from "../sitemaps/rewriteLocs.js";
 import { deriveRedirectRule } from "../sitemaps/redirectRule.js";
 import { recomputePatternStatsSql } from "../sitemaps/redirectApply.js";
+import { applyStructureFilterToRewriter } from "../sitemaps/structureClusters.js";
 import {
   FILE_REWRITE_PARALLEL_THRESHOLD,
   runFileRewriteJob
@@ -50,6 +51,10 @@ export async function processApplyRedirectsJob(
   const { session_id: sessionId, pattern_id: patternId } = data;
   const urlIds = data.url_ids;
   const inferredUrls = data.inferred_urls ?? [];
+  // Structure scope (v1.55), resolved by the route. Guards BOTH the inline and
+  // the pooled path below, because a derived rule otherwise rewrites every
+  // <loc> it can transform — including the structures the user excluded.
+  const structureFilters = data.structure_filters ?? null;
 
   const patternResult = await pool.query<{ source_role: string }>(
     "SELECT source_role FROM patterns WHERE id = $1",
@@ -268,6 +273,7 @@ export async function processApplyRedirectsJob(
       pattern_id: patternId,
       files: targets.length,
       replacements: replacements.size,
+      structure_filters: structureFilters?.length ?? 0,
       parallel: targets.length >= FILE_REWRITE_PARALLEL_THRESHOLD
     },
     "apply-redirects job started"
@@ -285,14 +291,18 @@ export async function processApplyRedirectsJob(
             spec: {
               kind: "redirectApply",
               replacements: replacementPairs,
-              rule: effectiveRule
+              rule: effectiveRule,
+              structureFilters
             }
           }).then((result) => result.rewrittenCount)
         )
       )
     );
   } else {
-    const rewriter = buildRedirectApplyRewriter(replacements, effectiveRule);
+    const rewriter = applyStructureFilterToRewriter(
+      buildRedirectApplyRewriter(replacements, effectiveRule),
+      structureFilters
+    );
 
     for (const file of targets) {
       await processFile(file, (input) =>

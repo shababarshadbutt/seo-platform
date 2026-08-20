@@ -210,7 +210,14 @@ export async function processVerifyUrlsJob(
         `,
       patternIds ? [sessionId, patternIds] : [sessionId]
     );
-    const patterns = patternsResult.rows;
+    // The scope rides on every selected pattern rather than as a separate
+    // argument: enumeratePopulation decides membership per pattern, and the
+    // modal that sends a structure scope always sends exactly one pattern id.
+    const structureFilters = data.structure_filters ?? null;
+    const patterns = patternsResult.rows.map((row) => ({
+      ...row,
+      structureFilters
+    }));
 
     // The DB clock stamps checked_at at flush time, so the stale-row sweep at
     // the end compares against the same clock — capture "before any check" now.
