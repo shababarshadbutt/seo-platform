@@ -72,13 +72,13 @@ test("still reports the pattern-wide total when nothing is selected yet", () => 
   );
 });
 
-// --- the "Set all to Fix" toggle drives the number (v1.54) ------------------
+// --- the "Set all to Fix" toggle drives the number (v1.66) ------------------
 // The toggle exists because a text link gave no way to tell pressed from
 // unpressed. A toggle whose number does not move when pressed would have the
 // same problem, so these pin the number to the toggle in both directions.
 
 test("pressed: reports the pattern total even with no inferable rule", () => {
-  // The pre-v1.54 behaviour returned 1,000 here. The number now states the scope
+  // The pre-v1.66 behaviour returned 1,000 here. The number now states the scope
   // the toggle asks for; fixModalBanner() carries the shortfall in words, and the
   // success toast reports what actually changed. See the header comment.
   assert.equal(
@@ -156,7 +156,7 @@ test("a real pattern-wide rule still turns the indigo banner ON", () => {
   );
 });
 
-// --- exactly one banner, ever (follow-up to ba286d5f, revised v1.54) --------
+// --- exactly one banner, ever (follow-up to ba286d5f, revised v1.66) --------
 // results/page.tsx has no component test harness, so these assert the function
 // that PICKS the banner rather than the rendered DOM. It replaced two
 // independent `? :` gates precisely because those two could both be true once

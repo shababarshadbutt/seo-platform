@@ -1,4 +1,4 @@
--- Structure-scoped verification (v1.55).
+-- Structure-scoped verification (v1.66).
 --
 -- WHY. The Fix Redirect URLs modal gained the same "Limit this edit to" control
 -- the Update Pattern modal has: pick one of the pattern's detected
@@ -21,7 +21,7 @@
 -- carry, so comparing "same scope?" is a plain jsonb equality on normalised
 -- data rather than a template-parsing exercise in SQL.
 --
--- NULL = whole pattern (or whole session), which is exactly the pre-v1.55
+-- NULL = whole pattern (or whole session), which is exactly the pre-v1.66
 -- behaviour, so every existing row and every unscoped run is unchanged.
 ALTER TABLE maintenance_jobs
   ADD COLUMN IF NOT EXISTS structure_filters jsonb;

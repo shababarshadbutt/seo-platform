@@ -12,7 +12,7 @@
 // reason fix-visibility.ts and fix-status-filter.ts are: results/page.tsx has no
 // test file, so logic left in the component is logic nothing can assert.
 //
-// WHY THE !inferredWithoutRule GUARD WAS RELAXED (v1.54). It used to suppress
+// WHY THE !inferredWithoutRule GUARD WAS RELAXED (v1.66). It used to suppress
 // the pattern-wide number outright: accepting applies a single inferred rewrite
 // rule to every matching URL on disk, so with no rule to infer there is nothing
 // to apply beyond the reviewed rows and the big number overstated the click.

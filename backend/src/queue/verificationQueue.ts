@@ -26,12 +26,12 @@ export type VerifyUrlsJobData = {
   // pattern of the session. The Fix modal ALWAYS sends exactly one id — sending
   // null from there is the bug this release fixes.
   pattern_ids: string[] | null;
-  // Structure scope (v1.55): resolved filters limiting the population to one of
+  // Structure scope (v1.66): resolved filters limiting the population to one of
   // the pattern's detected sub-structures, as picked in the Fix modal's "Limit
   // this edit to". Applies to every pattern in pattern_ids — the modal always
   // sends exactly one. null → the whole pattern.
   // Optional like every other structureFilters field in the codebase, so an
-  // unscoped enqueue reads exactly as it did before v1.55.
+  // unscoped enqueue reads exactly as it did before v1.66.
   structure_filters?: ResolvedStructureFilter[] | null;
   // Statuses the caller asked about, for a status-scoped run ("Verify 404s").
   // Narrows what the completion count REPORTS, not what gets probed: a URL's

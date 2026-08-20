@@ -4398,7 +4398,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
   }>(
     "/api/sessions/:id/patterns/:patternId/apply-redirects",
     async (request, reply) => {
-      // template joins the select for v1.55: a structure filter arrives as
+      // template joins the select for v1.66: a structure filter arrives as
       // {param} ORDINALS and has to be resolved to path-segment indexes before
       // anything downstream can apply it.
       const patternResult = await pool.query<{
@@ -4419,7 +4419,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       const sourceRole = patternResult.rows[0].source_role;
       const patternTemplate = patternResult.rows[0].template;
 
-      // Optional structure scope (v1.55): "Limit this edit to" in the Fix
+      // Optional structure scope (v1.66): "Limit this edit to" in the Fix
       // Redirect URLs modal. Same wire shape and the same all-or-nothing
       // resolution the transform endpoints use — a partially-resolved scope
       // would silently widen the edit to the position that dropped out, which

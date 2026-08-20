@@ -309,7 +309,7 @@ function defaultFixAction(candidate: RedirectCandidate): FixAction {
   return candidate.destination_not_found ? "delete" : "fix";
 }
 
-// Rows the header "Set all to Fix" toggle is allowed to claim (v1.54).
+// Rows the header "Set all to Fix" toggle is allowed to claim (v1.66).
 //
 // A delete_only row is a sampled 404 with no destination — its per-row Fix
 // button is `disabled` for exactly that reason — and a destination_not_found row
@@ -985,14 +985,14 @@ export default function ResultsDashboardPage({
   const [fixPatternTotal, setFixPatternTotal] = useState(0);
   const [fixLoading, setFixLoading] = useState(false);
   const [fixInferredWithoutRule, setFixInferredWithoutRule] = useState(false);
-  // The header "Set all to Fix" toggle, pressed by default (v1.54). Pressed =
+  // The header "Set all to Fix" toggle, pressed by default (v1.66). Pressed =
   // target every URL in the pattern; released = only the reviewed rows the user
   // selected. It used to be a bare text link that gave no way to tell clicked
   // from not-clicked — and since most rows already default to Fix, clicking it
   // often changed nothing visible, which read as a broken control. It now drives
   // the Accept button's count, so pressing it always moves something.
   const [fixAllInPattern, setFixAllInPattern] = useState(true);
-  // ---- "Limit this edit to" for the Fix modal (v1.55) --------------------
+  // ---- "Limit this edit to" for the Fix modal (v1.66) --------------------
   // Same control the Update Pattern modal has had since v1.51, and the same
   // state shape (see renameStructureSelections): one selection per {param}
   // ordinal, picks ANDed, a missing key meaning "any structure here". The SEO
@@ -2782,7 +2782,7 @@ export default function ResultsDashboardPage({
         setFixCandidates(data.candidates);
         setFixPatternTotal(data.pattern_total_urls);
         // Seeded through canBulkFix rather than defaultFixAction alone, because
-        // the header toggle opens PRESSED (v1.54) and the rows have to agree with
+        // the header toggle opens PRESSED (v1.66) and the rows have to agree with
         // it on the first render. What the toggle may not claim keeps its
         // analysis default (see canBulkFix): sampled 404s and soft-404
         // destinations open on Delete.
@@ -2824,7 +2824,7 @@ export default function ResultsDashboardPage({
     };
   }, [params.id, fixPatternId]);
 
-  // The Fix modal's structure dropdowns (v1.55). Loaded once per open, like the
+  // The Fix modal's structure dropdowns (v1.66). Loaded once per open, like the
   // Update Pattern modal's, so changing a dropdown costs nothing — the clusters
   // and their pooled counts are all client-side from here.
   useEffect(() => {
@@ -2842,7 +2842,7 @@ export default function ResultsDashboardPage({
       })
       .catch(() => {
         // Non-fatal: no dropdowns, and the modal behaves exactly as it did
-        // before v1.55. The URL list and Accept do not depend on this request.
+        // before v1.66. The URL list and Accept do not depend on this request.
         if (!cancelled) {
           setFixStructures(null);
         }
@@ -2879,7 +2879,7 @@ export default function ResultsDashboardPage({
     setFixActions((current) => ({ ...current, [key]: action }));
   }
 
-  // The header toggle (v1.54). Pressed claims every fixable row AND widens the
+  // The header toggle (v1.66). Pressed claims every fixable row AND widens the
   // Accept button's count to the whole pattern; released hands every row back to
   // its analysis default and narrows the count to the selection. Two-way on
   // purpose: the old one-way link left "already all Fix" and "your click did
@@ -2909,7 +2909,7 @@ export default function ResultsDashboardPage({
       return;
     }
 
-    // Only the rows toggled Fix, and only within the structure scope (v1.55).
+    // Only the rows toggled Fix, and only within the structure scope (v1.66).
     // Selecting from scopedFixCandidates rather than filtering afterwards means
     // an out-of-scope key left in fixActions by an earlier selection can never
     // be submitted. The server enforces the same scope independently.
@@ -3027,7 +3027,7 @@ export default function ResultsDashboardPage({
         )} files`
       : null;
 
-  // ---- Fix modal structure scope, derived (v1.55) ------------------------
+  // ---- Fix modal structure scope, derived (v1.66) ------------------------
   // The dropdown picks as the wire filters the backend will AND. Same shape and
   // same sort as renameStructureFilters — the two modals send an identical body.
   const fixStructureFilters = useMemo<StructureFilter[]>(
@@ -3131,7 +3131,7 @@ export default function ResultsDashboardPage({
   // HTTP-checked, so no status chip can honestly claim them and they drop out
   // of a filtered view rather than being shown under a code they might not have.
   //
-  // Structure scope applies FIRST and to everything below (v1.55): it is the
+  // Structure scope applies FIRST and to everything below (v1.66): it is the
   // population this dialog is working on, where the status chips are a view on
   // top of it. So the action counts and the summary line count scoped rows, and
   // an out-of-scope row can never be submitted even if a stale fixActions entry
@@ -3155,10 +3155,10 @@ export default function ResultsDashboardPage({
   // Does accepting reach beyond the rows on screen? One input object feeds the
   // scope banner, the caption under the toggle and the Accept button's count —
   // writing the condition out separately per call site is what let them disagree
-  // in the first place. See lib/fix-accept-count.ts. (v1.53, v1.54)
+  // in the first place. See lib/fix-accept-count.ts. (v1.53, v1.66)
   const fixScope = {
     // The SCOPED total, so every number the dialog shows describes the edit the
-    // user has actually limited it to (v1.55). Unscoped this is fixPatternTotal
+    // user has actually limited it to (v1.66). Unscoped this is fixPatternTotal
     // and nothing changes.
     fixPatternTotal: fixEffectiveTotal,
     fixCandidateCount: scopedFixCandidates.length,
@@ -3170,7 +3170,7 @@ export default function ResultsDashboardPage({
   // independent gates in the JSX: now that the count follows the toggle instead
   // of inferredWithoutRule, the old pair could both be true at once and the modal
   // would claim pattern-wide scope and "only the sampled URLs are listed" inches
-  // apart. (v1.54)
+  // apart. (v1.66)
   const fixBanner = fixModalBanner(fixScope);
   // What "Accept Selected Changes" targets, which is not the same as how many
   // rows are selected — the banner above the button already said so and the
@@ -5443,7 +5443,7 @@ export default function ResultsDashboardPage({
                   applied by inference (not individually verified).
                 </p>
               )}
-              {/* One banner, chosen by fixModalBanner (v1.54) — see the "ONE
+              {/* One banner, chosen by fixModalBanner (v1.66) — see the "ONE
                   SOURCE OF TRUTH" note in lib/fix-accept-count.ts. These were two
                   independent gates, mutually exclusive only because the Accept
                   count fell back to the reviewed rows whenever no rule could be
@@ -5511,13 +5511,13 @@ export default function ResultsDashboardPage({
                     // on page 4 of a now-2-page list shows an empty table.
                     setFixPage(0);
                   }}
-                  // "Limit this edit to" governs this panel too (v1.55): a
+                  // "Limit this edit to" governs this panel too (v1.66): a
                   // scoped verify probes only the chosen structure's URLs, and a
                   // scoped delete removes only its verified rows.
                   structureFilters={fixStructureFilters}
                 />
               ) : null}
-              {/* Per-position structure scope (v1.55) — the same control, state
+              {/* Per-position structure scope (v1.66) — the same control, state
                   shape and markup as the Update Pattern modal's, deliberately:
                   the SEO team asked for one treatment across both dialogs. One
                   dropdown per param slot, picks ANDed, so choosing at two
@@ -5726,7 +5726,7 @@ export default function ResultsDashboardPage({
                     </span>
                   </div>
                   <span className="shrink-0 text-xs text-slate-500">
-                    {/* Counted against the SCOPED pool (v1.55), so "10 of 613
+                    {/* Counted against the SCOPED pool (v1.66), so "10 of 613
                         shown" describes the structure being edited rather than
                         the whole pattern the dialog is no longer acting on. */}
                     {fixStatusFilter.size > 0

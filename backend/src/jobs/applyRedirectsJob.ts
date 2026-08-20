@@ -51,7 +51,7 @@ export async function processApplyRedirectsJob(
   const { session_id: sessionId, pattern_id: patternId } = data;
   const urlIds = data.url_ids;
   const inferredUrls = data.inferred_urls ?? [];
-  // Structure scope (v1.55), resolved by the route. Guards BOTH the inline and
+  // Structure scope (v1.66), resolved by the route. Guards BOTH the inline and
   // the pooled path below, because a derived rule otherwise rewrites every
   // <loc> it can transform — including the structures the user excluded.
   const structureFilters = data.structure_filters ?? null;

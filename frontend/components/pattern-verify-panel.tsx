@@ -100,13 +100,13 @@ type Props = {
   // and a never-attempted one look identical in the data, so the reason has to be
   // passed in.
   hostRefused?: RefusedHost | null;
-  // "Limit this edit to" from the Fix modal above (v1.55). Every action this
+  // "Limit this edit to" from the Fix modal above (v1.66). Every action this
   // panel starts narrows to the chosen structure(s): verification probes only
   // that structure's URLs, and the delete removes only its verified rows. Passed
   // in rather than owned here because the dropdowns live in the parent dialog,
   // where they also scope the URL list and the Accept button.
   //
-  // Empty/absent = the whole pattern, exactly the pre-v1.55 behaviour.
+  // Empty/absent = the whole pattern, exactly the pre-v1.66 behaviour.
   structureFilters?: StructureFilter[] | null;
 };
 

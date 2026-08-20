@@ -206,7 +206,7 @@ export async function verificationRoutes(app: FastifyInstance) {
         return reply.code(400).send(badRequest(targetStatuses.message));
       }
 
-      // Structure scope (v1.55): "Limit this edit to" in the Fix modal. Only
+      // Structure scope (v1.66): "Limit this edit to" in the Fix modal. Only
       // meaningful for a single-pattern request — the filters are {param}
       // ordinals against ONE template, so resolving them against several
       // patterns at once would mean different things per pattern. Rejected
@@ -296,7 +296,7 @@ export async function verificationRoutes(app: FastifyInstance) {
                 )
               )
             )
-            -- Structure scope is part of the identity of a run (v1.55), for the
+            -- Structure scope is part of the identity of a run (v1.66), for the
             -- same reason pattern_ids is: without this, a request to verify
             -- nsn-parts-{var} attaches to a running whole-pattern verification
             -- of the same pattern — same session, same pattern_ids — reports its
@@ -665,7 +665,7 @@ export async function verificationRoutes(app: FastifyInstance) {
           );
       }
 
-      // Structure scope (v1.55): "Limit this edit to" in the Fix modal governs
+      // Structure scope (v1.66): "Limit this edit to" in the Fix modal governs
       // this delete too. It cannot be a filter on the status query alone,
       // because verified_urls ACCUMULATES across runs — a whole-pattern
       // verification from before the user narrowed the dialog leaves rows

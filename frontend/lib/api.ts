@@ -1217,7 +1217,7 @@ export async function startUrlVerification(
   sessionId: string,
   patternIds?: string[],
   targetStatuses?: number[],
-  // Structure scope (v1.55). The server requires exactly one pattern_id to
+  // Structure scope (v1.66). The server requires exactly one pattern_id to
   // resolve it against, and records it on the job row so a scoped run can never
   // attach to an unscoped one and report its progress.
   structureFilters?: StructureFilter[] | null
@@ -1466,7 +1466,7 @@ export async function deleteVerifiedUrls(
   sessionId: string,
   patternId: string,
   statuses: number[],
-  // Structure scope (v1.55). The server resolves a scoped request to an explicit
+  // Structure scope (v1.66). The server resolves a scoped request to an explicit
   // URL list rather than filtering by status alone — verified_urls accumulates
   // across runs, so an earlier whole-pattern verification leaves rows outside
   // the chosen structure that a status-only filter would delete.
@@ -1926,7 +1926,7 @@ export async function applyPatternRedirects(
   patternId: string,
   urlIds?: string[],
   inferredUrls?: string[],
-  // "Limit this edit to" in the Fix modal (v1.55). Sent as {param} ORDINALS —
+  // "Limit this edit to" in the Fix modal (v1.66). Sent as {param} ORDINALS —
   // the server resolves them against the pattern template and refuses the whole
   // request if any one fails, so a scope can never half-apply. Without it the
   // derived rule sweeps every <loc> it can transform, i.e. the pattern's other

@@ -1,5 +1,5 @@
 // Which numbers the Fix Redirect URLs modal reports once "Limit this edit to"
-// has a structure selected (v1.55).
+// has a structure selected (v1.66).
 //
 // Extracted as pure functions for the same reason fix-accept-count.ts,
 // fix-visibility.ts and fix-status-filter.ts are: results/page.tsx has no test

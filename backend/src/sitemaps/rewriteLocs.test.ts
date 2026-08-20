@@ -82,7 +82,7 @@ test("an exact replacement equal to the URL is a no-op (null), not a rewrite", (
   assert.equal(rewrite("https://site.com/a"), null);
 });
 
-// --- structure-scoped widening (v1.55) --------------------------------------
+// --- structure-scoped widening (v1.66) --------------------------------------
 // The Fix Redirect URLs modal gained "Limit this edit to", so accepting a fix
 // reviewed on ONE of a pattern's sub-structures must leave the pattern's other
 // structures byte-identical. That guarantee lives in the composition the apply
@@ -159,7 +159,7 @@ test("the scope also withholds an EXACT confirmed replacement", () => {
   );
 });
 
-test("an empty scope means the pre-v1.55 sweep, unchanged", () => {
+test("an empty scope means the pre-v1.66 sweep, unchanged", () => {
   // [] is unscoped, not scoped-to-nothing — the distinction the modal relies on
   // when every dropdown sits on "Any structure".
   const rewrite = scopedRedirectRewriter(new Map(), catalogRule, []);

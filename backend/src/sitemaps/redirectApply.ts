@@ -115,7 +115,7 @@ export async function rewriteRedirectSourceFilesOnDisk(
     // pattern_urls sample. `replacements` (confirmed sampled pairs) still wins
     // per-URL. Null (or omitted) = exact-map-only, unchanged prior behaviour.
     rule?: RedirectRule | null;
-    // Scope the widening to one detected structure (v1.55). Resolved filters —
+    // Scope the widening to one detected structure (v1.66). Resolved filters —
     // path-segment indexes, not param ordinals. Empty/omitted = whole pattern,
     // unchanged prior behaviour. See applyStructureFilterToRewriter.
     structureFilters?: ResolvedStructureFilter[] | null;

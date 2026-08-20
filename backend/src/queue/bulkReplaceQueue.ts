@@ -55,7 +55,7 @@ export type ApplyRedirectsJobData = {
   url_ids: string[] | null;
   // Unsampled source URLs to rewrite by the inferred rule.
   inferred_urls: string[];
-  // Structure scope (v1.55), already RESOLVED against the pattern template by
+  // Structure scope (v1.66), already RESOLVED against the pattern template by
   // the route so the worker never parses a template. null → whole pattern.
   structure_filters?: ResolvedStructureFilter[] | null;
 };

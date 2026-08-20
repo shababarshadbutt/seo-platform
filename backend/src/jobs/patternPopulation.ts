@@ -48,7 +48,7 @@ const POPULATION_BATCH_SIZE = 8;
 export type PatternRow = {
   id: string;
   template: string;
-  // Structure scope (v1.55): when set, only URLs inside these detected
+  // Structure scope (v1.66): when set, only URLs inside these detected
   // sub-structures belong to the pattern's population. Resolved against the
   // template by the caller. Absent/empty = the whole pattern, unchanged.
   structureFilters?: ResolvedStructureFilter[] | null;

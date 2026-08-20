@@ -39,7 +39,7 @@ export type PatternPopulationInput = {
   provisionalPath: string;
   // The patterns being enumerated, in the caller's priority order.
   //
-  // structureFilters (v1.55) narrows a pattern to one of its detected
+  // structureFilters (v1.66) narrows a pattern to one of its detected
   // sub-structures, so "Verify all in this pattern" verifies only the structure
   // the user limited the dialog to. RESOLVED filters cross the thread edge
   // (path-segment indexes, not param ordinals), same as every other worker
