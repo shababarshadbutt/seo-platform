@@ -17,11 +17,19 @@ export type RedirectRule =
   | { kind: "replace"; find: string; replace: string }
   | { kind: "insert"; prefix: string; insert: string };
 
+// EXPORTED for redirectRuleCandidates (v1.71), which offers a human the
+// readings of a sample that deriveRedirectRule below REFUSES to choose
+// between. It has to diff and compare rules identically or the options on
+// screen would not be the ones the automatic path considered.
+//
 // Diff one source→dest pair into the substring that changed, by peeling off the
 // longest common prefix and suffix. When nothing was removed (the whole source
 // survives as a suffix of dest) this is a pure insertion, anchored on the
 // literal common prefix rather than a find/replace pair (v1.43).
-function diffPair(source: string, dest: string): RedirectRule | null {
+export function diffPair(
+  source: string,
+  dest: string
+): RedirectRule | null {
   const max = Math.min(source.length, dest.length);
   let prefix = 0;
 
@@ -54,7 +62,7 @@ function diffPair(source: string, dest: string): RedirectRule | null {
   return { kind: "replace", find, replace };
 }
 
-function sameRule(a: RedirectRule, b: RedirectRule): boolean {
+export function sameRule(a: RedirectRule, b: RedirectRule): boolean {
   if (a.kind !== b.kind) {
     return false;
   }

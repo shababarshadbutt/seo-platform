@@ -82,6 +82,7 @@ import {
   getPatternsResponse,
   getProblemUrlCount,
   type PatternStructuresResponse,
+  type RedirectRuleCandidate,
   type StructureFilter,
   getSession,
   getDeleteProblemUrlsStatus,
@@ -1027,6 +1028,16 @@ export default function ResultsDashboardPage({
   // URLs a trusted PER-SHAPE rule would reach (v1.69). Held apart from the
   // measured count so the label can name both halves — see fixAcceptBreakdown.
   const [fixExtrapolatedCount, setFixExtrapolatedCount] = useState(0);
+  // Rules a human can approve to reach every matching URL (v1.71), and the one
+  // they picked. deriveRedirectRule refuses whenever the confirmed pairs
+  // disagree, which left an operator who could SEE the right transformation with
+  // no way to say so — this is that way.
+  const [fixRuleCandidates, setFixRuleCandidates] = useState<
+    RedirectRuleCandidate[]
+  >([]);
+  const [fixApprovedRule, setFixApprovedRule] = useState<
+    RedirectRuleCandidate["rule"] | null
+  >(null);
   // Verify-then-act for the Fix modal now lives in PatternVerifyPanel (v1.50),
   // which owns its own pattern-scoped verification/triage state. It used to be
   // eight pieces of state here driving a SESSION-wide verify from inside a
@@ -2802,6 +2813,10 @@ export default function ResultsDashboardPage({
     setFixScopedOccurrences(null);
     setFixConfirmedCount(0);
     setFixExtrapolatedCount(0);
+    setFixRuleCandidates([]);
+    // An approval is for ONE pattern's evidence; carrying it across would apply
+    // a rule nobody reviewed here.
+    setFixApprovedRule(null);
     setFixPage(0);
     // Opening a different pattern must not inherit the previous one's chips.
     setFixStatusFilter(new Set());
@@ -2816,6 +2831,7 @@ export default function ResultsDashboardPage({
         setFixPatternTotal(data.pattern_total_urls);
         setFixConfirmedCount(data.confirmed_redirect_count ?? 0);
         setFixExtrapolatedCount(data.shape_extrapolated_count ?? 0);
+        setFixRuleCandidates(data.rule_candidates ?? []);
         // Seeded through canBulkFix rather than defaultFixAction alone, because
         // the header toggle opens PRESSED (v1.66) and the rows have to agree with
         // it on the first render. What the toggle may not claim keeps its
@@ -2978,7 +2994,8 @@ export default function ResultsDashboardPage({
         fixRow.id,
         acceptEverythingInScope ? undefined : sampledIds,
         inferredUrls,
-        fixStructureFilters
+        fixStructureFilters,
+        fixApprovedRule
       );
 
       setFixRow(null);
@@ -3223,7 +3240,11 @@ export default function ResultsDashboardPage({
     // and nothing changes.
     fixPatternTotal: fixEffectiveTotal,
     fixCandidateCount: scopedFixCandidates.length,
-    inferredWithoutRule: fixInferredWithoutRule,
+    // An APPROVED rule is a pure per-URL transform, so it reaches every matching
+    // URL exactly as a derived one does — which is what makes "579,034 of
+    // 579,034" true rather than a promise. Until one is approved this stays as
+    // v1.68 left it: only URLs with a fetched destination. (v1.71)
+    inferredWithoutRule: fixInferredWithoutRule && fixApprovedRule === null,
     allInPattern: fixAllInPattern,
     confirmedRedirectCount: fixConfirmedCount,
     shapeExtrapolatedCount: fixExtrapolatedCount
@@ -5686,6 +5707,131 @@ export default function ResultsDashboardPage({
                   // scoped delete removes only its verified rows.
                   structureFilters={fixStructureFilters}
                 />
+              ) : null}
+              {/* HUMAN-IN-THE-LOOP RULE APPROVAL (v1.71).
+                  deriveRedirectRule refuses whenever the confirmed pairs
+                  disagree, which is honest and is what put "only the 0 reviewed
+                  URLs can be rewritten" on screen — while an operator looking at
+                  the pairs could see the intended transformation at a glance.
+                  These are the readings of that same evidence, ranked by how many
+                  pairs each REPRODUCES. Approving one is what makes the Accept
+                  count the whole pattern instead of the fetched handful. */}
+              {fixRuleCandidates.length > 0 && fixInferredWithoutRule ? (
+                <div
+                  className="min-w-0 space-y-2 rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2"
+                  data-testid="fix-rule-approval"
+                >
+                  <p className="text-xs font-semibold uppercase tracking-wide text-indigo-900">
+                    Review the confirmed redirects, then approve a rule
+                  </p>
+                  <p className="text-xs text-indigo-800">
+                    No single rule explains every confirmed redirect, so nothing
+                    is applied beyond them automatically. Pick the rewrite you
+                    can see is intended and it will be applied to all{" "}
+                    {formatNumber(fixEffectiveTotal)} URLs in this pattern.
+                  </p>
+                  <ul className="space-y-1.5">
+                    {fixRuleCandidates.map((candidate, index) => {
+                      const selected =
+                        fixApprovedRule !== null &&
+                        JSON.stringify(fixApprovedRule) ===
+                          JSON.stringify(candidate.rule);
+                      const complete = candidate.fits === candidate.total;
+
+                      return (
+                        <li
+                          key={index}
+                          className={cn(
+                            "rounded border px-2 py-1.5 text-xs",
+                            selected
+                              ? "border-indigo-500 bg-white"
+                              : "border-indigo-200 bg-white/60"
+                          )}
+                        >
+                          <label className="flex cursor-pointer items-start gap-2">
+                            <input
+                              type="radio"
+                              name="fix-approved-rule"
+                              className="mt-0.5 h-3.5 w-3.5 shrink-0 border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                              checked={selected}
+                              onChange={() =>
+                                setFixApprovedRule(candidate.rule)
+                              }
+                            />
+                            <span className="min-w-0 space-y-1">
+                              <span className="block font-mono text-slate-800">
+                                {candidate.rule.kind === "replace"
+                                  ? `replace "${candidate.rule.find}" with "${candidate.rule.replace}"`
+                                  : `insert "${candidate.rule.insert}" after "${candidate.rule.prefix}"`}
+                              </span>
+                              <span
+                                className={cn(
+                                  "block font-semibold",
+                                  complete
+                                    ? "text-emerald-700"
+                                    : "text-amber-700"
+                                )}
+                              >
+                                fits {formatNumber(candidate.fits)} of{" "}
+                                {formatNumber(candidate.total)} confirmed
+                                redirects
+                              </span>
+                              {candidate.example ? (
+                                <span className="block break-all font-mono text-[11px] text-slate-500">
+                                  {candidate.example.source}
+                                  <span className="text-slate-400"> → </span>
+                                  {candidate.example.dest}
+                                </span>
+                              ) : null}
+                              {/* The half that matters on a partial rule: what
+                                  the URLs it does NOT explain would become. A
+                                  count alone cannot be reviewed. */}
+                              {candidate.counterExample ? (
+                                <span className="block break-all font-mono text-[11px] text-amber-800">
+                                  but {candidate.counterExample.source}
+                                  <span className="text-amber-600"> → </span>
+                                  {candidate.counterExample.actual ??
+                                    "(unchanged)"}
+                                  <span className="text-amber-600">
+                                    {" "}
+                                    · confirmed destination is{" "}
+                                  </span>
+                                  {candidate.counterExample.expected}
+                                </span>
+                              ) : null}
+                            </span>
+                          </label>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  {fixApprovedRule ? (
+                    /* The point of no return. Undo is the entire backstop and it
+                       is SESSION-wide, so that is said here rather than
+                       discovered afterwards. */
+                    <p
+                      className="rounded-md bg-amber-50 px-2 py-1.5 text-xs text-amber-900"
+                      data-testid="fix-rule-approved-warning"
+                    >
+                      This will rewrite{" "}
+                      <strong>{formatNumber(fixEffectiveTotal)} URLs</strong>{" "}
+                      using a rule approved from{" "}
+                      {formatNumber(fixRuleCandidates[0]?.total ?? 0)} reviewed
+                      redirects — including URLs that were never checked. Undo
+                      restores <strong>every</strong> redirect fix in this
+                      session, not only this pattern.
+                    </p>
+                  ) : (
+                    <button
+                      type="button"
+                      className="text-xs font-semibold text-indigo-700 underline hover:text-indigo-900"
+                      onClick={() => setFixApprovedRule(null)}
+                      disabled
+                    >
+                      Select a rule to enable Accept for the whole pattern
+                    </button>
+                  )}
+                </div>
               ) : null}
               {/* Per-position structure scope (v1.66) — the same control, state
                   shape and markup as the Update Pattern modal's, deliberately:

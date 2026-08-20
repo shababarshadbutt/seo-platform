@@ -448,3 +448,59 @@ test("the breakdown's halves never exceed the scope together", () => {
   assert.ok(split);
   assert.equal(split!.measured + split!.extrapolated, 2000);
 });
+
+// --- a human-approved rule counts as a rule (v1.71) --------------------------
+
+test("an APPROVED rule reaches the whole scope, exactly as a derived one does", () => {
+  // The HITL wiring: the modal passes inferredWithoutRule = (no single rule was
+  // derivable) AND (the operator has not approved one). Approving flips it, and
+  // the count becomes the whole pattern — which is truthful because a rule is a
+  // pure per-URL transform that reaches URLs nobody fetched.
+  //
+  // This is the ONE case where the v1.68 lesson does not apply: the number is
+  // not a promise about unfetched destinations, it is what the approved
+  // transform will compute for them.
+  const approved = fixAcceptCount({
+    fixCount: 10,
+    fixPatternTotal: 579034,
+    fixCandidateCount: 10,
+    // false = a rule now applies, derived or approved
+    inferredWithoutRule: false,
+    allInPattern: true,
+    confirmedRedirectCount: 5000
+  });
+
+  assert.equal(approved, 579034);
+
+  // And without an approval the same pattern reports only what was fetched —
+  // the v1.68 behaviour, unchanged.
+  assert.equal(
+    fixAcceptCount({
+      fixCount: 10,
+      fixPatternTotal: 579034,
+      fixCandidateCount: 10,
+      inferredWithoutRule: true,
+      allInPattern: true,
+      confirmedRedirectCount: 5000
+    }),
+    5000
+  );
+});
+
+test("approving a rule removes the measured/inferred split", () => {
+  // The split exists to name an extrapolation. A rule is not an extrapolation of
+  // some URLs and not others — it applies to all of them — so there is no
+  // half to name and no breakdown to show.
+  assert.equal(
+    fixAcceptBreakdown({
+      fixCount: 10,
+      fixPatternTotal: 579034,
+      fixCandidateCount: 10,
+      inferredWithoutRule: false,
+      allInPattern: true,
+      confirmedRedirectCount: 5000,
+      shapeExtrapolatedCount: 27000
+    }),
+    null
+  );
+});

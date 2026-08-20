@@ -177,6 +177,11 @@ import {
   measureTransformCoverage
 } from "../sitemaps/transformCoverage.js";
 import { parseShapeFilter } from "../sitemaps/shapeFilter.js";
+import {
+  isOfferedRule,
+  parseRedirectRule,
+  redirectRuleCandidates
+} from "../sitemaps/redirectRuleCandidates.js";
 import { looksLikeNotFoundUrl } from "../sitemaps/softNotFound.js";
 import {
   parseStructure,
@@ -4463,6 +4468,70 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         }
       }
 
+      // THE FULL VERIFIED POPULATION, IN THE LIST (v1.71).
+      //
+      // The bug this closes: the list was built from sampled_urls x pattern_urls
+      // and never read verified_urls, while confirmed_redirect_count (v1.68) did.
+      // On the reported pattern a running verification had banked 5,000 confirmed
+      // redirects and the modal still said "No redirect URLs remain for this
+      // pattern" — so the reviewer had literally nothing to review, which is
+      // fatal for a flow whose whole premise is a human eyeballing real
+      // before/after pairs.
+      //
+      // Sampled rows WIN on conflict, the same precedence mergeVerifiedReplacements
+      // uses on the apply side, so the list and the rewrite agree about which
+      // destination belongs to a URL.
+      const verifiedListResult = await pool.query<{
+        url: string;
+        final_url: string;
+        http_status: number | null;
+      }>(
+        `
+          SELECT url, final_url, http_status
+          FROM verified_urls
+          WHERE session_id = $1
+            AND pattern_id = $2
+            AND http_status_category = 'redirect'
+            AND final_url IS NOT NULL
+            AND final_url <> url
+            AND is_deleted_from_sitemap = false
+          ORDER BY url ASC
+        `,
+        [request.params.id, request.params.patternId]
+      );
+
+      for (const row of verifiedListResult.rows) {
+        if (seen.has(row.url)) {
+          continue;
+        }
+
+        if (
+          resolvedCandidateFilters.length > 0 &&
+          !urlMatchesStructureFilters(row.url, resolvedCandidateFilters)
+        ) {
+          continue;
+        }
+
+        seen.add(row.url);
+        candidates.push({
+          // Not a sampled_urls row, so there is no id to key on — same
+          // convention as the inferred rows below, which the client already
+          // handles.
+          key: `verified:${row.url}`,
+          url: row.url,
+          final_url: row.final_url,
+          // is_sampled drives "Delete" being offered, and the deletion engine
+          // only removes sampled_urls rows. A verified row is HTTP-confirmed but
+          // not sampled, so claiming otherwise would offer a delete that cannot
+          // run.
+          is_sampled: false,
+          sampled_url_id: null,
+          http_status: row.http_status,
+          destination_not_found: looksLikeNotFoundUrl(row.final_url),
+          delete_only: false
+        });
+      }
+
       // Verified rows first, then inferred.
       candidates.sort((a, b) => Number(b.is_sampled) - Number(a.is_sampled));
 
@@ -4593,8 +4662,28 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         0
       );
 
+      // THE SHORTLIST A HUMAN CHOOSES FROM (v1.71).
+      //
+      // `rule` above is deriveRedirectRule's answer to "is there ONE unambiguous
+      // rule?", and it is null whenever the confirmed pairs disagree — which on
+      // the reported pattern left the modal saying only the reviewed URLs could
+      // ever be rewritten, with no way for a person who could SEE the intended
+      // transformation to say so.
+      //
+      // These are the readings of the same evidence, ranked by how many pairs
+      // each actually reproduces. Derived from the candidate list's confirmed
+      // pairs — the very rows on screen — so the operator is choosing between
+      // explanations of what they are looking at.
+      const confirmedPairs = candidates
+        .filter((candidate) => candidate.final_url && !candidate.delete_only)
+        .map((candidate) => ({
+          source: candidate.url,
+          dest: candidate.final_url as string
+        }));
+
       return {
         rule: rule ?? null,
+        rule_candidates: redirectRuleCandidates(confirmedPairs),
         pattern_total_urls: patternTotalUrls,
         // URLs with a confirmed destination, in the CURRENT structure scope —
         // what an accept rewrites when no single rule could be derived.
@@ -4623,6 +4712,10 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       url_ids?: unknown[];
       inferred_urls?: unknown[];
       structure_filter?: unknown;
+      // A rewrite rule a human picked from the shortlist redirect-candidates
+      // offered (v1.71). Validated against the server's own candidates before
+      // use — see the check in the handler.
+      approved_rule?: unknown;
     };
   }>(
     "/api/sessions/:id/patterns/:patternId/apply-redirects",
@@ -4733,7 +4826,64 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // to 'success' (which would erase the evidence).
       let inferredRule: RedirectRule | null = null;
 
-      if (inferredUrls.length > 0) {
+      // A HUMAN-APPROVED RULE (v1.71), and why it is re-derived rather than
+      // trusted.
+      //
+      // This endpoint's contract is that "the client only says WHICH urls; the
+      // server recomputes their destinations, so a client can't inject arbitrary
+      // rewrites". Approving a rule must not weaken that. So the posted choice is
+      // checked against the candidates the server derives from its OWN confirmed
+      // pairs — the same set redirect-candidates put on screen — and anything
+      // else is refused. A caller can pick among readings of the evidence; it
+      // cannot invent a rewrite for 579,034 URLs.
+      const approvedRule = parseRedirectRule(request.body?.approved_rule);
+
+      if (request.body?.approved_rule !== undefined && !approvedRule) {
+        return reply
+          .code(400)
+          .send(badRequest("approved_rule is not a valid rewrite rule"));
+      }
+
+      if (approvedRule) {
+        // Evidence = every confirmed redirect for this pattern, from BOTH tables,
+        // matching what the review list showed. verified_urls is where a
+        // "Check by shape" run banks its destinations, and it is usually the only
+        // place they exist.
+        const evidence = await pool.query<{ url: string; final_url: string }>(
+          `
+            SELECT url, final_url FROM verified_urls
+            WHERE session_id = $1
+              AND pattern_id = $2
+              AND http_status_category = 'redirect'
+              AND final_url IS NOT NULL
+              AND final_url <> url
+              AND is_deleted_from_sitemap = false
+            UNION
+            SELECT url, final_url FROM sampled_urls
+            WHERE pattern_id = $2
+              AND http_status_category = 'redirect'
+              AND final_url IS NOT NULL
+              AND final_url <> url
+          `,
+          [request.params.id, request.params.patternId]
+        );
+        const pairs = evidence.rows.map((row) => ({
+          source: row.url,
+          dest: row.final_url
+        }));
+
+        if (!isOfferedRule(approvedRule, pairs)) {
+          return reply
+            .code(400)
+            .send(
+              badRequest(
+                "approved_rule is not one of the rules derived from this pattern's confirmed redirects — reload the pattern and choose again"
+              )
+            );
+        }
+
+        inferredRule = approvedRule;
+      } else if (inferredUrls.length > 0) {
         const ruleSamples = await pool.query<{ url: string; final_url: string }>(
           `
             SELECT url, final_url
@@ -4915,7 +5065,12 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // per-URL transform, so it reaches all real occurrences independent of
         // the pool/preview size. The confirmed sampled pairs (`replacements`)
         // still win per-URL inside buildRedirectApplyRewriter.
-        const widen = inferredUrls.length > 0 && inferredRule !== null;
+        // An APPROVED rule widens on its own authority (v1.71): the human's
+        // whole point is to reach the URLs nobody enumerated, so requiring the
+        // client to also list inferred_urls — which it can only draw from the
+        // capped preview — would cap the very thing being approved.
+        const widen =
+          inferredRule !== null && (approvedRule !== null || inferredUrls.length > 0);
 
         // A per-shape rule widens the same way a whole-pattern rule does: it is
         // a pure per-URL transform, so it reaches occurrences in files no sampled

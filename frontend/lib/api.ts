@@ -1891,6 +1891,30 @@ export type RedirectCandidate = {
   delete_only?: boolean;
 };
 
+// One reading of a pattern's confirmed redirects, for a human to approve.
+//
+// `rule` below is deriveRedirectRule's answer to "is there ONE unambiguous
+// rule?", and it is null whenever the sampled pairs disagree. These are the
+// readings of that same evidence, ranked by how many pairs each REPRODUCES —
+// so "fits 10 of 10" means it actually reproduces all ten, not that ten pairs
+// happened to derive it. (v1.71)
+export type RedirectRuleCandidate = {
+  rule:
+    | { kind: "replace"; find: string; replace: string }
+    | { kind: "insert"; prefix: string; insert: string };
+  fits: number;
+  total: number;
+  example: { source: string; dest: string } | null;
+  // A pair the rule does NOT reproduce, where one exists. The more useful half
+  // of the evidence: a rule at 8/10 is only safe to approve once you can see
+  // what the other two would become.
+  counterExample: {
+    source: string;
+    actual: string | null;
+    expected: string;
+  } | null;
+};
+
 export type RedirectCandidatesResponse = {
   rule:
     | { kind: "replace"; find: string; replace: string }
@@ -1914,6 +1938,9 @@ export type RedirectCandidatesResponse = {
   // than summing them into a number that hides the difference.
   shape_extrapolated_count?: number;
   trusted_shape_count?: number;
+  // Rules a human can approve to reach every matching URL, not only the fetched
+  // ones (v1.71). Empty when there are no confirmed redirects to reason from.
+  rule_candidates?: RedirectRuleCandidate[];
   // Sampled 404s in the list — delete-only rows, counted apart from the
   // redirects so the modal can say which of the two it is showing.
   sampled_broken_count?: number;
@@ -1977,12 +2004,17 @@ export async function applyPatternRedirects(
   // request if any one fails, so a scope can never half-apply. Without it the
   // derived rule sweeps every <loc> it can transform, i.e. the pattern's other
   // structures too.
-  structureFilters?: StructureFilter[] | null
+  structureFilters?: StructureFilter[] | null,
+  // A rule the operator picked from rule_candidates (v1.71). The server
+  // re-derives its own candidates and refuses anything not among them, so this
+  // is a CHOICE, never an injected rewrite.
+  approvedRule?: RedirectRuleCandidate["rule"] | null
 ) {
   const body: {
     url_ids?: string[];
     inferred_urls?: string[];
     structure_filter?: StructureFilter[];
+    approved_rule?: RedirectRuleCandidate["rule"];
   } = {};
 
   if (urlIds) {
@@ -1995,6 +2027,10 @@ export async function applyPatternRedirects(
 
   if (structureFilters && structureFilters.length > 0) {
     body.structure_filter = structureFilters;
+  }
+
+  if (approvedRule) {
+    body.approved_rule = approvedRule;
   }
 
   const response = await fetchWithTimeout(
