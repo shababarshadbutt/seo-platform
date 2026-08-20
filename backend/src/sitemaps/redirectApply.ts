@@ -248,7 +248,7 @@ export async function revertRedirectSourceFilesOnDisk(
 }
 
 // Merge the VERIFIED redirect population into a replacement map already built
-// from the sampled preview (v1.67).
+// from the sampled preview (v1.68).
 //
 // THE BUG THIS CLOSES. apply-redirects built its map only from sampled_urls rows
 // the client named by id, and the candidate list those ids come from is capped at

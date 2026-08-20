@@ -4,7 +4,7 @@ import {
   type ParsedStructure
 } from "./transformStructure.js";
 
-// Server-side half of the transform coverage gate (v1.67). Mirrors the intent of
+// Server-side half of the transform coverage gate (v1.68). Mirrors the intent of
 // frontend/lib/transform-coverage.ts, NOT its bytes: the client measures to warn
 // as the user types, this refuses to apply. Both must agree about what "the rule
 // did not apply" means, which is why the rule is stated once, here and there, in

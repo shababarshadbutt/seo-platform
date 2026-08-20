@@ -1017,7 +1017,7 @@ export default function ResultsDashboardPage({
   const [fixScopedOccurrences, setFixScopedOccurrences] = useState<
     number | null
   >(null);
-  // URLs with a CONFIRMED destination in the current scope (v1.67), from
+  // URLs with a CONFIRMED destination in the current scope (v1.68), from
   // redirect-candidates' confirmed_redirect_count. The ceiling on what an accept
   // can rewrite when no rule could be derived — the number whose absence let the
   // button claim 28,546 while the toast reported 10.
@@ -2947,7 +2947,7 @@ export default function ResultsDashboardPage({
       // side — including the verified_urls rows the client cannot enumerate,
       // because the candidate list is capped at ~1,000. That cap is why an
       // accept used to rewrite ~10 URLs however much the user had verified, so
-      // taking it off is the fix (v1.67).
+      // taking it off is the fix (v1.68).
       //
       // Only safe when nothing was deviated from Fix: url_ids: null ignores
       // per-row choices by design, so a single Skip or Delete anywhere in scope
@@ -3219,7 +3219,7 @@ export default function ResultsDashboardPage({
   // button disagreed with it. See lib/fix-accept-count.ts. (v1.53)
   const fixAcceptLabelCount = fixAcceptCount({ fixCount, ...fixScope });
   // The "of N" half of "Accept Selected Changes (10 of 28,546)" — null once the
-  // count already covers the whole scope. (v1.67)
+  // count already covers the whole scope. (v1.68)
   const fixAcceptContext = fixAcceptContextTotal({ fixCount, ...fixScope });
   const deleteCount = scopedFixCandidates.filter(
     (candidate) => fixActionFor(candidate) === "delete"
@@ -3493,7 +3493,7 @@ export default function ResultsDashboardPage({
             (entry): entry is { before: string; after: string } =>
               entry !== null
           )
-          // FAILURES FIRST (v1.67). This used to be the first ten of the pool,
+          // FAILURES FIRST (v1.68). This used to be the first ten of the pool,
           // which is exactly how the reported bug stayed hidden: the two URLs the
           // rule did transform happened to sort first, so the preview opened with
           // two correct rows and the five duplicated ones sat below the fold. A
@@ -3542,7 +3542,7 @@ export default function ResultsDashboardPage({
   }, [transformPreviewSource, transformParsed]);
 
   // Does the rule actually generalise, or does it only fit the example it was
-  // inferred from? (v1.67)
+  // inferred from? (v1.68)
   //
   // The reported case: one by-example pair inferred
   // {A|nsn-parts-1000|page-1-|} — a needle carrying the example's own digits —
@@ -3563,7 +3563,7 @@ export default function ResultsDashboardPage({
   }, [transformPreviewSource, transformParsed]);
   const transformLowCoverage =
     transformCoverage !== null && isLowCoverage(transformCoverage);
-  // A gate, not a wall (v1.67). A deliberately narrow rule is unusual but not
+  // A gate, not a wall (v1.68). A deliberately narrow rule is unusual but not
   // wrong, so the block is overridable — the same reasoning the duplication
   // warning uses for staying non-blocking. Reset whenever the structures change,
   // so an override can never outlive the rule it was granted for.
@@ -3675,7 +3675,7 @@ export default function ResultsDashboardPage({
     setDryRunError(null);
     // A low-coverage override was granted for ONE rule; carrying it across an
     // edit would silently re-arm the block's escape hatch for a rule nobody
-    // looked at. (v1.67)
+    // looked at. (v1.68)
     setForceLowCoverage(false);
   }, [transformCurrentStructure, effectiveNewStructure, renameRow?.id]);
 
@@ -5837,7 +5837,7 @@ export default function ResultsDashboardPage({
                     {/* Why the Accept count can be smaller than the scope, said
                         where the gap is visible. A URL is only rewritable if its
                         destination has been fetched; verifying more of the
-                        pattern raises the count. (v1.67) */}
+                        pattern raises the count. (v1.68) */}
                     {fixAcceptContext !== null && fixAllInPattern ? (
                       <span className="text-xs text-amber-700">
                         {formatNumber(fixAcceptLabelCount)} of{" "}
@@ -6203,7 +6203,7 @@ export default function ResultsDashboardPage({
                   ) : (
                     // "10 of 28,546" when the accept cannot reach the whole
                     // scope, so the gap is on the button rather than in a banner
-                    // beside it. (v1.67)
+                    // beside it. (v1.68)
                     `Accept Selected Changes (${formatNumber(
                       fixAcceptLabelCount
                     )}${
@@ -6692,7 +6692,7 @@ export default function ResultsDashboardPage({
                       ) : null}
                     </div>
                   ) : null}
-                  {/* Coverage gate (v1.67). RED, not amber: amber in this modal
+                  {/* Coverage gate (v1.68). RED, not amber: amber in this modal
                       is the established "informational, Apply stays enabled"
                       tone, and this one blocks. It names the real numbers and
                       quotes a URL the user would actually get, because "2 of 880"

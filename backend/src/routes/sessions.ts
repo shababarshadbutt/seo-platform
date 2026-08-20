@@ -275,7 +275,7 @@ type TransformBody = {
   current_structure?: string;
   new_structure?: string;
   source_files?: unknown[];
-  // Override the coverage gate (v1.67) for a deliberately narrow rule. The gate
+  // Override the coverage gate (v1.68) for a deliberately narrow rule. The gate
   // refuses a structure whose param transform leaves most matching URLs
   // untouched — see sitemaps/transformCoverage.ts.
   force_low_coverage?: unknown;
@@ -3331,7 +3331,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
       const structureFilters = parsedFilters;
 
-      // COVERAGE GATE (v1.67). Refuse a rule that fits almost nothing.
+      // COVERAGE GATE (v1.68). Refuse a rule that fits almost nothing.
       //
       // The reported bug: one by-example pair inferred a `replace` needle
       // carrying the example's own digits, so two URLs transformed and the rest
@@ -4244,7 +4244,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         });
       }
 
-      // Structure scope (v1.67), encoded like the source-files endpoint's:
+      // Structure scope (v1.68), encoded like the source-files endpoint's:
       // JSON in the query string, the same {param_index, anchor, value} shape
       // the rename/apply bodies carry. Only confirmed_redirect_count below reads
       // it — the candidate LIST stays unscoped and is narrowed client-side, so
@@ -4448,7 +4448,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // confirmed rule to all pattern_total_urls matching URLs (v1.45.1).
       const patternTotalUrls = Number(patternResult.rows[0].total_urls) || 0;
 
-      // WHAT ACCEPTING WILL ACTUALLY CHANGE (v1.67).
+      // WHAT ACCEPTING WILL ACTUALLY CHANGE (v1.68).
       //
       // The bug this closes: the Accept button reported pattern_total_urls
       // (28,546) whenever the pattern had unsampled URLs, the click succeeded,
@@ -4758,7 +4758,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           }
         }
 
-        // THE FULL VERIFIED POPULATION (v1.67). Everything above comes from
+        // THE FULL VERIFIED POPULATION (v1.68). Everything above comes from
         // sampled_urls — the small HTTP-checked preview, and the rows the client
         // can name by id. "Verify all in this pattern" writes verified_urls
         // instead, one row per URL with its own confirmed final_url, and until

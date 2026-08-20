@@ -84,7 +84,7 @@ test("still reports the pattern-wide total when nothing is selected yet", () => 
 
 test("pressed, no rule: reports the CONFIRMED count, not the pattern total", () => {
   // This assertion is the inverse of the one v1.66 shipped, and the reason it
-  // flipped is the whole point of v1.67. v1.66 returned 28,413 here on the
+  // flipped is the whole point of v1.68. v1.66 returned 28,413 here on the
   // theory that the button should state intended scope. Production then did
   // this: button 28,546, toast "10 URLs updated", ten <loc> entries changed.
   //

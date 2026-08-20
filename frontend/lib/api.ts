@@ -1791,7 +1791,7 @@ export async function transformPatternStructure(
     newStructure: string;
     sourceFiles: string[];
     structureFilters?: StructureFilter[] | null;
-    // Apply a rule that the coverage gate refuses (v1.67): one whose param
+    // Apply a rule that the coverage gate refuses (v1.68): one whose param
     // transform leaves most matching URLs untouched while still re-parenting
     // them. Set only from the modal's explicit "Override and apply anyway".
     forceLowCoverage?: boolean;
@@ -1881,7 +1881,7 @@ export type RedirectCandidatesResponse = {
   // pool) — for messaging that separates "shown for review" from "will rewrite".
   preview_count?: number;
   sampled_redirect_count: number;
-  // URLs with a CONFIRMED destination in the requested structure scope (v1.67):
+  // URLs with a CONFIRMED destination in the requested structure scope (v1.68):
   // verified_urls UNION the sampled preview, deduplicated. This is the ceiling on
   // what an accept can rewrite when `rule` is null, and it climbs as the user
   // verifies more of the pattern. Optional so a client talking to an older

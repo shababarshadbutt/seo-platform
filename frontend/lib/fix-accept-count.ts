@@ -12,7 +12,7 @@
 // reason fix-visibility.ts and fix-status-filter.ts are: results/page.tsx has no
 // test file, so logic left in the component is logic nothing can assert.
 //
-// WHY THE COUNT IS NOT THE PATTERN TOTAL (v1.67, reversing v1.66).
+// WHY THE COUNT IS NOT THE PATTERN TOTAL (v1.68, reversing v1.66).
 //
 // v1.66 made this report the scope the "Set all to Fix" toggle ASKS FOR, on the
 // reasoning that a toggle whose number does not move when pressed is a toggle
