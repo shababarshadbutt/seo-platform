@@ -6,11 +6,11 @@ import { runWithBoundedConcurrency } from "../sitemaps/boundedConcurrency.js";
 import {
   coverageFromVerdicts,
   DEFAULT_SHAPE_SAMPLE,
-  groupByShape,
   judgeStratum,
-  sampleStratum,
-  type ShapeStratum
+  ShapeReservoir,
+  sweepablePatternIds
 } from "./shapeStrata.js";
+import { sampleShapesForPattern } from "./shapeSampleScan.js";
 import { valueShape } from "../sitemaps/transformDryRun.js";
 import {
   enumeratePopulation,
@@ -303,13 +303,83 @@ export async function processVerifyUrlsJob(
       flushEnumProgress(filesDone, filesTotal);
     };
 
+    // STRATIFIED RUNS DO NOT ENUMERATE (v1.69.1).
+    //
+    // enumeratePopulation reads every sitemap file in the SESSION and builds a
+    // Map of the whole population. Once probing is cut to ~50 URLs per shape that
+    // scan is the entire wall clock — and below POPULATION_PARALLEL_THRESHOLD it
+    // runs inline on one thread, which is how a "quick shape check" on a 3-file
+    // session sat for 15 minutes to then look at 1,150 URLs.
+    //
+    // The sampled path streams only the files the PATTERN's URLs live in and
+    // keeps a bounded reservoir per shape, so the population is counted without
+    // ever being held. Everything downstream — the deleted filter, the reuse
+    // filter, the circuit breaker, the probe loop — is unchanged: it just receives
+    // a much smaller map.
+    //
+    // Requires exactly one pattern. Shapes and their populations are recorded
+    // against a single pattern_id, and the route rejects a stratified request
+    // that does not name one; this is the belt to that braces.
+    const stratified = data.strategy === "stratified" && patterns.length === 1;
+    const shapeSample = data.shape_sample ?? DEFAULT_SHAPE_SAMPLE;
+    let reservoir: ShapeReservoir | null = null;
+
     const enumerateStartedMs = Date.now();
-    const population = await enumeratePopulation(
-      sessionId,
-      patterns,
-      logger,
-      onEnumProgress
-    );
+    let population: Map<string, EnumeratedUrl>;
+
+    if (stratified) {
+      const pattern = patterns[0];
+      const sampled = await sampleShapesForPattern({
+        sessionId,
+        patternId: pattern.id,
+        sourceRole: "current",
+        template: pattern.template,
+        structureFilters: pattern.structureFilters ?? [],
+        sampleSize: shapeSample,
+        onProgress: onEnumProgress
+      });
+
+      reservoir = sampled.reservoir;
+      population = new Map(
+        reservoir.sampledUrls().map((url) => [
+          url,
+          {
+            url,
+            patternId: pattern.id,
+            template: pattern.template,
+            // The sampled path does not track which file each loc came from.
+            // sourceFiles only feeds the verified_urls row's file list, and for a
+            // SAMPLE that list would be a partial answer presented as a complete
+            // one — an empty set is the honest version. The delete flow derives
+            // its file scope from this column, so a partial one would silently
+            // narrow a later deletion.
+            sourceFiles: new Set<string>()
+          }
+        ])
+      );
+
+      logger.info(
+        {
+          session_id: sessionId,
+          pattern_id: pattern.id,
+          files_scanned: sampled.filesScanned,
+          files_skipped: sampled.filesSkipped,
+          shapes: reservoir.shapeCount,
+          population: reservoir.totalPopulation,
+          probing: population.size,
+          shape_sample: shapeSample
+        },
+        "verify urls: sampled by shape, population not enumerated"
+      );
+    } else {
+      population = await enumeratePopulation(
+        sessionId,
+        patterns,
+        logger,
+        onEnumProgress
+      );
+    }
+
     const enumerateMs = Date.now() - enumerateStartedMs;
 
     // Settle the last progress write before anything clears enum_files_*, so
@@ -500,40 +570,10 @@ export async function processVerifyUrlsJob(
       "verify urls: population enumerated, checking started"
     );
 
-    // STRATIFIED MODE (v1.69). Probe ~N per URL SHAPE instead of every URL.
-    //
-    // Inserted here, AFTER the circuit breaker has already dropped hosts that
-    // refuse everything: sampling first would spend its whole budget on a
-    // refusing host and conclude nothing about the shapes that do answer.
-    //
-    // toCheck is replaced rather than filtered lazily so every count downstream
-    // (progress denominator, logs) describes what will actually be probed.
-    const stratified = data.strategy === "stratified";
-    const shapeSample = data.shape_sample ?? DEFAULT_SHAPE_SAMPLE;
-    let strata: ShapeStratum[] = [];
-
-    if (stratified) {
-      strata = groupByShape(toCheck.map((entry) => entry.url));
-
-      const wanted = new Set(
-        strata.flatMap((stratum) => sampleStratum(stratum, shapeSample))
-      );
-      const sampled = toCheck.filter((entry) => wanted.has(entry.url));
-
-      logger.info(
-        {
-          session_id: sessionId,
-          shapes: strata.length,
-          population: toCheck.length,
-          probing: sampled.length,
-          shape_sample: shapeSample
-        },
-        "verify urls: stratified by shape"
-      );
-
-      toCheck.length = 0;
-      toCheck.push(...sampled);
-    }
+    // Sampling already happened, BEFORE any probing — see the sampled path where
+    // the population would otherwise have been enumerated. Nothing narrows
+    // toCheck here any more: it arrives holding only the reservoir's URLs, which
+    // is why the circuit breaker above still gets to run on them first. (v1.69.1)
 
     // Probed redirect pairs per shape, for the per-shape rule. Only collected in
     // stratified mode, where it is bounded by shapes x shapeSample (~1,150 on the
@@ -651,44 +691,47 @@ export async function processVerifyUrlsJob(
     // An unagreed row is kept rather than dropped: "we sampled this shape and its
     // URLs disagree" is what justifies escalating that shape, and a caller who
     // cannot see it would re-sample it forever.
-    if (stratified && strata.length > 0) {
-      const verdicts = strata.map((stratum) =>
+    if (stratified && reservoir && reservoir.shapeCount > 0) {
+      // The reservoir holds the SAMPLE in each stratum's `urls`, not the
+      // population, so judgeStratum is given the real population separately —
+      // that is the number extrapolation is measured against, and reading it off
+      // the sample would report a 10,000-URL shape as 50 and extrapolate nothing.
+      const verdicts = reservoir.strata().map((stratum) =>
         judgeStratum(
-          stratum,
+          {
+            shape: stratum.shape,
+            urls: new Array(reservoir!.populationOf(stratum.shape))
+          },
           pairsByShape.get(stratum.shape) ?? [],
-          sampleStratum(stratum, shapeSample).length
+          stratum.urls.length
         )
       );
-      // Scoped runs carry exactly one pattern (the route requires it for a
-      // structure filter, and the Fix modal always sends one); a session-wide
-      // stratified run has no single pattern to attribute a shape rule to, so it
-      // records nothing rather than attributing it to an arbitrary one.
-      const shapePatternId = patterns.length === 1 ? patterns[0].id : null;
+      // stratified is only true for a single-pattern run (see the sampled path),
+      // so this is that pattern.
+      const shapePatternId = patterns[0].id;
 
-      if (shapePatternId) {
-        for (const verdict of verdicts) {
-          await pool.query(
-            `
-              INSERT INTO pattern_shape_rules
-                (pattern_id, shape, rule, sample_size, population, agreed)
-              VALUES ($1, $2, $3::jsonb, $4, $5, $6)
-              ON CONFLICT (pattern_id, shape) DO UPDATE
-              SET rule = EXCLUDED.rule,
-                  sample_size = EXCLUDED.sample_size,
-                  population = EXCLUDED.population,
-                  agreed = EXCLUDED.agreed,
-                  measured_at = now()
-            `,
-            [
-              shapePatternId,
-              verdict.shape,
-              verdict.rule ? JSON.stringify(verdict.rule) : null,
-              verdict.sampleSize,
-              verdict.population,
-              verdict.agreed
-            ]
-          );
-        }
+      for (const verdict of verdicts) {
+        await pool.query(
+          `
+            INSERT INTO pattern_shape_rules
+              (pattern_id, shape, rule, sample_size, population, agreed)
+            VALUES ($1, $2, $3::jsonb, $4, $5, $6)
+            ON CONFLICT (pattern_id, shape) DO UPDATE
+            SET rule = EXCLUDED.rule,
+                sample_size = EXCLUDED.sample_size,
+                population = EXCLUDED.population,
+                agreed = EXCLUDED.agreed,
+                measured_at = now()
+          `,
+          [
+            shapePatternId,
+            verdict.shape,
+            verdict.rule ? JSON.stringify(verdict.rule) : null,
+            verdict.sampleSize,
+            verdict.population,
+            verdict.agreed
+          ]
+        );
       }
 
       const coverage = coverageFromVerdicts(verdicts);
@@ -712,7 +755,30 @@ export async function processVerifyUrlsJob(
     // table mirrors reality. Keyed on checked_at (every enumerated url just got
     // it reset) rather than a giant NOT IN url array. Deleted-from-sitemap rows
     // are kept: restore needs them.
-    const sweepPatternIds = patterns.map((pattern) => pattern.id);
+    // A STRATIFIED RUN MUST NOT SWEEP (v1.69.1).
+    //
+    // The sweep's premise is "this run enumerated the whole population, so a row
+    // it did not touch describes a URL that is no longer in the files". A
+    // stratified run looks at ~50 URLs per shape BY DESIGN, so that premise is
+    // false by construction: every other verified row for the pattern is older
+    // than runStarted and, once outside VERIFY_REUSE_WINDOW_HOURS, not
+    // reuse-eligible either — so the DELETE below would take all of them.
+    //
+    // A "quick shape check" would then destroy the measured verdicts an earlier
+    // full verification spent hours producing, and those are exactly the rows
+    // v1.68's apply path treats as confirmed destinations. A sampled run has no
+    // opinion about which URLs still exist and must not act as though it does.
+    const sweepPatternIds = sweepablePatternIds({
+      strategy: stratified ? "stratified" : "full",
+      patternIds: patterns.map((pattern) => pattern.id)
+    });
+
+    if (stratified) {
+      logger.info(
+        { session_id: sessionId, job_row_id: jobRowId },
+        "verify urls: stale-row sweep skipped — a sampled run cannot say which URLs are gone"
+      );
+    }
 
     if (sweepPatternIds.length > 0) {
       const swept = await pool.query(

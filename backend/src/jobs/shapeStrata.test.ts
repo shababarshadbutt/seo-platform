@@ -6,7 +6,9 @@ import {
   DEFAULT_SHAPE_SAMPLE,
   groupByShape,
   judgeStratum,
-  sampleStratum
+  sampleStratum,
+  ShapeReservoir,
+  sweepablePatternIds
 } from "./shapeStrata.js";
 
 function urls(count: number, make: (index: number) => string): string[] {
@@ -169,4 +171,165 @@ test("the default sample is a flat count, not a percentage", () => {
   // most expensive to clear, which is backwards.
   assert.equal(DEFAULT_SHAPE_SAMPLE, 50);
   assert.equal(sampleStratum({ shape: "s", urls: urls(500000, (i) => `https://x.com/p/a-${i}/`) }).length, 50);
+});
+
+// --- the sweep guard (v1.69.1) -----------------------------------------------
+// The only defect in this area that DESTROYS data, so it gets the first test.
+
+test("a stratified run sweeps NOTHING", () => {
+  // The sweep deletes verified rows the run did not touch, on the premise that
+  // the run enumerated everything. A sampled run touches ~50 per shape by
+  // design, so that premise is false and the sweep would delete the measured
+  // verdicts an earlier full verification spent hours producing.
+  assert.deepEqual(
+    sweepablePatternIds({ strategy: "stratified", patternIds: ["a", "b"] }),
+    []
+  );
+});
+
+test("a full run still sweeps its patterns", () => {
+  // The guard must not have disabled the sweep in the case it exists for: a full
+  // run DID enumerate everything, so a row it never saw is genuinely gone.
+  assert.deepEqual(
+    sweepablePatternIds({ strategy: "full", patternIds: ["a", "b"] }),
+    ["a", "b"]
+  );
+});
+
+// --- the streaming reservoir (v1.69.1) --------------------------------------
+
+// Deterministic source so Algorithm R's behaviour is pinned rather than sampled.
+function cyclingRandom(values: number[]): () => number {
+  let index = 0;
+
+  return () => {
+    const value = values[index % values.length];
+
+    index += 1;
+
+    return value;
+  };
+}
+
+test("counts the whole population while holding only the sample", () => {
+  // The point of the class: 10,000 URLs seen, at most 50 retained.
+  const reservoir = new ShapeReservoir({ sampleSize: 50 });
+
+  for (let index = 0; index < 10000; index += 1) {
+    reservoir.offer("/a/a-99999/", `https://x.com/p/a-${10000 + index}/`);
+  }
+
+  assert.equal(reservoir.populationOf("/a/a-99999/"), 10000);
+  assert.equal(reservoir.sampledUrls().length, 50);
+  assert.equal(reservoir.totalPopulation, 10000);
+  assert.equal(reservoir.shapeCount, 1);
+});
+
+test("a shape smaller than the sample size is kept whole", () => {
+  const reservoir = new ShapeReservoir({ sampleSize: 50 });
+
+  for (let index = 0; index < 7; index += 1) {
+    reservoir.offer("/a/a-9/", `https://x.com/p/a-${index}/`);
+  }
+
+  assert.equal(reservoir.populationOf("/a/a-9/"), 7);
+  assert.equal(reservoir.sampledUrls().length, 7);
+});
+
+test("each shape gets its own reservoir and its own count", () => {
+  const reservoir = new ShapeReservoir({ sampleSize: 2 });
+
+  for (let index = 0; index < 9; index += 1) {
+    reservoir.offer("/a/a-99999/", `https://x.com/five-${index}/`);
+  }
+
+  for (let index = 0; index < 3; index += 1) {
+    reservoir.offer("/a/a-9999/", `https://x.com/four-${index}/`);
+  }
+
+  assert.equal(reservoir.populationOf("/a/a-99999/"), 9);
+  assert.equal(reservoir.populationOf("/a/a-9999/"), 3);
+  // Two shapes x sampleSize 2.
+  assert.equal(reservoir.sampledUrls().length, 4);
+});
+
+test("strata come back biggest population first", () => {
+  // So a run cut short has already cleared the shapes whose extrapolation saves
+  // the most probing.
+  const reservoir = new ShapeReservoir({ sampleSize: 5 });
+
+  reservoir.offer("/small/", "https://x.com/s-1/");
+
+  for (let index = 0; index < 40; index += 1) {
+    reservoir.offer("/big/", `https://x.com/b-${index}/`);
+  }
+
+  assert.deepEqual(
+    reservoir.strata().map((stratum) => stratum.shape),
+    ["/big/", "/small/"]
+  );
+});
+
+test("a later item CAN displace an earlier one — the sample is not the first N", () => {
+  // Algorithm R with random() = 0 always targets slot 0, so the last URL offered
+  // must have replaced the first. If the reservoir were "keep the first N" this
+  // assertion fails, and that is the failure mode that matters: enumeration order
+  // follows file order, so the first N of a shape are usually all neighbours and
+  // "the samples agreed" would mean nothing.
+  const reservoir = new ShapeReservoir({
+    sampleSize: 2,
+    random: cyclingRandom([0])
+  });
+
+  reservoir.offer("/s/", "first");
+  reservoir.offer("/s/", "second");
+  reservoir.offer("/s/", "third");
+
+  const samples = reservoir.strata()[0].urls;
+
+  assert.equal(reservoir.populationOf("/s/"), 3);
+  assert.deepEqual(samples, ["third", "second"]);
+});
+
+test("an out-of-range draw keeps the reservoir untouched", () => {
+  // random() near 1 puts the index past the reservoir, which is the "do not
+  // replace" branch — the arm that makes the probability sampleSize/n rather
+  // than 1.
+  const reservoir = new ShapeReservoir({
+    sampleSize: 2,
+    random: cyclingRandom([0.99])
+  });
+
+  reservoir.offer("/s/", "first");
+  reservoir.offer("/s/", "second");
+  reservoir.offer("/s/", "third");
+
+  assert.deepEqual(reservoir.strata()[0].urls, ["first", "second"]);
+  assert.equal(reservoir.populationOf("/s/"), 3);
+});
+
+test("judgeStratum takes the sample size separately, not the reservoir's length", () => {
+  // A ShapeStratum from the reservoir carries the SAMPLE in .urls, so its length
+  // is not the population — which is why judgeStratum takes both. Getting this
+  // wrong would report population 50 for a 10,000-URL shape and extrapolate
+  // nothing.
+  const reservoir = new ShapeReservoir({ sampleSize: 3 });
+
+  for (let index = 0; index < 900; index += 1) {
+    reservoir.offer("/s/", `https://x.com/old/a-${index}/`);
+  }
+
+  const stratum = reservoir.strata()[0];
+  const verdict = judgeStratum(
+    { shape: stratum.shape, urls: new Array(reservoir.populationOf("/s/")) },
+    [
+      { source: "https://x.com/old/a-1/", dest: "https://x.com/new/a-1/" },
+      { source: "https://x.com/old/a-2/", dest: "https://x.com/new/a-2/" }
+    ],
+    stratum.urls.length
+  );
+
+  assert.equal(verdict.population, 900);
+  assert.equal(verdict.sampleSize, 3);
+  assert.equal(verdict.agreed, true);
 });

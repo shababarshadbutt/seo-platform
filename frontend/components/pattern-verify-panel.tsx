@@ -32,6 +32,7 @@ import {
   type VerificationStatus
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import { etaSecondsFrom, verifyProgress } from "@/lib/verify-progress";
 import { Progress } from "@/components/ui/progress";
 
 // The Fix Redirect URLs modal's verify-and-delete section, scoped to ONE
@@ -207,12 +208,14 @@ export function PatternVerifyPanel({
   // One auto-start per pattern, ever. Without this the effect below would re-fire
   // on every poll result and hammer the endpoint.
   const autoStartedForPattern = useRef<string | null>(null);
-  // First (time, urls_done) seen for the CURRENT job, which is what turns
-  // progress into a time estimate. Anchored per job id so re-opening the modal
-  // on a run already in flight starts a fresh measurement instead of dividing
-  // by the whole elapsed time of a run it did not watch.
+  // First (time, done) seen for the current job AND PHASE, which is what turns
+  // progress into a time estimate. Keyed per "<jobId>:<phase>" so re-opening the
+  // modal on a run already in flight starts a fresh measurement instead of
+  // dividing by the whole elapsed time of a run it did not watch — and so
+  // crossing from the file scan to probing re-measures rather than predicting URL
+  // throughput from a file rate. (v1.69.1)
   const progressAnchor = useRef<{
-    jobId: string;
+    key: string;
     at: number;
     done: number;
   } | null>(null);
@@ -249,6 +252,11 @@ export function PatternVerifyPanel({
     (verifyJob?.urls_total ?? 0) === 0 &&
     enumFilesTotal !== null &&
     enumFilesTotal > 0;
+  // QUEUED, not working (v1.69.1). The verification queue is concurrency 1, so a
+  // second request waits. This state had no rendering at all, which is why a
+  // queued "Check by shape" looked identical to a hung one for 15 minutes.
+  const isQueued = verifyJob?.status === "PENDING" && !isEnumerating;
+  const blockedBy = verification?.blocked_by ?? null;
   // Whether the bar has anything to divide by. False in the window before either
   // phase has published a total — the job is still queued, or the file list query
   // has not returned — which is exactly when a determinate bar would sit at 0%
@@ -307,25 +315,34 @@ export function PatternVerifyPanel({
     // the same request budget. Measuring beats predicting.
     const job = nextVerification.job;
 
-    if (job && IN_FLIGHT.includes(job.status) && job.urls_total > 0) {
+    // ONE anchor, EITHER phase (v1.69.1). It used to key on urls_total > 0, so an
+    // ETA existed only while probing — which is why a run sitting in the file scan
+    // showed no timeline at all, and a queued one showed nothing whatsoever.
+    //
+    // The phase choice and the reset key live in lib/verify-progress.ts: this
+    // component has no test harness, and those are the parts with real reasoning.
+    const progress = verifyProgress(job);
+
+    if (job && IN_FLIGHT.includes(job.status) && progress.anchorKey !== null) {
       const now = Date.now();
       const anchor = progressAnchor.current;
 
-      if (!anchor || anchor.jobId !== job.id) {
-        progressAnchor.current = { jobId: job.id, at: now, done: job.urls_done };
+      if (!anchor || anchor.key !== progress.anchorKey) {
+        progressAnchor.current = {
+          key: progress.anchorKey,
+          at: now,
+          done: progress.done
+        };
         setEtaSeconds(null);
       } else {
-        const elapsed = (now - anchor.at) / 1000;
-        const completed = job.urls_done - anchor.done;
+        const eta = etaSecondsFrom({
+          elapsedSeconds: (now - anchor.at) / 1000,
+          completed: progress.done - anchor.done,
+          remaining: progress.total - progress.done
+        });
 
-        // Needs a real sample before quoting a number — a couple of polls in,
-        // one flush of the progress counter makes the rate look infinite.
-        if (elapsed >= 10 && completed > 0) {
-          const perSecond = completed / elapsed;
-
-          setEtaSeconds(
-            Math.max(0, Math.round((job.urls_total - job.urls_done) / perSecond))
-          );
+        if (eta !== null) {
+          setEtaSeconds(eta);
         }
       }
     } else {
@@ -732,7 +749,21 @@ export function PatternVerifyPanel({
         >
           <p className="flex items-center gap-2 text-sm text-indigo-900">
             <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
-            {isEnumerating ? (
+            {isQueued ? (
+              <span data-testid="verify-queued">
+                Waiting to start — another verification is running on this
+                session
+                {blockedBy && Number(blockedBy.urls_total ?? 0) > 0
+                  ? ` (${formatNumber(
+                      Number(blockedBy.urls_done ?? 0)
+                    )} of ${formatNumber(
+                      Number(blockedBy.urls_total ?? 0)
+                    )} URLs)`
+                  : ""}
+                . This one keeps its place in the queue — you can close this and
+                come back.
+              </span>
+            ) : isEnumerating ? (
               <span data-testid="verify-enum-progress">
                 Scanning sitemap files: {formatNumber(enumFilesDone)} of{" "}
                 {formatNumber(enumFilesTotal ?? 0)}…
@@ -816,8 +847,15 @@ export function PatternVerifyPanel({
                 ·{" "}
               </>
             ) : null}
-            Deliberately rate-limited so the check cannot overload the site
-            being crawled — this is the speed, not a stall.
+            {/* Phase-accurate (v1.69.1). "Rate-limited" is only true of the
+                HTTP phase — saying it while the job is queued or reading files
+                off disk explains the wrong thing, and during a queue wait it
+                actively misdirects: the run is not slow, it has not started. */}
+            {isQueued
+              ? "Nothing is being checked yet — the queue runs one verification at a time so a big sweep cannot be starved by a small one."
+              : isEnumerating
+                ? "Reading the sitemap files to find this pattern's URLs. Disk-bound, not rate-limited — the HTTP checks start after this."
+                : "Deliberately rate-limited so the check cannot overload the site being crawled — this is the speed, not a stall."}
           </p>
           {/* Background verification already worked: the job runs server-side
               and re-attaches on reopen. It was simply never said, so a user

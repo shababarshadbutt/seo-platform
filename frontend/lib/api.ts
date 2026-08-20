@@ -1204,6 +1204,15 @@ export type VerificationStatus = {
   // Files were edited after the last verification — counts may be outdated.
   stale: boolean;
   counts_by_status: Array<{ http_status: number; count: number }>;
+  // Set only when `job` is PENDING: the run it is queued behind (v1.69.1). The
+  // verification queue is concurrency 1, so a second request waits — and with no
+  // way to say so, "queued" rendered identically to "working" and to "hung".
+  // Counts are strings because they come straight from a bigint column.
+  blocked_by: {
+    urls_total: string | null;
+    urls_done: string | null;
+    pattern_ids: string[] | null;
+  } | null;
 };
 
 // Start (or attach to) a verification.

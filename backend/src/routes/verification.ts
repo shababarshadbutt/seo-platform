@@ -488,6 +488,41 @@ export async function verificationRoutes(app: FastifyInstance) {
               urls_reused: jobRow.urls_reused
             }
           : null,
+        // WHAT A QUEUED JOB IS WAITING BEHIND (v1.69.1).
+        //
+        // The verification queue is concurrency 1, so a second request sits
+        // PENDING until the first finishes. Nothing said so: the panel had no
+        // waiting state, and PENDING rendered identically to enumerating and to
+        // hung — a "Check by shape" that was simply queued read as a 15-minute
+        // freeze, which is the reported bug.
+        //
+        // Only looked up when the job we are reporting is actually waiting, and
+        // it is a DIFFERENT scope by definition (same scope would have attached
+        // rather than queued), which is why the query is not the one above.
+        blocked_by:
+          jobRow && jobRow.status === "PENDING"
+            ? ((
+                await pool.query<{
+                  urls_total: string | null;
+                  urls_done: string | null;
+                  pattern_ids: string[] | null;
+                }>(
+                  `
+                    SELECT files_total AS urls_total,
+                           files_done AS urls_done,
+                           pattern_ids
+                    FROM maintenance_jobs
+                    WHERE session_id = $1
+                      AND kind = 'verify-urls'
+                      AND status = 'RUNNING'
+                      AND id <> $2
+                    ORDER BY started_at ASC
+                    LIMIT 1
+                  `,
+                  [sessionId, jobRow.id]
+                )
+              ).rows[0] ?? null)
+            : null,
         // Echoes the request scope so a client can tell a pattern-scoped
         // response from a session-wide one without tracking what it asked for.
         scope: patternId ? "pattern" : "session",
