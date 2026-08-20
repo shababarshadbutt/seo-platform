@@ -54,6 +54,10 @@ type ScopeInput = {
   // (confirmed_redirect_count). The ceiling on what an accept can rewrite when
   // no rule could be derived.
   confirmedRedirectCount: number;
+  // Additional URLs a PER-SHAPE rule would reach (v1.69), from a stratified
+  // verification. Inference, not measurement — kept as its own input so the two
+  // can be named separately and never silently summed.
+  shapeExtrapolatedCount?: number;
 };
 
 // Does accepting target more than the rows on screen?
@@ -76,9 +80,52 @@ export function fixAcceptCount(
   // at the scope total for the defensive case where the confirmed set somehow
   // exceeds it (both numbers are fetched separately, so a stale one is possible
   // and over-reporting is the direction that lies).
-  return input.inferredWithoutRule
-    ? Math.min(input.confirmedRedirectCount, input.fixPatternTotal)
-    : input.fixPatternTotal;
+  if (!input.inferredWithoutRule) {
+    return input.fixPatternTotal;
+  }
+
+  // No whole-pattern rule. Measured URLs plus whatever a trusted per-shape rule
+  // reaches — both real, and both clamped to the scope for the defensive case
+  // where separately-fetched numbers disagree. Over-reporting is the direction
+  // that lies, so it is the one that gets clamped.
+  const reachable =
+    input.confirmedRedirectCount + (input.shapeExtrapolatedCount ?? 0);
+
+  return Math.min(reachable, input.fixPatternTotal);
+}
+
+// The measured/inferred split behind the Accept count, for the line under the
+// button. Returned as a pair rather than a single total because v1.68's lesson
+// was "never state a number the backend will not deliver" — a per-shape rule DOES
+// deliver, so the number is honest, but the modal still has to be able to say
+// which half was fetched and which was inferred. Summing them in here would
+// remove that possibility permanently.
+export function fixAcceptBreakdown(
+  input: ScopeInput & { fixCount: number }
+): { measured: number; extrapolated: number } | null {
+  // Only meaningful for a pattern-wide accept with no single rule: with a rule
+  // the whole scope is reached by one transform and there is no split to show,
+  // and a released toggle only ever touches selected rows.
+  if (!appliesPatternWide(input) || !input.inferredWithoutRule) {
+    return null;
+  }
+
+  const extrapolated = input.shapeExtrapolatedCount ?? 0;
+
+  if (extrapolated === 0) {
+    return null;
+  }
+
+  const measured = Math.min(
+    input.confirmedRedirectCount,
+    input.fixPatternTotal
+  );
+
+  return {
+    measured,
+    // Never let the pair exceed the scope, and never report a negative.
+    extrapolated: Math.max(0, Math.min(extrapolated, input.fixPatternTotal - measured))
+  };
 }
 
 // The "of N" half of "Accept Selected Changes (10 of 28,546)". Null when there

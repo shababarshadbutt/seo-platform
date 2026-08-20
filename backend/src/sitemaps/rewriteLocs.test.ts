@@ -167,3 +167,77 @@ test("an empty scope means the pre-v1.66 sweep, unchanged", () => {
   assert.equal(rewrite(SIBLING), "https://site.com/nsn/part-types-1234");
   assert.equal(rewrite(IN_SCOPE), "https://site.com/nsn/nsn-parts-1234");
 });
+
+// --- per-shape rules (v1.69) --------------------------------------------------
+// A stratified verification distils a rule PER URL SHAPE, because
+// deriveRedirectRule needs every sampled pair to agree and across a whole
+// pattern that is a global constraint — which is why the reported 579,034-URL
+// pattern distilled to nothing and had to be probed end to end. Within one shape
+// the constraint only has to hold among URLs built by the same template.
+
+const FIVE_DIGIT = "https://site.com/nsn/nsn-parts-12191/";
+const FOUR_DIGIT = "https://site.com/nsn/nsn-parts-6492/";
+
+// Two shapes, two different rewrites — the case a single whole-pattern rule
+// cannot express at all.
+const shapeRules = new Map<string, RedirectRule>([
+  ["/a/a-a-99999/", { kind: "replace", find: "nsn-parts-", replace: "five/" }],
+  ["/a/a-a-9999/", { kind: "replace", find: "nsn-parts-", replace: "four/" }]
+]);
+
+test("each shape is rewritten by its OWN rule", () => {
+  const rewrite = buildRedirectApplyRewriter(new Map(), null, shapeRules);
+
+  assert.equal(rewrite(FIVE_DIGIT), "https://site.com/nsn/five/12191/");
+  assert.equal(rewrite(FOUR_DIGIT), "https://site.com/nsn/four/6492/");
+});
+
+test("a shape with no rule is left alone", () => {
+  // Only shapes whose samples AGREED get a rule. An unagreed shape must pass
+  // through untouched rather than borrowing a neighbour's rewrite.
+  const rewrite = buildRedirectApplyRewriter(new Map(), null, shapeRules);
+
+  assert.equal(rewrite("https://site.com/nsn/page-1-34/"), null);
+});
+
+test("a confirmed exact destination outranks a shape rule", () => {
+  // Measurement beats inference. This is the v1.68 invariant and it must survive
+  // per-shape rules being added underneath it.
+  const exact = new Map([[FIVE_DIGIT, "https://site.com/confirmed/"]]);
+  const rewrite = buildRedirectApplyRewriter(exact, null, shapeRules);
+
+  assert.equal(rewrite(FIVE_DIGIT), "https://site.com/confirmed/");
+});
+
+test("a whole-pattern rule outranks a shape rule", () => {
+  // The pattern-wide rule was distilled from every sample, the shape rule from
+  // one stratum, so the broader evidence wins where both apply.
+  const rewrite = buildRedirectApplyRewriter(
+    new Map(),
+    { kind: "replace", find: "nsn-parts-", replace: "all/" },
+    shapeRules
+  );
+
+  assert.equal(rewrite(FIVE_DIGIT), "https://site.com/nsn/all/12191/");
+});
+
+test("a shape rule still applies where the pattern rule does not match", () => {
+  // The fallback that makes this worth having: the pattern-wide rule is real but
+  // does not touch this URL, so the shape's own rule gets its turn instead of the
+  // URL being skipped.
+  const rewrite = buildRedirectApplyRewriter(
+    new Map(),
+    { kind: "replace", find: "never-present", replace: "x" },
+    shapeRules
+  );
+
+  assert.equal(rewrite(FIVE_DIGIT), "https://site.com/nsn/five/12191/");
+});
+
+test("no shape rules means the pre-v1.69 rewriter, unchanged", () => {
+  for (const rules of [undefined, null, new Map<string, RedirectRule>()]) {
+    const rewrite = buildRedirectApplyRewriter(new Map(), null, rules);
+
+    assert.equal(rewrite(FIVE_DIGIT), null);
+  }
+});

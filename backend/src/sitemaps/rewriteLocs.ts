@@ -5,6 +5,7 @@ import { StringDecoder } from "node:string_decoder";
 import { createGunzip, createGzip } from "node:zlib";
 
 import { applyRedirectRule, type RedirectRule } from "./redirectRule.js";
+import { valueShape } from "./transformDryRun.js";
 
 const PARAM_SEGMENT = "{param}";
 const LOC_OPEN = "<loc>";
@@ -59,8 +60,21 @@ export function buildLocMapRewriter(
 // exactly buildLocMapRewriter over the confirmed exact pairs.
 export function buildRedirectApplyRewriter(
   exactReplacements: Map<string, string>,
-  rule: RedirectRule | null
+  rule: RedirectRule | null,
+  // PER-SHAPE rules (v1.69), from a stratified verification. Keyed on
+  // valueShape(pathname). Consulted only when there is no exact replacement and
+  // no single whole-pattern rule applies to this URL.
+  //
+  // WHY THESE EXIST. deriveRedirectRule needs every sampled pair to produce a
+  // byte-identical diff. Across a whole pattern that is a global constraint, and
+  // it is why the reported 579,034-URL pattern distilled to NO rule and had to
+  // be probed end to end. Within one shape — one CMS template — the constraint
+  // only has to hold among URLs built the same way, so rules become derivable at
+  // all rather than merely faster.
+  shapeRules?: Map<string, RedirectRule> | null
 ): LocUrlRewriter {
+  const byShape = shapeRules ?? null;
+
   return (url: string) => {
     const exact = exactReplacements.get(url);
 
@@ -68,8 +82,31 @@ export function buildRedirectApplyRewriter(
       return exact === url ? null : exact;
     }
 
+    // A confirmed exact destination outranks any rule; a whole-pattern rule
+    // outranks a per-shape one, because it was distilled from every sample
+    // rather than from one stratum.
     if (rule) {
-      return applyRedirectRule(url, rule);
+      const applied = applyRedirectRule(url, rule);
+
+      if (applied) {
+        return applied;
+      }
+    }
+
+    if (byShape) {
+      let pathname: string;
+
+      try {
+        pathname = new URL(url).pathname;
+      } catch {
+        return null;
+      }
+
+      const shapeRule = byShape.get(valueShape(pathname));
+
+      if (shapeRule) {
+        return applyRedirectRule(url, shapeRule);
+      }
     }
 
     return null;

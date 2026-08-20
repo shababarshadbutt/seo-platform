@@ -4564,12 +4564,45 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         confirmedRedirectCount = Number(counted.rows[0]?.n ?? 0);
       }
 
+      // EXTRAPOLATED reach from a stratified verification (v1.69), reported
+      // SEPARATELY from confirmed_redirect_count and never folded into it.
+      //
+      // v1.68's lesson was not "never extrapolate" — it was "never state a number
+      // the backend will not deliver". A per-shape rule DOES deliver, so the
+      // number is real; it is just inference rather than measurement, and the
+      // modal has to be able to say which is which. Summing them here would
+      // remove that possibility permanently.
+      const shapeRuleRows = await pool.query<{
+        shape: string;
+        population: number;
+        sample_size: number;
+      }>(
+        `
+          SELECT shape, population, sample_size
+          FROM pattern_shape_rules
+          WHERE pattern_id = $1 AND agreed = true AND rule IS NOT NULL
+        `,
+        [request.params.patternId]
+      );
+      // Only the UNPROBED remainder of each trusted shape: its sampled members
+      // are already counted in confirmed_redirect_count, and counting them twice
+      // would inflate the total past the population.
+      const extrapolatedCount = shapeRuleRows.rows.reduce(
+        (sum, row) =>
+          sum + Math.max(0, Number(row.population) - Number(row.sample_size)),
+        0
+      );
+
       return {
         rule: rule ?? null,
         pattern_total_urls: patternTotalUrls,
         // URLs with a confirmed destination, in the CURRENT structure scope —
         // what an accept rewrites when no single rule could be derived.
         confirmed_redirect_count: confirmedRedirectCount,
+        // Additional URLs a per-shape rule would reach. Inference, reported apart
+        // from the measured count above so the label can name both.
+        shape_extrapolated_count: extrapolatedCount,
+        trusted_shape_count: shapeRuleRows.rowCount ?? 0,
         // How many rows the review preview holds (bounded by the pattern_urls
         // sample pool) — distinct from pattern_total_urls, the real rewrite scope.
         preview_count: candidates.length,
@@ -4836,6 +4869,29 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           ]
         );
 
+        // PER-SHAPE RULES from a stratified verification (v1.69). Only the
+        // shapes whose samples AGREED are loaded: an unagreed row exists to say
+        // "this shape was sampled and its URLs disagree", which is grounds for
+        // escalating it to a full verification, never for rewriting it.
+        //
+        // These are inference, and the endpoint keeps them strictly separate
+        // from verified_urls above, which is measurement. That separation is
+        // what v1.68 was for.
+        const shapeRuleResult = await client.query<{
+          shape: string;
+          rule: RedirectRule;
+        }>(
+          `
+            SELECT shape, rule
+            FROM pattern_shape_rules
+            WHERE pattern_id = $1 AND agreed = true AND rule IS NOT NULL
+          `,
+          [request.params.patternId]
+        );
+        const shapeRules = new Map<string, RedirectRule>(
+          shapeRuleResult.rows.map((row) => [row.shape, row.rule])
+        );
+
         // Merge rules (scope guard, no-op destinations, sampled-wins) live in
         // mergeVerifiedReplacements so they are unit-testable — see its comment.
         mergeVerifiedReplacements({
@@ -4861,7 +4917,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // still win per-URL inside buildRedirectApplyRewriter.
         const widen = inferredUrls.length > 0 && inferredRule !== null;
 
-        if (widen) {
+        // A per-shape rule widens the same way a whole-pattern rule does: it is
+        // a pure per-URL transform, so it reaches occurrences in files no sampled
+        // URL came from. Without this the scan would be limited to the files the
+        // confirmed replacements touched and a shape rule would silently reach
+        // only part of its shape.
+        const widenFiles = widen || shapeRules.size > 0;
+
+        if (widenFiles) {
           // Scan the pattern's real, complete file list (pattern_file_occurrences
           // — the precise set of files this pattern's URLs live in), not just the
           // files the sampled URLs came from. Empty (older sessions) → scan every
@@ -4878,20 +4941,25 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         }
 
         const selectedDisplayFiles =
-          widen && candidateFiles.size === 0 ? [] : Array.from(candidateFiles);
+          widenFiles && candidateFiles.size === 0
+            ? []
+            : Array.from(candidateFiles);
 
         let rewrittenLocCount = 0;
 
-        // Rewrite when there are confirmed exact replacements to apply OR a rule
-        // to widen across the pattern's files.
-        if (replacements.size > 0 || widen) {
+        // Rewrite when there are confirmed exact replacements to apply, a rule
+        // to widen across the pattern's files, OR per-shape rules from a
+        // stratified verification — that last one is the whole point of v1.69:
+        // a pattern that distils no single rule can still have one per shape.
+        if (replacements.size > 0 || widen || shapeRules.size > 0) {
           const rewrite = await rewriteRedirectSourceFilesOnDisk(client, {
             sessionId: request.params.id,
             sourceRole,
             replacements,
             selectedDisplayFiles,
             rule: widen ? inferredRule : null,
-            structureFilters: redirectStructureFilters
+            structureFilters: redirectStructureFilters,
+            shapeRules
           });
 
           filesToDeleteOnError = rewrite.newFilePaths;

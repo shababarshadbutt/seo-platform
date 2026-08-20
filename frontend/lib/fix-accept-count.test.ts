@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
   appliesPatternWide,
+  fixAcceptBreakdown,
   fixAcceptContextTotal,
   fixAcceptCount,
   fixModalBanner
@@ -347,4 +348,103 @@ test("the banner never overclaims: 'scope' implies a rule and a wide accept", ()
       }
     }
   }
+});
+
+// --- per-shape extrapolation (v1.69) ----------------------------------------
+// A stratified verification probes ~50 per URL shape and distils a rule per
+// shape, so a pattern that yields NO whole-pattern rule can still be reached
+// almost entirely. Those URLs are real reach but they were never fetched, so the
+// count includes them and the breakdown names them.
+
+const NO_RULE = {
+  fixCount: 10,
+  fixPatternTotal: 28413,
+  fixCandidateCount: 10,
+  inferredWithoutRule: true,
+  allInPattern: true
+};
+
+test("per-shape reach is added to the measured count", () => {
+  assert.equal(
+    fixAcceptCount({
+      ...NO_RULE,
+      confirmedRedirectCount: 1150,
+      shapeExtrapolatedCount: 27000
+    }),
+    28150
+  );
+});
+
+test("the pair is clamped to the scope, never past it", () => {
+  // The two numbers come from separate queries, so a stale pair is possible.
+  assert.equal(
+    fixAcceptCount({
+      ...NO_RULE,
+      confirmedRedirectCount: 1150,
+      shapeExtrapolatedCount: 999999
+    }),
+    28413
+  );
+});
+
+test("the breakdown names both halves and never sums them", () => {
+  assert.deepEqual(
+    fixAcceptBreakdown({
+      ...NO_RULE,
+      confirmedRedirectCount: 1150,
+      shapeExtrapolatedCount: 27000
+    }),
+    { measured: 1150, extrapolated: 27000 }
+  );
+});
+
+test("no extrapolation means no breakdown to show", () => {
+  // Nothing was inferred, so the count is entirely measured and a split line
+  // would be noise.
+  assert.equal(
+    fixAcceptBreakdown({
+      ...NO_RULE,
+      confirmedRedirectCount: 1150,
+      shapeExtrapolatedCount: 0
+    }),
+    null
+  );
+});
+
+test("a whole-pattern rule has no split to report", () => {
+  // One transform reaches the whole scope; "measured vs inferred" is not the
+  // useful distinction there, and the indigo scope banner already says so.
+  assert.equal(
+    fixAcceptBreakdown({
+      ...NO_RULE,
+      inferredWithoutRule: false,
+      confirmedRedirectCount: 1150,
+      shapeExtrapolatedCount: 27000
+    }),
+    null
+  );
+});
+
+test("a released toggle reports no split", () => {
+  assert.equal(
+    fixAcceptBreakdown({
+      ...NO_RULE,
+      allInPattern: false,
+      confirmedRedirectCount: 1150,
+      shapeExtrapolatedCount: 27000
+    }),
+    null
+  );
+});
+
+test("the breakdown's halves never exceed the scope together", () => {
+  const split = fixAcceptBreakdown({
+    ...NO_RULE,
+    fixPatternTotal: 2000,
+    confirmedRedirectCount: 1150,
+    shapeExtrapolatedCount: 27000
+  });
+
+  assert.ok(split);
+  assert.equal(split!.measured + split!.extrapolated, 2000);
 });

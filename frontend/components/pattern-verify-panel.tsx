@@ -110,6 +110,11 @@ type Props = {
   structureFilters?: StructureFilter[] | null;
 };
 
+// Below this a full verification is already quick enough that offering a second,
+// weaker option only adds a decision. At ~50 req/s a 20,000-URL pattern is
+// roughly 7 minutes; past that the hours start.
+const STRATIFIED_WORTH_IT = 20000;
+
 function formatNumber(value: number) {
   return new Intl.NumberFormat("en-US").format(value);
 }
@@ -510,7 +515,13 @@ export function PatternVerifyPanel({
     }
   }
 
-  async function handleVerify() {
+  // strategy "stratified" probes ~50 per URL SHAPE instead of every URL (v1.69).
+  // On the reported 579,034-URL pattern that is roughly 1,150 requests rather
+  // than 579,034 — minutes instead of 3h17m — because URLs sharing a shape come
+  // from one CMS template. Shapes whose samples DISAGREE are reported unagreed
+  // rather than extrapolated, so nothing is guessed about a shape that is not
+  // actually uniform.
+  async function handleVerify(strategy: "full" | "stratified" = "full") {
     setError("");
 
     try {
@@ -519,7 +530,8 @@ export function PatternVerifyPanel({
         sessionId,
         [patternId],
         selected.size > 0 ? effectiveStatuses : undefined,
-        structureFilters
+        structureFilters,
+        strategy
       );
       await refresh();
     } catch (nextError) {
@@ -1029,6 +1041,22 @@ export function PatternVerifyPanel({
                 : "Quick check"}{" "}
               (~1% sample)
             </Button>
+            {/* Offered ABOVE the full run and only where it would actually save
+                something: on a small pattern the full check is already quick and
+                a second button is just a choice nobody needs to make. The
+                threshold is the point past which sampling beats probing
+                everything by enough to matter. */}
+            {populationTotal >= STRATIFIED_WORTH_IT ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="default"
+                onClick={() => void handleVerify("stratified")}
+                title="Probes about 50 URLs per URL shape and infers the rest from each shape's own rule. Shapes whose samples disagree are reported, not guessed."
+              >
+                Check by shape — {formatNumber(populationTotal)} URLs in minutes
+              </Button>
+            ) : null}
             <Button
               type="button"
               size="sm"

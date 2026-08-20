@@ -199,6 +199,7 @@ import { cn } from "@/lib/utils";
 
 import {
   appliesPatternWide,
+  fixAcceptBreakdown,
   fixAcceptContextTotal,
   fixAcceptCount,
   fixModalBanner
@@ -1023,6 +1024,9 @@ export default function ResultsDashboardPage({
   // can rewrite when no rule could be derived — the number whose absence let the
   // button claim 28,546 while the toast reported 10.
   const [fixConfirmedCount, setFixConfirmedCount] = useState(0);
+  // URLs a trusted PER-SHAPE rule would reach (v1.69). Held apart from the
+  // measured count so the label can name both halves — see fixAcceptBreakdown.
+  const [fixExtrapolatedCount, setFixExtrapolatedCount] = useState(0);
   // Verify-then-act for the Fix modal now lives in PatternVerifyPanel (v1.50),
   // which owns its own pattern-scoped verification/triage state. It used to be
   // eight pieces of state here driving a SESSION-wide verify from inside a
@@ -2797,6 +2801,7 @@ export default function ResultsDashboardPage({
     setFixScopedFiles(null);
     setFixScopedOccurrences(null);
     setFixConfirmedCount(0);
+    setFixExtrapolatedCount(0);
     setFixPage(0);
     // Opening a different pattern must not inherit the previous one's chips.
     setFixStatusFilter(new Set());
@@ -2810,6 +2815,7 @@ export default function ResultsDashboardPage({
         setFixCandidates(data.candidates);
         setFixPatternTotal(data.pattern_total_urls);
         setFixConfirmedCount(data.confirmed_redirect_count ?? 0);
+        setFixExtrapolatedCount(data.shape_extrapolated_count ?? 0);
         // Seeded through canBulkFix rather than defaultFixAction alone, because
         // the header toggle opens PRESSED (v1.66) and the rows have to agree with
         // it on the first render. What the toggle may not claim keeps its
@@ -3130,6 +3136,7 @@ export default function ResultsDashboardPage({
       .then((data) => {
         if (fixScopeRequestIdRef.current === requestId) {
           setFixConfirmedCount(data.confirmed_redirect_count ?? 0);
+          setFixExtrapolatedCount(data.shape_extrapolated_count ?? 0);
         }
       })
       .catch(() => {
@@ -3218,7 +3225,8 @@ export default function ResultsDashboardPage({
     fixCandidateCount: scopedFixCandidates.length,
     inferredWithoutRule: fixInferredWithoutRule,
     allInPattern: fixAllInPattern,
-    confirmedRedirectCount: fixConfirmedCount
+    confirmedRedirectCount: fixConfirmedCount,
+    shapeExtrapolatedCount: fixExtrapolatedCount
   };
   const fixAppliesPatternWide = appliesPatternWide(fixScope);
   // Which banner qualifies the scope, chosen by one function rather than two
@@ -3234,6 +3242,8 @@ export default function ResultsDashboardPage({
   // The "of N" half of "Accept Selected Changes (10 of 28,546)" — null once the
   // count already covers the whole scope. (v1.68)
   const fixAcceptContext = fixAcceptContextTotal({ fixCount, ...fixScope });
+  // measured vs inferred, or null when there is nothing inferred to name. (v1.69)
+  const fixAcceptSplit = fixAcceptBreakdown({ fixCount, ...fixScope });
   const deleteCount = scopedFixCandidates.filter(
     (candidate) => fixActionFor(candidate) === "delete"
   ).length;
@@ -5888,7 +5898,18 @@ export default function ResultsDashboardPage({
                         where the gap is visible. A URL is only rewritable if its
                         destination has been fetched; verifying more of the
                         pattern raises the count. (v1.68) */}
-                    {fixAcceptContext !== null && fixAllInPattern ? (
+                    {/* Measured vs inferred, named rather than summed (v1.69).
+                        A per-shape rule DOES deliver its URLs, so the count is
+                        honest — but half of it was fetched and half was inferred
+                        from a sample, and that is exactly the distinction two
+                        releases were spent making visible. */}
+                    {fixAcceptSplit !== null && fixAllInPattern ? (
+                      <span className="text-xs text-slate-600">
+                        {formatNumber(fixAcceptSplit.measured)} measured ·{" "}
+                        {formatNumber(fixAcceptSplit.extrapolated)} by per-shape
+                        rule
+                      </span>
+                    ) : fixAcceptContext !== null && fixAllInPattern ? (
                       <span className="text-xs text-amber-700">
                         {formatNumber(fixAcceptLabelCount)} of{" "}
                         {formatNumber(fixAcceptContext)} have a confirmed

@@ -4,6 +4,15 @@ import { config } from "../config.js";
 import { pool } from "../db/pool.js";
 import { runWithBoundedConcurrency } from "../sitemaps/boundedConcurrency.js";
 import {
+  coverageFromVerdicts,
+  DEFAULT_SHAPE_SAMPLE,
+  groupByShape,
+  judgeStratum,
+  sampleStratum,
+  type ShapeStratum
+} from "./shapeStrata.js";
+import { valueShape } from "../sitemaps/transformDryRun.js";
+import {
   enumeratePopulation,
   type EnumeratedUrl,
   type PatternRow
@@ -491,6 +500,46 @@ export async function processVerifyUrlsJob(
       "verify urls: population enumerated, checking started"
     );
 
+    // STRATIFIED MODE (v1.69). Probe ~N per URL SHAPE instead of every URL.
+    //
+    // Inserted here, AFTER the circuit breaker has already dropped hosts that
+    // refuse everything: sampling first would spend its whole budget on a
+    // refusing host and conclude nothing about the shapes that do answer.
+    //
+    // toCheck is replaced rather than filtered lazily so every count downstream
+    // (progress denominator, logs) describes what will actually be probed.
+    const stratified = data.strategy === "stratified";
+    const shapeSample = data.shape_sample ?? DEFAULT_SHAPE_SAMPLE;
+    let strata: ShapeStratum[] = [];
+
+    if (stratified) {
+      strata = groupByShape(toCheck.map((entry) => entry.url));
+
+      const wanted = new Set(
+        strata.flatMap((stratum) => sampleStratum(stratum, shapeSample))
+      );
+      const sampled = toCheck.filter((entry) => wanted.has(entry.url));
+
+      logger.info(
+        {
+          session_id: sessionId,
+          shapes: strata.length,
+          population: toCheck.length,
+          probing: sampled.length,
+          shape_sample: shapeSample
+        },
+        "verify urls: stratified by shape"
+      );
+
+      toCheck.length = 0;
+      toCheck.push(...sampled);
+    }
+
+    // Probed redirect pairs per shape, for the per-shape rule. Only collected in
+    // stratified mode, where it is bounded by shapes x shapeSample (~1,150 on the
+    // reported pattern) — cheap to hold, unlike the full population.
+    const pairsByShape = new Map<string, Array<{ source: string; dest: string }>>();
+
     // Pending upserts, flushed every PROGRESS_FLUSH_EVERY completions and once
     // at the end. splice(0) hands the current batch to one flusher atomically
     // (single-threaded between awaits), so concurrent onSettled calls never
@@ -547,6 +596,35 @@ export async function processVerifyUrlsJob(
       async (settled, completed, _total) => {
         pending.push(settled);
 
+        if (stratified) {
+          const { entry, result } = settled;
+
+          // Only genuine redirects carry a rewrite; everything else tells us
+          // nothing about how this shape should be rewritten.
+          if (
+            result.httpStatusCategory === "redirect" &&
+            result.finalUrl &&
+            result.finalUrl !== entry.url
+          ) {
+            let shape: string;
+
+            try {
+              shape = valueShape(new URL(entry.url).pathname);
+            } catch {
+              return;
+            }
+
+            const pairs = pairsByShape.get(shape);
+            const pair = { source: entry.url, dest: result.finalUrl };
+
+            if (pairs) {
+              pairs.push(pair);
+            } else {
+              pairsByShape.set(shape, [pair]);
+            }
+          }
+        }
+
         if (completed % PROGRESS_FLUSH_EVERY === 0) {
           const batch = pending.splice(0);
 
@@ -561,6 +639,73 @@ export async function processVerifyUrlsJob(
 
     // Flush the final partial batch.
     await upsertVerifiedBatch(sessionId, pending.splice(0));
+
+    // PER-SHAPE VERDICTS (v1.69). One row per shape: the distilled rule when its
+    // probed pairs agreed, or an agreed=false row when they did not.
+    //
+    // WRITTEN TO pattern_shape_rules, NEVER TO verified_urls. v1.68 made
+    // apply-redirects treat every verified_urls row carrying a final_url as a URL
+    // that was actually FETCHED — that is what fixed "the button says 28,546 and
+    // the toast says 10". Writing an extrapolated destination there would
+    // re-create that bug with nothing left to distinguish measured from guessed.
+    // An unagreed row is kept rather than dropped: "we sampled this shape and its
+    // URLs disagree" is what justifies escalating that shape, and a caller who
+    // cannot see it would re-sample it forever.
+    if (stratified && strata.length > 0) {
+      const verdicts = strata.map((stratum) =>
+        judgeStratum(
+          stratum,
+          pairsByShape.get(stratum.shape) ?? [],
+          sampleStratum(stratum, shapeSample).length
+        )
+      );
+      // Scoped runs carry exactly one pattern (the route requires it for a
+      // structure filter, and the Fix modal always sends one); a session-wide
+      // stratified run has no single pattern to attribute a shape rule to, so it
+      // records nothing rather than attributing it to an arbitrary one.
+      const shapePatternId = patterns.length === 1 ? patterns[0].id : null;
+
+      if (shapePatternId) {
+        for (const verdict of verdicts) {
+          await pool.query(
+            `
+              INSERT INTO pattern_shape_rules
+                (pattern_id, shape, rule, sample_size, population, agreed)
+              VALUES ($1, $2, $3::jsonb, $4, $5, $6)
+              ON CONFLICT (pattern_id, shape) DO UPDATE
+              SET rule = EXCLUDED.rule,
+                  sample_size = EXCLUDED.sample_size,
+                  population = EXCLUDED.population,
+                  agreed = EXCLUDED.agreed,
+                  measured_at = now()
+            `,
+            [
+              shapePatternId,
+              verdict.shape,
+              verdict.rule ? JSON.stringify(verdict.rule) : null,
+              verdict.sampleSize,
+              verdict.population,
+              verdict.agreed
+            ]
+          );
+        }
+      }
+
+      const coverage = coverageFromVerdicts(verdicts);
+
+      logger.info(
+        {
+          session_id: sessionId,
+          pattern_id: shapePatternId,
+          shapes: verdicts.length,
+          trusted_shapes: coverage.trustedShapes,
+          unagreed_shapes: coverage.unagreedShapes,
+          measured: coverage.measured,
+          extrapolated: coverage.extrapolated
+        },
+        "verify urls: per-shape verdicts recorded"
+      );
+    }
 
     // Re-verification sweep: rows for the SAME selected patterns whose url was
     // NOT re-enumerated this run no longer exist in the files — drop them so the

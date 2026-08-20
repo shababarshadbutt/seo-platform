@@ -119,10 +119,19 @@ export async function rewriteRedirectSourceFilesOnDisk(
     // path-segment indexes, not param ordinals. Empty/omitted = whole pattern,
     // unchanged prior behaviour. See applyStructureFilterToRewriter.
     structureFilters?: ResolvedStructureFilter[] | null;
+    // Per-shape rules from a stratified verification (v1.69), keyed on
+    // valueShape(pathname). Reached only where there is no confirmed exact
+    // destination and no whole-pattern rule applies. See shapeStrata.ts for why
+    // a shape can distil a rule when the whole pattern cannot.
+    shapeRules?: Map<string, RedirectRule> | null;
   }
 ): Promise<RedirectFileRewrite> {
   const rewriteUrl = applyStructureFilterToRewriter(
-    buildRedirectApplyRewriter(options.replacements, options.rule ?? null),
+    buildRedirectApplyRewriter(
+      options.replacements,
+      options.rule ?? null,
+      options.shapeRules ?? null
+    ),
     options.structureFilters ?? null
   );
   const selectedSet = new Set(options.selectedDisplayFiles);

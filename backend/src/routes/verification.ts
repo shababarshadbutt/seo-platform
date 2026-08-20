@@ -175,6 +175,11 @@ export async function verificationRoutes(app: FastifyInstance) {
       pattern_ids?: unknown;
       target_statuses?: unknown;
       structure_filter?: unknown;
+      // "stratified" probes a sample per URL SHAPE instead of every URL (v1.69),
+      // turning a 579,034-URL run from 3h17m into roughly 1,150 requests. Shapes
+      // whose samples disagree are reported unagreed rather than extrapolated.
+      strategy?: unknown;
+      shape_sample?: unknown;
     };
   }>(
     "/api/sessions/:id/verify-urls",
@@ -261,6 +266,20 @@ export async function verificationRoutes(app: FastifyInstance) {
         structureFilters = resolved;
       }
 
+      // Default "full", so an unspecified request behaves exactly as it did
+      // before v1.69 and nothing silently starts extrapolating.
+      const strategy =
+        request.body?.strategy === "stratified" ? "stratified" : "full";
+      const rawSample = Number(request.body?.shape_sample);
+      // Clamped rather than rejected: this only decides how much evidence to
+      // gather, and a nonsense value should fall back to the default rather than
+      // fail a run someone is waiting on. Floor of 5 because a rule distilled
+      // from fewer pairs is not evidence of a template behaving consistently.
+      const shapeSample =
+        Number.isFinite(rawSample) && rawSample > 0
+          ? Math.max(5, Math.min(500, Math.floor(rawSample)))
+          : undefined;
+
       // Serialised once and used for BOTH the attach comparison and the insert,
       // so "same scope?" is asked of exactly the value that gets stored.
       const structureFiltersJson = structureFilters
@@ -305,10 +324,16 @@ export async function verificationRoutes(app: FastifyInstance) {
             -- as jsonb of the RESOLVED filters, so representation cannot make
             -- two identical scopes look different.
             AND structure_filters IS NOT DISTINCT FROM $3::jsonb
+            -- Strategy is part of the identity too (v1.69): a request for a FULL
+            -- verification must never attach to a running STRATIFIED one and
+            -- inherit a sampled result set as though it were exhaustive.
+            -- COALESCE so pre-v1.69 rows, which are all full runs, still match a
+            -- full request.
+            AND COALESCE(strategy, 'full') = $4
           ORDER BY started_at DESC
           LIMIT 1
         `,
-        [sessionId, patternIds, structureFiltersJson]
+        [sessionId, patternIds, structureFiltersJson, strategy]
       );
 
       if (active.rows[0]) {
@@ -317,11 +342,12 @@ export async function verificationRoutes(app: FastifyInstance) {
 
       const jobRow = await pool.query<{ id: string }>(
         `
-          INSERT INTO maintenance_jobs (session_id, kind, pattern_ids, structure_filters)
-          VALUES ($1, 'verify-urls', $2::uuid[], $3::jsonb)
+          INSERT INTO maintenance_jobs
+            (session_id, kind, pattern_ids, structure_filters, strategy)
+          VALUES ($1, 'verify-urls', $2::uuid[], $3::jsonb, $4)
           RETURNING id
         `,
-        [sessionId, patternIds, structureFiltersJson]
+        [sessionId, patternIds, structureFiltersJson, strategy]
       );
       const jobRowId = jobRow.rows[0].id;
 
@@ -330,7 +356,9 @@ export async function verificationRoutes(app: FastifyInstance) {
         job_row_id: jobRowId,
         pattern_ids: patternIds,
         target_statuses: targetStatuses,
-        structure_filters: structureFilters
+        structure_filters: structureFilters,
+        strategy,
+        ...(shapeSample === undefined ? {} : { shape_sample: shapeSample })
       });
 
       return reply.code(202).send({ job_row_id: jobRowId });

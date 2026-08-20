@@ -1220,7 +1220,13 @@ export async function startUrlVerification(
   // Structure scope (v1.66). The server requires exactly one pattern_id to
   // resolve it against, and records it on the job row so a scoped run can never
   // attach to an unscoped one and report its progress.
-  structureFilters?: StructureFilter[] | null
+  structureFilters?: StructureFilter[] | null,
+  // "stratified" probes a sample per URL SHAPE instead of every URL (v1.69),
+  // turning a 579,034-URL run from ~3h17m into roughly 1,150 requests. Shapes
+  // whose samples disagree come back unagreed rather than extrapolated, so the
+  // caller can escalate just those. Recorded on the job row for the same reason
+  // the structure scope is: a full request must never attach to a stratified one.
+  strategy?: "full" | "stratified"
 ): Promise<{ job_row_id: string }> {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/verify-urls`),
@@ -1234,7 +1240,8 @@ export async function startUrlVerification(
           : {}),
         ...(structureFilters && structureFilters.length > 0
           ? { structure_filter: structureFilters }
-          : {})
+          : {}),
+        ...(strategy === "stratified" ? { strategy } : {})
       })
     }
   );
@@ -1893,6 +1900,11 @@ export type RedirectCandidatesResponse = {
   // verifies more of the pattern. Optional so a client talking to an older
   // backend degrades to 0 rather than NaN.
   confirmed_redirect_count?: number;
+  // Additional URLs a per-shape rule would reach (v1.69) — INFERENCE, reported
+  // apart from the measured count above so the Accept label can name both rather
+  // than summing them into a number that hides the difference.
+  shape_extrapolated_count?: number;
+  trusted_shape_count?: number;
   // Sampled 404s in the list — delete-only rows, counted apart from the
   // redirects so the modal can say which of the two it is showing.
   sampled_broken_count?: number;

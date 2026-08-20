@@ -33,6 +33,17 @@ export type VerifyUrlsJobData = {
   // Optional like every other structureFilters field in the codebase, so an
   // unscoped enqueue reads exactly as it did before v1.66.
   structure_filters?: ResolvedStructureFilter[] | null;
+  // Probe a sample per URL SHAPE instead of every URL (v1.69). "full" is the
+  // default and the pre-v1.69 behaviour, so an older queued job replays
+  // unchanged.
+  //
+  // A shape is a CMS template, so a sample of one usually answers for all of it
+  // — turning 579,034 probes into roughly 1,150. Shapes whose samples DISAGREE
+  // are reported unagreed rather than extrapolated, so the caller can escalate
+  // just those. See jobs/shapeStrata.ts.
+  strategy?: "full" | "stratified";
+  // Probes per shape. Absent = DEFAULT_SHAPE_SAMPLE.
+  shape_sample?: number;
   // Statuses the caller asked about, for a status-scoped run ("Verify 404s").
   // Narrows what the completion count REPORTS, not what gets probed: a URL's
   // status cannot be known without checking it. null → every problem status.
