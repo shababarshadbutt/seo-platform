@@ -191,7 +191,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 
-import { appliesPatternWide, fixAcceptCount } from "@/lib/fix-accept-count";
+import {
+  appliesPatternWide,
+  fixAcceptCount,
+  fixModalBanner
+} from "@/lib/fix-accept-count";
 import { findSegmentDuplication } from "@/lib/segment-duplication";
 import {
   fixButtonState,
@@ -298,6 +302,21 @@ function defaultFixAction(candidate: RedirectCandidate): FixAction {
   }
 
   return candidate.destination_not_found ? "delete" : "fix";
+}
+
+// Rows the header "Set all to Fix" toggle is allowed to claim (v1.54).
+//
+// A delete_only row is a sampled 404 with no destination — its per-row Fix
+// button is `disabled` for exactly that reason — and a destination_not_found row
+// redirects to something that already looks like a soft-404. Analysis
+// pre-selects Delete for both. The old setAllFix() mapped over every candidate
+// unconditionally, so it assigned "fix" to rows the UI refuses to let you fix
+// one at a time; that only stayed harmless because you had to click it. The
+// toggle is now pressed on open, so a blanket "fix" would silently repoint live
+// URLs at dead ends before the user touched anything. Both kinds stay
+// individually settable.
+function canBulkFix(candidate: RedirectCandidate): boolean {
+  return !candidate.delete_only && !candidate.destination_not_found;
 }
 
 const statusColors: Record<PatternStatus, string> = {
@@ -961,6 +980,13 @@ export default function ResultsDashboardPage({
   const [fixPatternTotal, setFixPatternTotal] = useState(0);
   const [fixLoading, setFixLoading] = useState(false);
   const [fixInferredWithoutRule, setFixInferredWithoutRule] = useState(false);
+  // The header "Set all to Fix" toggle, pressed by default (v1.54). Pressed =
+  // target every URL in the pattern; released = only the reviewed rows the user
+  // selected. It used to be a bare text link that gave no way to tell clicked
+  // from not-clicked — and since most rows already default to Fix, clicking it
+  // often changed nothing visible, which read as a broken control. It now drives
+  // the Accept button's count, so pressing it always moves something.
+  const [fixAllInPattern, setFixAllInPattern] = useState(true);
   // Verify-then-act for the Fix modal now lives in PatternVerifyPanel (v1.50),
   // which owns its own pattern-scoped verification/triage state. It used to be
   // eight pieces of state here driving a SESSION-wide verify from inside a
@@ -2712,6 +2738,7 @@ export default function ResultsDashboardPage({
     setFixPatternTotal(0);
     setFixActions({});
     setFixInferredWithoutRule(false);
+    setFixAllInPattern(true);
     setFixPage(0);
     // Opening a different pattern must not inherit the previous one's chips.
     setFixStatusFilter(new Set());
@@ -2724,14 +2751,23 @@ export default function ResultsDashboardPage({
 
         setFixCandidates(data.candidates);
         setFixPatternTotal(data.pattern_total_urls);
-        // Default action per row (see defaultFixAction): verified-normal → Fix,
-        // verified-not-found → Delete, inferred → Skip (excluded from both
-        // actions until someone reviews it). (v1.42.1)
+        // Seeded through canBulkFix rather than defaultFixAction alone, because
+        // the header toggle opens PRESSED (v1.54) and the rows have to agree with
+        // it on the first render. What the toggle may not claim keeps its
+        // analysis default (see canBulkFix): sampled 404s and soft-404
+        // destinations open on Delete.
+        //
+        // NOTE this reverses the v1.42.1 default for INFERRED rows, which used to
+        // open on Skip so a user opted into them deliberately. A pressed "Set all
+        // to Fix" that quietly excluded most of the pattern would contradict both
+        // its own caption and the Accept button's count, so the opt-in now lives
+        // in the toggle itself — release it and every row falls back to
+        // defaultFixAction, inferred rows included.
         setFixActions(
           Object.fromEntries(
             data.candidates.map((candidate) => [
               candidate.key,
-              defaultFixAction(candidate)
+              canBulkFix(candidate) ? "fix" : defaultFixAction(candidate)
             ])
           )
         );
@@ -2784,10 +2820,25 @@ export default function ResultsDashboardPage({
     setFixActions((current) => ({ ...current, [key]: action }));
   }
 
-  // Top-level default: reset every row to Fix (per-row toggles stay overridable).
-  function setAllFix() {
+  // The header toggle (v1.54). Pressed claims every fixable row AND widens the
+  // Accept button's count to the whole pattern; released hands every row back to
+  // its analysis default and narrows the count to the selection. Two-way on
+  // purpose: the old one-way link left "already all Fix" and "your click did
+  // nothing" looking identical, which is what made it unreadable.
+  //
+  // Spans every loaded row, not the visible page — selection is keyed by
+  // candidate.key, so it survives paging and the status chips.
+  function toggleAllInPattern() {
+    const next = !fixAllInPattern;
+
+    setFixAllInPattern(next);
     setFixActions(
-      Object.fromEntries(fixCandidates.map((candidate) => [candidate.key, "fix"]))
+      Object.fromEntries(
+        fixCandidates.map((candidate) => [
+          candidate.key,
+          next && canBulkFix(candidate) ? "fix" : defaultFixAction(candidate)
+        ])
+      )
     );
   }
 
@@ -2928,24 +2979,27 @@ export default function ResultsDashboardPage({
   const fixCount = fixCandidates.filter(
     (candidate) => fixActionFor(candidate) === "fix"
   ).length;
-  // Does accepting reach beyond the rows on screen? Drives BOTH the indigo
-  // scope banner and the Accept button's count, from one predicate — writing the
-  // condition out separately per call site is what let them disagree in the
-  // first place. See lib/fix-accept-count.ts. (v1.53)
-  const fixAppliesPatternWide = appliesPatternWide({
+  // Does accepting reach beyond the rows on screen? One input object feeds the
+  // scope banner, the caption under the toggle and the Accept button's count —
+  // writing the condition out separately per call site is what let them disagree
+  // in the first place. See lib/fix-accept-count.ts. (v1.53, v1.54)
+  const fixScope = {
     fixPatternTotal,
     fixCandidateCount: fixCandidates.length,
-    inferredWithoutRule: fixInferredWithoutRule
-  });
-  // What "Accept Selected Changes" will actually change, which is not the same as
-  // how many rows are selected — the banner above the button already said so and
-  // the button disagreed with it. See lib/fix-accept-count.ts. (v1.53)
-  const fixAcceptLabelCount = fixAcceptCount({
-    fixCount,
-    fixPatternTotal,
-    fixCandidateCount: fixCandidates.length,
-    inferredWithoutRule: fixInferredWithoutRule
-  });
+    inferredWithoutRule: fixInferredWithoutRule,
+    allInPattern: fixAllInPattern
+  };
+  const fixAppliesPatternWide = appliesPatternWide(fixScope);
+  // Which banner qualifies the scope, chosen by one function rather than two
+  // independent gates in the JSX: now that the count follows the toggle instead
+  // of inferredWithoutRule, the old pair could both be true at once and the modal
+  // would claim pattern-wide scope and "only the sampled URLs are listed" inches
+  // apart. (v1.54)
+  const fixBanner = fixModalBanner(fixScope);
+  // What "Accept Selected Changes" targets, which is not the same as how many
+  // rows are selected — the banner above the button already said so and the
+  // button disagreed with it. See lib/fix-accept-count.ts. (v1.53)
+  const fixAcceptLabelCount = fixAcceptCount({ fixCount, ...fixScope });
   const deleteCount = fixCandidates.filter(
     (candidate) => fixActionFor(candidate) === "delete"
   ).length;
@@ -5213,22 +5267,41 @@ export default function ResultsDashboardPage({
                   applied by inference (not individually verified).
                 </p>
               )}
-              {/* Gated on the same predicate as the Accept button (v1.53). It used
-                  to key off the row-count comparison alone, so on a pattern whose
-                  redirects were too varied to infer one rule it claimed a
-                  pattern-wide rule applies while the amber banner directly below
-                  said the opposite — the scope-overclaiming bug this release fixed
-                  on the button, one element higher up. The two banners are now
-                  mutually exclusive by construction. */}
-              {fixAppliesPatternWide ? (
+              {/* One banner, chosen by fixModalBanner (v1.54) — see the "ONE
+                  SOURCE OF TRUTH" note in lib/fix-accept-count.ts. These were two
+                  independent gates, mutually exclusive only because the Accept
+                  count fell back to the reviewed rows whenever no rule could be
+                  inferred. The header toggle now drives that count instead, so on
+                  a pressed-but-ruleless pattern both gates would open and the
+                  modal would claim pattern-wide scope and "only the sampled URLs
+                  are listed" three lines apart. "scope-limited" is that case,
+                  stating both facts in one place.
+
+                  The showCheckButton guard is unchanged and still load-bearing:
+                  fixInferredWithoutRule is TRUE for a never-sampled pattern
+                  (rule === null, total > 0 sampled redirects), so copy about what
+                  "the confirmed redirects" showed would describe a measurement
+                  that never happened. "scope" cannot reach an unscored pattern at
+                  all — it needs a rule, and a rule needs samples. */}
+              {fixBanner === "scope" ? (
                 <p className="rounded-md bg-indigo-50 px-3 py-2 text-xs text-indigo-800">
                   Showing {formatNumber(fixCandidates.length)} for review —
                   accepting applies the confirmed rule to all{" "}
                   {formatNumber(fixPatternTotal)} matching URLs across this
                   pattern&rsquo;s files.
                 </p>
-              ) : null}
-              {fixInferredWithoutRule && !(fixRow && showCheckButton(fixRow)) ? (
+              ) : fixBanner === "scope-limited" ? (
+                <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  Accepting targets all {formatNumber(fixPatternTotal)} URLs in
+                  this pattern.{" "}
+                  {fixRow && showCheckButton(fixRow)
+                    ? "Nothing here has been checked yet, so only URLs with a confirmed destination can actually be rewritten — run a check below first."
+                    : `The confirmed redirects were too varied to infer a single rewrite rule, so only the ${formatNumber(
+                        fixCandidates.length
+                      )} reviewed URLs can be rewritten right now — verify more of the pattern to widen it.`}
+                </p>
+              ) : fixBanner === "no-rule" &&
+                !(fixRow && showCheckButton(fixRow)) ? (
                 <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
                   Only the sampled URLs are listed — the confirmed redirects were
                   too varied to infer a single rewrite rule for the rest.
@@ -5265,16 +5338,47 @@ export default function ResultsDashboardPage({
                 />
               ) : null}
               <div className="rounded-md border border-slate-200">
-                <div className="flex items-center justify-between border-b border-slate-200 px-3 py-2">
-                  <button
-                    type="button"
-                    className="text-sm font-semibold text-indigo-600 hover:text-indigo-700 disabled:opacity-40"
-                    onClick={setAllFix}
-                    disabled={fixCandidates.length === 0}
-                  >
-                    Set all to Fix
-                  </button>
-                  <span className="text-xs text-slate-500">
+                {/* items-start, not items-center: the left column is a button
+                    over a caption now, the right one a single line. */}
+                <div className="flex items-start justify-between gap-3 border-b border-slate-200 px-3 py-2">
+                  <div className="flex min-w-0 flex-col gap-1">
+                    {/* Pressed style lifted from the per-row Fix button below
+                        (bg-indigo-600 text-white) so the header control and the
+                        row controls speak one language. aria-pressed is a first
+                        for this codebase — the row toggles signal by colour alone
+                        — and the caption underneath is the non-colour cue. */}
+                    <button
+                      type="button"
+                      aria-pressed={fixAllInPattern}
+                      className={cn(
+                        "self-start rounded-md border px-3 py-1 text-sm font-semibold transition-colors disabled:opacity-40",
+                        fixAllInPattern
+                          ? "border-indigo-600 bg-indigo-600 text-white hover:bg-indigo-700"
+                          : "border-slate-300 bg-white text-slate-600 hover:bg-slate-50"
+                      )}
+                      onClick={toggleAllInPattern}
+                      disabled={fixCandidates.length === 0}
+                    >
+                      Set all to Fix
+                    </button>
+                    {/* Says the scope in words, so the state is legible without
+                        reading the colour — and so the jump between the Accept
+                        button's two numbers is explained where it is caused. */}
+                    <span className="text-xs text-slate-500">
+                      {fixAllInPattern
+                        ? fixPatternTotal > fixCandidates.length
+                          ? `Applies to all ${formatNumber(
+                              fixPatternTotal
+                            )} URLs in this pattern`
+                          : `Applies to all ${formatNumber(
+                              fixCandidates.length
+                            )} URLs`
+                        : `Applies to the ${formatNumber(fixCount)} selected URL${
+                            fixCount === 1 ? "" : "s"
+                          } only`}
+                    </span>
+                  </div>
+                  <span className="shrink-0 text-xs text-slate-500">
                     {fixStatusFilter.size > 0
                       ? `${formatNumber(filteredFixCandidates.length)} of ${formatNumber(
                           fixCandidates.length
