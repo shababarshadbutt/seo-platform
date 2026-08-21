@@ -336,18 +336,23 @@ export async function processApplyRedirectsJob(
 
   await invalidateSessionZipCache(sessionId);
 
-  // Mark the pattern as fixed, which is what draws the grey "Fixed" chip in the
+  // Mark the pattern as fixed, which is what draws the "Fixed" badge in the
   // results table (migration 046).
   //
-  // Deliberately here and NOT on the "nothing to rewrite" path above: that path
-  // returns without changing a single URL, and claiming a pattern was fixed when
-  // nothing happened is the same lie in the other direction as the button
-  // vanishing. Reached whenever real work was done — a confirmed pair rewritten
-  // in the transaction above, a widened rule applied to the files, or both.
-  await pool.query(
-    "UPDATE patterns SET redirects_applied_at = now() WHERE id = $1",
-    [patternId]
-  );
+  // GATED ON WORK ACTUALLY DONE (v1.74). The comment here used to say this was
+  // "reached whenever real work was done", and that was true when the only way
+  // past the early return was a confirmed pair. It stopped being true once a RULE
+  // could exist without matching anything: the reported case had a rule, swept
+  // every file, rewrote zero <loc> entries, and still stamped the pattern Fixed —
+  // "0 URLs updated" under a success tick, next to a grey Fixed chip.
+  //
+  // A pattern is fixed when a URL changed. Nothing else counts.
+  if (rewrittenLocCount > 0) {
+    await pool.query(
+      "UPDATE patterns SET redirects_applied_at = now() WHERE id = $1",
+      [patternId]
+    );
+  }
 
   logger.info(
     {

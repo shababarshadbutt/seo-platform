@@ -2112,6 +2112,18 @@ export async function applyPatternRedirects(
     updated?: number;
     inferred_applied?: number;
     rewritten_loc_count?: number;
+    files_scanned?: number;
+    // WHY nothing changed, when nothing changed (v1.74). "0 URLs updated" was the
+    // same message for "nothing to apply", "the rule matched nothing", and "these
+    // URLs were already rewritten by an earlier fix" — three situations needing
+    // opposite next steps. See sitemaps/applyOutcome.ts.
+    outcome?:
+      | "applied"
+      | "nothing-to-apply"
+      | "already-rewritten"
+      | "rule-matched-nothing"
+      | "no-source-files";
+    outcome_message?: string;
     // Set when a widened whole-pattern fix was too large to run inline and was
     // routed to a background job instead. (v1.42)
     queued?: boolean;

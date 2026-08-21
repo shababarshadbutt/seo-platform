@@ -214,9 +214,10 @@ import {
   measureTransformCoverage
 } from "@/lib/transform-coverage";
 import {
-  fixButtonState,
+  fixActionState,
+  hasStaleCountsAfterFix,
+  showFixedBadge,
   showCheckButton,
-  showFixButton,
   type PatternStatus
 } from "@/lib/fix-visibility";
 import {
@@ -258,10 +259,12 @@ type PatternRow = {
   missingInCurrent: boolean;
   redirectArtifactSegment: string | null;
   sourceFile: string | null;
-  // When this pattern's redirect fixes were applied, or null if never. Drives the
-  // grey "Fixed" chip — see fixButtonState. Deliberately NOT derived from status:
-  // a successful fix rescores the row healthy, so status alone cannot tell a
-  // fixed pattern from one that never needed fixing.
+  // When this pattern's redirect fixes were applied, or null if never.
+  //
+  // Drives TWO things (v1.74): the grey "Fixed" badge, and the warning that this
+  // row's URL counts predate that fix. Deliberately NOT derived from status — a
+  // successful fix rescores the row healthy, so status alone cannot tell a fixed
+  // pattern from one that never needed fixing. See lib/fix-visibility.ts.
   redirectsAppliedAt: string | null;
   originalTemplate: string | null;
   transformOriginalTemplate: string | null;
@@ -1693,9 +1696,12 @@ export default function ResultsDashboardPage({
         id: "fix",
         header: "Fix",
         enableSorting: false,
-        meta: { width: "60px" } satisfies PatternColumnMeta,
-        cell: ({ row }) =>
-          fixButtonState(row.original) === "fixed" ? (
+        // Wider since v1.74: a fixed pattern that is still fixable shows the
+        // badge AND the action, stacked.
+        meta: { width: "96px" } satisfies PatternColumnMeta,
+        cell: ({ row }) => (
+          <div className="flex flex-col items-start gap-1">
+            {showFixedBadge(row.original) ? (
             // Already fixed. Grey, not amber and not absent: amber asserts "a
             // problem is confirmed here", and absent is what this chip exists to
             // replace — a successful fix rescores the row healthy, so the button
@@ -1726,7 +1732,14 @@ export default function ResultsDashboardPage({
               <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
               Fixed
             </button>
-          ) : showFixButton(row.original) ? (
+            ) : null}
+            {/* THE ACTION, INDEPENDENT OF THE BADGE (v1.74). The badge used to
+                render INSTEAD of this, so a fixed pattern lost its amber "there
+                is still a problem here" cue — and on the reported session two
+                patterns showed Fixed with no visible way to act on them again.
+                fixActionState defers to status exactly as before; it just no
+                longer gets suppressed by having been fixed once. */}
+            {fixActionState(row.original) === "fix" ? (
             <button
               type="button"
               aria-label={`Fix redirects for ${row.original.template}`}
@@ -1741,7 +1754,7 @@ export default function ResultsDashboardPage({
               <Wrench className="h-3 w-3" aria-hidden="true" />
               Fix
             </button>
-          ) : showCheckButton(row.original) ? (
+            ) : fixActionState(row.original) === "check" ? (
             // Never-scored pattern (backend PENDING -> UNKNOWN here). Opens the
             // SAME dialog as Fix — which renders PatternVerifyPanel whenever
             // fixRow is set — so the triage/verify controls stop being reachable
@@ -1764,7 +1777,9 @@ export default function ResultsDashboardPage({
               <RefreshCw className="h-3 w-3" aria-hidden="true" />
               Check
             </button>
-          ) : null
+            ) : null}
+          </div>
+        )
       },
       {
         accessorKey: "coveragePct",
@@ -3083,15 +3098,25 @@ export default function ResultsDashboardPage({
       const changed =
         result.rewritten_loc_count ??
         (result.updated ?? 0) + (result.inferred_applied ?? 0);
+      // WHY, when nothing changed (v1.74). This used to report "0 URLs updated
+      // to their redirect destinations" with a success tick — the same sentence
+      // for "there was nothing to apply", "the rule is wrong", and "this pattern
+      // was already fixed", which are three situations needing opposite next
+      // steps. The server classifies it now; the tone follows.
+      const nothingChanged = changed === 0;
+
       setFindReplaceToast({
-        tone: "success",
-        message: `${formatNumber(changed)} URL${
-          changed === 1 ? "" : "s"
-        } updated to their redirect destinations${
-          result.inferred_applied
-            ? ` (${formatNumber(result.inferred_applied)} by inferred rule)`
-            : ""
-        }`
+        tone: nothingChanged ? "error" : "success",
+        message: nothingChanged
+          ? result.outcome_message ??
+            "Nothing was changed. Re-analyse the session to see the current URLs."
+          : `${formatNumber(changed)} URL${
+              changed === 1 ? "" : "s"
+            } updated to their redirect destinations${
+              result.inferred_applied
+                ? ` (${formatNumber(result.inferred_applied)} by inferred rule)`
+                : ""
+            }`
       });
     } catch (nextError) {
       setFindReplaceToast({
@@ -5786,6 +5811,35 @@ export default function ResultsDashboardPage({
                   // scoped delete removes only its verified rows.
                   structureFilters={fixStructureFilters}
                 />
+              ) : null}
+              {/* THE COUNTS ON THIS PATTERN PREDATE ITS LAST FIX (v1.74).
+                  apply-redirects rewrites the <loc> entries and then recomputes
+                  only redirect_pct and confidence_pct — it never re-extracts
+                  pattern_urls, pattern_file_occurrences or total_urls. So once a
+                  pattern has been fixed, its occurrence count and URL list
+                  describe the PRE-FIX files and its template no longer matches
+                  what is on disk.
+
+                  That is the root cause of the reported confusion: a second
+                  apply reports "0 URLs updated" and the Update Pattern modal says
+                  "No source files found" while the table still shows six figures
+                  of occurrences. Both are correct readings of stale inputs, and
+                  saying so is what makes them comprehensible. */}
+              {fixRow && hasStaleCountsAfterFix(fixRow) ? (
+                <p
+                  className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900"
+                  data-testid="fix-stale-counts"
+                >
+                  This pattern was already fixed
+                  {fixRow.redirectsAppliedAt
+                    ? ` on ${formatTimestamp(fixRow.redirectsAppliedAt)}`
+                    : ""}
+                  , and the counts here are from <strong>before</strong> that —
+                  the URL list and occurrence totals still describe the files as
+                  they were. If applying reports that nothing changed, that is
+                  why: these URLs have already been rewritten. Re-analyse the
+                  session to see the current ones.
+                </p>
               ) : null}
               {/* HUMAN-IN-THE-LOOP RULE APPROVAL (v1.71).
                   deriveRedirectRule refuses whenever the confirmed pairs

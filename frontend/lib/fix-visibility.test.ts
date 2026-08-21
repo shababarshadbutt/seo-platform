@@ -2,9 +2,12 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 
 import {
+  fixActionState,
   fixButtonState,
+  hasStaleCountsAfterFix,
   showCheckButton,
-  showFixButton
+  showFixButton,
+  showFixedBadge
 } from "./fix-visibility";
 
 // The regression this guards: /about-us-style patterns — total_urls = 1, the
@@ -169,4 +172,61 @@ test("fixed outranks check, so a fixed row does not auto-start a re-check", () =
     fixButtonState({ status: "UNKNOWN", redirectsAppliedAt: APPLIED }),
     "check"
   );
+});
+
+// --- badge and action are separate answers (v1.74) --------------------------
+
+const FIXED_BROKEN = {
+  status: "BAD" as const,
+  redirectsAppliedAt: "2026-08-21T02:30:00Z"
+};
+
+test("a fixed pattern still offers the Fix action", () => {
+  // The regression this closes: fixButtonState returns "fixed", the row rendered
+  // an inert chip INSTEAD of the button, and a fixed pattern became a dead end —
+  // exactly the wall hit on the reported session, where two patterns showed Fixed
+  // and there was no way to reopen either.
+  assert.equal(fixButtonState(FIXED_BROKEN), "fixed");
+  assert.equal(fixActionState(FIXED_BROKEN), "fix");
+  assert.equal(showFixedBadge(FIXED_BROKEN), true);
+});
+
+test("the badge does not invent an action where there was none", () => {
+  // A fixed pattern that is now Healthy has nothing to fix and nothing to check.
+  // The badge is still true; the action must not be conjured up to match it.
+  const healthy = { status: "GOOD" as const, redirectsAppliedAt: "2026-08-21T02:30:00Z" };
+
+  assert.equal(showFixedBadge(healthy), true);
+  assert.equal(fixActionState(healthy), "none");
+});
+
+test("a fixed UNKNOWN pattern still offers Check, not Fix", () => {
+  // The action keeps deferring to status, which is the distinction showFixButton
+  // and showCheckButton exist to keep apart. Being fixed once does not turn
+  // "never measured" into "confirmed broken".
+  const unknown = {
+    status: "UNKNOWN" as const,
+    redirectsAppliedAt: "2026-08-21T02:30:00Z"
+  };
+
+  assert.equal(fixActionState(unknown), "check");
+});
+
+test("an unfixed pattern has no badge and its action is unchanged", () => {
+  const unfixed = { status: "BAD" as const, redirectsAppliedAt: null };
+
+  assert.equal(showFixedBadge(unfixed), false);
+  assert.equal(fixActionState(unfixed), fixButtonState(unfixed));
+});
+
+// --- stale counts after a fix ------------------------------------------------
+
+test("counts are stale exactly once a fix has run", () => {
+  // apply-redirects rewrites the files and never re-extracts the pattern's URLs,
+  // so after a fix the occurrence count describes files that no longer exist in
+  // that shape. This is the root cause of "0 URLs updated" and of "No source
+  // files found" appearing beside a six-figure occurrence count.
+  assert.equal(hasStaleCountsAfterFix(FIXED_BROKEN), true);
+  assert.equal(hasStaleCountsAfterFix({ redirectsAppliedAt: null }), false);
+  assert.equal(hasStaleCountsAfterFix({}), false);
 });

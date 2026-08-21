@@ -90,6 +90,10 @@ export type RedirectFileRewrite = {
   // Newly written fixed files to delete if the transaction rolls back.
   newFilePaths: string[];
   rewrittenLocCount: number;
+  // Files actually opened and streamed (v1.74). Reported so a caller can tell
+  // "the rule matched nothing" from "no file was ever read" — those look
+  // identical in rewrittenLocCount and mean completely different things.
+  filesScanned: number;
 };
 
 // Rewrite the source XML files for a pattern's redirect fixes: every <loc>
@@ -157,7 +161,8 @@ export async function rewriteRedirectSourceFilesOnDisk(
     fixedStoredFilenames: [],
     oldFilePaths: [],
     newFilePaths: [],
-    rewrittenLocCount: 0
+    rewrittenLocCount: 0,
+    filesScanned: 0
   };
 
   for (const file of filesResult.rows) {
@@ -177,6 +182,8 @@ export async function rewriteRedirectSourceFilesOnDisk(
     try {
       await access(inputPath);
     } catch {
+      // Deliberately NOT counted as scanned: a file that could not be opened has
+      // told us nothing about whether the rule matches.
       // File already cleaned up / missing — nothing to rewrite for this row.
       continue;
     }
@@ -195,6 +202,11 @@ export async function rewriteRedirectSourceFilesOnDisk(
       isGzip,
       rewriteUrl
     });
+
+    // Counted AFTER the read succeeded and regardless of whether anything
+    // matched: this is "we looked in here", which is what separates a rule that
+    // found nothing from a pattern whose files are gone.
+    result.filesScanned += 1;
 
     if (rewrittenLocCount === 0) {
       // This file contained none of the affected URLs — discard the identical

@@ -176,6 +176,10 @@ import {
   lowCoverageMessage,
   measureTransformCoverage
 } from "../sitemaps/transformCoverage.js";
+import {
+  applyOutcomeMessage,
+  classifyApplyOutcome
+} from "../sitemaps/applyOutcome.js";
 import { parseShapeFilter } from "../sitemaps/shapeFilter.js";
 import {
   isOfferedRule,
@@ -4894,8 +4898,13 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       const patternResult = await pool.query<{
         source_role: string;
         template: string;
+        redirects_applied_at: string | null;
       }>(
-        "SELECT source_role, template FROM patterns WHERE session_id = $1 AND id = $2",
+        // redirects_applied_at joins the select for v1.74: a rewrite that matched
+        // nothing means something completely different on a pattern that was
+        // already fixed (expected end state) than on one that never was (the rule
+        // is wrong), and the response has to say which.
+        "SELECT source_role, template, redirects_applied_at FROM patterns WHERE session_id = $1 AND id = $2",
         [request.params.id, request.params.patternId]
       );
 
@@ -5326,6 +5335,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             : Array.from(candidateFiles);
 
         let rewrittenLocCount = 0;
+        let filesScanned = 0;
 
         // Rewrite when there are confirmed exact replacements to apply, a rule
         // to widen across the pattern's files, OR per-shape rules from a
@@ -5346,6 +5356,18 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           filesToDeleteOnError = rewrite.newFilePaths;
           filesToDeleteAfterCommit = rewrite.oldFilePaths;
           rewrittenLocCount = rewrite.rewrittenLocCount;
+          filesScanned = rewrite.filesScanned;
+        }
+
+        // A pattern is fixed when a URL changed, and not otherwise (v1.74). The
+        // inline path never stamped this at all, so a small pattern fixed here
+        // showed no Fixed badge while the queued path stamped even a zero-change
+        // run — the same flag unreliable in both directions.
+        if (rewrittenLocCount > 0) {
+          await client.query(
+            "UPDATE patterns SET redirects_applied_at = now() WHERE id = $1",
+            [request.params.patternId]
+          );
         }
 
         await client.query("COMMIT");
@@ -5363,10 +5385,28 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           ? Math.max(0, rewrittenLocCount - updated)
           : 0;
 
+        // WHY nothing changed, when nothing changed (v1.74). "0 URLs updated"
+        // under a success tick was the same message for "there was nothing to
+        // apply", "the rule is wrong" and "this pattern was already fixed" —
+        // three situations needing opposite next steps from the operator.
+        const outcome = classifyApplyOutcome({
+          rewrittenLocCount,
+          replacementCount: replacements.size,
+          widened: widen,
+          filesScanned,
+          previouslyFixed: Boolean(patternResult.rows[0].redirects_applied_at)
+        });
+
         return reply.send({
           updated,
           inferred_applied: inferredApplied,
-          rewritten_loc_count: rewrittenLocCount
+          rewritten_loc_count: rewrittenLocCount,
+          files_scanned: filesScanned,
+          outcome,
+          outcome_message: applyOutcomeMessage(
+            outcome,
+            rewrittenLocCount || updated
+          )
         });
       } catch (error) {
         await client.query("ROLLBACK");

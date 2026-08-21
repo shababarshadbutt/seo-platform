@@ -65,3 +65,55 @@ export function fixButtonState(row: {
 
   return showCheckButton(row) ? "check" : "none";
 }
+
+// The badge and the ACTION are two answers, not one (v1.74).
+//
+// WHAT WAS WRONG. fixButtonState returns "fixed" and the row renders an inert
+// grey chip INSTEAD of the Fix button, so a fixed pattern had no way back in. On
+// the reported session two patterns showed Fixed, a third reported "0 URLs
+// updated", and there was no route to reopen any of them and find out why.
+//
+// "fixed" outranking the current status is still right — it is a fact about what
+// was done, not a reading of the latest measurement, and the comment above
+// explains why. What was wrong is that it suppressed the action as well as
+// answering the question. A pattern that was fixed can still need previewing,
+// re-fixing after a re-analysis, or simply looking at.
+export function fixActionState(row: {
+  status: PatternStatus;
+  redirectsAppliedAt?: string | null;
+}): Exclude<FixButtonState, "fixed"> {
+  if (showFixButton(row)) {
+    return "fix";
+  }
+
+  return showCheckButton(row) ? "check" : "none";
+}
+
+// Is this pattern showing a Fixed badge?
+export function showFixedBadge(row: {
+  redirectsAppliedAt?: string | null;
+}): boolean {
+  return Boolean(row.redirectsAppliedAt);
+}
+
+// Do this pattern's URL counts predate its last fix?
+//
+// THE ROOT CAUSE OF THE REPORTED CONFUSION. apply-redirects rewrites the <loc>
+// entries and then recomputes only redirect_pct and confidence_pct — it never
+// re-extracts pattern_urls, pattern_file_occurrences or total_urls. So once a
+// pattern has been fixed, its occurrence count, coverage and URL list describe
+// the PRE-FIX files, and its template no longer matches what is on disk.
+//
+// That is why a second apply reports "0 URLs updated" and why the Update Pattern
+// modal says "No source files found" while the table still shows 6,969
+// occurrences: both are correct readings of stale inputs. Saying so is what makes
+// the zeros comprehensible instead of looking like a broken tool.
+//
+// Cleared by a re-analysis for free: extraction DELETEs and re-INSERTs the
+// pattern rows, so redirects_applied_at comes back NULL on a fresh row. That is
+// why this needs no separate timestamp to compare against.
+export function hasStaleCountsAfterFix(row: {
+  redirectsAppliedAt?: string | null;
+}): boolean {
+  return Boolean(row.redirectsAppliedAt);
+}
