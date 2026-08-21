@@ -11,7 +11,8 @@ import {
   Loader2,
   RefreshCw,
   ShieldAlert,
-  Trash2
+  Trash2,
+  Wrench
 } from "lucide-react";
 
 import {
@@ -32,6 +33,7 @@ import {
   type VerificationStatus
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { confirmedProblemKind } from "@/lib/confirmed-problem-kind";
 import { etaSecondsFrom, verifyProgress } from "@/lib/verify-progress";
 import { Progress } from "@/components/ui/progress";
@@ -86,6 +88,19 @@ type Props = {
   // exactly what a re-check rewrites. Must be stable (useCallback): it is a
   // dependency of the poll loop.
   onRescored?: () => void;
+  // Take these URLs to the fix flow instead of deleting them (v1.75).
+  //
+  // v1.74 demoted the delete button and added a line saying redirects can be
+  // fixed rather than deleted — both correct, and both in the BUTTON ROW. The
+  // review panel below it, which is what an operator is actually looking at
+  // once they have pressed Review, offered a red confirm and a Cancel and no
+  // fix path at all. The advice had scrolled out of view at the exact moment
+  // the decision was made.
+  //
+  // The parent owns the fix controls (they live above this panel in the same
+  // dialog), so this hands the decision back rather than reaching upward from
+  // here. Omitted = no fix affordance, unchanged prior behaviour.
+  onFixInstead?: () => void;
   // Start the re-check immediately on open, without a second click.
   //
   // Set when the dialog was opened from the table's "Check" button, which appears
@@ -172,6 +187,7 @@ export function PatternVerifyPanel({
   selectedStatuses,
   onSelectedStatusesChange,
   onRescored,
+  onFixInstead,
   autoStartRecheck = false,
   hostRefused = null,
   structureFilters = null
@@ -495,6 +511,12 @@ export function PatternVerifyPanel({
     statuses: effectiveStatuses,
     counts: confirmedCounts
   }).allFixable;
+  // Whether the OPEN REVIEW PANEL leads with fix rather than delete (v1.75).
+  // Same decision as the button row above, applied where the operator actually
+  // commits — the parent must have given us somewhere to send them, or an
+  // offered fix would be a button that does nothing.
+  const canFixInsteadOfDelete =
+    isConfirmed && confirmedAreAllFixable && Boolean(onFixInstead);
 
   async function handleTriage() {
     setError("");
@@ -1235,12 +1257,50 @@ export function PatternVerifyPanel({
                 ) : null}
               </p>
 
+              {/* THE FIX PATH, AT THE POINT OF DECISION (v1.75). Saying
+                  "these can be fixed" up in the button row was not enough: by
+                  the time this panel is open that line is off screen, and the
+                  only things in front of the operator are a red confirm and a
+                  Cancel. When every URL here redirects somewhere, rewriting is
+                  the action and deleting discards pages that still work — so
+                  the fix leads and the delete is demoted to a quiet outline.
+                  An explicit chip selection still keeps delete available; this
+                  changes which one is loud, not which ones exist. */}
+              {canFixInsteadOfDelete ? (
+                <p className="text-xs text-red-900">
+                  Every one of these redirects to a working page. Rewriting them
+                  to their destinations keeps those pages in the sitemap;
+                  deleting removes them.
+                </p>
+              ) : null}
+
               <div className="flex flex-wrap gap-2">
+                {canFixInsteadOfDelete ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="gap-1"
+                    disabled={deleting}
+                    data-testid="delete-review-fix-instead"
+                    onClick={() => {
+                      setDeleteReview(null);
+                      onFixInstead?.();
+                    }}
+                  >
+                    <Wrench className="h-3.5 w-3.5" />
+                    Fix these {formatNumber(deleteReview.total_urls)} URL
+                    {deleteReview.total_urls === 1 ? "" : "s"} instead
+                  </Button>
+                ) : null}
                 <Button
                   type="button"
-                  variant="destructive"
+                  variant={canFixInsteadOfDelete ? "outline" : "destructive"}
                   size="sm"
-                  className="gap-1"
+                  className={cn(
+                    "gap-1",
+                    canFixInsteadOfDelete &&
+                      "border-red-300 text-red-700 hover:bg-red-100"
+                  )}
                   disabled={deleting}
                   onClick={() => void handleDelete()}
                 >

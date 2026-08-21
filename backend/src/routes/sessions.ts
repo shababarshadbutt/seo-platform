@@ -180,6 +180,7 @@ import {
   applyOutcomeMessage,
   classifyApplyOutcome
 } from "../sitemaps/applyOutcome.js";
+import { applyFileScope } from "../sitemaps/applyFileScope.js";
 import { parseShapeFilter } from "../sitemaps/shapeFilter.js";
 import {
   isOfferedRule,
@@ -5306,33 +5307,22 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             inferredUrls.length > 0 ||
             widenRequested);
 
-        // A per-shape rule widens the same way a whole-pattern rule does: it is
-        // a pure per-URL transform, so it reaches occurrences in files no sampled
-        // URL came from. Without this the scan would be limited to the files the
-        // confirmed replacements touched and a shape rule would silently reach
-        // only part of its shape.
-        const widenFiles = widen || shapeRules.size > 0;
-
-        if (widenFiles) {
-          // Scan the pattern's real, complete file list (pattern_file_occurrences
-          // — the precise set of files this pattern's URLs live in), not just the
-          // files the sampled URLs came from. Empty (older sessions) → scan every
-          // file of the role via the [] fallback below; the rewriter no-ops on
-          // files with no matching <loc>, so an over-broad scan is only slower.
-          const occurrenceResult = await client.query<{ source_file: string }>(
-            "SELECT DISTINCT source_file FROM pattern_file_occurrences WHERE pattern_id = $1",
-            [request.params.patternId]
-          );
-
-          for (const row of occurrenceResult.rows) {
-            candidateFiles.add(row.source_file);
-          }
-        }
-
-        const selectedDisplayFiles =
-          widenFiles && candidateFiles.size === 0
-            ? []
-            : Array.from(candidateFiles);
+        // WHICH FILES TO OPEN — one decision, shared with the queued job so the
+        // same apply cannot reach a different set of files depending on whether
+        // the pattern crossed the inline/queued threshold. That divergence is
+        // what rewrote 10 of 579,034 URLs on a 187-file pattern; applyFileScope
+        // holds the full reasoning.
+        const occurrenceResult = await client.query<{ source_file: string }>(
+          "SELECT DISTINCT source_file FROM pattern_file_occurrences WHERE pattern_id = $1",
+          [request.params.patternId]
+        );
+        const patternFileCount = occurrenceResult.rows.length;
+        const selectedDisplayFiles = applyFileScope({
+          sampledFiles: candidateFiles,
+          occurrenceFiles: occurrenceResult.rows.map((row) => row.source_file),
+          hasReplacements: replacements.size > 0,
+          hasRule: widen || shapeRules.size > 0
+        });
 
         let rewrittenLocCount = 0;
         let filesScanned = 0;
@@ -5402,6 +5392,11 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           inferred_applied: inferredApplied,
           rewritten_loc_count: rewrittenLocCount,
           files_scanned: filesScanned,
+          // How many files the pattern spans, so the UI can say "across 4 of
+          // 187 files" (v1.75). A count that disagrees with the button is much
+          // easier to chase when the scope is on screen next to it — that
+          // sentence is what was missing when 10 of 579,034 looked like success.
+          pattern_file_count: patternFileCount,
           outcome,
           outcome_message: applyOutcomeMessage(
             outcome,

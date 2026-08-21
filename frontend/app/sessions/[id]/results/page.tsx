@@ -220,6 +220,7 @@ import {
   showCheckButton,
   type PatternStatus
 } from "@/lib/fix-visibility";
+import { applyScopeNote } from "@/lib/apply-scope-note";
 import {
   analysisSettled,
   unscoredReasonFor,
@@ -1006,6 +1007,8 @@ export default function ResultsDashboardPage({
   // often changed nothing visible, which read as a broken control. It now drives
   // the Accept button's count, so pressing it always moves something.
   const [fixAllInPattern, setFixAllInPattern] = useState(true);
+  // Scroll target for handleFixInsteadOfDelete (v1.75).
+  const fixAcceptRef = useRef<HTMLButtonElement>(null);
   // ---- "Limit this edit to" for the Fix modal (v1.66) --------------------
   // Same control the Update Pattern modal has had since v1.51, and the same
   // state shape (see renameStructureSelections): one selection per {param}
@@ -2984,6 +2987,35 @@ export default function ResultsDashboardPage({
     }));
   }
 
+  // "Fix these N URLs instead", from inside the delete review panel (v1.75).
+  //
+  // Does the two things the operator would otherwise have to do by hand after
+  // cancelling out of the review: claim every fixable row in the current scope,
+  // and put the Accept button in front of them. Nothing is applied here — the
+  // decision still needs the press, and the count on Accept is what they are
+  // agreeing to.
+  function handleFixInsteadOfDelete() {
+    setFixAllInPattern(true);
+    setFixActions((current) => ({
+      ...current,
+      ...Object.fromEntries(
+        scopedFixCandidates.map((candidate) => [
+          candidate.key,
+          canBulkFix(candidate) ? "fix" : defaultFixAction(candidate)
+        ])
+      )
+    }));
+    // After the state lands, so the button exists to scroll to. Centred rather
+    // than aligned to the top: the rows being accepted should stay visible with
+    // it, or this becomes a jump to a number with no context.
+    window.requestAnimationFrame(() => {
+      fixAcceptRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "center"
+      });
+    });
+  }
+
   // Count how many URLs each candidate rule really changes (v1.72).
   //
   // Streams the pattern's files server-side, so it is asked for rather than run
@@ -3104,6 +3136,13 @@ export default function ResultsDashboardPage({
       // was already fixed", which are three situations needing opposite next
       // steps. The server classifies it now; the tone follows.
       const nothingChanged = changed === 0;
+      // How much of the pattern the rewrite actually opened (v1.75). "10 URLs
+      // updated" was true while 183 of 187 files were never read, and nothing
+      // said so — see applyScopeNote.
+      const scopeNote = applyScopeNote({
+        filesScanned: result.files_scanned,
+        patternFileCount: result.pattern_file_count
+      });
 
       setFindReplaceToast({
         tone: nothingChanged ? "error" : "success",
@@ -3116,7 +3155,7 @@ export default function ResultsDashboardPage({
               result.inferred_applied
                 ? ` (${formatNumber(result.inferred_applied)} by inferred rule)`
                 : ""
-            }`
+            }${scopeNote ? ` ${scopeNote}` : ""}`
       });
     } catch (nextError) {
       setFindReplaceToast({
@@ -5791,6 +5830,12 @@ export default function ResultsDashboardPage({
                   // lands. Silent + modal stays open: the user is still working
                   // in it.
                   onRescored={handlePatternRescored}
+                  // The delete review panel's way out (v1.75). Pressing Review
+                  // used to leave a red confirm as the only action on screen
+                  // even when every URL redirected somewhere; the fix controls
+                  // are in THIS dialog, above the panel, so taking that route
+                  // is a matter of selecting them and scrolling there.
+                  onFixInstead={handleFixInsteadOfDelete}
                   // Opened via "Check" (never-scored rows only) → check it, don't
                   // just show a panel. Opened via the amber "Fix" → leave it to an
                   // explicit press; that row already has a measurement.
@@ -6588,6 +6633,7 @@ export default function ResultsDashboardPage({
                 </Button>
                 <Button
                   type="button"
+                  ref={fixAcceptRef}
                   className="bg-amber-600 hover:bg-amber-700"
                   // fixScopeEmpty as well as the selection count: a settled
                   // zero-match combination has nothing to rewrite, and the user

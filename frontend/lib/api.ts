@@ -2113,6 +2113,10 @@ export async function applyPatternRedirects(
     inferred_applied?: number;
     rewritten_loc_count?: number;
     files_scanned?: number;
+    // How many files the pattern spans (v1.75), so the toast can say "across 4
+    // of 187 files" when the rewrite reached only part of it. That sentence is
+    // what was missing when 10 of 579,034 URLs looked like a clean success.
+    pattern_file_count?: number;
     // WHY nothing changed, when nothing changed (v1.74). "0 URLs updated" was the
     // same message for "nothing to apply", "the rule matched nothing", and "these
     // URLs were already rewritten by an earlier fix" — three situations needing

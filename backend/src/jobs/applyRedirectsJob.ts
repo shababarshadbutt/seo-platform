@@ -18,6 +18,7 @@ import {
 } from "../sitemaps/rewriteLocs.js";
 import { deriveRedirectRule } from "../sitemaps/redirectRule.js";
 import { recomputePatternStatsSql } from "../sitemaps/redirectApply.js";
+import { applyFileScope } from "../sitemaps/applyFileScope.js";
 import { applyStructureFilterToRewriter } from "../sitemaps/structureClusters.js";
 import {
   FILE_REWRITE_PARALLEL_THRESHOLD,
@@ -178,13 +179,23 @@ export async function processApplyRedirectsJob(
     return;
   }
 
-  // Target files: those this pattern's URLs actually live in.
+  // Target files: those this pattern's URLs actually live in. Decided by the
+  // shared applyFileScope (v1.75) — this path had it right and the inline route
+  // did not, so the fix is for both to ask the same function rather than for
+  // this logic to be correct twice.
   const occurrenceResult = await pool.query<{ source_file: string }>(
     "SELECT DISTINCT source_file FROM pattern_file_occurrences WHERE pattern_id = $1",
     [patternId]
   );
   const targetDisplays = new Set(
-    occurrenceResult.rows.map((row) => row.source_file)
+    applyFileScope({
+      // The job re-reads occurrences rather than carrying the route's candidate
+      // set, so it contributes none of its own.
+      sampledFiles: [],
+      occurrenceFiles: occurrenceResult.rows.map((row) => row.source_file),
+      hasReplacements: replacements.size > 0,
+      hasRule: effectiveRule !== null
+    })
   );
 
   const filesResult = await pool.query<SitemapFileRow>(
