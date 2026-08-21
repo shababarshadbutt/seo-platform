@@ -126,13 +126,17 @@ export async function rewriteRedirectSourceFilesOnDisk(
     // destination and no whole-pattern rule applies. See shapeStrata.ts for why
     // a shape can distil a rule when the whole pattern cannot.
     shapeRules?: Map<string, RedirectRule> | null;
+    // URLs the operator set to Skip or Delete (v1.73). The rule would otherwise
+    // sweep them anyway — see buildRedirectApplyRewriter.
+    excludeUrls?: Set<string> | null;
   }
 ): Promise<RedirectFileRewrite> {
   const rewriteUrl = applyStructureFilterToRewriter(
     buildRedirectApplyRewriter(
       options.replacements,
       options.rule ?? null,
-      options.shapeRules ?? null
+      options.shapeRules ?? null,
+      options.excludeUrls ?? null
     ),
     options.structureFilters ?? null
   );

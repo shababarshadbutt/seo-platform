@@ -4874,6 +4874,16 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // redirects usually decompose into one literal rule per category, so no
       // single option fits them all.
       approved_rules?: unknown;
+      // Apply the rule pattern-wide (v1.73). Replaces inferred_urls in its only
+      // remaining job — that field is already documented as "a widen requested
+      // signal; its contents are not used to rewrite", so sending 27,365 URLs to
+      // convey one boolean was pure waste, and on a big pattern it was a 413.
+      widen?: unknown;
+      // URLs to leave alone: the rows set to Skip or Delete. Sending the
+      // EXCLUSIONS keeps the request a few hundred bytes at any pattern size,
+      // where listing the inclusions grew to ~1.6 MB and was rejected by the
+      // proxy in front of the app.
+      exclude_urls?: unknown[];
     };
   }>(
     "/api/sessions/:id/patterns/:patternId/apply-redirects",
@@ -4939,6 +4949,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           )
         : null;
 
+      const excludeUrls = Array.isArray(request.body?.exclude_urls)
+        ? request.body!.exclude_urls.filter(
+            (url): url is string => typeof url === "string"
+          )
+        : [];
+      const excludeSet = excludeUrls.length > 0 ? new Set(excludeUrls) : null;
+      const widenRequested = request.body?.widen === true;
+
       // Optional (v1.42): unsampled URLs to also rewrite by inference. The
       // client only sends WHICH urls; the server recomputes their destinations
       // from the rule distilled from the confirmed samples, so it stays
@@ -4989,7 +5007,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // That is exactly what this routing exists to prevent, and the comment
       // below names the two incidents it came from. It had not bitten only
       // because the reported pattern spans 3 files, under the threshold.
-      if (approvedRules.length > 0 || inferredUrls.length > 0) {
+      if (approvedRules.length > 0 || inferredUrls.length > 0 || widenRequested) {
         const fileSpanResult = await pool.query<{ n: string }>(
           "SELECT COUNT(DISTINCT source_file)::bigint AS n FROM pattern_file_occurrences WHERE pattern_id = $1",
           [request.params.patternId]
@@ -5003,7 +5021,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             url_ids: urlIds,
             inferred_urls: inferredUrls,
             structure_filters: redirectStructureFilters,
-            approved_rules: approvedRules.length > 0 ? approvedRules : null
+            approved_rules: approvedRules.length > 0 ? approvedRules : null,
+            exclude_urls: excludeUrls.length > 0 ? excludeUrls : null
           });
 
           return reply.send({
@@ -5126,9 +5145,17 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
               AND final_url IS NOT NULL
               AND final_url <> url
               AND ($2::uuid[] IS NULL OR id = ANY($2::uuid[]))
+              -- Skip is the operator's explicit "leave this alone", so an
+              -- excluded row must not have its destination adopted either — the
+              -- row would then read as fixed while the file was untouched.
+              AND ($3::text[] IS NULL OR NOT (url = ANY($3::text[])))
             RETURNING original_url, url, source_file
           `,
-          [request.params.patternId, urlIds]
+          [
+            request.params.patternId,
+            urlIds,
+            excludeUrls.length > 0 ? excludeUrls : null
+          ]
         );
         // Recompute redirect / confidence from samples using the SAME formula
         // as the sampling job (scoreWeight per category), so this is an exact
@@ -5191,6 +5218,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
               AND final_url <> url
               AND is_deleted_from_sitemap = false
               AND ($3::text[] IS NULL OR url = ANY($3::text[]))
+              AND ($4::text[] IS NULL OR NOT (url = ANY($4::text[])))
           `,
           [
             request.params.id,
@@ -5205,7 +5233,11 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             // destination instead, which is strictly better than an inference.
             // Sampled selections need no entry here: the UPDATE above already
             // put them in `replacements`.
-            urlIds === null ? null : inferredUrls
+            // widen (v1.73) means "every confirmed redirect in scope", which is
+            // what url_ids: null already meant. Kept separate from inferredUrls
+            // so an older client that still sends the list keeps working.
+            urlIds === null || widenRequested ? null : inferredUrls,
+            excludeUrls.length > 0 ? excludeUrls : null
           ]
         );
 
@@ -5261,7 +5293,9 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // capped preview — would cap the very thing being approved.
         const widen =
           inferredRule !== null &&
-          (approvedRules.length > 0 || inferredUrls.length > 0);
+          (approvedRules.length > 0 ||
+            inferredUrls.length > 0 ||
+            widenRequested);
 
         // A per-shape rule widens the same way a whole-pattern rule does: it is
         // a pure per-URL transform, so it reaches occurrences in files no sampled
@@ -5305,7 +5339,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             selectedDisplayFiles,
             rule: widen ? inferredRule : null,
             structureFilters: redirectStructureFilters,
-            shapeRules
+            shapeRules,
+            excludeUrls: excludeSet
           });
 
           filesToDeleteOnError = rewrite.newFilePaths;

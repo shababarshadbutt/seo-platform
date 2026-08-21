@@ -79,12 +79,25 @@ export function buildRedirectApplyRewriter(
   // be probed end to end. Within one shape — one CMS template — the constraint
   // only has to hold among URLs built the same way, so rules become derivable at
   // all rather than merely faster.
-  shapeRules?: Map<string, RedirectRule> | null
+  shapeRules?: Map<string, RedirectRule> | null,
+  // URLs the operator set to Skip or Delete (v1.73). A rule sweeps EVERY matching
+  // <loc>, so without this guard a skipped row is still rewritten — the database
+  // would record "skipped" and the file would say otherwise, which is the worst
+  // of the two possible bugs because nothing on screen would ever disagree.
+  //
+  // Checked FIRST, before the exact map: an exclusion is the operator's explicit
+  // "leave this alone", and it outranks even a confirmed destination.
+  excludeUrls?: Set<string> | null
 ): LocUrlRewriter {
   const byShape = shapeRules ?? null;
   const rules = rule === null ? [] : Array.isArray(rule) ? rule : [rule];
+  const excluded = excludeUrls ?? null;
 
   return (url: string) => {
+    if (excluded !== null && excluded.has(url)) {
+      return null;
+    }
+
     const exact = exactReplacements.get(url);
 
     if (exact !== undefined) {

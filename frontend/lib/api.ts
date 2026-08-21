@@ -2054,13 +2054,24 @@ export async function applyPatternRedirects(
   // usually decompose into one literal rule per category, so no single option
   // fits them all. The server validates EVERY entry against the candidates it
   // derived itself, so this is a selection, never an injected rewrite.
-  approvedRules?: RedirectRuleCandidate["rule"][] | null
+  approvedRules?: RedirectRuleCandidate["rule"][] | null,
+  // Apply the rule pattern-wide, and the URLs to leave alone (v1.73).
+  //
+  // WHY EXCLUSIONS. This request used to list every SELECTED url — 27,365 of
+  // them on the reported pattern, ~1.6 MB of body, which the proxy in front of
+  // the app rejected with a 413. The selection is almost always "everything
+  // except a handful", so sending the handful is a few hundred bytes at any
+  // pattern size and the payload stops scaling with the pattern.
+  widen?: boolean,
+  excludeUrls?: string[] | null
 ) {
   const body: {
     url_ids?: string[];
     inferred_urls?: string[];
     structure_filter?: StructureFilter[];
     approved_rules?: RedirectRuleCandidate["rule"][];
+    widen?: boolean;
+    exclude_urls?: string[];
   } = {};
 
   if (urlIds) {
@@ -2077,6 +2088,14 @@ export async function applyPatternRedirects(
 
   if (approvedRules && approvedRules.length > 0) {
     body.approved_rules = approvedRules;
+  }
+
+  if (widen) {
+    body.widen = true;
+  }
+
+  if (excludeUrls && excludeUrls.length > 0) {
+    body.exclude_urls = excludeUrls;
   }
 
   const response = await fetchWithTimeout(

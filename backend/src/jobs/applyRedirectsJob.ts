@@ -154,6 +154,10 @@ export async function processApplyRedirectsJob(
   // derived from its own confirmed pairs, so they are as authoritative here as
   // the derived rule was.
   const approvedRules = data.approved_rules ?? null;
+  // URLs the operator set to Skip or Delete (v1.73). Held as a Set here and
+  // passed as an array to the pool — see the spec's note.
+  const excludeUrls = data.exclude_urls ?? null;
+  const excludeSet = excludeUrls ? new Set(excludeUrls) : null;
   const widen =
     (approvedRules !== null && approvedRules.length > 0) ||
     (inferredUrls.length > 0 && rule !== null);
@@ -310,6 +314,7 @@ export async function processApplyRedirectsJob(
               kind: "redirectApply",
               replacements: replacementPairs,
               rule: effectiveRule,
+              excludeUrls,
               structureFilters
             }
           }).then((result) => result.rewrittenCount)
@@ -318,7 +323,7 @@ export async function processApplyRedirectsJob(
     );
   } else {
     const rewriter = applyStructureFilterToRewriter(
-      buildRedirectApplyRewriter(replacements, effectiveRule),
+      buildRedirectApplyRewriter(replacements, effectiveRule, null, excludeSet),
       structureFilters
     );
 

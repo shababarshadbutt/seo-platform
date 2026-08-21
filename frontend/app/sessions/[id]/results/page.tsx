@@ -3019,8 +3019,20 @@ export default function ResultsDashboardPage({
     const sampledIds = selected
       .filter((candidate) => candidate.is_sampled && candidate.sampled_url_id)
       .map((candidate) => candidate.sampled_url_id as string);
-    const inferredUrls = selected
-      .filter((candidate) => !candidate.is_sampled)
+    // EXCLUSIONS, not inclusions (v1.73). Everything in scope the operator did
+    // NOT leave on Fix.
+    //
+    // This request used to list every selected URL. v1.71 put verified_urls rows
+    // in the list as is_sampled: false, which routed them into inferred_urls —
+    // 27,365 full URLs, ~1.6 MB of body, rejected by the proxy with a 413. The
+    // selection is almost always "everything except a handful", and one skipped
+    // row was enough to defeat the v1.68 shortcut below, so the payload has to
+    // stop scaling with the pattern rather than scale a bit less often.
+    const excludeUrls = scopedFixCandidates
+      .filter(
+        (candidate) =>
+          (fixActions[candidate.key] ?? defaultFixAction(candidate)) !== "fix"
+      )
       .map((candidate) => candidate.url);
 
     setIsFixing(true);
@@ -3032,18 +3044,20 @@ export default function ResultsDashboardPage({
       // accept used to rewrite ~10 URLs however much the user had verified, so
       // taking it off is the fix (v1.68).
       //
-      // Only safe when nothing was deviated from Fix: url_ids: null ignores
-      // per-row choices by design, so a single Skip or Delete anywhere in scope
-      // sends the explicit list instead and keeps that choice honoured.
-      const acceptEverythingInScope =
-        fixAllInPattern && deleteCount === 0 && skipCount === 0;
+      // Now ALWAYS omitted when the toggle is pressed: the per-row choices that
+      // used to force an explicit list are carried by exclude_urls instead, so a
+      // single Skip no longer means enumerating tens of thousands of inclusions.
       const result = await applyPatternRedirects(
         params.id,
         fixRow.id,
-        acceptEverythingInScope ? undefined : sampledIds,
-        inferredUrls,
+        fixAllInPattern ? undefined : sampledIds,
+        // inferred_urls is no longer sent: `widen` carries the one bit of
+        // meaning it had left.
+        undefined,
         fixStructureFilters,
-        fixApprovedRules
+        fixApprovedRules,
+        fixAllInPattern,
+        excludeUrls
       );
 
       setFixRow(null);

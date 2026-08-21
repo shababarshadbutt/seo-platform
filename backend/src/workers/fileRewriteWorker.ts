@@ -64,6 +64,11 @@ export type FileRewriteSpec =
       // crosses the thread edge unchanged.
       rule: RedirectRule | RedirectRule[] | null;
       structureFilters?: ResolvedStructureFilter[] | null;
+      // Excluded URLs as an ARRAY, not a Set: structured clone does carry Sets,
+      // but every other collection in this spec crosses as a plain array
+      // (replacements is [string, string][] for the same reason) and one
+      // exception is how a serialisation bug gets introduced later.
+      excludeUrls?: string[] | null;
     }
   // Pattern structure transform (v1.48). The RAW structure strings cross the
   // thread edge, not the parsed form — parseStructure is cheap, deterministic and
@@ -108,7 +113,12 @@ function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
     // out-of-scope URL must pass through even if it happens to be one of the
     // confirmed sampled pairs, or "limit this edit to" would leak.
     return applyStructureFilterToRewriter(
-      buildRedirectApplyRewriter(new Map(spec.replacements), spec.rule),
+      buildRedirectApplyRewriter(
+        new Map(spec.replacements),
+        spec.rule,
+        null,
+        spec.excludeUrls ? new Set(spec.excludeUrls) : null
+      ),
       spec.structureFilters ?? null
     );
   }

@@ -65,6 +65,10 @@ export type ApplyRedirectsJobData = {
   // exactly the disagreeing pairs that make an approval necessary, so a job that
   // re-derived would silently do nothing.
   approved_rules?: RedirectRule[] | null;
+  // URLs to leave alone (v1.73). Carried into the job or a wide pattern loses the
+  // operator's Skip choices at the queue boundary — the DB would say skipped and
+  // the file would not.
+  exclude_urls?: string[] | null;
 };
 
 // Pattern structure operations. Everything the worker needs is in the

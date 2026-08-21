@@ -326,3 +326,74 @@ test("an empty rule list behaves exactly like no rule", () => {
     );
   }
 });
+
+// --- exclusions (v1.73) ------------------------------------------------------
+// A rule sweeps every matching <loc>, so a row the operator set to Skip is still
+// rewritten unless something stops it. That is the worst of the two possible
+// bugs: the database records "skipped", the file disagrees, and nothing on
+// screen ever contradicts itself.
+
+test("an excluded URL is left alone even though a rule matches it", () => {
+  const rule: RedirectRule = { kind: "replace", find: "-old", replace: "-new" };
+  const skipped = "https://x.com/a/thing-old/";
+  const rewrite = buildRedirectApplyRewriter(
+    new Map(),
+    rule,
+    null,
+    new Set([skipped])
+  );
+
+  assert.equal(rewrite(skipped), null);
+  // The control: the same rule DOES rewrite its neighbours, so the null above is
+  // the exclusion working and not a rule that never applied.
+  assert.equal(
+    rewrite("https://x.com/b/thing-old/"),
+    "https://x.com/b/thing-new/"
+  );
+});
+
+test("an exclusion outranks even a confirmed destination", () => {
+  // Skip is the operator's explicit "leave this alone". A fetched destination is
+  // stronger evidence than a rule, but it is not a decision — this is.
+  const url = "https://x.com/a/1/";
+  const exact = new Map([[url, "https://x.com/confirmed/"]]);
+  const rewrite = buildRedirectApplyRewriter(
+    exact,
+    null,
+    null,
+    new Set([url])
+  );
+
+  assert.equal(rewrite(url), null);
+});
+
+test("an exclusion blocks a per-shape rule too", () => {
+  const shapeRules = new Map<string, RedirectRule>([
+    ["/a/a-9/", { kind: "replace", find: "old", replace: "new" }]
+  ]);
+  const url = "https://x.com/a/old-1/";
+
+  assert.equal(
+    buildRedirectApplyRewriter(new Map(), null, shapeRules, new Set([url]))(url),
+    null
+  );
+  // Control: without the exclusion the shape rule does fire.
+  assert.equal(
+    buildRedirectApplyRewriter(new Map(), null, shapeRules)(url),
+    "https://x.com/a/new-1/"
+  );
+});
+
+test("no exclusions changes nothing", () => {
+  // The pre-v1.73 path, unchanged — an empty set and an absent argument must both
+  // behave as they did before.
+  const rule: RedirectRule = { kind: "replace", find: "-old", replace: "-new" };
+  const url = "https://x.com/a/thing-old/";
+
+  for (const excluded of [undefined, null, new Set<string>()]) {
+    assert.equal(
+      buildRedirectApplyRewriter(new Map(), rule, null, excluded)(url),
+      "https://x.com/a/thing-new/"
+    );
+  }
+});

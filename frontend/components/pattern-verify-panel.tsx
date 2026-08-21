@@ -32,6 +32,7 @@ import {
   type VerificationStatus
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import { confirmedProblemKind } from "@/lib/confirmed-problem-kind";
 import { etaSecondsFrom, verifyProgress } from "@/lib/verify-progress";
 import { Progress } from "@/components/ui/progress";
 
@@ -487,6 +488,13 @@ export function PatternVerifyPanel({
     (sum, code) => sum + (confirmedCounts.get(code) ?? 0),
     0
   );
+  // FIXABLE vs NOT (v1.73). The decision lives in lib/confirmed-problem-kind.ts
+  // because this panel has no test harness and it is what governs how loudly a
+  // destructive action is offered — see that file for the reported case.
+  const confirmedAreAllFixable = confirmedProblemKind({
+    statuses: effectiveStatuses,
+    counts: confirmedCounts
+  }).allFixable;
 
   async function handleTriage() {
     setError("");
@@ -1116,7 +1124,9 @@ export function PatternVerifyPanel({
         {isConfirmed ? (
           <Button
             type="button"
-            variant="destructive"
+            // Demoted to a quiet secondary when every URL it would delete could
+            // instead be fixed. Same action, same count, far less pull.
+            variant={confirmedAreAllFixable ? "outline" : "destructive"}
             size="sm"
             className="gap-1"
             disabled={confirmedTarget === 0 || deleting || reviewLoading}
@@ -1138,6 +1148,20 @@ export function PatternVerifyPanel({
               </>
             )}
           </Button>
+        ) : null}
+        {/* Said next to the button rather than instead of it: the operator may
+            still have a reason to remove a redirecting URL, but they should not
+            reach for it by default when every one of them can be rewritten. */}
+        {isConfirmed && confirmedAreAllFixable ? (
+          <p
+            className="w-full text-xs text-slate-600"
+            data-testid="verify-redirects-are-fixable"
+          >
+            All {formatNumber(confirmedTarget)} of these redirect somewhere — they
+            can be <strong>fixed</strong> rather than deleted. Use Fix Redirect
+            URLs above to rewrite them to their destinations; deleting removes
+            pages that still work.
+          </p>
         ) : null}
       </div>
 
