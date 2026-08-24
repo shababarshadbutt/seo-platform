@@ -49,6 +49,7 @@ import {
   removeSessionJobs
 } from "../queue/sitemapQueue.js";
 import {
+  bulkReplaceQueue,
   enqueueApplyRedirectsJob,
   enqueueBulkReplaceJob,
   enqueueBulkReplaceUndoJob,
@@ -167,6 +168,7 @@ import {
 } from "../sitemaps/redirectRule.js";
 import {
   mergeVerifiedReplacements,
+  resolveApplyInputs,
   recomputePatternStatsSql,
   rewriteRedirectSourceFilesOnDisk,
   revertRedirectSourceFilesOnDisk
@@ -5048,6 +5050,44 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           threshold: FILE_REWRITE_PARALLEL_THRESHOLD
         })
       ) {
+        // ATTACH TO AN APPLY ALREADY RUNNING ON THIS PATTERN (v1.79).
+        //
+        // enqueueApplyRedirectsJob is a singleton keyed on the pattern: a second
+        // enqueue while one is in flight silently REUSES the first job, so this
+        // caller's rules, exclusions and scope are discarded. That was survivable
+        // until v1.78 started inserting the progress row first — the row then had
+        // no job to drive it, and the second operator watched a PENDING row for
+        // thirty minutes before giving up.
+        //
+        // So: if a run is already going, hand back ITS row and say so. The client
+        // follows the live run instead of a corpse, and nobody is told their
+        // settings were applied when they were dropped.
+        const runningRow = await pool.query<{ id: string }>(
+          `
+            SELECT j.id
+              FROM maintenance_jobs j
+             WHERE j.session_id = $1
+               AND j.kind = 'apply-redirects'
+               AND j.status IN ('PENDING', 'RUNNING')
+             ORDER BY j.started_at DESC
+             LIMIT 1
+          `,
+          [request.params.id]
+        );
+        const alreadyRunning =
+          (await bulkReplaceQueue
+            .getJob(`apply-redirects-${request.params.patternId}`)
+            .catch(() => null)) !== null;
+
+        if (alreadyRunning && runningRow.rowCount && runningRow.rowCount > 0) {
+          return reply.send({
+            queued: true,
+            already_running: true,
+            files_total: patternFileSpan,
+            job_row_id: runningRow.rows[0].id
+          });
+        }
+
         // A PROGRESS ROW, CREATED BEFORE THE JOB (v1.78). Same shape and the same
         // reason as every other background op here: without it the client has
         // nothing to poll, and this job in particular reported nothing at all —
@@ -5071,6 +5111,9 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           structure_filters: redirectStructureFilters,
           approved_rules: approvedRules.length > 0 ? approvedRules : null,
           exclude_urls: excludeUrls.length > 0 ? excludeUrls : null,
+          // v1.79: the flag that never travelled. Without it the job inferred
+          // widening from inferred_urls, which v1.73 had stopped sending.
+          widen: widenRequested,
           job_row_id: jobRowId
         });
 
@@ -5084,14 +5127,12 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         });
       }
 
-      // Derive the rule BEFORE the UPDATE below flips the selected redirect rows
-      // to 'success' (which would erase the evidence).
-      // One derived rule, or the list a human approved. The rewriter takes
-      // either, applying a list in order with the first match winning.
-      let inferredRule: RedirectRule | RedirectRule[] | null = null;
-
-      // A HUMAN-APPROVED RULE (v1.71), and why it is re-derived rather than
-      // trusted.
+      // VALIDATE the approved rules here — and only validate them. Deriving the
+      // rule moved into resolveApplyInputs (v1.79) so the route and the job
+      // cannot disagree about it; what stays is the part that has to answer with
+      // a 400, which a background job has nobody to answer.
+      //
+      // WHY AN APPROVED RULE IS CHECKED RATHER THAN TRUSTED (v1.71).
       //
       // This endpoint's contract is that "the client only says WHICH urls; the
       // server recomputes their destinations, so a client can't inject arbitrary
@@ -5142,27 +5183,6 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
               );
           }
         }
-
-        inferredRule = approvedRules;
-      } else if (inferredUrls.length > 0) {
-        const ruleSamples = await pool.query<{ url: string; final_url: string }>(
-          `
-            SELECT url, final_url
-            FROM sampled_urls
-            WHERE pattern_id = $1
-              AND http_status_category = 'redirect'
-              AND final_url IS NOT NULL
-              AND final_url <> url
-          `,
-          [request.params.patternId]
-        );
-
-        inferredRule = deriveRedirectRule(
-          ruleSamples.rows.map((row) => ({
-            source: row.url,
-            dest: row.final_url
-          }))
-        );
       }
 
       const client = await pool.connect();
@@ -5174,180 +5194,29 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
       try {
         await client.query("BEGIN");
-        // Adopt each redirect's destination as the URL, snapshotting the original
-        // url / category / is_hit so "Undo last replace" can fully restore them.
-        // The destination is treated as a live hit (success). RETURNING gives us
-        // the old→new URL pairs needed to rewrite the source XML on disk.
-        const updateResult = await client.query<{
-          original_url: string;
-          url: string;
-          source_file: string | null;
-        }>(
-          `
-            UPDATE sampled_urls
-            SET original_url = COALESCE(original_url, url),
-                original_http_status_category =
-                  COALESCE(original_http_status_category, http_status_category),
-                original_is_hit = COALESCE(original_is_hit, is_hit),
-                url = final_url,
-                http_status_category = 'success',
-                is_hit = TRUE
-            WHERE pattern_id = $1
-              AND http_status_category = 'redirect'
-              AND final_url IS NOT NULL
-              AND final_url <> url
-              AND ($2::uuid[] IS NULL OR id = ANY($2::uuid[]))
-              -- Skip is the operator's explicit "leave this alone", so an
-              -- excluded row must not have its destination adopted either — the
-              -- row would then read as fixed while the file was untouched.
-              AND ($3::text[] IS NULL OR NOT (url = ANY($3::text[])))
-            RETURNING original_url, url, source_file
-          `,
-          [
-            request.params.patternId,
-            urlIds,
-            excludeUrls.length > 0 ? excludeUrls : null
-          ]
-        );
-        // Recompute redirect / confidence from samples using the SAME formula
-        // as the sampling job (scoreWeight per category), so this is an exact
-        // inverse of undo: success=1, soft_404=0.25, redirect=0.5, failure=0.
-        await client.query(recomputePatternStatsSql, [request.params.patternId]);
-
-        // Rewrite the source XML on disk so each redirected <loc> carries its
-        // final URL — original_url is the value still present in the file (a
-        // find/replace never touches files), url is the redirect destination.
-        const replacements = new Map<string, string>();
-        // Narrow the disk scan to the files the affected URLs came from.
-        // sampled_urls.source_file holds a comma-separated list of contributing
-        // display filenames.
-        const candidateFiles = new Set<string>();
-        for (const row of updateResult.rows) {
-          if (row.original_url && row.original_url !== row.url) {
-            replacements.set(row.original_url, row.url);
-          }
-
-          for (const name of (row.source_file ?? "").split(",")) {
-            const trimmed = name.trim();
-
-            if (trimmed.length > 0) {
-              candidateFiles.add(trimmed);
-            }
-          }
-        }
-
-        // THE FULL VERIFIED POPULATION (v1.68). Everything above comes from
-        // sampled_urls — the small HTTP-checked preview, and the rows the client
-        // can name by id. "Verify all in this pattern" writes verified_urls
-        // instead, one row per URL with its own confirmed final_url, and until
-        // now NOTHING in this endpoint read it. So a user who verified all
-        // 28,546 URLs of a pattern and pressed Accept still got ~10 rewrites,
-        // because the only paths to the rest were the ≤1,000-row preview and an
-        // inferred rule. That is the bug this closes: the button said 28,546,
-        // the toast said 10, and the toast was right.
-        //
-        // Confirmed destinations, not inference — every row here was actually
-        // fetched. That makes this strictly better than the rule-based widening
-        // below, and it is why these are merged BEFORE the rule is considered.
-        //
-        // READ-ONLY on verified_urls, deliberately. The undo path restores files
-        // from the preserved originals and rolls back sampled_urls.original_url;
-        // snapshotting verified_urls too would need a second column and a
-        // matching revert for no gain, since a stale verdict is simply re-probed
-        // on the next verify.
-        const verifiedResult = await client.query<{
-          url: string;
-          final_url: string;
-          source_files: string[] | null;
-        }>(
-          `
-            SELECT url, final_url, source_files
-            FROM verified_urls
-            WHERE session_id = $1
-              AND pattern_id = $2
-              AND http_status_category = 'redirect'
-              AND final_url IS NOT NULL
-              AND final_url <> url
-              AND is_deleted_from_sitemap = false
-              AND ($3::text[] IS NULL OR url = ANY($3::text[]))
-              AND ($4::text[] IS NULL OR NOT (url = ANY($4::text[])))
-          `,
-          [
-            request.params.id,
-            request.params.patternId,
-            // Mirrors the sampled path's ($2 IS NULL OR id = ANY($2)): null =
-            // every verified redirect in the pattern, which is what the pressed
-            // "Set all to Fix" toggle means.
-            //
-            // Otherwise narrow to inferred_urls — the non-sampled URLs the user
-            // ticked. Those used to be rewritten by the derived RULE; if any of
-            // them has been verified, this now gives it its own confirmed
-            // destination instead, which is strictly better than an inference.
-            // Sampled selections need no entry here: the UPDATE above already
-            // put them in `replacements`.
-            // widen (v1.73) means "every confirmed redirect in scope", which is
-            // what url_ids: null already meant. Kept separate from inferredUrls
-            // so an older client that still sends the list keeps working.
-            urlIds === null || widenRequested ? null : inferredUrls,
-            excludeUrls.length > 0 ? excludeUrls : null
-          ]
-        );
-
-        // PER-SHAPE RULES from a stratified verification (v1.69). Only the
-        // shapes whose samples AGREED are loaded: an unagreed row exists to say
-        // "this shape was sampled and its URLs disagree", which is grounds for
-        // escalating it to a full verification, never for rewriting it.
-        //
-        // These are inference, and the endpoint keeps them strictly separate
-        // from verified_urls above, which is measurement. That separation is
-        // what v1.68 was for.
-        const shapeRuleResult = await client.query<{
-          shape: string;
-          rule: RedirectRule;
-        }>(
-          `
-            SELECT shape, rule
-            FROM pattern_shape_rules
-            WHERE pattern_id = $1 AND agreed = true AND rule IS NOT NULL
-          `,
-          [request.params.patternId]
-        );
-        const shapeRules = new Map<string, RedirectRule>(
-          shapeRuleResult.rows.map((row) => [row.shape, row.rule])
-        );
-
-        // Merge rules (scope guard, no-op destinations, sampled-wins) live in
-        // mergeVerifiedReplacements so they are unit-testable — see its comment.
-        mergeVerifiedReplacements({
-          replacements,
-          candidateFiles,
-          verified: verifiedResult.rows,
-          matchesScope: redirectStructureFilters
-            ? (url) =>
-                urlMatchesStructureFilters(url, redirectStructureFilters)
-            : undefined
+        // EVERY INPUT THIS APPLY REWRITES WITH, from the one builder the queued
+        // job also calls (v1.79). This block used to be the only place that knew
+        // about verified_urls, per-shape rules and widen — the job had none of
+        // the three — so which of them an apply could use depended on whether
+        // the pattern happened to cross the inline/queued threshold. See
+        // resolveApplyInputs; it is the same remedy applyFileScope is for file
+        // scope, applied to the inputs instead of the targets.
+        const inputs = await resolveApplyInputs({
+          client,
+          sessionId: request.params.id,
+          patternId: request.params.patternId,
+          urlIds,
+          excludeUrls,
+          inferredUrls,
+          approvedRules,
+          widenRequested,
+          structureFilters: redirectStructureFilters
         });
-
-        // Whole-pattern widening (v1.42, fixed v1.45.1): when the client opted
-        // into the unsampled URLs AND the confirmed samples distil into a single
-        // rule, apply that rule to EVERY <loc> in the pattern's files via a
-        // streaming rewrite. The previous approach built a replacement map from
-        // the client's inferred_urls list — which was sourced from the CAPPED
-        // pattern_urls sample pool (≤ ~1,000 rows), so on a pattern with e.g.
-        // 92,643 real occurrences only the sampled ~1,000 were ever rewritten
-        // and the other ~91,000 were silently left broken. The rule is a pure
-        // per-URL transform, so it reaches all real occurrences independent of
-        // the pool/preview size. The confirmed sampled pairs (`replacements`)
-        // still win per-URL inside buildRedirectApplyRewriter.
-        // An APPROVED rule widens on its own authority (v1.71): the human's
-        // whole point is to reach the URLs nobody enumerated, so requiring the
-        // client to also list inferred_urls — which it can only draw from the
-        // capped preview — would cap the very thing being approved.
-        const widen =
-          inferredRule !== null &&
-          (approvedRules.length > 0 ||
-            inferredUrls.length > 0 ||
-            widenRequested);
+        const replacements = inputs.replacements;
+        const candidateFiles = inputs.candidateFiles;
+        const shapeRules = inputs.shapeRules;
+        const widen = inputs.widen;
+        const inferredRule = inputs.rule;
 
         // WHICH FILES TO OPEN — one decision, shared with the queued job so the
         // same apply cannot reach a different set of files depending on whether
@@ -5412,7 +5281,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // .length, which no longer reflects the true count). inferred_applied is
         // the rule-driven remainder beyond the confirmed sampled rows, reported
         // for the modal's "(N inferred)" note.
-        const updated = updateResult.rowCount ?? 0;
+        const updated = inputs.updatedCount;
         const inferredApplied = widen
           ? Math.max(0, rewrittenLocCount - updated)
           : 0;
@@ -6934,7 +6803,19 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         [jobRowId, request.params.id]
       );
 
-      return { job: result.rows[0] ?? null };
+      const job = result.rows[0] ?? null;
+      // QUEUE POSITION, so waiting reads as waiting (v1.79). apply-redirects
+      // shares one concurrency-1 worker with rename, transform and bulk replace
+      // across EVERY session and user, so a second operator can sit at 0 files
+      // for minutes through no fault of their own. Reported from the real queue
+      // rather than counted per kind, because all of those kinds are ahead of
+      // this job and only BullMQ knows how many there are.
+      const waitingAhead =
+        job && job.status === "PENDING"
+          ? await bulkReplaceQueue.getWaitingCount().catch(() => 0)
+          : 0;
+
+      return { job, waiting_ahead: waitingAhead };
     }
   );
 

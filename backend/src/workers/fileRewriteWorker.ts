@@ -69,6 +69,12 @@ export type FileRewriteSpec =
       // (replacements is [string, string][] for the same reason) and one
       // exception is how a serialisation bug gets introduced later.
       excludeUrls?: string[] | null;
+      // Per-shape rules (v1.69), as PAIRS for the same reason replacements are
+      // — a Map would cross structured clone intact but nothing else in this
+      // spec does. Their absence here is half of why a queued apply could not
+      // use them: the sequential branch passed null and this one had nowhere
+      // to put them. (v1.79)
+      shapeRules?: [string, RedirectRule][] | null;
     }
   // Pattern structure transform (v1.48). The RAW structure strings cross the
   // thread edge, not the parsed form — parseStructure is cheap, deterministic and
@@ -116,7 +122,7 @@ function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
       buildRedirectApplyRewriter(
         new Map(spec.replacements),
         spec.rule,
-        null,
+        spec.shapeRules ? new Map(spec.shapeRules) : null,
         spec.excludeUrls ? new Set(spec.excludeUrls) : null
       ),
       spec.structureFilters ?? null

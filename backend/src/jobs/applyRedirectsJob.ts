@@ -19,6 +19,7 @@ import {
 import { deriveRedirectRule } from "../sitemaps/redirectRule.js";
 import { recomputePatternStatsSql } from "../sitemaps/redirectApply.js";
 import { applyFileScope } from "../sitemaps/applyFileScope.js";
+import { resolveApplyInputs } from "../sitemaps/redirectApply.js";
 import { applyStructureFilterToRewriter } from "../sitemaps/structureClusters.js";
 import {
   FILE_REWRITE_PARALLEL_THRESHOLD,
@@ -137,62 +138,30 @@ async function runApplyRedirectsJob(
 
   const sourceRole = patternResult.rows[0].source_role;
 
-  // Derive the rule from the confirmed redirect samples BEFORE the UPDATE below
-  // flips the selected rows to 'success' (which would erase the evidence).
-  const ruleSamples = await pool.query<{ url: string; final_url: string }>(
-    `
-      SELECT url, final_url
-      FROM sampled_urls
-      WHERE pattern_id = $1
-        AND http_status_category = 'redirect'
-        AND final_url IS NOT NULL
-        AND final_url <> url
-    `,
-    [patternId]
-  );
-  const rule = deriveRedirectRule(
-    ruleSamples.rows.map((row) => ({ source: row.url, dest: row.final_url }))
-  );
-
-  // Adopt the confirmed sampled destinations + recompute stats (one txn), then
-  // build the replacement map (sampled confirmed pairs + inferred pairs).
-  const replacements = new Map<string, string>();
+  // EVERY INPUT THIS APPLY REWRITES WITH, from the one builder the route also
+  // calls (v1.79). What used to be here read sampled_urls and nothing else: no
+  // verified_urls, no per-shape rules, and no widen flag, because the payload had
+  // no field to carry one. Those three capabilities existed only on the inline
+  // path, and v1.77 made this the path almost every apply takes — so a 187-file
+  // pattern rewrote the ten files its sampled rows lived in. See
+  // resolveApplyInputs for the whole story.
   const client = await pool.connect();
+  let inputs;
 
   try {
     await client.query("BEGIN");
-
-    const updateResult = await client.query<{
-      original_url: string;
-      url: string;
-    }>(
-      `
-        UPDATE sampled_urls
-        SET original_url = COALESCE(original_url, url),
-            original_http_status_category =
-              COALESCE(original_http_status_category, http_status_category),
-            original_is_hit = COALESCE(original_is_hit, is_hit),
-            url = final_url,
-            http_status_category = 'success',
-            is_hit = TRUE
-        WHERE pattern_id = $1
-          AND http_status_category = 'redirect'
-          AND final_url IS NOT NULL
-          AND final_url <> url
-          AND ($2::uuid[] IS NULL OR id = ANY($2::uuid[]))
-        RETURNING original_url, url
-      `,
-      [patternId, urlIds]
-    );
-
-    await client.query(recomputePatternStatsSql, [patternId]);
+    inputs = await resolveApplyInputs({
+      client,
+      sessionId,
+      patternId,
+      urlIds,
+      excludeUrls: data.exclude_urls ?? [],
+      inferredUrls,
+      approvedRules: data.approved_rules ?? null,
+      widenRequested: data.widen === true,
+      structureFilters
+    });
     await client.query("COMMIT");
-
-    for (const row of updateResult.rows) {
-      if (row.original_url && row.original_url !== row.url) {
-        replacements.set(row.original_url, row.url);
-      }
-    }
   } catch (error) {
     await client.query("ROLLBACK");
     client.release();
@@ -201,41 +170,23 @@ async function runApplyRedirectsJob(
 
   client.release();
 
-  // Whole-pattern widening (fixed v1.45.1): when the client opted into the
-  // unsampled URLs AND a single rule distilled from the confirmed samples, apply
-  // that rule to EVERY matching <loc> in the pattern's files via a streaming
-  // rewrite — NOT a replacement map built from the client's inferred_urls, which
-  // came from the capped pattern_urls pool and covered only the sample. The
-  // confirmed sampled pairs (`replacements`) still win per-URL. inferred_urls is
-  // now only a "widen requested" signal; its contents are not used to rewrite.
-  // APPROVED RULES BEAT THE DERIVED ONE (v1.72).
-  //
-  // The job used to derive its own rule and widen only when inferred_urls was
-  // non-empty. Both are wrong for a human-approved apply: deriveRedirectRule
-  // returns null for precisely the disagreeing pairs that make an approval
-  // necessary, so a re-deriving job would silently rewrite nothing — and the
-  // operator would see a queued job complete having changed no files.
-  //
-  // The route has already validated each of these against the candidates it
-  // derived from its own confirmed pairs, so they are as authoritative here as
-  // the derived rule was.
-  const approvedRules = data.approved_rules ?? null;
-  // URLs the operator set to Skip or Delete (v1.73). Held as a Set here and
-  // passed as an array to the pool — see the spec's note.
+  const replacements = inputs.replacements;
+  const shapeRules = inputs.shapeRules;
+  // Held as an array for the worker-thread spec (it crosses a structuredClone
+  // boundary) and as a Set for the in-process rewriter.
   const excludeUrls = data.exclude_urls ?? null;
-  const excludeSet = excludeUrls ? new Set(excludeUrls) : null;
-  const widen =
-    (approvedRules !== null && approvedRules.length > 0) ||
-    (inferredUrls.length > 0 && rule !== null);
-  const effectiveRule = !widen
-    ? null
-    : approvedRules && approvedRules.length > 0
-      ? approvedRules
-      : rule;
+  const excludeSet =
+    excludeUrls && excludeUrls.length > 0 ? new Set(excludeUrls) : null;
+  // The rule only sweeps when widening was asked for; otherwise the confirmed
+  // exact pairs are the whole edit.
+  const effectiveRule = inputs.widen ? inputs.rule : null;
 
   // Nothing to do only when there is neither a confirmed pair nor a rule to
   // widen with (a rule can rewrite files even with zero confirmed pairs).
-  if (replacements.size === 0 && !effectiveRule) {
+  // shapeRules counts as something to do (v1.79). Without it a pattern whose
+  // only reach is a stratified verification bailed out here having rewritten
+  // nothing — and reported success. The inline route always counted them.
+  if (replacements.size === 0 && !effectiveRule && shapeRules.size === 0) {
     logger.info(
       { session_id: sessionId, pattern_id: patternId },
       "apply-redirects job: nothing to rewrite"
@@ -269,7 +220,7 @@ async function runApplyRedirectsJob(
       sampledFiles: [],
       occurrenceFiles: occurrenceResult.rows.map((row) => row.source_file),
       hasReplacements: replacements.size > 0,
-      hasRule: effectiveRule !== null
+      hasRule: effectiveRule !== null || shapeRules.size > 0
     })
   );
 
@@ -383,10 +334,16 @@ async function runApplyRedirectsJob(
     // in the two loops below so the parallel and sequential paths cannot report
     // differently — the divergence v1.75 was spent removing.
     filesDone += 1;
+    // BOTH numbers, every file (v1.79). Files carry the progress bar because
+    // they have a true denominator; the URL count rides along as a running
+    // total so the operator can see work happening between file ticks — on a
+    // wide pattern one file can take many seconds. Deliberately NOT reported
+    // against the pattern total: only matching <loc>s change, so "of 579,034"
+    // would be a denominator the run can never reach.
     await markApplyJob(
       data.job_row_id,
-      "files_done = $2",
-      [filesDone],
+      "files_done = $2, items_changed = $3",
+      [filesDone, rewrittenLocCount],
       logger
     );
   };
@@ -423,6 +380,7 @@ async function runApplyRedirectsJob(
               kind: "redirectApply",
               replacements: replacementPairs,
               rule: effectiveRule,
+              shapeRules: Array.from(shapeRules.entries()),
               excludeUrls,
               structureFilters
             }
@@ -432,7 +390,14 @@ async function runApplyRedirectsJob(
     );
   } else {
     const rewriter = applyStructureFilterToRewriter(
-      buildRedirectApplyRewriter(replacements, effectiveRule, null, excludeSet),
+      // shapeRules, not null (v1.79): a stratified verification distils a rule
+      // per URL shape, and this branch used to discard every one of them.
+      buildRedirectApplyRewriter(
+        replacements,
+        effectiveRule,
+        shapeRules,
+        excludeSet
+      ),
       structureFilters
     );
 

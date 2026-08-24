@@ -69,6 +69,13 @@ export type ApplyRedirectsJobData = {
   // operator's Skip choices at the queue boundary — the DB would say skipped and
   // the file would not.
   exclude_urls?: string[] | null;
+  // "Set all to Fix" (v1.73), carried into the job at last (v1.79). Its absence
+  // here is why a queued apply could not widen: the job inferred widening from
+  // inferred_urls being non-empty, and v1.73 had stopped sending that list
+  // precisely because it grew to 1.6 MB on a wide pattern. So the flag meant to
+  // replace it never arrived, and "every confirmed redirect in scope" quietly
+  // became "the handful the client could name".
+  widen?: boolean;
   // maintenance_jobs.id — the progress/status row this job drives (v1.78).
   //
   // This job used to report NOTHING: no row, no progress, no completion, and a

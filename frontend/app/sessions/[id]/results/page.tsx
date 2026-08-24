@@ -3088,9 +3088,13 @@ export default function ResultsDashboardPage({
       }
 
       let job;
+      let waitingAhead = 0;
 
       try {
-        ({ job } = await getApplyRedirectsStatus(params.id, jobRowId));
+        const status = await getApplyRedirectsStatus(params.id, jobRowId);
+
+        job = status.job;
+        waitingAhead = status.waiting_ahead ?? 0;
       } catch {
         // A dropped poll is not a failed apply — the job runs in the worker,
         // independent of this tab. Keep waiting; the deadline bounds it.
@@ -3132,13 +3136,38 @@ export default function ResultsDashboardPage({
         return;
       }
 
-      // RUNNING or PENDING: say where it is. files_done climbs once per file, so
-      // this moves on a wide pattern instead of sitting on one sentence.
+      // WAITING vs WORKING, said differently (v1.79). apply-redirects shares one
+      // single-concurrency worker with rename, transform and bulk replace across
+      // every session and user, so a second operator can legitimately sit at zero
+      // files for minutes. "0 of 187 files done" for that is indistinguishable
+      // from a job that died, which is exactly how it was reported.
+      if (job.status === "PENDING") {
+        setFindReplaceToast({
+          tone: "success",
+          message:
+            waitingAhead > 0
+              ? `Queued — ${formatNumber(waitingAhead)} job${
+                  waitingAhead === 1 ? "" : "s"
+                } ahead of this one. It will start on its own.`
+              : "Queued — starting shortly."
+        });
+        continue;
+      }
+
+      // Both numbers, because one file of a wide pattern can take many seconds
+      // and the file counter alone looks stuck. URLs have no denominator on
+      // purpose — only matching <loc>s change, so a total would never be reached.
+      const urlsSoFar = Number(job.items_changed ?? 0);
+
       setFindReplaceToast({
         tone: "success",
         message: `Applying redirect fixes — ${formatNumber(
           job.files_done
-        )} of ${formatNumber(job.files_total || filesTotal)} files done…`
+        )} of ${formatNumber(job.files_total || filesTotal)} files${
+          urlsSoFar > 0
+            ? ` · ${formatNumber(urlsSoFar)} URLs fixed so far`
+            : ""
+        }…`
       });
     }
   }
@@ -3232,10 +3261,15 @@ export default function ResultsDashboardPage({
         // collapsing". It was never reporting anything. Now the job drives a
         // maintenance_jobs row and this polls it to the end.
         setFindReplaceToast({
-          tone: "success",
-          message: `Applying redirect fixes across ${formatNumber(
-            result.files_total ?? 0
-          )} files in the background…`
+          tone: result.already_running ? "error" : "success",
+          message: result.already_running
+            ? // The singleton job was reused, so THIS request's rules and scope
+              // were dropped. Saying "applying" here would credit the operator
+              // with an edit that is not happening. (v1.79)
+              "An apply is already running on this pattern — following it. Your selection was not applied; wait for it to finish, then accept again."
+            : `Applying redirect fixes across ${formatNumber(
+                result.files_total ?? 0
+              )} files in the background…`
         });
 
         const jobRowId = result.job_row_id;

@@ -2132,6 +2132,10 @@ export async function applyPatternRedirects(
     // routed to a background job instead. (v1.42)
     queued?: boolean;
     files_total?: number;
+    // Set when this request attached to an apply already running on the pattern
+    // (v1.79): the singleton job was reused, so THIS caller's rules and scope
+    // were not applied. Say so rather than implying they were.
+    already_running?: boolean;
     // The maintenance_jobs row driving that background run, to poll (v1.78).
     // Absent from an older backend, in which case the caller degrades to the
     // single delayed refresh it used to do.
@@ -2155,7 +2159,11 @@ export async function getApplyRedirectsStatus(
     { cache: "no-store" }
   );
 
-  return readJsonResponse<{ job: MaintenanceJob | null }>(response);
+  return readJsonResponse<{
+    job: MaintenanceJob | null;
+    // Jobs ahead of this one on the shared single-concurrency worker (v1.79).
+    waiting_ahead?: number;
+  }>(response);
 }
 
 export type BulkReplaceFile = {
