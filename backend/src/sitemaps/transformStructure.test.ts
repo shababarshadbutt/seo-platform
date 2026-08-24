@@ -590,7 +590,18 @@ test("refuses when the new URL drops the varying part entirely", () => {
   );
 });
 
-test("refuses when the new URL reorders the params", () => {
+// THIS ASSERTION IS THE INVERSE OF THE ONE IT REPLACES (v1.78).
+//
+// It used to require that a reorder be REFUSED, which documented alignSegments'
+// left-to-right limit rather than anything the applier could not do. Production
+// then found the cost: internetofindustrials.com rewrote
+//   /product/{cat}/rfq/{mfr}/{pn}/{id} -> /rfq/product/{cat}/{mfr}/{pn}/{id}
+// across 579,034 URLs, typing that pair into the modal was refused with "does
+// not keep every varying part of the old one, in the same order" — every part
+// WAS kept — and nobody found that the same rewrite works when the structure is
+// typed by hand. A move is a rewrite this system can apply, so it is a rewrite
+// it must be able to infer.
+test("infers a reorder of the params", () => {
   const current = parseStructure("/a/{A}/{B}/");
   const result = inferNewStructure(
     "https://x.com/a/one/two/",
@@ -598,7 +609,72 @@ test("refuses when the new URL reorders the params", () => {
     current
   );
 
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.structure, "/a/{B}/{A}/");
+});
+
+test("infers the reported production reorder, trailing slash intact", () => {
+  // The exact pair from the report, against the structure the modal pre-fills.
+  // The trailing slash matters as much as the order: dropping it here would take
+  // it off all 579,034 URLs.
+  const result = inferNewStructure(
+    "https://www.io.com/product/safety/rfq/scott-safety/200130-01/9u694/",
+    "https://www.io.com/rfq/product/safety/scott-safety/200130-01/9u694/",
+    parseStructure("/product/{A}/{B}/{C}/{D}/{E}")
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(
+    result.ok && result.structure,
+    "/{B}/product/{A}/{C}/{D}/{E}/"
+  );
+});
+
+test("refuses a reorder that has more than one equally good reading", () => {
+  // {A} and {B} both captured "aa", so "which one moved to the end" has two
+  // answers. Guessing would rewrite a million URLs under the wrong name, so the
+  // inference declines and sends the operator to the direct entry instead.
+  const result = inferNewStructure(
+    "https://x.com/p/aa/aa/bb/",
+    "https://x.com/q/bb/aa/aa/",
+    parseStructure("/p/{A}/{B}/{C}")
+  );
+
   assert.equal(result.ok, false);
+  assert.match(
+    result.ok ? "" : result.error,
+    /interchangeable|type the new structure directly/
+  );
+});
+
+test("an order-preserving example is still read by the ordered pass", () => {
+  // The reorder search is a FALLBACK. When two params share a value but the
+  // order is unchanged, the ordered pass answers first and deterministically —
+  // no ambiguity is reported, because left-to-right is a real answer here.
+  const result = inferNewStructure(
+    "https://x.com/p/aa/aa/",
+    "https://x.com/q/aa/aa/",
+    parseStructure("/p/{A}/{B}")
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.structure, "/q/{A}/{B}/");
+});
+
+test("a current structure that repeats a param name says so", () => {
+  // What the pattern template itself looks like: /product/{param}/{param}/...
+  // captureStructureValues keys by name, so the values collapse and every
+  // alignment fails. The message used to blame ordering; now it names the cause
+  // and the fix.
+  const result = inferNewStructure(
+    "https://www.io.com/product/safety/rfq/scott-safety/200130-01/9u694/",
+    "https://www.io.com/rfq/product/safety/scott-safety/200130-01/9u694/",
+    parseStructure("/product/{param}/{param}/{param}/{param}/{param}")
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.ok ? "" : result.error, /repeats a param name/);
+  assert.match(result.ok ? "" : result.error, /\{A\}, \{B\}, \{C\}/);
 });
 
 test("refuses when nothing changed", () => {

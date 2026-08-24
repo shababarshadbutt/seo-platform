@@ -2132,7 +2132,30 @@ export async function applyPatternRedirects(
     // routed to a background job instead. (v1.42)
     queued?: boolean;
     files_total?: number;
+    // The maintenance_jobs row driving that background run, to poll (v1.78).
+    // Absent from an older backend, in which case the caller degrades to the
+    // single delayed refresh it used to do.
+    job_row_id?: string;
   }>(response);
+}
+
+// Poll one queued apply. BY ROW ID, because an apply is per pattern and two of
+// them can be in flight on one session minutes apart — "the newest row" would
+// report the wrong one. (v1.78)
+export async function getApplyRedirectsStatus(
+  sessionId: string,
+  jobRowId: string
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/apply-redirects/status?job_row_id=${encodeURIComponent(
+        jobRowId
+      )}`
+    ),
+    { cache: "no-store" }
+  );
+
+  return readJsonResponse<{ job: MaintenanceJob | null }>(response);
 }
 
 export type BulkReplaceFile = {

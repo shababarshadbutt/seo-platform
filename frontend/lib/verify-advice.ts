@@ -47,3 +47,71 @@ export function verifyAdviceFor(scopeTotal: number): VerifyAdvice {
 export function verifyAdviceLabel(advice: VerifyAdvice): string {
   return advice === "shape" ? "Check by shape" : "Verify all in this pattern";
 }
+
+// IS THIS CHANGE A SEGMENT MOVE? (v1.78)
+//
+// WHY IT MATTERS ENOUGH TO DETECT. The reported site's redirects were
+//   /product/{cat}/rfq/{mfr}/{pn}/{id}  ->  /rfq/product/{cat}/{mfr}/{pn}/{id}
+// on a pattern of 579,034 URLs. Nothing in the redirect-fix route can express
+// that: rule candidates are literal find/replace, so each one is derived from a
+// single pair and matches almost nothing (measured: 10 of 579,034), and per-shape
+// rules use the same literal derivation inside a valueShape bucket where every
+// category collapses to the same shape, so their samples disagree and the shape
+// is reported unagreed. Verifying more URLs cannot help either — the destinations
+// were already confirmed; there was simply no rule able to carry them.
+//
+// The Update Pattern structure transform CAN do it, deterministically and with no
+// probing at all, because it substitutes params by name. So when the confirmed
+// pairs look like a move, the modal's job is to say so and name that route rather
+// than offer counting and verifying, which cannot converge here.
+//
+// Detected from the pairs already on screen: same multiset of path segments, in a
+// different order. Deliberately strict — EVERY pair must agree, because one
+// coincidental anagram among a hundred ordinary redirects is not a pattern-wide
+// move and recommending a whole-pattern rewrite off it would be worse than
+// saying nothing.
+export function looksLikeSegmentReorder(
+  pairs: Array<{ source: string; destination: string | null }>
+): boolean {
+  const usable = pairs.filter(
+    (pair): pair is { source: string; destination: string } =>
+      typeof pair.destination === "string" && pair.destination.length > 0
+  );
+
+  if (usable.length === 0) {
+    return false;
+  }
+
+  return usable.every((pair) => {
+    const before = pathSegmentsOf(pair.source);
+    const after = pathSegmentsOf(pair.destination);
+
+    if (before === null || after === null) {
+      return false;
+    }
+
+    if (before.length !== after.length || before.length === 0) {
+      return false;
+    }
+
+    // Same parts, different order. Equal order is not a move — it is either no
+    // change at all or an edit inside a segment, both of which the ordinary rule
+    // routes handle.
+    if (before.join("/") === after.join("/")) {
+      return false;
+    }
+
+    const sortedBefore = [...before].sort();
+    const sortedAfter = [...after].sort();
+
+    return sortedBefore.every((value, index) => value === sortedAfter[index]);
+  });
+}
+
+function pathSegmentsOf(rawUrl: string): string[] | null {
+  try {
+    return new URL(rawUrl).pathname.split("/").filter(Boolean);
+  } catch {
+    return null;
+  }
+}

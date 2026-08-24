@@ -45,7 +45,62 @@ type SitemapFileRow = {
   fixed_file_path: string | null;
 };
 
+// PROGRESS AND OUTCOME REPORTING (v1.78).
+//
+// This job used to be silent: no maintenance_jobs row, so no progress, no
+// completion, and a throw landed in Redis where the app could never see it. The
+// UI toasted once and refreshed after six seconds, which made a long apply and a
+// dead one look the same — reported as "the background job is collapsing". v1.77
+// then routed far more applies here, so the silence got louder.
+//
+// Every write is best-effort: a progress row that cannot be updated must never
+// fail an apply that is rewriting files correctly. That is the same rule the
+// enumeration progress writes in verifyUrlsJob follow, and for the same reason —
+// this is bookkeeping about the work, not the work.
+async function markApplyJob(
+  jobRowId: string | null | undefined,
+  set: string,
+  params: unknown[],
+  logger: FastifyBaseLogger
+) {
+  if (!jobRowId) {
+    return;
+  }
+
+  try {
+    await pool.query(
+      `UPDATE maintenance_jobs SET ${set} WHERE id = $1`,
+      [jobRowId, ...params]
+    );
+  } catch (error) {
+    logger.warn(
+      { job_row_id: jobRowId, err: error },
+      "apply-redirects job: progress write failed"
+    );
+  }
+}
+
 export async function processApplyRedirectsJob(
+  data: ApplyRedirectsJobData,
+  logger: FastifyBaseLogger
+) {
+  try {
+    await runApplyRedirectsJob(data, logger);
+  } catch (error) {
+    // The row is what the UI reads, so the failure has to land there before the
+    // throw goes on to BullMQ for its own retry/inspection bookkeeping.
+    await markApplyJob(
+      data.job_row_id,
+      "status = 'FAILED', error = $2, completed_at = now()",
+      [error instanceof Error ? error.message : String(error)],
+      logger
+    );
+
+    throw error;
+  }
+}
+
+async function runApplyRedirectsJob(
   data: ApplyRedirectsJobData,
   logger: FastifyBaseLogger
 ) {
@@ -67,6 +122,16 @@ export async function processApplyRedirectsJob(
       { session_id: sessionId, pattern_id: patternId },
       "apply-redirects job: pattern missing"
     );
+    // Every early return has to settle the row too, or the UI polls a PENDING
+    // job forever — the same "waiting on something that will never finish" state
+    // that stranded verification rows produce.
+    await markApplyJob(
+      data.job_row_id,
+      "status = 'FAILED', error = $2, completed_at = now()",
+      ["the pattern no longer exists — re-analyse the session"],
+      logger
+    );
+
     return;
   }
 
@@ -176,6 +241,16 @@ export async function processApplyRedirectsJob(
       "apply-redirects job: nothing to rewrite"
     );
     await invalidateSessionZipCache(sessionId);
+    // COMPLETED, not FAILED: nothing to rewrite is a valid outcome, and the
+    // zero in items_changed is the honest report of it. v1.74 spent a release on
+    // exactly this distinction for the inline path.
+    await markApplyJob(
+      data.job_row_id,
+      "status = 'COMPLETED', items_changed = 0, files_done = 0, completed_at = now()",
+      [],
+      logger
+    );
+
     return;
   }
 
@@ -223,6 +298,9 @@ export async function processApplyRedirectsJob(
     replacements.entries()
   );
   let rewrittenLocCount = 0;
+  // Files finished, for the progress row. Incremented inside processFile so both
+  // the parallel and the sequential path count the same way.
+  let filesDone = 0;
 
   // Swap in the rewritten copy for one file and preserve its pre-fix original
   // for undo — main-thread DB writes only, even when rewrites ran in parallel.
@@ -298,7 +376,27 @@ export async function processApplyRedirectsJob(
     }
 
     await finalize(file, inputPath, newStored, outputPath, rewrittenCount);
+
+    // One row write per FILE, not per <loc>: on the reported pattern that is 187
+    // writes across several minutes, which is what the progress bar needs and
+    // nothing like the volume a per-URL write would be. Counted here rather than
+    // in the two loops below so the parallel and sequential paths cannot report
+    // differently — the divergence v1.75 was spent removing.
+    filesDone += 1;
+    await markApplyJob(
+      data.job_row_id,
+      "files_done = $2",
+      [filesDone],
+      logger
+    );
   };
+
+  await markApplyJob(
+    data.job_row_id,
+    "status = 'RUNNING', files_total = $2, files_done = 0",
+    [targets.length],
+    logger
+  );
 
   logger.info(
     {
@@ -364,6 +462,19 @@ export async function processApplyRedirectsJob(
       [patternId]
     );
   }
+
+  // items_changed carries the <loc> count, matching what every other
+  // maintenance job puts there — so the completion toast can state the same
+  // number the inline path returns as rewritten_loc_count. A run that changed
+  // nothing still completes: "0" is a real answer here (v1.74's outcome
+  // classification says which of the three reasons it was), and reporting it as
+  // a failure would be the older bug in reverse.
+  await markApplyJob(
+    data.job_row_id,
+    "status = 'COMPLETED', items_changed = $2, completed_at = now()",
+    [rewrittenLocCount],
+    logger
+  );
 
   logger.info(
     {

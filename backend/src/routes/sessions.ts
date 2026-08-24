@@ -5048,6 +5048,21 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           threshold: FILE_REWRITE_PARALLEL_THRESHOLD
         })
       ) {
+        // A PROGRESS ROW, CREATED BEFORE THE JOB (v1.78). Same shape and the same
+        // reason as every other background op here: without it the client has
+        // nothing to poll, and this job in particular reported nothing at all —
+        // so a long apply and a dead one looked identical. files_total is the
+        // file span, which is exactly what the job will walk.
+        const jobRow = await pool.query<{ id: string }>(
+          `
+            INSERT INTO maintenance_jobs (session_id, kind, files_total)
+            VALUES ($1, 'apply-redirects', $2)
+            RETURNING id
+          `,
+          [request.params.id, patternFileSpan]
+        );
+        const jobRowId = jobRow.rows[0].id;
+
         await enqueueApplyRedirectsJob({
           session_id: request.params.id,
           pattern_id: request.params.patternId,
@@ -5055,12 +5070,17 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           inferred_urls: inferredUrls,
           structure_filters: redirectStructureFilters,
           approved_rules: approvedRules.length > 0 ? approvedRules : null,
-          exclude_urls: excludeUrls.length > 0 ? excludeUrls : null
+          exclude_urls: excludeUrls.length > 0 ? excludeUrls : null,
+          job_row_id: jobRowId
         });
 
         return reply.send({
           queued: true,
-          files_total: patternFileSpan
+          files_total: patternFileSpan,
+          // So the client can poll this exact run rather than "the latest
+          // apply-redirects row for the session", which would attach to someone
+          // else's apply on a shared session.
+          job_row_id: jobRowId
         });
       }
 
@@ -6867,6 +6887,51 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           LIMIT 1
         `,
         [request.params.id]
+      );
+
+      return { job: result.rows[0] ?? null };
+    }
+  );
+
+  // Poll one queued apply-redirects run (v1.78).
+  //
+  // BY ROW ID, not "the newest row for this session", which is how the delete
+  // poll above works. That is fine there — deletion is a session-wide operation
+  // a user runs one at a time — but an apply is PER PATTERN, and two patterns
+  // can be applied minutes apart on the same session. Keyed on the session too,
+  // so one session's id cannot be used to read another's job.
+  app.get<{ Params: SessionParams; Querystring: { job_row_id?: string } }>(
+    "/api/sessions/:id/apply-redirects/status",
+    async (request, reply) => {
+      const jobRowId = request.query?.job_row_id;
+
+      // Shape-checked before it reaches SQL: maintenance_jobs.id is a uuid, and
+      // a non-uuid string makes Postgres raise "invalid input syntax for type
+      // uuid" — a 500 for what is plainly a bad request.
+      if (
+        typeof jobRowId !== "string" ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+          jobRowId
+        )
+      ) {
+        return reply.code(400).send(badRequest("job_row_id must be a uuid"));
+      }
+
+      const result = await pool.query<{
+        id: string;
+        kind: string;
+        status: string;
+        files_total: number;
+        files_done: number;
+        items_changed: string;
+        error: string | null;
+      }>(
+        `
+          SELECT id, kind, status, files_total, files_done, items_changed, error
+          FROM maintenance_jobs
+          WHERE id = $1 AND session_id = $2 AND kind = 'apply-redirects'
+        `,
+        [jobRowId, request.params.id]
       );
 
       return { job: result.rows[0] ?? null };

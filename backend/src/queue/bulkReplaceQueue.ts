@@ -69,6 +69,17 @@ export type ApplyRedirectsJobData = {
   // operator's Skip choices at the queue boundary — the DB would say skipped and
   // the file would not.
   exclude_urls?: string[] | null;
+  // maintenance_jobs.id — the progress/status row this job drives (v1.78).
+  //
+  // This job used to report NOTHING: no row, no progress, no completion, and a
+  // throw was recorded only in Redis where the app could never see it. The UI
+  // toasted once and refreshed after six seconds, so a multi-minute apply looked
+  // exactly like one that had silently died — which is what "the background job
+  // is collapsing" turned out to mean. v1.77 then routed far more applies here.
+  //
+  // Optional so a job already sitting in the queue at deploy time still runs: an
+  // older payload has no row to drive and simply reports as it always did.
+  job_row_id?: string | null;
 };
 
 // Pattern structure operations. Everything the worker needs is in the

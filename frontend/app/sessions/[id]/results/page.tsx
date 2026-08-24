@@ -58,6 +58,7 @@ import {
 
 import {
   applyPatternRedirects,
+  getApplyRedirectsStatus,
   getRedirectCandidates,
   getRedirectRuleImpact,
   deleteRedirectUrls,
@@ -208,7 +209,11 @@ import {
   fixAcceptLimit,
   fixModalBanner
 } from "@/lib/fix-accept-count";
-import { verifyAdviceFor, verifyAdviceLabel } from "@/lib/verify-advice";
+import {
+  looksLikeSegmentReorder,
+  verifyAdviceFor,
+  verifyAdviceLabel
+} from "@/lib/verify-advice";
 import { findSegmentDuplication } from "@/lib/segment-duplication";
 import {
   classifyTransform,
@@ -3052,6 +3057,92 @@ export default function ResultsDashboardPage({
     }
   }
 
+  // Follow a queued apply to its end (v1.78).
+  //
+  // WHY THIS EXISTS. The queued path reported nothing at all — no row, no
+  // progress, no completion, and a throw that only Redis saw. This screen showed
+  // a toast and refreshed once, six seconds later, which on a multi-minute apply
+  // is always too early and is indistinguishable from a job that died on its
+  // first file. The operator's words were "the background job is collapsing";
+  // what it was doing was working in silence, and sometimes failing in silence.
+  //
+  // Polls rather than streams, matching the delete/restore flow — the same
+  // maintenance_jobs row, the same cadence, no new transport for one screen.
+  async function pollQueuedApply(jobRowId: string, filesTotal: number) {
+    // Long enough for the widest pattern seen (187 files, several minutes) with
+    // room to spare, short enough that a worker killed mid-run stops being
+    // polled. Reaching it is reported as "still running", never as success.
+    const deadline = Date.now() + 30 * 60 * 1000;
+
+    for (;;) {
+      await new Promise((resolve) => window.setTimeout(resolve, 3000));
+
+      if (Date.now() > deadline) {
+        setFindReplaceToast({
+          tone: "error",
+          message:
+            "The apply is taking longer than expected — it may still be running. Reload to see where it got to."
+        });
+        await loadResults({ silent: true });
+        return;
+      }
+
+      let job;
+
+      try {
+        ({ job } = await getApplyRedirectsStatus(params.id, jobRowId));
+      } catch {
+        // A dropped poll is not a failed apply — the job runs in the worker,
+        // independent of this tab. Keep waiting; the deadline bounds it.
+        continue;
+      }
+
+      if (!job) {
+        continue;
+      }
+
+      if (job.status === "FAILED") {
+        setFindReplaceToast({
+          tone: "error",
+          message:
+            job.error ??
+            "The background apply failed. Nothing was left half-written — the files are restored from their originals.",
+        });
+        await loadResults({ silent: true });
+        return;
+      }
+
+      if (job.status === "COMPLETED") {
+        const changed = Number(job.items_changed ?? 0);
+
+        // Reload BEFORE the toast, so the number and the table agree the moment
+        // the user reads it.
+        await loadResults({ silent: true });
+        setFindReplaceToast({
+          tone: changed === 0 ? "error" : "success",
+          message:
+            changed === 0
+              ? "The apply finished without changing any URL. Re-analyse the session to see the current ones."
+              : `${formatNumber(changed)} URL${
+                  changed === 1 ? "" : "s"
+                } updated to their redirect destinations across ${formatNumber(
+                  job.files_total || filesTotal
+                )} files.`
+        });
+        return;
+      }
+
+      // RUNNING or PENDING: say where it is. files_done climbs once per file, so
+      // this moves on a wide pattern instead of sitting on one sentence.
+      setFindReplaceToast({
+        tone: "success",
+        message: `Applying redirect fixes — ${formatNumber(
+          job.files_done
+        )} of ${formatNumber(job.files_total || filesTotal)} files done…`
+      });
+    }
+  }
+
   async function handleAcceptFixes() {
     // fixAcceptUncounted here as well as on the button (v1.76): this is the one
     // path that rewrites files pattern-wide, and "the label could not say what
@@ -3132,16 +3223,31 @@ export default function ResultsDashboardPage({
       setFixRow(null);
 
       if (result.queued) {
-        // Large whole-pattern fix routed to a background job — no synchronous
-        // result. Tell the user and refresh shortly so the recomputed pattern
-        // + rewritten files show once the worker finishes.
+        // Wide fix routed to a background job — no synchronous result.
+        //
+        // THIS USED TO BE A TOAST AND ONE REFRESH SIX SECONDS LATER (v1.78 fixes
+        // it). The job takes minutes on a wide pattern, so that refresh always
+        // landed on unchanged data, and a job that had actually died looked
+        // exactly the same: the operator reported it as "the background job is
+        // collapsing". It was never reporting anything. Now the job drives a
+        // maintenance_jobs row and this polls it to the end.
         setFindReplaceToast({
           tone: "success",
           message: `Applying redirect fixes across ${formatNumber(
             result.files_total ?? 0
-          )} files in the background — results will update shortly.`
+          )} files in the background…`
         });
-        window.setTimeout(() => void loadResults({ silent: true }), 6000);
+
+        const jobRowId = result.job_row_id;
+
+        if (!jobRowId) {
+          // Older backend: no row to poll, so keep the previous behaviour rather
+          // than leaving the user with a toast and nothing at all.
+          window.setTimeout(() => void loadResults({ silent: true }), 6000);
+          return;
+        }
+
+        void pollQueuedApply(jobRowId, result.files_total ?? 0);
         return;
       }
 
@@ -3459,6 +3565,22 @@ export default function ResultsDashboardPage({
   // scope (v1.77). Keyed on the SCOPED total, so a small structure inside a huge
   // pattern is advised on its own size. See lib/verify-advice.ts.
   const fixVerifyAdvice = verifyAdviceFor(fixEffectiveTotal);
+  // Are the confirmed redirects a segment MOVE? If so, no rule candidate in the
+  // approval box can express it and the structure transform is the only route
+  // that reaches the whole pattern — see lib/verify-advice.ts. (v1.78)
+  //
+  // Read from the candidates already loaded, so it costs nothing and describes
+  // the same evidence the operator is looking at.
+  const fixLooksLikeReorder = useMemo(
+    () =>
+      looksLikeSegmentReorder(
+        fixCandidates.map((candidate) => ({
+          source: candidate.url,
+          destination: candidate.final_url
+        }))
+      ),
+    [fixCandidates]
+  );
   const deleteCount = scopedFixCandidates.filter(
     (candidate) => fixActionFor(candidate) === "delete"
   ).length;
@@ -5978,6 +6100,30 @@ export default function ResultsDashboardPage({
                     usually split one per category, so tick every rewrite you can
                     see is intended. Unticked categories are left untouched.
                   </p>
+                  {/* WHEN NO RULE HERE CAN WIN (v1.78). If the confirmed
+                      redirects are a segment MOVE, this whole box is the wrong
+                      tool and no amount of ticking will fix the pattern: rule
+                      candidates are literal find/replace, so each is derived
+                      from one pair and matches almost nothing — 10 of 579,034 on
+                      the reported pattern. The structure transform expresses a
+                      move directly and rewrites every matching URL without
+                      probing any of them. Said here rather than in a doc because
+                      this box is where the operator is when the question comes
+                      up. See lib/verify-advice.ts. */}
+                  {fixLooksLikeReorder ? (
+                    <p
+                      className="rounded-md bg-white/70 px-2 py-1.5 text-xs text-indigo-900"
+                      data-testid="fix-reorder-advice"
+                    >
+                      These redirects move a path segment rather than rewrite one
+                      — the same parts in a different order. No rule below can
+                      express that, so ticking them will only fix the handful
+                      they were each derived from. Use{" "}
+                      <strong>Update Pattern → transform structure</strong> on
+                      this pattern instead: it rewrites every matching URL in one
+                      pass, with a dry run first and no URL checking at all.
+                    </p>
+                  ) : null}
                   <ul className="space-y-1.5">
                     {fixRuleCandidates.map((candidate, index) => {
                       const ticked = fixApprovedRuleIndexes.has(index);

@@ -662,6 +662,163 @@ function alignSegments(
   return assigned.reverse();
 }
 
+// Cap on params for the reorder search below. The state space is 2^n masks, so
+// this is what keeps a pathological template from turning an inference into a
+// hang. Twelve is far past any real pattern (the widest reported is five) and
+// 4,096 masks x segments is microseconds.
+const PARAM_PERMUTATION_LIMIT = 12;
+
+// The same alignment, with the params allowed to appear in ANY order (v1.78).
+//
+// WHY THIS EXISTS. alignSegments consumes params strictly left to right, so it
+// cannot read a MOVE. The reported site rewrote
+//   /product/{cat}/rfq/{mfr}/{pn}/{id}  ->  /rfq/product/{cat}/{mfr}/{pn}/{id}
+// across 579,034 URLs — every varying part kept, only the order changed — and
+// pasting that pair returned "does not keep every varying part of the old one,
+// in the same order", which is not what happened and told the operator nothing.
+// Typing the new structure BY HAND already worked: validateStructures only
+// requires the names to be unique, all kept and none invented, and transformUrl
+// substitutes by name. So the capability was always there; only the inference
+// could not reach it.
+//
+// RUN ONLY AS A FALLBACK, after the ordered pass fails. That is deliberate:
+// alignSegments' scoring has documented subtleties (the niin-parts note above)
+// and every example that infers correctly today must keep inferring exactly the
+// same thing. This can only turn a refusal into an answer, never change one.
+//
+// AMBIGUITY IS REFUSED, NOT GUESSED. Left-to-right order is what currently makes
+// the assignment unique: for /p/aa/aa/ -> /q/aa/aa/ the ordered pass binds {A}
+// then {B} and is right by construction. Once any permutation is allowed, two
+// params holding interchangeable values have two equally good readings, and
+// picking one would silently rewrite a million URLs under the wrong name. So the
+// number of optimal readings is counted and anything above one is refused.
+//
+// Only param/param ambiguity can arise: transformQuality never returns less than
+// 30 and a static segment contributes 0, so carrying a param always beats
+// spelling it out as a literal, and a param/static tie is impossible.
+function alignSegmentsAnyOrder(
+  segments: string[],
+  names: string[],
+  values: Map<string, string>
+): Array<{ rule: SegmentRule; options: ParamTransform[] }> | "ambiguous" | null {
+  const segmentCount = segments.length;
+  const nameCount = names.length;
+
+  if (nameCount === 0 || nameCount > PARAM_PERMUTATION_LIMIT) {
+    return null;
+  }
+
+  const optionsFor: ParamTransform[][][] = [];
+
+  for (let i = 0; i < segmentCount; i += 1) {
+    const row: ParamTransform[][] = [];
+
+    for (let j = 0; j < nameCount; j += 1) {
+      const value = values.get(names[j]);
+
+      row.push(value === undefined ? [] : candidateTransforms(value, segments[i]));
+    }
+
+    optionsFor.push(row);
+  }
+
+  // best[i][mask]: score for the first i segments having consumed exactly the
+  // params in `mask`. -1 marks unreachable. ways[] counts optimal readings,
+  // capped at 2 because "more than one" is the only thing it decides.
+  const width = 1 << nameCount;
+  const full = width - 1;
+  const best = new Array<number>((segmentCount + 1) * width).fill(-1);
+  const ways = new Array<number>((segmentCount + 1) * width).fill(0);
+  // Which param each state consumed, or -1 for a static segment.
+  const took = new Array<number>((segmentCount + 1) * width).fill(-1);
+
+  best[0] = 0;
+  ways[0] = 1;
+
+  for (let i = 0; i < segmentCount; i += 1) {
+    for (let mask = 0; mask < width; mask += 1) {
+      const at = i * width + mask;
+
+      if (best[at] < 0) {
+        continue;
+      }
+
+      const consider = (nextMask: number, score: number, param: number) => {
+        const to = (i + 1) * width + nextMask;
+
+        if (score > best[to]) {
+          best[to] = score;
+          ways[to] = ways[at];
+          took[to] = param;
+
+          return;
+        }
+
+        if (score === best[to]) {
+          ways[to] = Math.min(2, ways[to] + ways[at]);
+        }
+      };
+
+      // This segment is a static literal.
+      consider(mask, best[at], -1);
+
+      // Or it carries any param not yet consumed — the whole difference from
+      // alignSegments, which may only take the NEXT one.
+      for (let j = 0; j < nameCount; j += 1) {
+        if (mask & (1 << j)) {
+          continue;
+        }
+
+        if (optionsFor[i][j].length === 0) {
+          continue;
+        }
+
+        consider(
+          mask | (1 << j),
+          best[at] + transformQuality(optionsFor[i][j][0]),
+          j
+        );
+      }
+    }
+  }
+
+  const finalAt = segmentCount * width + full;
+
+  if (best[finalAt] < 0) {
+    return null;
+  }
+
+  if (ways[finalAt] > 1) {
+    return "ambiguous";
+  }
+
+  const assigned: Array<{ rule: SegmentRule; options: ParamTransform[] }> = [];
+  let mask = full;
+
+  for (let i = segmentCount; i > 0; i -= 1) {
+    const param = took[i * width + mask];
+
+    if (param < 0) {
+      assigned.push({
+        rule: { type: "static", value: segments[i - 1] },
+        options: []
+      });
+
+      continue;
+    }
+
+    const options = optionsFor[i - 1][param];
+
+    assigned.push({
+      rule: { type: "param", name: names[param], transform: options[0] },
+      options
+    });
+    mask ^= 1 << param;
+  }
+
+  return assigned.reverse();
+}
+
 // Infer a new-structure string from one real URL and the URL the user wants it
 // to become.
 //
@@ -709,7 +866,40 @@ export function inferNewStructure(
   const trailingSlash =
     target.pathname.length > 1 && target.pathname.endsWith("/");
   const names = structureParamNames(current);
-  const aligned = alignSegments(segments, names, values);
+
+  // DUPLICATE NAMES ARE CHECKED HERE, NOT LATER (v1.78). captureStructureValues
+  // keys by NAME, so a current structure of /product/{param}/{param}/... — which
+  // is exactly what the pattern template looks like — collapses five values into
+  // one map entry, and every alignment below then fails. validateStructures has
+  // the accurate message for this ("repeats a param name") but runs after
+  // alignment, so the operator only ever saw the ordering error. Same diagnosis,
+  // moved to where it is reachable.
+  if (new Set(names).size !== names.length) {
+    return {
+      ok: false,
+      error:
+        "the current structure repeats a param name, so its varying parts cannot be told apart — give each one a distinct name, e.g. {A}, {B}, {C}"
+    };
+  }
+
+  let aligned = alignSegments(segments, names, values);
+
+  // A MOVE, not a mismatch (v1.78). The ordered pass cannot read a reorder, so a
+  // refusal is retried allowing any order before it is reported as one. See
+  // alignSegmentsAnyOrder — it can only turn a refusal into an answer.
+  if (!aligned) {
+    const anyOrder = alignSegmentsAnyOrder(segments, names, values);
+
+    if (anyOrder === "ambiguous") {
+      return {
+        ok: false,
+        error:
+          "more than one reading of that example fits equally well, because two of its varying parts are interchangeable here — type the new structure directly instead, so which part moved where is your decision rather than a guess"
+      };
+    }
+
+    aligned = anyOrder;
+  }
 
   if (!aligned) {
     return {
@@ -719,7 +909,7 @@ export function inferNewStructure(
           ? 'the new URL keeps nothing of "' +
             (values.get(names[0]) ?? "") +
             '", so every URL in this pattern would collapse to the same literal — keep the varying part somewhere in it'
-          : "the new URL does not keep every varying part of the old one, in the same order"
+          : "the new URL does not keep every varying part of the old one — each has to appear somewhere in it, in any order"
     };
   }
 

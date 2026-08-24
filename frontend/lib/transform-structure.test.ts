@@ -537,7 +537,10 @@ test("refuses when the new URL drops the varying part entirely", () => {
   );
 });
 
-test("refuses when the new URL reorders the params", () => {
+// Inverse of the assertion it replaces (v1.78) — see the note on the backend
+// twin. A move is a rewrite the applier can perform, so the modal must be able
+// to infer it; refusing was documenting alignSegments' limit, not a real one.
+test("infers a reorder of the params", () => {
   const current = parseStructure("/a/{A}/{B}/");
   const result = inferNewStructure(
     "https://x.com/a/one/two/",
@@ -545,7 +548,51 @@ test("refuses when the new URL reorders the params", () => {
     current
   );
 
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.structure, "/a/{B}/{A}/");
+});
+
+test("infers the reported production reorder, trailing slash intact", () => {
+  // The modal is where this pair gets pasted, so the frontend copy asserts it
+  // too: the user must not be told one thing here and another by the API.
+  const result = inferNewStructure(
+    "https://www.io.com/product/safety/rfq/scott-safety/200130-01/9u694/",
+    "https://www.io.com/rfq/product/safety/scott-safety/200130-01/9u694/",
+    parseStructure("/product/{A}/{B}/{C}/{D}/{E}")
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(
+    result.ok && result.structure,
+    "/{B}/product/{A}/{C}/{D}/{E}/"
+  );
+});
+
+test("refuses a reorder that has more than one equally good reading", () => {
+  const result = inferNewStructure(
+    "https://x.com/p/aa/aa/bb/",
+    "https://x.com/q/bb/aa/aa/",
+    parseStructure("/p/{A}/{B}/{C}")
+  );
+
   assert.equal(result.ok, false);
+  assert.match(
+    result.ok ? "" : result.error,
+    /interchangeable|type the new structure directly/
+  );
+});
+
+test("a current structure that repeats a param name says so", () => {
+  // The pre-filled structure uses {A}, {B}, ... but a user who pastes the
+  // pattern template gets {param} five times. This is the message they see.
+  const result = inferNewStructure(
+    "https://www.io.com/product/safety/rfq/scott-safety/200130-01/9u694/",
+    "https://www.io.com/rfq/product/safety/scott-safety/200130-01/9u694/",
+    parseStructure("/product/{param}/{param}/{param}/{param}/{param}")
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.ok ? "" : result.error, /repeats a param name/);
 });
 
 test("refuses when nothing changed", () => {
