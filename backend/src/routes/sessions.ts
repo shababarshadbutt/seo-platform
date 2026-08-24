@@ -180,7 +180,7 @@ import {
   applyOutcomeMessage,
   classifyApplyOutcome
 } from "../sitemaps/applyOutcome.js";
-import { applyFileScope } from "../sitemaps/applyFileScope.js";
+import { applyFileScope, shouldQueueApply } from "../sitemaps/applyFileScope.js";
 import { parseShapeFilter } from "../sitemaps/shapeFilter.js";
 import {
   isOfferedRule,
@@ -4977,13 +4977,10 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           )
         : [];
 
-      // Route a WIDENED apply that would rewrite more than the parallel
-      // threshold's worth of files to a background job (v1.42). The sampled-only
-      // path (no inferred URLs) only ever touches a handful of files, so it
-      // always stays inline; only the whole-pattern inference can span hundreds
-      // of files, and rewriting those synchronously here would block the API
-      // event loop / trip the request timeout — the failure mode that hit the
-      // ZIP path (v1.27) and Cleaner (v1.38). The job re-derives everything
+      // Route an apply that would rewrite more than the parallel threshold's
+      // worth of files to a background job (v1.42), because rewriting those
+      // synchronously here blocks the API — the failure mode that hit the ZIP
+      // path (v1.27) and Cleaner (v1.38). The job re-derives everything
       // server-side and rewrites via the piscina pool.
       const rawApproved = request.body?.approved_rules;
       const approvedRules: RedirectRule[] = [];
@@ -5008,38 +5005,63 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         }
       }
 
-      // APPROVED RULES QUEUE TOO (v1.72 — fixing v1.71).
+      // THE FILE COUNT DECIDES, NOT THE INTENT (v1.77 — fixing v1.75).
       //
-      // This gate used to be `inferredUrls.length > 0`, from when a widened apply
-      // could only be requested by listing URLs. v1.71 deliberately stopped
-      // requiring that for an approved rule — so an approved rule on a wide
-      // pattern skipped the queue and rewrote inline, on the API event loop.
-      // That is exactly what this routing exists to prevent, and the comment
-      // below names the two incidents it came from. It had not bitten only
-      // because the reported pattern spans 3 files, under the threshold.
-      if (approvedRules.length > 0 || inferredUrls.length > 0 || widenRequested) {
-        const fileSpanResult = await pool.query<{ n: string }>(
-          "SELECT COUNT(DISTINCT source_file)::bigint AS n FROM pattern_file_occurrences WHERE pattern_id = $1",
-          [request.params.patternId]
-        );
-        const patternFileSpan = Number(fileSpanResult.rows[0]?.n ?? 0);
+      // This gate has been narrowed twice and been wrong both times, for the same
+      // reason each time: it tried to infer "will this apply open many files?"
+      // from what the CALLER asked for.
+      //
+      //   * originally `inferredUrls.length > 0`, from when a widened apply could
+      //     only be requested by listing URLs;
+      //   * v1.72 added approvedRules/widenRequested, after v1.71 let an approved
+      //     rule reach the inline path.
+      //
+      // v1.75 removed the premise underneath all of it. applyFileScope made the
+      // scope of EVERY apply that changes anything the pattern's own file list —
+      // deliberately, because a confirmed destination in file 187 needs file 187
+      // opened just as much as a rule does. From that moment a plain
+      // confirmed-destinations apply (no rule, no widen, matching none of the
+      // conditions above) opened every file the pattern spans while still routing
+      // itself inline.
+      //
+      // What that costs is not a slow response, it is a starved API: the inline
+      // path walks those files SEQUENTIALLY inside the route's BEGIN..COMMIT
+      // (see rewriteRedirectSourceFilesOnDisk), so it holds one of the pool's ten
+      // connections in an open transaction for minutes. The reported symptom was
+      // "Unable to load this analysis — Request timed out" on an unrelated
+      // session, because GET /api/sessions/:id was queued behind it waiting for a
+      // connection.
+      //
+      // So the predicate is now the only thing that actually predicts the work:
+      // how many files this pattern spans. Asked unconditionally — one indexed
+      // COUNT DISTINCT — because "which applies are wide?" is no longer knowable
+      // from the request body.
+      const fileSpanResult = await pool.query<{ n: string }>(
+        "SELECT COUNT(DISTINCT source_file)::bigint AS n FROM pattern_file_occurrences WHERE pattern_id = $1",
+        [request.params.patternId]
+      );
+      const patternFileSpan = Number(fileSpanResult.rows[0]?.n ?? 0);
 
-        if (patternFileSpan > FILE_REWRITE_PARALLEL_THRESHOLD) {
-          await enqueueApplyRedirectsJob({
-            session_id: request.params.id,
-            pattern_id: request.params.patternId,
-            url_ids: urlIds,
-            inferred_urls: inferredUrls,
-            structure_filters: redirectStructureFilters,
-            approved_rules: approvedRules.length > 0 ? approvedRules : null,
-            exclude_urls: excludeUrls.length > 0 ? excludeUrls : null
-          });
+      if (
+        shouldQueueApply({
+          patternFileSpan,
+          threshold: FILE_REWRITE_PARALLEL_THRESHOLD
+        })
+      ) {
+        await enqueueApplyRedirectsJob({
+          session_id: request.params.id,
+          pattern_id: request.params.patternId,
+          url_ids: urlIds,
+          inferred_urls: inferredUrls,
+          structure_filters: redirectStructureFilters,
+          approved_rules: approvedRules.length > 0 ? approvedRules : null,
+          exclude_urls: excludeUrls.length > 0 ? excludeUrls : null
+        });
 
-          return reply.send({
-            queued: true,
-            files_total: patternFileSpan
-          });
-        }
+        return reply.send({
+          queued: true,
+          files_total: patternFileSpan
+        });
       }
 
       // Derive the rule BEFORE the UPDATE below flips the selected redirect rows

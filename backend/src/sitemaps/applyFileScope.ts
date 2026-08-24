@@ -71,3 +71,30 @@ export function applyFileScope(input: ApplyFileScopeInput): string[] {
 
   return Array.from(occurrences);
 }
+
+// INLINE OR QUEUED? (v1.77)
+//
+// Lives next to applyFileScope because it is the other half of one decision: the
+// function above says an apply opens the pattern's whole file list, and this one
+// says a request may not do that many files itself. They were separated before —
+// scope keyed on what the apply would change, routing keyed on what the CALLER
+// asked for — and the gap between them is the bug this pairing closes.
+//
+// An inline apply walks its files sequentially inside the route's open
+// transaction (rewriteRedirectSourceFilesOnDisk), holding one of the pool's ten
+// connections the whole time. A 187-file pattern held it for minutes, and the
+// visible symptom was an unrelated page reporting "Request timed out" because
+// GET /api/sessions/:id was waiting for a connection that never came back.
+//
+// So routing asks the only question that predicts the work — how many files —
+// and nothing about intent. Extracted as a pure function rather than left as a
+// comparison in the route because the route has no test harness, and this
+// predicate has now been wrong twice.
+export function shouldQueueApply(input: {
+  // DISTINCT source_file count from pattern_file_occurrences.
+  patternFileSpan: number;
+  // FILE_REWRITE_PARALLEL_THRESHOLD.
+  threshold: number;
+}): boolean {
+  return input.patternFileSpan > input.threshold;
+}

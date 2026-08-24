@@ -208,6 +208,7 @@ import {
   fixAcceptLimit,
   fixModalBanner
 } from "@/lib/fix-accept-count";
+import { verifyAdviceFor, verifyAdviceLabel } from "@/lib/verify-advice";
 import { findSegmentDuplication } from "@/lib/segment-duplication";
 import {
   classifyTransform,
@@ -3454,6 +3455,10 @@ export default function ResultsDashboardPage({
   // number to put on the button, so it does not offer one — the shortlist's own
   // "Count exactly how many URLs each rule changes" is one click away.
   const fixAcceptUncounted = fixAcceptLimitReason === "rules-uncounted";
+  // Which verification to send the operator to when the count falls short of the
+  // scope (v1.77). Keyed on the SCOPED total, so a small structure inside a huge
+  // pattern is advised on its own size. See lib/verify-advice.ts.
+  const fixVerifyAdvice = verifyAdviceFor(fixEffectiveTotal);
   const deleteCount = scopedFixCandidates.filter(
     (candidate) => fixActionFor(candidate) === "delete"
   ).length;
@@ -5858,6 +5863,11 @@ export default function ResultsDashboardPage({
                   actually change.
                 </p>
               ) : fixBanner === "scope-limited" ? (
+                /* NAMES THE RUN THAT FINISHES (v1.77). "verify more of the
+                   pattern" was true and unactionable: on a scope this size the
+                   only verification that completes in a working day is the shape
+                   check, and an operator reading this banner had no way to know
+                   that. See lib/verify-advice.ts. */
                 <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
                   Accepting targets all {formatNumber(fixPatternTotal)} URLs in
                   this pattern.{" "}
@@ -5865,7 +5875,11 @@ export default function ResultsDashboardPage({
                     ? "Nothing here has been checked yet, so only URLs with a confirmed destination can actually be rewritten — run a check below first."
                     : `The confirmed redirects were too varied to infer a single rewrite rule, so only the ${formatNumber(
                         fixCandidates.length
-                      )} reviewed URLs can be rewritten right now — verify more of the pattern to widen it.`}
+                      )} reviewed URLs can be rewritten right now. ${
+                        fixVerifyAdvice === "shape"
+                          ? `Use "Check by shape" above — it probes about 50 URLs per shape and derives a rule for each, which reaches the rest without checking them one by one.`
+                          : `Use "Verify all in this pattern" above to widen it.`
+                      }`}
                 </p>
               ) : fixBanner === "no-rule" &&
                 !(fixRow && showCheckButton(fixRow)) ? (
@@ -6379,11 +6393,21 @@ export default function ResultsDashboardPage({
                         to widen it.
                       </span>
                     ) : fixAcceptContext !== null && fixAllInPattern ? (
+                      /* WHICH verification, by scope size (v1.77). This line used
+                         to name the full run unconditionally, so a 320,876-URL
+                         scope was told to probe all 320,876 — most of a day, and
+                         the advice that produced the "nothing is fixed" report.
+                         See lib/verify-advice.ts. */
                       <span className="text-xs text-amber-700">
                         {formatNumber(fixAcceptLabelCount)} of{" "}
                         {formatNumber(fixAcceptContext)} have a confirmed
-                        destination — use &ldquo;Verify all in this
-                        pattern&rdquo; above to raise this.
+                        destination — use &ldquo;
+                        {verifyAdviceLabel(fixVerifyAdvice)}&rdquo; above to raise
+                        this
+                        {fixVerifyAdvice === "shape"
+                          ? ": it probes about 50 URLs per shape instead of all of them"
+                          : ""}
+                        .
                       </span>
                     ) : null}
                   </div>

@@ -11,7 +11,7 @@ import { logPrivateHostMapStatus } from "./http/privateHostMap.js";
 import { closeSitemapQueue } from "./queue/sitemapQueue.js";
 import { destroyCleanerPools } from "./jobs/cleanerPool.js";
 import { destroyPatternPopulationPool } from "./jobs/patternPopulationPool.js";
-import { closePool } from "./db/pool.js";
+import { closePool, DB_POOL_MAX, pool } from "./db/pool.js";
 import { runMigrations } from "./db/migrate.js";
 import { fsErrorResponse } from "./errors/fsErrors.js";
 import { sessionRoutes } from "./routes/sessions.js";
@@ -55,6 +55,45 @@ logPrivateHostMapStatus(app.log, {
 //
 // Names and booleans only, so this line is safe to paste into a ticket.
 app.log.info(awsConfigStatus(), "deployment config");
+
+// SLOW REQUESTS, NAMED (v1.77).
+//
+// The reported symptom was "Unable to load this analysis — Request timed out" on
+// a healthy session. That message is a CLIENT-side abort at 60s, so the server
+// logged nothing at all: from the box there was no evidence a request had even
+// been slow, and the six-round hunt that followed started from zero.
+//
+// One line per slow request, at warn, with the route rather than the URL — a
+// parameterised route keeps this to a handful of distinct lines instead of one
+// per session id. The pool counters ride along because API slowness here is
+// almost always connection starvation rather than a slow query, and knowing
+// which of the two it was is the difference between tuning SQL and finding the
+// request that is holding a transaction open (see shouldQueueApply).
+const SLOW_REQUEST_MS = 2000;
+
+app.addHook("onResponse", async (request, reply) => {
+  const elapsedMs = reply.elapsedTime;
+
+  if (elapsedMs < SLOW_REQUEST_MS) {
+    return;
+  }
+
+  request.log.warn(
+    {
+      method: request.method,
+      route: request.routeOptions?.url ?? request.url,
+      status_code: reply.statusCode,
+      duration_ms: Math.round(elapsedMs),
+      // waiting > 0 means requests are queued for a connection, which is the
+      // shape of this failure: the slow request is a VICTIM, and the culprit is
+      // whatever holds a client without releasing it.
+      pool_total: pool.totalCount,
+      pool_idle: pool.idleCount,
+      pool_waiting: pool.waitingCount
+    },
+    "slow request"
+  );
+});
 
 await app.register(cors, {
   origin: true,
@@ -126,7 +165,21 @@ app.get("/health", async () => ({
   mode: config.nodeEnv,
   uploadDir: config.uploadDir,
   exportDir: config.exportDir,
-  config: awsConfigStatus()
+  config: awsConfigStatus(),
+  // THE POOL, because a starved one was invisible from outside (v1.77). max is
+  // 10; an apply that opened 187 files inline held one of those inside an open
+  // transaction for minutes, and every other request queued behind it until the
+  // browser gave up. Nothing anywhere reported that — /health said ok:true
+  // throughout, which is why this presented as an unexplained timeout.
+  //
+  // waiting is the number that matters: 0 is healthy at any total, and anything
+  // sustained above 0 means requests are being made to wait for a connection.
+  db_pool: {
+    max: DB_POOL_MAX,
+    total: pool.totalCount,
+    idle: pool.idleCount,
+    waiting: pool.waitingCount
+  }
 }));
 
 app.get("/", async () => ({

@@ -36,6 +36,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { confirmedProblemKind } from "@/lib/confirmed-problem-kind";
 import { etaSecondsFrom, verifyProgress } from "@/lib/verify-progress";
+import { STRATIFIED_WORTH_IT } from "@/lib/verify-advice";
 import { Progress } from "@/components/ui/progress";
 
 // The Fix Redirect URLs modal's verify-and-delete section, scoped to ONE
@@ -130,7 +131,10 @@ type Props = {
 // Below this a full verification is already quick enough that offering a second,
 // weaker option only adds a decision. At ~50 req/s a 20,000-URL pattern is
 // roughly 7 minutes; past that the hours start.
-const STRATIFIED_WORTH_IT = 20000;
+// Moved to lib/verify-advice.ts (v1.77) so the Fix modal recommends the same
+// button this panel actually renders. While the number lived here, the modal was
+// free to advise "Verify all in this pattern" on a population where the shape
+// check is the only run that finishes — and it did, on every one of them.
 
 function formatNumber(value: number) {
   return new Intl.NumberFormat("en-US").format(value);

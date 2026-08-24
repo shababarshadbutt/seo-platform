@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { applyFileScope } from "./applyFileScope.js";
+import { applyFileScope, shouldQueueApply } from "./applyFileScope.js";
 
 // The reported bug: Accept said 579,034, the toast said "10 URLs updated". The
 // pattern spans 187 files; the inline path scanned only the files the 10
@@ -99,4 +99,56 @@ test("sampled files outside the occurrence list are still scanned", () => {
   });
 
   assert.deepEqual(new Set(scope), new Set(["sitemap-1.xml", "stray.xml"]));
+});
+
+// --- inline or queued (v1.77) -----------------------------------------------
+// The other half of the same decision. applyFileScope says an apply opens the
+// pattern's whole file list; these say a REQUEST may not do that many files
+// itself. Routing used to key on the caller's intent, so the apply above ran
+// inline over 187 files inside an open transaction and starved the API pool.
+
+test("a wide pattern queues even with no rule and no widen", () => {
+  // The reported case: confirmed destinations only. It matched none of the old
+  // gate's conditions (approved rules / inferred urls / widen) and therefore
+  // rewrote 187 files on the API request. This is the assertion that catches it.
+  assert.equal(
+    shouldQueueApply({ patternFileSpan: 187, threshold: 25 }),
+    true
+  );
+});
+
+test("a narrow pattern stays inline", () => {
+  // The common case, and why the inline path still exists: a handful of files is
+  // well inside a request's budget and the user is waiting on the result.
+  assert.equal(shouldQueueApply({ patternFileSpan: 3, threshold: 25 }), false);
+});
+
+test("the boundary is exclusive, matching the parallel pool's own crossover", () => {
+  // At exactly the threshold the file-rewrite pool still takes the sequential
+  // path, so the request may too. One number, one meaning, both sides.
+  assert.equal(shouldQueueApply({ patternFileSpan: 25, threshold: 25 }), false);
+  assert.equal(shouldQueueApply({ patternFileSpan: 26, threshold: 25 }), true);
+});
+
+test("intent cannot route an apply — only the file count can", () => {
+  // The invariant the last two regressions violated: for a given span the answer
+  // is the same whatever the caller asked for. Written as a property because
+  // both previous fixes added one more intent flag to the condition instead.
+  for (const patternFileSpan of [0, 1, 25, 26, 187, 1200]) {
+    const expected = patternFileSpan > 25;
+
+    assert.equal(
+      shouldQueueApply({ patternFileSpan, threshold: 25 }),
+      expected,
+      `span ${patternFileSpan} must route on size alone`
+    );
+  }
+});
+
+test("a session with no occurrence rows stays inline", () => {
+  // Span 0 means pattern_file_occurrences was never populated (pre-v1.42
+  // sessions). applyFileScope answers that case by scanning the whole role, but
+  // it is not a reason to queue: there is no measured width to queue on, and the
+  // inline path reports the resulting no-op immediately.
+  assert.equal(shouldQueueApply({ patternFileSpan: 0, threshold: 25 }), false);
 });

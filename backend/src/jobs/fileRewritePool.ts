@@ -20,14 +20,24 @@ import type {
 // ones stay on the simpler inline sequential loop (thread overhead isn't worth
 // it, and most sessions are small).
 //
+// IT ALSO BOUNDS HOW LONG AN API REQUEST MAY HOLD A DB CONNECTION (v1.77), which
+// is why the default came down from 200 to 25. apply-redirects uses this same
+// number to decide inline-vs-queued, and since v1.75 an inline apply opens every
+// file its pattern spans — sequentially, inside an open transaction, on one of
+// the pool's ten connections. At 200 a 187-file pattern qualified as "small" and
+// starved the API for minutes; unrelated pages then failed with "Request timed
+// out". 25 files is still comfortably inside a request's budget and everything
+// above it belongs to the worker.
+//
 // Env-tunable so the two paths can be measured against each OTHER on identical
 // input — setting it above the file count forces the sequential path, which is
 // how the parallel speedup on this code path is benchmarked rather than
 // asserted (bench/patternRewriteScale.ts). It also lets a deployment on a
-// bigger or smaller box move the crossover without a rebuild.
+// bigger or smaller box move the crossover without a rebuild. Raising it past a
+// few dozen now trades API responsiveness for it, so raise it deliberately.
 export const FILE_REWRITE_PARALLEL_THRESHOLD = readPositiveInt(
   "FILE_REWRITE_PARALLEL_THRESHOLD",
-  200
+  25
 );
 
 // Parallel file processors. Kept at 4 — a safe default for typical machines
