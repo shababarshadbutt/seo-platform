@@ -205,6 +205,7 @@ import {
   fixAcceptBreakdown,
   fixAcceptContextTotal,
   fixAcceptCount,
+  fixAcceptLimit,
   fixModalBanner
 } from "@/lib/fix-accept-count";
 import { findSegmentDuplication } from "@/lib/segment-duplication";
@@ -3051,7 +3052,16 @@ export default function ResultsDashboardPage({
   }
 
   async function handleAcceptFixes() {
-    if (!fixRow || fixCount === 0 || isFixing || isDeletingRedirects) {
+    // fixAcceptUncounted here as well as on the button (v1.76): this is the one
+    // path that rewrites files pattern-wide, and "the label could not say what
+    // this does" is a reason not to run it, not just a reason to grey a button.
+    if (
+      !fixRow ||
+      fixCount === 0 ||
+      fixAcceptUncounted ||
+      isFixing ||
+      isDeletingRedirects
+    ) {
       return;
     }
 
@@ -3102,7 +3112,18 @@ export default function ResultsDashboardPage({
         // meaning it had left.
         undefined,
         fixStructureFilters,
-        fixApprovedRules,
+        // ONLY WHEN THE TOGGLE IS PRESSED (v1.76). apply-redirects widens on
+        // approved_rules ALONE — its `widen` is
+        // (rule !== null && (approvedRules.length > 0 || ...)) — so sending them
+        // with the toggle released swept the rule across every file in the
+        // pattern while the button promised "the N selected URLs only". The
+        // over-claim this release fixes, pointing the other way.
+        //
+        // Nothing is lost by withholding them: a selected row is rewritten from
+        // its own confirmed destination via the exact replacement map, never by
+        // the rule. Ticked rules exist to reach the URLs nobody enumerated,
+        // which is precisely what a released toggle says not to do.
+        fixAllInPattern ? fixApprovedRules : [],
         fixAllInPattern,
         excludeUrls
       );
@@ -3262,6 +3283,13 @@ export default function ResultsDashboardPage({
     // total for null and would flash "(0)" for a 0.
     setFixScopedFiles(null);
     setFixScopedOccurrences(null);
+    // AND the rule-impact scan, which was run against the OLD scope (v1.76). It
+    // was previously cleared only when the pattern changed, which was survivable
+    // while it fed one advisory line; now that the Accept button's number comes
+    // from it, keeping it would re-label the button with a count measured over a
+    // different population. Accept blocks until it is re-counted, which is the
+    // honest state — see fixAcceptUncounted.
+    setFixRuleImpact(null);
 
     // Nothing to ask for when every dropdown is on "Any structure": the summary
     // box does not render, and fixEffectiveTotal is patterns.total_urls, which
@@ -3356,6 +3384,29 @@ export default function ResultsDashboardPage({
   const fixCount = scopedFixCandidates.filter(
     (candidate) => fixActionFor(candidate) === "fix"
   ).length;
+  // The ticked rules, in shortlist order — the order the rewriter applies them
+  // in, so what is counted is what will happen.
+  const fixApprovedRules = fixRuleCandidates
+    .filter((_, index) => fixApprovedRuleIndexes.has(index))
+    .map((candidate) => candidate.rule);
+  // MEASURED impact of the ticked rules over the in-scope population, or null
+  // when the scan has not run — an unknown, and the Accept button refuses to
+  // render one (v1.76). Sits above fixScope because the button's count reads it.
+  //
+  // anyRule when EVERY candidate is ticked: that is the DISTINCT count the scan
+  // measured, where the per-rule sum is only an upper bound (a URL two rules
+  // match is rewritten once, by whichever comes first). For a partial tick the
+  // sum is exact as long as the scan reports no overlap, and the note under the
+  // shortlist says so when it does.
+  const fixApprovedImpact =
+    fixRuleImpact === null
+      ? null
+      : fixRuleCandidates.length > 0 &&
+          fixApprovedRuleIndexes.size === fixRuleCandidates.length
+        ? fixRuleImpact.anyRule
+        : fixRuleImpact.perRule
+            .filter((entry) => fixApprovedRuleIndexes.has(entry.ruleIndex))
+            .reduce((sum, entry) => sum + entry.matches, 0);
   // Does accepting reach beyond the rows on screen? One input object feeds the
   // scope banner, the caption under the toggle and the Accept button's count —
   // writing the condition out separately per call site is what let them disagree
@@ -3366,15 +3417,17 @@ export default function ResultsDashboardPage({
     // and nothing changes.
     fixPatternTotal: fixEffectiveTotal,
     fixCandidateCount: scopedFixCandidates.length,
-    // An APPROVED rule is a pure per-URL transform, so it reaches every matching
-    // URL exactly as a derived one does — which is what makes "579,034 of
-    // 579,034" true rather than a promise. Until one is approved this stays as
-    // v1.68 left it: only URLs with a fetched destination. (v1.71)
-    inferredWithoutRule:
-      fixInferredWithoutRule && fixApprovedRuleIndexes.size === 0,
+    // The SERVER's fact, and only that (v1.76): did redirect-candidates distil a
+    // single whole-pattern rule? Ticking a shortlist rule used to flip this off,
+    // which made the Accept button report the pattern total — 579,034 for rules
+    // the impact scan had already measured at 10. An approval is not a
+    // pattern-wide rule; it arrives below as a measurement or not at all.
+    inferredWithoutRule: fixInferredWithoutRule,
     allInPattern: fixAllInPattern,
     confirmedRedirectCount: fixConfirmedCount,
-    shapeExtrapolatedCount: fixExtrapolatedCount
+    shapeExtrapolatedCount: fixExtrapolatedCount,
+    approvedRuleCount: fixApprovedRuleIndexes.size,
+    approvedRuleImpact: fixApprovedImpact
   };
   const fixAppliesPatternWide = appliesPatternWide(fixScope);
   // Which banner qualifies the scope, chosen by one function rather than two
@@ -3390,24 +3443,17 @@ export default function ResultsDashboardPage({
   // The "of N" half of "Accept Selected Changes (10 of 28,546)" — null once the
   // count already covers the whole scope. (v1.68)
   const fixAcceptContext = fixAcceptContextTotal({ fixCount, ...fixScope });
-  // The ticked rules, in shortlist order — the order the rewriter applies them
-  // in, so what is counted is what will happen.
-  const fixApprovedRules = fixRuleCandidates
-    .filter((_, index) => fixApprovedRuleIndexes.has(index))
-    .map((candidate) => candidate.rule);
-  // Summed impact of the ticked rules, or null when the scan has not run. Summing
-  // is exact only because the scan reports `overlapping` and it is 0 for these
-  // category-per-rule shortlists; when it is not, the UI says so rather than
-  // quietly over-reporting.
-  const fixApprovedImpact =
-    fixRuleImpact === null
-      ? null
-      : fixRuleImpact.perRule
-          .filter((entry) => fixApprovedRuleIndexes.has(entry.ruleIndex))
-          .reduce((sum, entry) => sum + entry.matches, 0);
-
   // measured vs inferred, or null when there is nothing inferred to name. (v1.69)
   const fixAcceptSplit = fixAcceptBreakdown({ fixCount, ...fixScope });
+  // WHY the count falls short of the scope, decided once for the caption under
+  // the toggle, the banner above the list and the gate on the button — three
+  // places that have contradicted each other every time they judged it
+  // separately. See lib/fix-accept-count.ts. (v1.76)
+  const fixAcceptLimitReason = fixAcceptLimit({ fixCount, ...fixScope });
+  // Rules are ticked and nobody has measured what they reach. There is no honest
+  // number to put on the button, so it does not offer one — the shortlist's own
+  // "Count exactly how many URLs each rule changes" is one click away.
+  const fixAcceptUncounted = fixAcceptLimitReason === "rules-uncounted";
   const deleteCount = scopedFixCandidates.filter(
     (candidate) => fixActionFor(candidate) === "delete"
   ).length;
@@ -5800,6 +5846,17 @@ export default function ResultsDashboardPage({
                   {formatNumber(fixPatternTotal)} matching URLs across this
                   pattern&rsquo;s files.
                 </p>
+              ) : fixBanner === "scope-rules" ? (
+                /* Deliberately WITHOUT the number (v1.76). The rule box directly
+                   below states what the ticked rules change, the caption on the
+                   toggle repeats it and the Accept button carries it — a fourth
+                   copy here would be noise, and the one thing this banner has to
+                   do is stop "scope" from claiming the whole pattern. */
+                <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  Accepting targets all {formatNumber(fixPatternTotal)} URLs in
+                  this pattern — the rules ticked below decide which of them
+                  actually change.
+                </p>
               ) : fixBanner === "scope-limited" ? (
                 <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
                   Accepting targets all {formatNumber(fixPatternTotal)} URLs in
@@ -6259,11 +6316,22 @@ export default function ResultsDashboardPage({
                     </button>
                     {/* Says the scope in words, so the state is legible without
                         reading the colour — and so the jump between the Accept
-                        button's two numbers is explained where it is caused. */}
+                        button's two numbers is explained where it is caused.
+
+                        "Targets", not "Applies to", whenever the accept cannot
+                        reach the whole population (v1.76). The toggle chooses
+                        which URLs are in play; how many of them actually change
+                        is the button's number, and one word promising the first
+                        IS the second is how "Applies to all 579,034" came to sit
+                        above a click that rewrote 10. */}
                     <span className="text-xs text-slate-500">
                       {fixAllInPattern
                         ? fixEffectiveTotal > scopedFixCandidates.length
-                          ? `Applies to all ${formatNumber(fixEffectiveTotal)} URLs in ${
+                          ? `${
+                              fixAcceptLimitReason === "none"
+                                ? "Applies to"
+                                : "Targets"
+                            } all ${formatNumber(fixEffectiveTotal)} URLs in ${
                               hasFixStructureScope
                                 ? fixScopeSummaryLabel
                                 : "this pattern"
@@ -6276,19 +6344,39 @@ export default function ResultsDashboardPage({
                           } only`}
                     </span>
                     {/* Why the Accept count can be smaller than the scope, said
-                        where the gap is visible. A URL is only rewritable if its
-                        destination has been fetched; verifying more of the
-                        pattern raises the count. (v1.68) */}
-                    {/* Measured vs inferred, named rather than summed (v1.69).
+                        where the gap is visible.
+
+                        Measured vs inferred, named rather than summed (v1.69).
                         A per-shape rule DOES deliver its URLs, so the count is
                         honest — but half of it was fetched and half was inferred
                         from a sample, and that is exactly the distinction two
-                        releases were spent making visible. */}
+                        releases were spent making visible.
+
+                        WHICH shortfall is fixAcceptLimit's decision, not this
+                        JSX's (v1.76). The chain used to know only about confirmed
+                        destinations, so a count produced by ticked rules was
+                        explained by advice — "verify more of the pattern" — that
+                        would not move it by one URL. Order matters: the
+                        uncounted case first, because it is the one where no
+                        number here can be trusted. */}
                     {fixAcceptSplit !== null && fixAllInPattern ? (
                       <span className="text-xs text-slate-600">
                         {formatNumber(fixAcceptSplit.measured)} measured ·{" "}
                         {formatNumber(fixAcceptSplit.extrapolated)} by per-shape
                         rule
+                      </span>
+                    ) : fixAcceptUncounted && fixAllInPattern ? (
+                      <span className="text-xs text-amber-700">
+                        Count the ticked rules above to see how many of these{" "}
+                        {formatNumber(fixEffectiveTotal)} URLs change.
+                      </span>
+                    ) : fixAcceptLimitReason === "rules" && fixAllInPattern ? (
+                      <span className="text-xs text-amber-700">
+                        The ticked rules change{" "}
+                        {formatNumber(fixAcceptLabelCount)} of{" "}
+                        {formatNumber(fixEffectiveTotal)} — the rest are left as
+                        they are. Tick more rules, or verify more of the pattern,
+                        to widen it.
                       </span>
                     ) : fixAcceptContext !== null && fixAllInPattern ? (
                       <span className="text-xs text-amber-700">
@@ -6592,6 +6680,22 @@ export default function ResultsDashboardPage({
                   </div>
                 ) : null}
               </div>
+              {/* WHY ACCEPT IS OFF (v1.76). Ticked rules whose reach nobody has
+                  measured leave this dialog with no honest number for the button
+                  — the state that shipped as "Accept Selected Changes (579,034)"
+                  for a rewrite of 10. Blocking is deliberate over quoting the
+                  confirmed floor: the floor would be a number, and a number here
+                  reads as a promise. The count is one click away, above. */}
+              {fixAcceptUncounted ? (
+                <p
+                  className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-900"
+                  data-testid="fix-accept-blocked"
+                >
+                  Count the ticked rules&rsquo; impact first — until then this
+                  dialog cannot say how many of the{" "}
+                  {formatNumber(fixEffectiveTotal)} URLs in scope would change.
+                </p>
+              ) : null}
               <p className="rounded-md bg-indigo-50 px-3 py-2 text-sm font-medium text-indigo-800">
                 {formatNumber(fixCount)} to update, {formatNumber(deleteCount)}{" "}
                 to delete
@@ -6640,9 +6744,16 @@ export default function ResultsDashboardPage({
                   // should learn that here rather than from a job that touches
                   // no files. See lib/fix-structure-scope.ts — a still-loading
                   // count is deliberately NOT this.
+                  //
+                  // fixAcceptUncounted joins them for v1.76: ticked rules whose
+                  // reach was never measured. Same principle — the operator
+                  // learns it here, from a label that admits it does not know,
+                  // rather than from a toast reporting 10 under a button that
+                  // said 579,034.
                   disabled={
                     fixCount === 0 ||
                     fixScopeEmpty ||
+                    fixAcceptUncounted ||
                     isFixing ||
                     isDeletingRedirects
                   }

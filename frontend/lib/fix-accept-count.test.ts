@@ -6,6 +6,7 @@ import {
   fixAcceptBreakdown,
   fixAcceptContextTotal,
   fixAcceptCount,
+  fixAcceptLimit,
   fixModalBanner
 } from "./fix-accept-count";
 
@@ -177,7 +178,8 @@ test("the context total appears only when the count falls short of it", () => {
 
 test("released: always the reviewed count, whatever else is true", () => {
   // Releasing the toggle means "only the rows I selected", so no combination of
-  // the other inputs may widen the number back out.
+  // the other inputs may widen the number back out — a ticked, measured rule
+  // reaching the whole pattern included (v1.76).
   for (const fixPatternTotal of [0, 12, 1000, 92643]) {
     for (const fixCandidateCount of [0, 12, 1000]) {
       for (const inferredWithoutRule of [false, true]) {
@@ -188,7 +190,9 @@ test("released: always the reviewed count, whatever else is true", () => {
             fixCandidateCount,
             inferredWithoutRule,
             allInPattern: false,
-            confirmedRedirectCount: 999999
+            confirmedRedirectCount: 999999,
+            approvedRuleCount: 2,
+            approvedRuleImpact: 92643
           }),
           42,
           `released must stay at the reviewed count at total=${fixPatternTotal} candidates=${fixCandidateCount} noRule=${inferredWithoutRule}`
@@ -312,38 +316,46 @@ test("the banner never overclaims: 'scope' implies a rule and a wide accept", ()
     for (const fixCandidateCount of [0, 12, 1000]) {
       for (const inferredWithoutRule of [false, true]) {
         for (const allInPattern of [false, true]) {
-          const banner = fixModalBanner({
-            fixPatternTotal,
-            fixCandidateCount,
-            inferredWithoutRule,
-            allInPattern,
-            confirmedRedirectCount: 999999
-          });
-          const where = `total=${fixPatternTotal} candidates=${fixCandidateCount} noRule=${inferredWithoutRule} pressed=${allInPattern}`;
-
-          if (banner === "scope") {
-            assert.equal(inferredWithoutRule, false, `overclaimed at ${where}`);
-            assert.equal(allInPattern, true, `overclaimed at ${where}`);
-            assert.ok(
-              fixPatternTotal > fixCandidateCount,
-              `overclaimed at ${where}`
-            );
-          }
-
-          // And whichever banner is chosen, the button agrees with it about
-          // whether this accept is pattern-wide.
-          const wide = banner === "scope" || banner === "scope-limited";
-          assert.equal(
-            wide,
-            appliesPatternWide({
+          // Ticked rules are in the sweep since v1.76: approving one must not be
+          // able to reach the indigo banner, which is how the button came to
+          // claim 579,034 for a rule that changed 10.
+          for (const approvedRuleCount of [0, 1, 3]) {
+            const scope = {
               fixPatternTotal,
               fixCandidateCount,
               inferredWithoutRule,
               allInPattern,
-              confirmedRedirectCount: 999999
-            }),
-            `banner and button disagree at ${where}`
-          );
+              confirmedRedirectCount: 999999,
+              approvedRuleCount
+            };
+            const banner = fixModalBanner(scope);
+            const where = `total=${fixPatternTotal} candidates=${fixCandidateCount} noRule=${inferredWithoutRule} pressed=${allInPattern} ticked=${approvedRuleCount}`;
+
+            if (banner === "scope") {
+              assert.equal(
+                inferredWithoutRule,
+                false,
+                `overclaimed at ${where}`
+              );
+              assert.equal(allInPattern, true, `overclaimed at ${where}`);
+              assert.ok(
+                fixPatternTotal > fixCandidateCount,
+                `overclaimed at ${where}`
+              );
+            }
+
+            // And whichever banner is chosen, the button agrees with it about
+            // whether this accept is pattern-wide.
+            const wide =
+              banner === "scope" ||
+              banner === "scope-rules" ||
+              banner === "scope-limited";
+            assert.equal(
+              wide,
+              appliesPatternWide(scope),
+              `banner and button disagree at ${where}`
+            );
+          }
         }
       }
     }
@@ -449,48 +461,29 @@ test("the breakdown's halves never exceed the scope together", () => {
   assert.equal(split!.measured + split!.extrapolated, 2000);
 });
 
-// --- a human-approved rule counts as a rule (v1.71) --------------------------
+// --- a DERIVED rule reaches the whole scope (v1.71, narrowed v1.76) ----------
 
-test("an APPROVED rule reaches the whole scope, exactly as a derived one does", () => {
-  // The HITL wiring: the modal passes inferredWithoutRule = (no single rule was
-  // derivable) AND (the operator has not approved one). Approving flips it, and
-  // the count becomes the whole pattern — which is truthful because a rule is a
-  // pure per-URL transform that reaches URLs nobody fetched.
-  //
-  // This is the ONE case where the v1.68 lesson does not apply: the number is
-  // not a promise about unfetched destinations, it is what the approved
-  // transform will compute for them.
-  const approved = fixAcceptCount({
-    fixCount: 10,
-    fixPatternTotal: 579034,
-    fixCandidateCount: 10,
-    // false = a rule now applies, derived or approved
-    inferredWithoutRule: false,
-    allInPattern: true,
-    confirmedRedirectCount: 5000
-  });
-
-  assert.equal(approved, 579034);
-
-  // And without an approval the same pattern reports only what was fetched —
-  // the v1.68 behaviour, unchanged.
+test("a DERIVED rule reaches the whole scope, ignoring the confirmed count", () => {
+  // inferredWithoutRule === false means the server distilled ONE rule that
+  // reproduces every confirmed pair. That case is unchanged since v1.53 and is
+  // deliberately still unmeasured — see the module header's note on the gap.
   assert.equal(
     fixAcceptCount({
       fixCount: 10,
       fixPatternTotal: 579034,
       fixCandidateCount: 10,
-      inferredWithoutRule: true,
+      inferredWithoutRule: false,
       allInPattern: true,
       confirmedRedirectCount: 5000
     }),
-    5000
+    579034
   );
 });
 
-test("approving a rule removes the measured/inferred split", () => {
-  // The split exists to name an extrapolation. A rule is not an extrapolation of
-  // some URLs and not others — it applies to all of them — so there is no
-  // half to name and no breakdown to show.
+test("a derived rule removes the measured/inferred split", () => {
+  // The split exists to name an extrapolation. A whole-pattern rule is not an
+  // extrapolation of some URLs and not others — it applies to all of them — so
+  // there is no half to name and no breakdown to show.
   assert.equal(
     fixAcceptBreakdown({
       fixCount: 10,
@@ -503,4 +496,134 @@ test("approving a rule removes the measured/inferred split", () => {
     }),
     null
   );
+});
+
+// --- an APPROVED rule reaches only what it MATCHES (v1.76) ------------------
+// The reported regression, and the reason v1.71's assertion above was narrowed to
+// derived rules only. A shortlist candidate is a literal edit distilled from
+// single confirmed pairs; it can match one URL out of half a million.
+
+const APPROVED = {
+  fixCount: 10,
+  fixPatternTotal: 579034,
+  fixCandidateCount: 10,
+  // The server derived NO whole-pattern rule. Ticking one does not change that
+  // fact, which is why this input no longer carries the approval (v1.76).
+  inferredWithoutRule: true,
+  allInPattern: true,
+  confirmedRedirectCount: 10,
+  approvedRuleCount: 1
+};
+
+test("the reported case: button 579,034, apply 10 — the measured 10 wins", () => {
+  // Production, v1.75-Live, /product/{param}x6 on internetofindustrials.com. The
+  // apply was already correct (v1.75 opened all 187 files); the rule-impact scan
+  // had already measured 10 matches across 579,034 URLs; the button said 579,034
+  // anyway because ticking a rule flipped inferredWithoutRule off.
+  assert.equal(fixAcceptCount({ ...APPROVED, approvedRuleImpact: 10 }), 10);
+  // And the gap goes ON the button: "Accept Selected Changes (10 of 579,034)".
+  assert.equal(
+    fixAcceptContextTotal({ ...APPROVED, approvedRuleImpact: 10 }),
+    579034
+  );
+  assert.equal(fixAcceptLimit({ ...APPROVED, approvedRuleImpact: 10 }), "rules");
+});
+
+test("a ticked rule that really does reach the pattern reports it", () => {
+  // v1.71's intent, now earned by measurement rather than assumed: the same
+  // wiring reports 500,000 when the scan actually found 500,000 matches.
+  assert.equal(
+    fixAcceptCount({ ...APPROVED, approvedRuleImpact: 500000 }),
+    500000
+  );
+});
+
+test("ticked but NOT counted is an unknown, never a number", () => {
+  // No scan has run, so the ticked rule contributes nothing and the count falls
+  // back to the confirmed floor. The limit says why, and the modal blocks Accept
+  // on it rather than putting a guess on a button that rewrites files.
+  assert.equal(
+    fixAcceptCount({ ...APPROVED, approvedRuleImpact: null }),
+    10
+  );
+  assert.equal(
+    fixAcceptLimit({ ...APPROVED, approvedRuleImpact: null }),
+    "rules-uncounted"
+  );
+});
+
+test("an uncounted tick cannot block a scope that is already fully confirmed", () => {
+  // Every URL in the scope has a fetched destination, so the count is the whole
+  // scope and no scan could raise it. Blocking there would be friction with no
+  // honesty to buy.
+  assert.equal(
+    fixAcceptLimit({
+      ...APPROVED,
+      confirmedRedirectCount: 579034,
+      approvedRuleImpact: null
+    }),
+    "none"
+  );
+});
+
+test("measured rule reach is clamped to the scope", () => {
+  // The impact scan and the pattern total are separate requests, so a stale pair
+  // is possible. Over-reporting is the direction that lies.
+  assert.equal(
+    fixAcceptCount({ ...APPROVED, approvedRuleImpact: 999999999 }),
+    579034
+  );
+});
+
+test("rules and confirmed destinations are MAXed, not summed", () => {
+  // The rewrite resolves each <loc> by precedence, so its reach is a union whose
+  // overlap nothing measures. 1,150 confirmed + 27,000 per-shape against a rule
+  // measured at 10 must report the larger term, not 28,160.
+  assert.equal(
+    fixAcceptCount({
+      ...APPROVED,
+      confirmedRedirectCount: 1150,
+      shapeExtrapolatedCount: 27000,
+      approvedRuleImpact: 10
+    }),
+    28150
+  );
+  assert.equal(
+    fixAcceptLimit({
+      ...APPROVED,
+      confirmedRedirectCount: 1150,
+      shapeExtrapolatedCount: 27000,
+      approvedRuleImpact: 10
+    }),
+    "confirmed"
+  );
+});
+
+test("a rules-derived count reports no measured/inferred split", () => {
+  // That pair names the halves of the confirmed + per-shape number. Printing it
+  // beside a count the rules produced would explain the button with figures that
+  // do not add up to it.
+  assert.equal(
+    fixAcceptBreakdown({
+      ...APPROVED,
+      shapeExtrapolatedCount: 5,
+      approvedRuleImpact: 40000
+    }),
+    null
+  );
+});
+
+test("ticking a rule swaps the amber banner for the one about rules", () => {
+  // "scope-limited" says "verify more of the pattern to widen it", which answers
+  // a different question than the one an operator holding a partial rule asks.
+  assert.equal(
+    fixModalBanner({ ...APPROVED, approvedRuleImpact: 10 }),
+    "scope-rules"
+  );
+  assert.equal(
+    fixModalBanner({ ...APPROVED, approvedRuleCount: 0 }),
+    "scope-limited"
+  );
+  // And neither is ever the indigo one, which claims the whole pattern.
+  assert.notEqual(fixModalBanner({ ...APPROVED, approvedRuleImpact: 10 }), "scope");
 });
