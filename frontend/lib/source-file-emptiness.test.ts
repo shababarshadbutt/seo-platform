@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { sourceFileEmptinessMessage } from "./source-file-emptiness";
+import {
+  sourceFileEmptinessMessage,
+  sourceFileLoadErrorMessage
+} from "./source-file-emptiness";
 import type { ScopedSkipCounts } from "./api";
 
 const noSkips: ScopedSkipCounts = {
@@ -117,5 +120,84 @@ test("unscoped request has no drop counters to reason from", () => {
   assert.equal(
     sourceFileEmptinessMessage({ staleAfterFix: false }),
     "No source files found for this pattern."
+  );
+});
+
+// ---- sourceFileLoadErrorMessage: the request FAILED, vs came back empty ----
+
+test("the reported abort — Chromium's wording", () => {
+  // What v1.80 actually put on screen: "Could not load this pattern's source
+  // files: signal is aborted without reason". That is this request's own 10s
+  // timeout, not a data problem.
+  const error = new Error("signal is aborted without reason");
+
+  error.name = "AbortError";
+
+  const message = sourceFileLoadErrorMessage(error);
+
+  assert.match(message, /took too long/);
+  assert.match(message, /Any structure/);
+  // The browser internal must not survive into the UI.
+  assert.doesNotMatch(message, /signal is aborted/);
+});
+
+test("the same abort in undici's wording gets the same answer", () => {
+  // THE POINT OF MATCHING ON name. Node 24's fetch says "This operation was
+  // aborted" for the identical condition, so any check against the message text
+  // would handle one runtime and silently miss the other.
+  const error = new Error("This operation was aborted");
+
+  error.name = "AbortError";
+
+  assert.equal(
+    sourceFileLoadErrorMessage(error),
+    sourceFileLoadErrorMessage(
+      Object.assign(new Error("signal is aborted without reason"), {
+        name: "AbortError"
+      })
+    )
+  );
+});
+
+test("a bare DOMException-shaped object is still recognised", () => {
+  // Not every runtime hands back a real Error instance; the check is on the
+  // name property, so a plain object with the right name must work too.
+  assert.match(
+    sourceFileLoadErrorMessage({ name: "AbortError" }),
+    /took too long/
+  );
+});
+
+test("a real backend error keeps its own message", () => {
+  // The 400 the endpoint returns when a cached dropdown sends a param_index the
+  // current template no longer has. That text is diagnostic and must reach the
+  // user verbatim rather than being flattened into the timeout sentence.
+  const message = "structure_filter param_index 2 does not all exist in /{param}";
+
+  assert.equal(
+    sourceFileLoadErrorMessage(new Error(message)),
+    `Could not load this pattern's source files: ${message}`
+  );
+});
+
+test("an error that merely MENTIONS aborting is not treated as one", () => {
+  // Guards the inverse of the name check: matching on text would misclassify a
+  // genuine backend message that happens to contain the word.
+  const error = new Error("upstream aborted the transfer");
+
+  assert.match(
+    sourceFileLoadErrorMessage(error),
+    /^Could not load this pattern's source files: upstream aborted the transfer$/
+  );
+});
+
+test("a non-Error rejection still produces a sentence", () => {
+  assert.equal(
+    sourceFileLoadErrorMessage("boom"),
+    "Could not load this pattern's source files: request failed"
+  );
+  assert.equal(
+    sourceFileLoadErrorMessage(null),
+    "Could not load this pattern's source files: request failed"
   );
 });

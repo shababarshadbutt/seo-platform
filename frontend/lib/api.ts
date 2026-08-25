@@ -1696,6 +1696,21 @@ export type RenamePatternResult = {
 // used to, because an empty array on its own cannot be explained: the scoped
 // scan discards files for four different reasons that need four different
 // remedies. See lib/source-file-emptiness.ts for the wording built from them.
+//
+// NOT ON THE DEFAULT TIMEOUT (v1.82). This is the only read in the modal that
+// OPENS FILES: once a structure is selected it streams every candidate sitemap
+// off disk to count matching <loc> entries, and on a pattern spanning a
+// multi-million-URL corpus that takes far longer than DEFAULT_API_TIMEOUT_MS's
+// 10s. It was left on the default while the two comparable scoped calls —
+// getRedirectCandidates and getRedirectRuleImpact, both of which do strictly
+// LESS work — were given EXPORT_API_TIMEOUT_MS. The 10s abort surfaced as
+// "Could not load this pattern's source files: signal is aborted without
+// reason", and before v1.80 surfaced errors at all it was swallowed and shown
+// as a clean "No source files found for this pattern."
+//
+// It also matters that this matches getRedirectCandidates exactly: the Fix
+// modal fires the two together for one scope and must not have one of them
+// give up at 10s while the other keeps going to 180s.
 export async function getPatternSourceFiles(
   sessionId: string,
   patternId: string,
@@ -1709,7 +1724,8 @@ export async function getPatternSourceFiles(
     backendUrl(
       `/api/sessions/${sessionId}/patterns/${patternId}/source-files${query}`
     ),
-    { cache: "no-store" }
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
   );
   const data = await readJsonResponse<{
     source_files: PatternSourceFile[];

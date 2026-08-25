@@ -89,3 +89,42 @@ export function sourceFileEmptinessMessage({
 
   return plain;
 }
+
+// What the panel says when the request FAILED, as opposed to succeeding with
+// nothing in it. Lives beside sourceFileEmptinessMessage because it answers the
+// same question — what goes in that box when it has no rows — and the two must
+// not drift into different voices.
+//
+// WHAT WAS WRONG. v1.80 stopped swallowing the error and interpolated
+// error.message raw, which put a browser internal in front of the user:
+// "Could not load this pattern's source files: signal is aborted without
+// reason". That is an abort, and the abort is this request's own timeout.
+//
+// MATCH ON name, NEVER ON THE MESSAGE TEXT. The identical condition is worded
+// differently depending on who reports it — undici (the Next proxy hop, Node 24)
+// says "This operation was aborted", Chromium says "signal is aborted without
+// reason" — so any check against the text is a check that silently stops working
+// in the other runtime, or on a browser update. `name` is "AbortError" in both.
+//
+// And an AbortError reaching this particular caller can ONLY be the timeout:
+// getPatternSourceFiles passes no init.signal, so fetchWithTimeout's own timer
+// is the sole thing that can abort it. Do not widen this to cover navigation or
+// unmount aborts without giving the caller a way to tell them apart — the two
+// need opposite wording ("took too long" vs. say nothing at all).
+export function sourceFileLoadErrorMessage(error: unknown): string {
+  const isAbort =
+    typeof error === "object" &&
+    error !== null &&
+    (error as { name?: unknown }).name === "AbortError";
+
+  if (isAbort) {
+    // Deliberately says what to do next. "Any structure" takes the DB-rollup
+    // path on the backend and opens no files at all, so unlike a retry it is
+    // guaranteed to return — that is real advice, not a consolation.
+    return 'Scanning this pattern\'s sitemap files took too long to finish. It spans enough files that the scoped preview cannot complete in time — pick a narrower structure above, or switch to "Any structure", which reads recorded counts instead of opening files.';
+  }
+
+  return `Could not load this pattern's source files: ${
+    error instanceof Error ? error.message : "request failed"
+  }`;
+}

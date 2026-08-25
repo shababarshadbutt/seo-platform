@@ -234,7 +234,10 @@ import {
 } from "@/lib/fix-visibility";
 import { applyScopeNote } from "@/lib/apply-scope-note";
 import { skippedShapeLines, skippedSummary } from "@/lib/skipped-shapes";
-import { sourceFileEmptinessMessage } from "@/lib/source-file-emptiness";
+import {
+  sourceFileEmptinessMessage,
+  sourceFileLoadErrorMessage
+} from "@/lib/source-file-emptiness";
 import {
   analysisSettled,
   unscoredReasonFor,
@@ -3988,11 +3991,13 @@ export default function ResultsDashboardPage({
           // the endpoint 400s on a structure_filter whose param_index no longer
           // resolves against the template, and that used to read as a clean
           // zero. Same reasoning as the Fix modal's scoped count above.
-          setRenameSourceFilesNotice(
-            `Could not load this pattern's source files: ${
-              error instanceof Error ? error.message : "request failed"
-            }`
-          );
+          //
+          // The wording lives in the helper rather than here (v1.82) because the
+          // common failure is this request's own timeout, and interpolating
+          // error.message raw put a browser internal on screen: "signal is
+          // aborted without reason". See sourceFileLoadErrorMessage for why it
+          // matches on error.name and not on that text.
+          setRenameSourceFilesNotice(sourceFileLoadErrorMessage(error));
         }
       })
       .finally(() => {
