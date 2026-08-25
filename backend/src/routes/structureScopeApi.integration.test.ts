@@ -101,6 +101,14 @@ test("structures returns the URL pool, and source-files returns file ids", async
     await closePublishQueue().catch(() => {});
     await closePreGenerateZipQueue().catch(() => {});
     await closeMaintenanceQueue().catch(() => {});
+    // v1.83's cache and the lock it uses each hold their own Redis connection.
+    const { closeScanResultCache } = await import(
+      "../cache/scanResultCache.js"
+    );
+    const { closeRedisLockClient } = await import("../queue/redisLock.js");
+
+    closeScanResultCache();
+    await closeRedisLockClient().catch(() => {});
     await closePool().catch(() => {});
     rmSync(uploadDir, { recursive: true, force: true });
   });
@@ -437,4 +445,89 @@ test("structures returns the URL pool, and source-files returns file ids", async
     ).file_id,
     null
   );
+
+  // ---- v1.83: the scoped scan is cached, and superseded entries are
+  // unreachable rather than deleted -------------------------------------------
+  //
+  // WHY THIS MATTERS. The scan opens every sitemap the pattern spans — ~100s for
+  // the widest pattern in the dev data — and the modal re-ran it on every
+  // dropdown change. Caching it is only safe if a cached answer can never
+  // outlive the files it describes, which is what the second case below checks.
+
+  const cacheFilterParam = niinFilterParam;
+  const cacheUrl = `/api/sessions/${sessionId}/patterns/${patternId}/source-files?structure_filter=${cacheFilterParam}`;
+
+  const firstScoped = await app.inject({ method: "GET", url: cacheUrl });
+  const secondScoped = await app.inject({ method: "GET", url: cacheUrl });
+
+  assert.equal(firstScoped.statusCode, 200);
+  assert.equal(secondScoped.statusCode, 200);
+
+  // Identical answers, and the second one says it did not do the work. The
+  // counters have to survive the round trip too: a cached empty list that lost
+  // its scope_skipped would be back to the bare "No source files found" that
+  // v1.80 removed.
+  assert.deepEqual(
+    secondScoped.json().source_files,
+    firstScoped.json().source_files
+  );
+  assert.deepEqual(
+    secondScoped.json().scope_skipped,
+    firstScoped.json().scope_skipped
+  );
+  assert.ok(secondScoped.json().scope_skipped, "counters must survive a hit");
+  assert.equal(secondScoped.json().cached, true);
+
+  // THE INVALIDATION TEST. Repoint a file the way every real edit does
+  // (copy-on-write to a new stored name) and the next request must MISS. If this
+  // ever passes while still reporting cached:true, the modal would keep serving
+  // a file list describing sitemaps that no longer exist — the exact class of
+  // bug v1.80 and v1.81 were both spent chasing.
+  // Mirrors buildRenamedStoredFilename: the marker goes BEFORE the display
+  // label, so displaySourceFilename still maps this back to
+  // "current-part-1.xml" and the occurrence row still matches. Dropping the
+  // role segment here would change the display name and test nothing real.
+  const movedStored = `${sessionId}-renamed-abcd1234-current-part-1.xml`;
+
+  writeFileSync(
+    path.join(uploadDir, movedStored),
+    `<?xml version="1.0" encoding="UTF-8"?>
+<urlset>${scopedLocs
+      .slice(0, 3)
+      .map((loc) => `<url><loc>${loc}</loc></url>`)
+      .join("")}</urlset>
+`,
+    "utf8"
+  );
+  await pool.query("UPDATE sitemap_files SET filename = $1 WHERE id = $2", [
+    movedStored,
+    scopedFileRow.rows[0].id
+  ]);
+
+  const afterRepoint = await app.inject({ method: "GET", url: cacheUrl });
+
+  assert.equal(afterRepoint.statusCode, 200);
+  assert.notEqual(
+    afterRepoint.json().cached,
+    true,
+    "a changed file set must make the old entry unreachable"
+  );
+  // And it reflects the NEW file: 3 of the niin-parts URLs, not the original 7.
+  assert.equal(
+    afterRepoint.json().source_files.find(
+      (file: { source_file: string }) => file.source_file === scopedDisplay
+    ).occurrences,
+    3
+  );
+
+  // The UNSCOPED path is a DB rollup that opens no files, so it is never cached
+  // and must never claim to be.
+  const unscopedCacheCheck = await app.inject({
+    method: "GET",
+    url: `/api/sessions/${sessionId}/patterns/${patternId}/source-files`
+  });
+
+  assert.equal(unscopedCacheCheck.statusCode, 200);
+  assert.equal(unscopedCacheCheck.json().cached, undefined);
+  assert.equal(unscopedCacheCheck.json().scope_skipped, undefined);
 });

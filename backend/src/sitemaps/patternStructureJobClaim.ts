@@ -71,11 +71,20 @@ export function describeKind(kind: string): string {
   return KIND_LABELS[kind] ?? "an operation";
 }
 
-// Stable hash of everything that defines the operation. Arrays are sorted so a
-// client that sends the same file selection in a different order still looks like
-// the same request.
-export function patternStructureFingerprint(
-  kind: PatternStructureKind,
+// Stable hash of a labelled set of inputs, insensitive to the order they arrive
+// in: arrays are sorted, object keys are sorted, undefined is dropped and absent
+// collapses to null. So a client that sends the same file selection — or the same
+// structure filters — in a different order still hashes identically.
+//
+// EXPORTED SEPARATELY FROM patternStructureFingerprint (v1.83) so the
+// source-file scan cache can key on the same canonical form without borrowing
+// the job machinery. The alternative was widening patternStructureFingerprint's
+// first parameter from PatternStructureKind to string, which would have removed
+// the type guard that stops a typo'd job kind reaching pattern_structure_jobs'
+// kind CHECK constraint at runtime. The label is part of the hash, so two
+// different callers cannot collide.
+export function canonicalFingerprint(
+  label: string,
   inputs: Record<string, unknown>
 ): string {
   const normalise = (value: unknown): unknown => {
@@ -94,8 +103,18 @@ export function patternStructureFingerprint(
   };
 
   return createHash("sha256")
-    .update(JSON.stringify([kind, normalise(inputs)]))
+    .update(JSON.stringify([label, normalise(inputs)]))
     .digest("hex");
+}
+
+// Stable hash of everything that defines the operation. Arrays are sorted so a
+// client that sends the same file selection in a different order still looks like
+// the same request.
+export function patternStructureFingerprint(
+  kind: PatternStructureKind,
+  inputs: Record<string, unknown>
+): string {
+  return canonicalFingerprint(kind, inputs);
 }
 
 async function activeJobForPattern(patternId: string) {

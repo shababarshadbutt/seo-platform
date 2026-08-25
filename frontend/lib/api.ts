@@ -1676,6 +1676,11 @@ export type PatternSourceFilesResult = {
   files: PatternSourceFile[];
   // null when the request was unscoped.
   skipped: ScopedSkipCounts | null;
+  // True when the scoped scan was served from the backend's cache rather than
+  // computed for this request (v1.83) — including when this request waited for
+  // another one's scan instead of duplicating it. Always false unscoped, which
+  // never touches the cache because it is already a DB rollup.
+  cached: boolean;
 };
 
 export type RenamePatternResult = {
@@ -1730,9 +1735,14 @@ export async function getPatternSourceFiles(
   const data = await readJsonResponse<{
     source_files: PatternSourceFile[];
     scope_skipped?: ScopedSkipCounts;
+    cached?: boolean;
   }>(response);
 
-  return { files: data.source_files, skipped: data.scope_skipped ?? null };
+  return {
+    files: data.source_files,
+    skipped: data.scope_skipped ?? null,
+    cached: data.cached === true
+  };
 }
 
 // ---- Pattern structure operations run as background jobs -------------------

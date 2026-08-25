@@ -960,6 +960,10 @@ export default function ResultsDashboardPage({
   const [renameSourceFilesNotice, setRenameSourceFilesNotice] = useState<
     string | null
   >(null);
+  // Was the file list below served from the backend's cache (v1.83)? Shown so an
+  // instant result reads as "already scanned" rather than as a scan that
+  // suspiciously found nothing — the two look identical otherwise.
+  const [renameSourceFilesCached, setRenameSourceFilesCached] = useState(false);
   const [selectedRenameFiles, setSelectedRenameFiles] = useState<Set<string>>(
     new Set()
   );
@@ -3959,16 +3963,18 @@ export default function ResultsDashboardPage({
     sourceFilesRequestIdRef.current = requestId;
     setRenameSourceFiles([]);
     setRenameSourceFilesNotice(null);
+    setRenameSourceFilesCached(false);
     setSelectedRenameFiles(new Set());
     setIsLoadingRenameFiles(true);
 
     getPatternSourceFiles(params.id, renameRow.id, renameStructureFilters)
-      .then(({ files, skipped }) => {
+      .then(({ files, skipped, cached }) => {
         if (sourceFilesRequestIdRef.current !== requestId) {
           return;
         }
 
         setRenameSourceFiles(files);
+        setRenameSourceFilesCached(cached);
         setSelectedRenameFiles(new Set(files.map((file) => file.source_file)));
         // Computed here, with the response that produced the list, rather than
         // during render: the drop counters describe THIS response, and deriving
@@ -7796,9 +7802,18 @@ export default function ResultsDashboardPage({
                       />
                       Select all
                     </label>
-                    <span className="text-xs text-slate-500">
-                      {renameSourceFiles.length} file
-                      {renameSourceFiles.length === 1 ? "" : "s"}
+                    <span className="flex items-center gap-2 text-xs text-slate-500">
+                      {/* Muted and only when the backend says so: a fast result
+                          should be legibly a cache hit, not an unexplained one.
+                          Deliberately not styled as a warning — nothing is
+                          wrong when this shows. */}
+                      {renameSourceFilesCached ? (
+                        <span className="text-slate-400">Loaded from cache</span>
+                      ) : null}
+                      <span>
+                        {renameSourceFiles.length} file
+                        {renameSourceFiles.length === 1 ? "" : "s"}
+                      </span>
                     </span>
                   </div>
                   <div className="max-h-[300px] overflow-y-auto">

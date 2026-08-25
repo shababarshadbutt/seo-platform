@@ -70,6 +70,14 @@ import {
   serialisePatternStructureJob,
   type PatternStructureKind
 } from "../sitemaps/patternStructureJobClaim.js";
+import {
+  cachedWithSingleFlight,
+  type CachedResult
+} from "../cache/scanResultCache.js";
+import {
+  patternFilesVersion,
+  sourceFileScanCacheKey
+} from "../sitemaps/sourceFileScanKey.js";
 import { FILE_REWRITE_PARALLEL_THRESHOLD } from "../jobs/fileRewritePool.js";
 import { isSameDomain, normalizeHost } from "../sitemaps/domain.js";
 import {
@@ -1227,6 +1235,48 @@ async function scopedPatternSourceFileBreakdown(
     ),
     skipped
   };
+}
+
+// The scoped breakdown, but paid for once (v1.83).
+//
+// WHY. The scan above opens every sitemap the pattern spans — ~100s for the
+// widest pattern here at the measured 137k <loc>/s — and the modal re-ran it on
+// EVERY dropdown change, including flipping back to a structure scanned a minute
+// earlier. v1.82 raised the client timeout from 10s to 180s, which stopped the
+// request failing but, as its own runbook says, only converted the failure into a
+// long spinner. This is what removes the repeat cost.
+//
+// Two callers, one wrapper, so neither can be the one that forgets to cache:
+// the source-files route and the transform sample-file route.
+//
+// The cache is an OPTIMISATION. Every Redis call inside is wrapped, so with Redis
+// down this degrades to calling the scan directly — which is exactly what it did
+// before this existed.
+async function cachedScopedPatternSourceFileBreakdown(
+  patternId: string,
+  sessionId: string,
+  sourceRole: string,
+  template: string,
+  resolvedFilters: ResolvedStructureFilter[]
+): Promise<CachedResult<ScopedSourceFileBreakdown>> {
+  const key = sourceFileScanCacheKey({
+    patternId,
+    // Derived, not stored: this is what makes a superseded entry unreachable
+    // rather than something a mutation path has to remember to delete. See
+    // sitemaps/sourceFileScanKey.ts.
+    filesVersion: await patternFilesVersion(sessionId, sourceRole),
+    resolvedFilters
+  });
+
+  return cachedWithSingleFlight(key, () =>
+    scopedPatternSourceFileBreakdown(
+      patternId,
+      sessionId,
+      sourceRole,
+      template,
+      resolvedFilters
+    )
+  );
 }
 
 // Everything the three transform endpoints (apply, dry run, sample file) agree
@@ -3130,7 +3180,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // genuinely empty pattern from an unexplained one.
       const scoped =
         resolvedFilters.length > 0
-          ? await scopedPatternSourceFileBreakdown(
+          ? await cachedScopedPatternSourceFileBreakdown(
               request.params.patternId,
               request.params.id,
               source_role,
@@ -3139,7 +3189,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             )
           : null;
       const sourceFiles =
-        scoped?.files ??
+        scoped?.value.files ??
         (await patternSourceFileBreakdown(
           request.params.patternId,
           Number(total_urls),
@@ -3156,7 +3206,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           ...file,
           file_id: fileIds.get(file.source_file) ?? null
         })),
-        ...(scoped ? { scope_skipped: scoped.skipped } : {})
+        // The v1.80 drop counters are cached WITH the file list, not recomputed:
+        // a cached empty list that lost its explanation would be back to the
+        // bare "No source files found for this pattern." that v1.80 removed.
+        ...(scoped ? { scope_skipped: scoped.value.skipped } : {}),
+        // Only ever true on the scoped path, and only when nothing was computed
+        // for this request — so the modal can say an instant answer was a cache
+        // hit rather than leaving a suspiciously fast scan unexplained.
+        ...(scoped?.cached ? { cached: true } : {})
       };
     }
   );
@@ -3721,14 +3778,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         const breakdown =
           resolved.value.resolvedFilters.length > 0
             ? (
-                await scopedPatternSourceFileBreakdown(
+                await cachedScopedPatternSourceFileBreakdown(
                   request.params.patternId,
                   request.params.id,
                   resolved.value.sourceRole,
                   resolved.value.template,
                   resolved.value.resolvedFilters
                 )
-              ).files
+              ).value.files
             : await patternSourceFileBreakdown(
                 request.params.patternId,
                 resolved.value.totalUrls,

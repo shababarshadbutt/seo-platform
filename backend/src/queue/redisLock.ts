@@ -49,12 +49,23 @@ return 0
 
 // Take `key`, or return null immediately if someone else holds it. Never blocks —
 // the caller decides whether to fail, wait, or carry on without the lock.
+//
+// `client` lets a caller supply its OWN connection (v1.83) while still sharing
+// this one implementation of the compare-and-delete. The default connection is
+// configured for BullMQ, which requires maxRetriesPerRequest: null — meaning a
+// command issued while Redis is unreachable is retried forever and NEVER
+// rejects. That is correct for a queue, whose whole job is to not lose work, and
+// wrong for anything that must degrade instead of hang: the source-file scan
+// cache passes a fail-fast client for exactly that reason. Callers that do not
+// care keep the old behaviour by omitting it.
 export async function tryAcquireRedisLock(
   key: string,
-  ttlSeconds: number
+  ttlSeconds: number,
+  client?: Redis
 ): Promise<RedisLock | null> {
+  const connection = client ?? redis();
   const token = randomUUID();
-  const result = await redis().set(key, token, "EX", Math.max(1, ttlSeconds), "NX");
+  const result = await connection.set(key, token, "EX", Math.max(1, ttlSeconds), "NX");
 
   if (result !== "OK") {
     return null;
@@ -73,7 +84,7 @@ export async function tryAcquireRedisLock(
       }
 
       released = true;
-      await redis().eval(RELEASE_SCRIPT, 1, key, token).catch(() => undefined);
+      await connection.eval(RELEASE_SCRIPT, 1, key, token).catch(() => undefined);
     }
   };
 }
