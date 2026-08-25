@@ -1630,6 +1630,32 @@ export type PatternSourceFile = {
   file_id: string | null;
 };
 
+// Why a structure-scoped file list came back shorter than the pattern's
+// recorded file set — one counter per reason the backend scan drops a candidate
+// file. Mirrors ScopedSkipCounts in backend/src/routes/sessions.ts.
+//
+// Sent ONLY for a scoped request: the unscoped rollup opens no files, so it has
+// no drops to report, and the absence of the key is meaningful — it says
+// "dropping isn't a thing on this path", not "nothing was dropped".
+export type ScopedSkipCounts = {
+  // Fetched from a URL: the file row exists but there is no local copy, so it
+  // cannot be scanned or edited by any path in the app.
+  remote: number;
+  // Recorded at extraction, but no live sitemap_files row matches it now.
+  no_file_row: number;
+  // Row exists, the blob on disk does not (or won't read).
+  unreadable: number;
+  // Read successfully and matched nothing — stale template, or a scope
+  // narrower than the file's contents.
+  no_matches: number;
+};
+
+export type PatternSourceFilesResult = {
+  files: PatternSourceFile[];
+  // null when the request was unscoped.
+  skipped: ScopedSkipCounts | null;
+};
+
 export type RenamePatternResult = {
   old_template: string;
   new_template: string;
@@ -1643,11 +1669,16 @@ export type RenamePatternResult = {
 // scopedPatternSourceFileBreakdown on the backend for why the whole-pattern
 // rollup can't just be filtered client-side after the fact. Omitted/empty
 // keeps the old whole-pattern behaviour.
+//
+// Returns the drop counters alongside the files rather than the bare array it
+// used to, because an empty array on its own cannot be explained: the scoped
+// scan discards files for four different reasons that need four different
+// remedies. See lib/source-file-emptiness.ts for the wording built from them.
 export async function getPatternSourceFiles(
   sessionId: string,
   patternId: string,
   structureFilters?: StructureFilter[]
-) {
+): Promise<PatternSourceFilesResult> {
   const query =
     structureFilters && structureFilters.length > 0
       ? `?structure_filter=${encodeURIComponent(JSON.stringify(structureFilters))}`
@@ -1658,11 +1689,12 @@ export async function getPatternSourceFiles(
     ),
     { cache: "no-store" }
   );
-  const data = await readJsonResponse<{ source_files: PatternSourceFile[] }>(
-    response
-  );
+  const data = await readJsonResponse<{
+    source_files: PatternSourceFile[];
+    scope_skipped?: ScopedSkipCounts;
+  }>(response);
 
-  return data.source_files;
+  return { files: data.source_files, skipped: data.scope_skipped ?? null };
 }
 
 // ---- Pattern structure operations run as background jobs -------------------

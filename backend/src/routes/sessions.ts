@@ -1030,6 +1030,33 @@ async function patternSourceFileBreakdown(
   return files.map((file) => ({ source_file: file, occurrences: per }));
 }
 
+// Why the structure-scoped file list came back shorter than the pattern's
+// recorded file set. One counter per reason the scan drops a candidate file,
+// so the Update Pattern modal can name the cause instead of showing a bare
+// zero — see scopedPatternSourceFileBreakdown for what each one means and why
+// they must stay separate.
+export type ScopedSkipCounts = {
+  // Fetched from a URL: the file row exists but there is no local copy, so it
+  // cannot be scanned OR edited by any path in the app.
+  remote: number;
+  // Recorded at extraction, but no live sitemap_files row matches it now.
+  no_file_row: number;
+  // Row and stored name exist, the blob on disk does not (or won't read).
+  unreadable: number;
+  // Read successfully and matched nothing — stale template, or a scope
+  // narrower than this file's contents.
+  no_matches: number;
+};
+
+type ScopedSourceFileBreakdown = {
+  files: Array<{ source_file: string; occurrences: number }>;
+  skipped: ScopedSkipCounts;
+};
+
+function emptyScopedSkipCounts(): ScopedSkipCounts {
+  return { remote: 0, no_file_row: 0, unreadable: 0, no_matches: 0 };
+}
+
 // How many files to stream-count in parallel. Read-only and lightweight next
 // to the actual rewrite (no output file, no worker-pool handoff), so this can
 // run inline on the request thread; capped so a pattern spanning hundreds of
@@ -1053,20 +1080,31 @@ const SCOPED_BREAKDOWN_CONCURRENCY = 6;
 // the session's role, which this scoped preview does not need to do: a file
 // with zero recorded occurrences of the pattern cannot contain a structure
 // inside it either.
+//
+// WHY IT ALSO REPORTS WHAT IT DROPPED. This function discards candidate files
+// at four separate points, and until now every one of them was silent — so all
+// four arrived at the modal as the same empty array and the same sentence, "No
+// source files found for this pattern." Those four causes need four different
+// remedies (upload the file, re-upload it, re-run the analysis, widen the
+// scope), and one of them is not a fault at all: a sitemap fetched from a URL
+// has no local copy, so it can never be scanned or edited, and reporting that
+// as "not found" reads as a broken tool rather than as the read-only file it
+// is. The counts below are ONLY a diagnostic — which files are accepted, and
+// the occurrence numbers, are unchanged.
 async function scopedPatternSourceFileBreakdown(
   patternId: string,
   sessionId: string,
   sourceRole: string,
   template: string,
   resolvedFilters: ResolvedStructureFilter[]
-): Promise<Array<{ source_file: string; occurrences: number }>> {
+): Promise<ScopedSourceFileBreakdown> {
   const candidates = await pool.query<{ source_file: string }>(
     "SELECT source_file FROM pattern_file_occurrences WHERE pattern_id = $1",
     [patternId]
   );
 
   if (candidates.rows.length === 0) {
-    return [];
+    return { files: [], skipped: emptyScopedSkipCounts() };
   }
 
   const filesResult = await pool.query<{ filename: string }>(
@@ -1078,9 +1116,18 @@ async function scopedPatternSourceFileBreakdown(
     [sessionId, sourceRole]
   );
   const storedFilenameByDisplay = new Map<string, string>();
+  // Display names whose file row exists but is a REMOTE sitemap. Kept apart
+  // from the rest so the !storedFilename branch below can tell "fetched from a
+  // URL, nothing on disk to scan" from "the file row is gone", which are the
+  // same lookup miss but different problems. A remote row is skipped here for
+  // the same reason every mutation path skips it (patternFileRewrites,
+  // patternFileScan, applyRedirectsJob, bulkReplaceJob, redirectApply): there
+  // is no local blob, and no code path ever writes one.
+  const remoteDisplayNames = new Set<string>();
 
   for (const file of filesResult.rows) {
     if (isHttpUrl(file.filename)) {
+      remoteDisplayNames.add(displaySourceFilename(sessionId, file.filename));
       continue;
     }
 
@@ -1107,6 +1154,10 @@ async function scopedPatternSourceFileBreakdown(
 
   const displayNames = candidates.rows.map((row) => row.source_file);
   const results: Array<{ source_file: string; occurrences: number }> = [];
+  // Plain closure-local counters, incremented from the concurrent workers
+  // below exactly as results.push already is: Node runs one worker at a time
+  // between await points, so ++ needs no synchronisation.
+  const skipped = emptyScopedSkipCounts();
   let cursor = 0;
 
   async function worker() {
@@ -1122,8 +1173,17 @@ async function scopedPatternSourceFileBreakdown(
       const storedFilename = storedFilenameByDisplay.get(displayName);
 
       if (!storedFilename) {
-        // Recorded at extraction time but the file row is gone/renamed since —
-        // the unscoped breakdown tolerates this too (file_id resolves to null).
+        // Two different situations behind one lookup miss, hence two counters:
+        // the file was fetched from a URL and has no local copy, or the row was
+        // deleted/renamed/role-mismatched since extraction recorded it. The
+        // unscoped breakdown tolerates the latter too (file_id resolves to
+        // null).
+        if (remoteDisplayNames.has(displayName)) {
+          skipped.remote += 1;
+        } else {
+          skipped.no_file_row += 1;
+        }
+
         continue;
       }
 
@@ -1136,10 +1196,16 @@ async function scopedPatternSourceFileBreakdown(
 
         if (occurrences > 0) {
           results.push({ source_file: displayName, occurrences });
+        } else {
+          // Read fine, matched nothing. Usually a template that no longer
+          // describes what is on disk (see hasStaleCountsAfterFix) or a scope
+          // narrower than this file's contents.
+          skipped.no_matches += 1;
         }
       } catch {
         // Missing/unreadable on disk — excluded rather than failing the whole
         // preview.
+        skipped.unreadable += 1;
       }
     }
   }
@@ -1151,10 +1217,14 @@ async function scopedPatternSourceFileBreakdown(
     )
   );
 
-  return results.sort(
-    (a, b) =>
-      b.occurrences - a.occurrences || a.source_file.localeCompare(b.source_file)
-  );
+  return {
+    files: results.sort(
+      (a, b) =>
+        b.occurrences - a.occurrences ||
+        a.source_file.localeCompare(b.source_file)
+    ),
+    skipped
+  };
 }
 
 // Everything the three transform endpoints (apply, dry run, sample file) agree
@@ -3042,7 +3112,12 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         );
       }
 
-      const sourceFiles =
+      // scope_skipped accompanies ONLY the scoped path. The unscoped rollup
+      // opens no files, so it has no drops to report — and leaving the key off
+      // rather than sending zeros keeps "nothing was dropped" distinct from
+      // "dropping isn't a thing here", which is what lets the client tell a
+      // genuinely empty pattern from an unexplained one.
+      const scoped =
         resolvedFilters.length > 0
           ? await scopedPatternSourceFileBreakdown(
               request.params.patternId,
@@ -3051,11 +3126,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
               template,
               resolvedFilters
             )
-          : await patternSourceFileBreakdown(
-              request.params.patternId,
-              Number(total_urls),
-              source_file
-            );
+          : null;
+      const sourceFiles =
+        scoped?.files ??
+        (await patternSourceFileBreakdown(
+          request.params.patternId,
+          Number(total_urls),
+          source_file
+        ));
       // file_id lets the Update Pattern modal download exactly the files the
       // user ticked (v1.51) — the download endpoint excludes by id, and the
       // client must not be the thing that derives one from a display name.
@@ -3066,7 +3144,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         source_files: sourceFiles.map((file) => ({
           ...file,
           file_id: fileIds.get(file.source_file) ?? null
-        }))
+        })),
+        ...(scoped ? { scope_skipped: scoped.skipped } : {})
       };
     }
   );
@@ -3630,13 +3709,15 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       if (!displayName) {
         const breakdown =
           resolved.value.resolvedFilters.length > 0
-            ? await scopedPatternSourceFileBreakdown(
-                request.params.patternId,
-                request.params.id,
-                resolved.value.sourceRole,
-                resolved.value.template,
-                resolved.value.resolvedFilters
-              )
+            ? (
+                await scopedPatternSourceFileBreakdown(
+                  request.params.patternId,
+                  request.params.id,
+                  resolved.value.sourceRole,
+                  resolved.value.template,
+                  resolved.value.resolvedFilters
+                )
+              ).files
             : await patternSourceFileBreakdown(
                 request.params.patternId,
                 resolved.value.totalUrls,

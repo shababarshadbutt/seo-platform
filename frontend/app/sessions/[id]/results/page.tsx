@@ -228,6 +228,7 @@ import {
   type PatternStatus
 } from "@/lib/fix-visibility";
 import { applyScopeNote } from "@/lib/apply-scope-note";
+import { sourceFileEmptinessMessage } from "@/lib/source-file-emptiness";
 import {
   analysisSettled,
   unscoredReasonFor,
@@ -908,6 +909,15 @@ export default function ResultsDashboardPage({
   const [renameSourceFiles, setRenameSourceFiles] = useState<
     PatternSourceFile[]
   >([]);
+  // What to say when the list above is empty (v1.80). An empty list has five
+  // different causes — four ways the scoped scan drops a file, plus the request
+  // failing outright — and they were all rendering as the same sentence, "No
+  // source files found for this pattern.", which is why a pattern with 885
+  // recorded URLs looked like a broken tool. Written by the SAME single effect
+  // that writes renameSourceFiles so the two can never disagree.
+  const [renameSourceFilesNotice, setRenameSourceFilesNotice] = useState<
+    string | null
+  >(null);
   const [selectedRenameFiles, setSelectedRenameFiles] = useState<Set<string>>(
     new Set()
   );
@@ -3457,7 +3467,7 @@ export default function ResultsDashboardPage({
       });
 
     getPatternSourceFiles(params.id, fixRow.id, fixStructureFilters)
-      .then((files) => {
+      .then(({ files }) => {
         if (fixScopeRequestIdRef.current !== requestId) {
           return;
         }
@@ -3796,21 +3806,44 @@ export default function ResultsDashboardPage({
 
     sourceFilesRequestIdRef.current = requestId;
     setRenameSourceFiles([]);
+    setRenameSourceFilesNotice(null);
     setSelectedRenameFiles(new Set());
     setIsLoadingRenameFiles(true);
 
     getPatternSourceFiles(params.id, renameRow.id, renameStructureFilters)
-      .then((files) => {
+      .then(({ files, skipped }) => {
         if (sourceFilesRequestIdRef.current !== requestId) {
           return;
         }
 
         setRenameSourceFiles(files);
         setSelectedRenameFiles(new Set(files.map((file) => file.source_file)));
+        // Computed here, with the response that produced the list, rather than
+        // during render: the drop counters describe THIS response, and deriving
+        // the sentence later would let it outlive the numbers it explains.
+        setRenameSourceFilesNotice(
+          files.length === 0
+            ? sourceFileEmptinessMessage({
+                skipped,
+                staleAfterFix: hasStaleCountsAfterFix({
+                  redirectsAppliedAt: renameRow.redirectsAppliedAt
+                })
+              })
+            : null
+        );
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (sourceFilesRequestIdRef.current === requestId) {
           setRenameSourceFiles([]);
+          // A failed request is NOT evidence that the pattern has no files —
+          // the endpoint 400s on a structure_filter whose param_index no longer
+          // resolves against the template, and that used to read as a clean
+          // zero. Same reasoning as the Fix modal's scoped count above.
+          setRenameSourceFilesNotice(
+            `Could not load this pattern's source files: ${
+              error instanceof Error ? error.message : "request failed"
+            }`
+          );
         }
       })
       .finally(() => {
@@ -7570,7 +7603,8 @@ export default function ResultsDashboardPage({
                       </div>
                     ) : renameSourceFiles.length === 0 ? (
                       <p className="px-3 py-3 text-sm text-slate-500">
-                        No source files found for this pattern.
+                        {renameSourceFilesNotice ??
+                          "No source files found for this pattern."}
                       </p>
                     ) : (
                       <ul>

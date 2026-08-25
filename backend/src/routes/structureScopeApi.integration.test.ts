@@ -325,4 +325,116 @@ test("structures returns the URL pool, and source-files returns file ids", async
   });
 
   assert.equal(malformedResponse.statusCode, 400);
+
+  // ---- scope_skipped: WHY a scoped list came back short -------------------
+  //
+  // THE REPORTED BUG. The scoped scan discards candidate files at four separate
+  // points and every one of them was silent, so all four reached the modal as
+  // the same empty array and the same sentence, "No source files found for this
+  // pattern." On the reported session the dropdown offered quote (885) and
+  // manufacturer (115) — read from pattern_urls — while the file list showed 0
+  // and Preview was dead, with nothing on screen to say why.
+  //
+  // The counters are a DIAGNOSTIC only: which files are accepted and what
+  // occurrence numbers they carry must not change, which is what the
+  // NIIN_COUNT assertion above and the unscoped check below pin down.
+
+  // The empty `display` file is already a no_matches drop — it read fine and
+  // contained no niin-parts URL. That is asserted as an exclusion above; here
+  // it must also be COUNTED, because "excluded" and "explained" are the whole
+  // difference this change makes.
+  assert.ok(scopedBody.scope_skipped, "a scoped response must report its drops");
+  assert.ok(
+    scopedBody.scope_skipped.no_matches >= 1,
+    "the file that read fine and matched nothing must be counted"
+  );
+
+  // A sitemap fetched from a URL: the row exists, filename is the URL itself
+  // (parseSitemapJob inserts index children this way) and no code path ever
+  // writes a local copy — so it can never be scanned OR edited. This is the
+  // drop the reported session hits, and reporting it as "not found" is what
+  // made a read-only file look like a broken tool.
+  const remoteUrl = `${BASE}/remote-sitemap.xml`;
+
+  await pool.query(
+    `
+      INSERT INTO sitemap_files (session_id, filename, total_urls, parsed_at, is_valid, is_index)
+      VALUES ($1, $2, 40, now(), true, false)
+    `,
+    [sessionId, remoteUrl]
+  );
+  await pool.query(
+    "INSERT INTO pattern_file_occurrences (pattern_id, source_file, occurrence_count) VALUES ($1, $2, 40)",
+    [patternId, displaySourceFilename(sessionId, remoteUrl)]
+  );
+
+  // A row whose stored blob is absent from uploadDir — what deleteSessionUploads
+  // leaves behind, since it reclaims the blobs and keeps sitemap_files.
+  const missingStored = `${sessionId}-current-reclaimed.xml`;
+
+  await pool.query(
+    `
+      INSERT INTO sitemap_files (session_id, filename, total_urls, parsed_at, is_valid, is_index)
+      VALUES ($1, $2, 30, now(), true, false)
+    `,
+    [sessionId, missingStored]
+  );
+  await pool.query(
+    "INSERT INTO pattern_file_occurrences (pattern_id, source_file, occurrence_count) VALUES ($1, $2, 30)",
+    [patternId, displaySourceFilename(sessionId, missingStored)]
+  );
+
+  // An occurrence recorded at extraction whose sitemap_files row is gone.
+  await pool.query(
+    "INSERT INTO pattern_file_occurrences (pattern_id, source_file, occurrence_count) VALUES ($1, $2, 20)",
+    [patternId, "vanished.xml"]
+  );
+
+  const diagnosed = await app.inject({
+    method: "GET",
+    url: `/api/sessions/${sessionId}/patterns/${patternId}/source-files?structure_filter=${niinFilterParam}`
+  });
+  const diagnosedBody = diagnosed.json();
+
+  assert.equal(diagnosed.statusCode, 200);
+  assert.equal(diagnosedBody.scope_skipped.remote, 1);
+  assert.equal(diagnosedBody.scope_skipped.unreadable, 1);
+  assert.equal(diagnosedBody.scope_skipped.no_file_row, 1);
+  assert.ok(diagnosedBody.scope_skipped.no_matches >= 1);
+
+  // None of the three dropped files may appear, and the one real file's count
+  // is still its own — the diagnostic must not have widened what is returned.
+  const diagnosedNames = diagnosedBody.source_files.map(
+    (file: { source_file: string }) => file.source_file
+  );
+
+  assert.deepEqual(diagnosedNames, [scopedDisplay]);
+  assert.equal(diagnosedBody.source_files[0].occurrences, NIIN_COUNT);
+
+  // The UNSCOPED rollup opens no files, so it has no drops to report. The key
+  // must be ABSENT rather than zeroed: its absence is what tells the client
+  // "dropping isn't a thing on this path", as distinct from "nothing was
+  // dropped", and the rows themselves must be untouched by this change —
+  // including the remote and reclaimed files, which the rollup has always
+  // listed with a null file_id.
+  const unscopedAfter = await app.inject({
+    method: "GET",
+    url: `/api/sessions/${sessionId}/patterns/${patternId}/source-files`
+  });
+  const unscopedBody = unscopedAfter.json();
+
+  assert.equal(unscopedAfter.statusCode, 200);
+  assert.equal(unscopedBody.scope_skipped, undefined);
+  assert.equal(unscopedBody.source_files.length, 5);
+  assert.ok(
+    unscopedBody.source_files.every(
+      (file: { occurrences: number }) => file.occurrences > 0
+    )
+  );
+  assert.equal(
+    unscopedBody.source_files.find(
+      (file: { source_file: string }) => file.source_file === remoteUrl
+    ).file_id,
+    null
+  );
 });
