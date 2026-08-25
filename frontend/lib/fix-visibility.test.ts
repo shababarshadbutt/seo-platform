@@ -4,6 +4,9 @@ import { test } from "node:test";
 import {
   fixActionState,
   fixButtonState,
+  fixedBadgeDetail,
+  fixedBadgeLabel,
+  fixedBadgeState,
   hasStaleCountsAfterFix,
   showCheckButton,
   showFixButton,
@@ -229,4 +232,76 @@ test("counts are stale exactly once a fix has run", () => {
   assert.equal(hasStaleCountsAfterFix(FIXED_BROKEN), true);
   assert.equal(hasStaleCountsAfterFix({ redirectsAppliedAt: null }), false);
   assert.equal(hasStaleCountsAfterFix({}), false);
+});
+
+// --- partial fixes (v1.81) ---------------------------------------------------
+
+test("a fix that left pattern URLs behind reads as partial, not as done", () => {
+  // The reported case. Both applies stamped redirects_applied_at and both drew
+  // the same chip; only one of them had actually finished.
+  assert.equal(
+    fixedBadgeState({
+      redirectsAppliedAt: "2026-08-21T02:30:00Z",
+      redirectsSkippedLocs: 579022
+    }),
+    "partial"
+  );
+  assert.equal(
+    fixedBadgeState({
+      redirectsAppliedAt: "2026-08-21T02:30:00Z",
+      redirectsSkippedLocs: 0
+    }),
+    "full"
+  );
+});
+
+test("an unmeasured fix makes no claim either way", () => {
+  // Rows fixed before migration 052 have no measurement. Guessing one from
+  // total_urls would report a shortfall on a complete apply, because that column
+  // is an extrapolation describing the PRE-fix files.
+  assert.equal(
+    fixedBadgeState({ redirectsAppliedAt: "2026-08-21T02:30:00Z" }),
+    "full"
+  );
+  assert.equal(
+    fixedBadgeState({
+      redirectsAppliedAt: "2026-08-21T02:30:00Z",
+      redirectsSkippedLocs: null
+    }),
+    "full"
+  );
+});
+
+test("an unfixed pattern has no badge state at all", () => {
+  assert.equal(
+    fixedBadgeState({ redirectsAppliedAt: null, redirectsSkippedLocs: 12 }),
+    "none"
+  );
+});
+
+test("the chip says which of the two it is", () => {
+  assert.equal(fixedBadgeLabel("full"), "Fixed");
+  assert.equal(fixedBadgeLabel("partial"), "Partly fixed");
+  assert.equal(fixedBadgeLabel("none"), null);
+});
+
+test("the detail line states both halves, and only when it is qualified", () => {
+  assert.equal(
+    fixedBadgeDetail({
+      redirectsAppliedAt: "2026-08-21T02:30:00Z",
+      redirectsAppliedLocs: 12,
+      redirectsSkippedLocs: 579022
+    }),
+    "12 of 579,034 URLs in this pattern were updated; 579,022 were left unchanged."
+  );
+  // A complete fix needs no caveat, and an unmeasured one has none to give.
+  assert.equal(
+    fixedBadgeDetail({
+      redirectsAppliedAt: "2026-08-21T02:30:00Z",
+      redirectsAppliedLocs: 400,
+      redirectsSkippedLocs: 0
+    }),
+    null
+  );
+  assert.equal(fixedBadgeDetail({ redirectsAppliedAt: null }), null);
 });

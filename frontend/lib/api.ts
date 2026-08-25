@@ -152,8 +152,30 @@ export type Pattern = {
   // When this pattern's redirect fixes were applied. Drives the grey "Fixed"
   // chip; null means never fixed (see fix-visibility.ts).
   redirects_applied_at?: string | null;
+  // HOW MUCH that fix covered (v1.81, migration 052). A URL is only rewritten
+  // when a confirmed destination or an agreed rewrite rule reaches it, so an
+  // apply routinely lands on part of a pattern — and the chip was drawn the same
+  // either way. Both counts are MEASURED during the rewrite, never derived from
+  // total_urls (an extrapolation, and one describing the pre-fix files).
+  // Undefined/null = an older row that was never measured, which fix-visibility
+  // deliberately reads as "no claim" rather than as a shortfall.
+  redirects_applied_locs?: NumberLike | null;
+  redirects_skipped_locs?: NumberLike | null;
+  // Bounded top-N of the URL shapes left unchanged, biggest first, each with a
+  // real example URL — the answer to "which ones did it miss?".
+  redirects_skipped_shapes?: SkippedShape[] | null;
   original_template?: string | null;
   transform_original_template?: string | null;
+};
+
+// One entry of a fix's shortfall histogram (v1.81). `shape` is valueShape() of
+// the pathname — the same key pattern_shape_rules uses, so a shape here can be
+// traced to the stratum whose samples disagreed. `example` is a real URL because
+// "/a/a-a-9999/" identifies nothing to a reviewer looking at a sitemap.
+export type SkippedShape = {
+  shape: string;
+  count: number;
+  example: string;
 };
 
 export type SampledUrl = {
@@ -2012,6 +2034,22 @@ export type RedirectCandidatesResponse = {
   // than summing them into a number that hides the difference.
   shape_extrapolated_count?: number;
   trusted_shape_count?: number;
+  // THE OTHER HALF OF THE SAME MEASUREMENT (v1.81). trusted_shape_count says how
+  // far a stratified check reaches; nothing said what it does NOT reach, so the
+  // modal could show "4 trusted shapes" over a pattern where twenty disagreed and
+  // most of the population would go untouched — and the first anyone heard of it
+  // was an unchanged sitemap after a success tick.
+  //
+  // An unagreed shape is not an error: it means the shape WAS sampled and its
+  // URLs redirect inconsistently (or none of them redirected), which is grounds
+  // for escalating that shape rather than rewriting it. `example` is null when no
+  // row on the current review page happens to carry that shape.
+  unagreed_shapes?: Array<{
+    shape: string;
+    population: number;
+    sample_size: number;
+    example: string | null;
+  }>;
   // Rules a human can approve to reach every matching URL, not only the fetched
   // ones (v1.71). Empty when there are no confirmed redirects to reason from.
   rule_candidates?: RedirectRuleCandidate[];
@@ -2155,11 +2193,23 @@ export async function applyPatternRedirects(
     // opposite next steps. See sitemaps/applyOutcome.ts.
     outcome?:
       | "applied"
+      // Real work landed, but pattern URLs were left unchanged (v1.81). Every
+      // non-zero count used to be plain "applied", so twelve of 579,034 read
+      // exactly like a complete fix.
+      | "partially-applied"
       | "nothing-to-apply"
       | "already-rewritten"
       | "rule-matched-nothing"
       | "no-source-files";
     outcome_message?: string;
+    // WHICH URLs were left behind (v1.81). The count answers "did this finish?";
+    // the shapes answer "which ones?", which is what an operator staring at an
+    // unchanged sitemap is actually asking.
+    skipped_in_scope?: number;
+    skipped_shapes?: SkippedShape[];
+    // The shape list is a bounded top-N; this says so rather than letting it
+    // imply it is exhaustive.
+    skipped_shapes_truncated?: boolean;
     // Set when a widened whole-pattern fix was too large to run inline and was
     // routed to a background job instead. (v1.42)
     queued?: boolean;
@@ -2323,6 +2373,16 @@ export type MaintenanceJob = {
   files_done: number;
   items_changed: NumberLike;
   error: string | null;
+  // Items the job deliberately skipped — NOT failures (migration 036). For
+  // apply-redirects (v1.81) this is the shortfall report, so a QUEUED apply can
+  // tell the operator the same thing an inline one returns in its response body.
+  // Without it the two paths describe the same operation differently, which is a
+  // divergence this codebase has already paid for twice (v1.75, v1.79).
+  skipped?: {
+    skipped_in_scope: number;
+    by_shape: SkippedShape[];
+    shapes_truncated: boolean;
+  } | null;
 };
 
 export type TrailingSlashPreview = {
@@ -2621,11 +2681,30 @@ export async function downloadCorrectedSitemap(
   const link = document.createElement("a");
 
   link.href = objectUrl;
+  // .zip when the pattern spans several edited files (v1.81) — the server picks,
+  // and content-disposition carries the real name either way.
   link.download = downloadFilename(response, "corrected-sitemap.xml");
   document.body.appendChild(link);
   link.click();
   link.remove();
   URL.revokeObjectURL(objectUrl);
+
+  // HOW MUCH OF THE PATTERN IS IN THAT FILE (v1.81).
+  //
+  // This endpoint used to stream the FIRST edited file of the pattern and stop —
+  // one XML for a pattern spanning 187 of them, chosen by stored-filename order,
+  // which sorts on the copy-on-write marker and is therefore arbitrary. An
+  // operator opened it, found the old URLs still there and concluded the fix had
+  // not applied. It had; they were holding one file out of hundreds. The server
+  // now sends every edited file, and these two numbers let the UI say so instead
+  // of leaving the download to imply it.
+  const filesInPattern = Number(response.headers.get("x-pattern-files-total"));
+  const filesEdited = Number(response.headers.get("x-pattern-files-edited"));
+
+  return {
+    filesInPattern: Number.isFinite(filesInPattern) ? filesInPattern : null,
+    filesEdited: Number.isFinite(filesEdited) ? filesEdited : null
+  };
 }
 
 // One file whose <loc>s point at a domain other than the session's base URL;

@@ -91,6 +91,8 @@ import {
   getDeleteProblemUrlsStatus,
   getTrailingSlashStatus,
   numberValue,
+  type NumberLike,
+  type SkippedShape,
   renamePatternTemplate,
   restoreDeletedUrls,
   restoreSampledUrlToFiles,
@@ -222,12 +224,16 @@ import {
 } from "@/lib/transform-coverage";
 import {
   fixActionState,
+  fixedBadgeDetail,
+  fixedBadgeLabel,
+  fixedBadgeState,
   hasStaleCountsAfterFix,
   showFixedBadge,
   showCheckButton,
   type PatternStatus
 } from "@/lib/fix-visibility";
 import { applyScopeNote } from "@/lib/apply-scope-note";
+import { skippedShapeLines, skippedSummary } from "@/lib/skipped-shapes";
 import { sourceFileEmptinessMessage } from "@/lib/source-file-emptiness";
 import {
   analysisSettled,
@@ -275,6 +281,13 @@ type PatternRow = {
   // successful fix rescores the row healthy, so status alone cannot tell a fixed
   // pattern from one that never needed fixing. See lib/fix-visibility.ts.
   redirectsAppliedAt: string | null;
+  // HOW MUCH that fix covered (v1.81). Both counts are measured on disk during
+  // the rewrite; null means an older row nobody measured, which fixedBadgeState
+  // reads as "no claim" rather than as a shortfall. redirectsSkippedShapes names
+  // the URL shapes left behind, with a real example each.
+  redirectsAppliedLocs: number | null;
+  redirectsSkippedLocs: number | null;
+  redirectsSkippedShapes: SkippedShape[];
   originalTemplate: string | null;
   transformOriginalTemplate: string | null;
   hasRedirects: boolean;
@@ -647,6 +660,21 @@ function redirectArtifactSegment(template: string, samples: SampledUrl[]) {
   return segment ?? null;
 }
 
+// numberValue coerces null to 0, which is right for a count and WRONG for the
+// fix-coverage columns: there, null means "this row was fixed before v1.81 and
+// nobody measured it", and 0 means "measured, and nothing was left behind". Those
+// draw different chips (see fixedBadgeState), so the distinction has to survive
+// the mapper.
+function numberOrNull(value: NumberLike): number | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const parsed = typeof value === "number" ? value : Number(value);
+
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function buildRows(
   patterns: Pattern[],
   samplesByPattern: SamplesByPattern,
@@ -686,6 +714,9 @@ function buildRows(
       redirectArtifactSegment: redirectArtifactSegment(pattern.template, samples),
       sourceFile: pattern.source_file,
       redirectsAppliedAt: pattern.redirects_applied_at ?? null,
+      redirectsAppliedLocs: numberOrNull(pattern.redirects_applied_locs),
+      redirectsSkippedLocs: numberOrNull(pattern.redirects_skipped_locs),
+      redirectsSkippedShapes: pattern.redirects_skipped_shapes ?? [],
       originalTemplate: pattern.original_template ?? null,
       transformOriginalTemplate: pattern.transform_original_template ?? null,
       hasRedirects: samples.some(
@@ -897,6 +928,14 @@ export default function ResultsDashboardPage({
     // shipped, which is the opposite of what happened.
     tone: "success" | "warning" | "error";
     message: string;
+    // Lines under the message (v1.81) — for a partial fix, the URL shapes it left
+    // behind, one real example each. A one-line toast could say "579,022 URLs were
+    // left unchanged" but not WHICH, and "which" is the whole question when you
+    // are looking at a sitemap that still has the old paths in it.
+    details?: string[];
+    // Stays until dismissed. A four-second toast is fine for "12 URLs updated"
+    // and useless for a list somebody has to read and act on.
+    sticky?: boolean;
   } | null>(null);
   const [renameRow, setRenameRow] = useState<PatternRow | null>(null);
   const [renameValue, setRenameValue] = useState("");
@@ -1053,6 +1092,18 @@ export default function ResultsDashboardPage({
   // URLs a trusted PER-SHAPE rule would reach (v1.69). Held apart from the
   // measured count so the label can name both halves — see fixAcceptBreakdown.
   const [fixExtrapolatedCount, setFixExtrapolatedCount] = useState(0);
+  // Shapes a stratified check sampled and could NOT distil a rule for (v1.81).
+  // These are the URLs an accept will walk straight past, and until now the modal
+  // had no way to mention them — the first anyone heard was an unchanged sitemap
+  // after a success tick.
+  const [fixUnagreedShapes, setFixUnagreedShapes] = useState<
+    Array<{
+      shape: string;
+      population: number;
+      sample_size: number;
+      example: string | null;
+    }>
+  >([]);
   // Rules a human can approve to reach every matching URL (v1.71), and the one
   // they picked. deriveRedirectRule refuses whenever the confirmed pairs
   // disagree, which left an operator who could SEE the right transformation with
@@ -1731,26 +1782,47 @@ export default function ResultsDashboardPage({
             // Still a button, deliberately. It opens the same dialog, so a
             // reviewer can go back and see what was applied without having to
             // undo anything to get the panel back.
+            //
+            // AND IT SAYS HOW MUCH (v1.81). One chip used to cover both "every URL
+            // in this pattern now points at its destination" and "twelve of
+            // 579,034 do". On the reported session the operator fixed several
+            // patterns, saw several of these, downloaded the sitemap and found the
+            // old URLs still in it — the chips were literally true and answered
+            // the wrong question. Amber for partial: it is not a failure, but it
+            // is unfinished, and it must not sit there looking done.
             <button
               type="button"
               data-testid="pattern-fixed-chip"
+              data-fixed-state={fixedBadgeState(row.original)}
               aria-label={`Review the fix applied to ${row.original.template}`}
-              title={
+              title={[
                 row.original.redirectsAppliedAt
                   ? `Redirects applied ${formatTimestamp(
                       row.original.redirectsAppliedAt
-                    )} — open to review`
-                  : "Redirects applied — open to review"
+                    )}`
+                  : "Redirects applied",
+                fixedBadgeDetail(row.original),
+                "open to review"
+              ]
+                .filter(Boolean)
+                .join(" — ")}
+              className={
+                fixedBadgeState(row.original) === "partial"
+                  ? "inline-flex items-center gap-1 rounded-md border border-amber-300 bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-700 hover:bg-amber-100"
+                  : "inline-flex items-center gap-1 rounded-md border border-slate-300 bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500 hover:bg-slate-200"
               }
-              className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500 hover:bg-slate-200"
               onClick={(event) => {
                 event.stopPropagation();
                 setFindReplaceToast(null);
                 setFixRow(row.original);
               }}
             >
-              <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
-              Fixed
+              {fixedBadgeState(row.original) === "partial" ? (
+                <TriangleAlert className="h-3 w-3" aria-hidden="true" />
+              ) : (
+                <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
+              )}
+              {fixedBadgeLabel(fixedBadgeState(row.original))}
             </button>
             ) : null}
             {/* THE ACTION, INDEPENDENT OF THE BADGE (v1.74). The badge used to
@@ -1991,7 +2063,9 @@ export default function ResultsDashboardPage({
     [allSamples]
   );
   useEffect(() => {
-    if (!findReplaceToast) {
+    // A sticky toast carries something to read and act on, so it waits for the
+    // operator instead of the clock (v1.81).
+    if (!findReplaceToast || findReplaceToast.sticky) {
       return;
     }
 
@@ -2521,9 +2595,27 @@ export default function ResultsDashboardPage({
     setDownloadingSitemapId(rowData.id);
 
     try {
-      await downloadCorrectedSitemap(params.id, rowData.id, {
+      const scope = await downloadCorrectedSitemap(params.id, rowData.id, {
         onProgress: setDownloadTransfer
       });
+
+      // SAY WHAT IS IN THE FILE THEY JUST GOT (v1.81). Silence here is how "the
+      // corrected sitemap" came to mean "one arbitrary file of a 187-file
+      // pattern" without anybody being told. Only worth a toast when the pattern
+      // really does span more than one file — on a single-file pattern the
+      // download is self-evidently the whole thing.
+      if (scope.filesInPattern != null && scope.filesInPattern > 1) {
+        setFindReplaceToast({
+          tone: "success",
+          message: `Downloaded ${formatNumber(
+            scope.filesEdited ?? 0
+          )} edited file${
+            scope.filesEdited === 1 ? "" : "s"
+          } of the ${formatNumber(
+            scope.filesInPattern
+          )} this pattern spans. The rest were not changed by a fix, so they are unchanged from what you uploaded.`
+        });
+      }
     } catch (nextError) {
       setFindReplaceToast({
         tone: "error",
@@ -2860,6 +2952,7 @@ export default function ResultsDashboardPage({
     setFixScopedOccurrences(null);
     setFixConfirmedCount(0);
     setFixExtrapolatedCount(0);
+    setFixUnagreedShapes([]);
     setFixRuleCandidates([]);
     // An approval is for ONE pattern's evidence; carrying it across would apply
     // a rule nobody reviewed here. Same for the counts, which describe this
@@ -2880,6 +2973,7 @@ export default function ResultsDashboardPage({
         setFixPatternTotal(data.pattern_total_urls);
         setFixConfirmedCount(data.confirmed_redirect_count ?? 0);
         setFixExtrapolatedCount(data.shape_extrapolated_count ?? 0);
+        setFixUnagreedShapes(data.unagreed_shapes ?? []);
         setFixRuleCandidates(data.rule_candidates ?? []);
         // Seeded through canBulkFix rather than defaultFixAction alone, because
         // the header toggle opens PRESSED (v1.66) and the rows have to agree with
@@ -3128,10 +3222,35 @@ export default function ResultsDashboardPage({
 
       if (job.status === "COMPLETED") {
         const changed = Number(job.items_changed ?? 0);
+        // The SAME shortfall the inline path reports in its response body
+        // (v1.81), carried on the job row so a queued apply and an inline one
+        // cannot tell the operator different things about the same operation.
+        // That divergence has already cost this codebase two releases (v1.75 for
+        // which files an apply opens, v1.79 for which inputs it uses).
+        const skippedInScope = job.skipped?.skipped_in_scope ?? 0;
 
         // Reload BEFORE the toast, so the number and the table agree the moment
         // the user reads it.
         await loadResults({ silent: true });
+
+        if (changed > 0 && skippedInScope > 0) {
+          setFindReplaceToast({
+            tone: "warning",
+            message: skippedSummary({
+              applied: changed,
+              skipped: skippedInScope,
+              filesEdited: job.files_done ?? null,
+              filesInPattern: job.files_total || filesTotal || null
+            }),
+            details: skippedShapeLines(job.skipped?.by_shape ?? [], {
+              truncated: job.skipped?.shapes_truncated
+            }),
+            sticky: true
+          });
+
+          return;
+        }
+
         setFindReplaceToast({
           tone: changed === 0 ? "error" : "success",
           message:
@@ -3316,6 +3435,35 @@ export default function ResultsDashboardPage({
         patternFileCount: result.pattern_file_count
       });
 
+      // WHAT IT DID NOT DO (v1.81). Real work landing used to print one cheerful
+      // sentence whether it had rewritten the whole pattern or twelve URLs of
+      // 579,034 — and the reported session was the second, which is why the
+      // downloaded sitemap still had the old paths in it. A partial apply is not
+      // a failure and must not read as one; it is unfinished, and it has to say
+      // so and name what is left.
+      const skippedInScope = result.skipped_in_scope ?? 0;
+      const isPartial = !nothingChanged && skippedInScope > 0;
+
+      if (isPartial) {
+        setFindReplaceToast({
+          tone: "warning",
+          message: skippedSummary({
+            applied: changed,
+            skipped: skippedInScope,
+            filesEdited: result.files_scanned ?? null,
+            filesInPattern: result.pattern_file_count ?? null
+          }),
+          details: skippedShapeLines(result.skipped_shapes ?? [], {
+            truncated: result.skipped_shapes_truncated
+          }),
+          // Held open: this is a list to read and act on, not a confirmation to
+          // glance at.
+          sticky: true
+        });
+
+        return;
+      }
+
       setFindReplaceToast({
         tone: nothingChanged ? "error" : "success",
         message: nothingChanged
@@ -3459,6 +3607,7 @@ export default function ResultsDashboardPage({
         if (fixScopeRequestIdRef.current === requestId) {
           setFixConfirmedCount(data.confirmed_redirect_count ?? 0);
           setFixExtrapolatedCount(data.shape_extrapolated_count ?? 0);
+          setFixUnagreedShapes(data.unagreed_shapes ?? []);
         }
       })
       .catch(() => {
@@ -6077,6 +6226,58 @@ export default function ResultsDashboardPage({
                   too varied to infer a single rewrite rule for the rest.
                 </p>
               ) : null}
+              {/* WHAT AN ACCEPT WILL WALK PAST (v1.81).
+                  The banners above all describe REACH. Nothing described the
+                  remainder, so a pattern where twenty URL shapes had been sampled
+                  and disagreed presented as a clean fix, and the first the
+                  operator heard of it was a downloaded sitemap that still had the
+                  old paths in it. This is the same list the apply reports
+                  afterwards, shown BEFORE the button so the choice is informed
+                  rather than the surprise explained.
+
+                  An unagreed shape is not an error: it means the shape was
+                  sampled and its URLs redirect inconsistently (or none of them
+                  redirected). The next step is genuinely different from
+                  "verify more" — see looksLikeSegmentReorder in verify-advice. */}
+              {fixUnagreedShapes.length > 0 ? (
+                <div className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  <p>
+                    {formatNumber(
+                      fixUnagreedShapes.reduce(
+                        (sum, entry) => sum + entry.population,
+                        0
+                      )
+                    )}{" "}
+                    URLs in {formatNumber(fixUnagreedShapes.length)} group
+                    {fixUnagreedShapes.length === 1 ? "" : "s"} will NOT be
+                    rewritten: they were checked and their redirects disagree, so
+                    no rule can be derived for them.
+                  </p>
+                  <ul className="mt-1 space-y-0.5">
+                    {fixUnagreedShapes.slice(0, 5).map((entry) => (
+                      <li key={entry.shape} className="break-all font-mono">
+                        {formatNumber(entry.population)} like{" "}
+                        {entry.example ?? entry.shape}
+                      </li>
+                    ))}
+                  </ul>
+                  {fixUnagreedShapes.length > 5 ? (
+                    <p className="mt-1">
+                      …and {formatNumber(fixUnagreedShapes.length - 5)} more
+                      group
+                      {fixUnagreedShapes.length - 5 === 1 ? "" : "s"}.
+                    </p>
+                  ) : null}
+                  {fixLooksLikeReorder ? (
+                    <p className="mt-1">
+                      These redirects move whole path segments around, which this
+                      route cannot express — use <strong>Update Pattern</strong>{" "}
+                      (the pencil icon on the row) instead. It substitutes params
+                      by name and needs no probing at all.
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
               {/* Verify-then-act, scoped to THIS pattern (v1.50). Owns its own
                   triage/verification state; see components/pattern-verify-panel. */}
               {fixRow ? (
@@ -8610,7 +8811,32 @@ export default function ResultsDashboardPage({
               ) : (
                 <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
               )}
-              <span className="text-foreground">{findReplaceToast.message}</span>
+              <div className="min-w-0">
+                <span className="text-foreground">
+                  {findReplaceToast.message}
+                </span>
+                {findReplaceToast.details &&
+                findReplaceToast.details.length > 0 ? (
+                  // Monospace and break-all: these are URLs, and a wrapped URL
+                  // that breaks at a hyphen reads as two different URLs.
+                  <ul className="mt-2 space-y-1 border-t border-border pt-2 text-xs text-muted-foreground">
+                    {findReplaceToast.details.map((detail) => (
+                      <li key={detail} className="break-all font-mono">
+                        {detail}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+                {findReplaceToast.sticky ? (
+                  <button
+                    type="button"
+                    className="mt-2 text-xs font-semibold text-muted-foreground underline hover:text-foreground"
+                    onClick={() => setFindReplaceToast(null)}
+                  >
+                    Dismiss
+                  </button>
+                ) : null}
+              </div>
             </div>
           </div>
         ) : null}

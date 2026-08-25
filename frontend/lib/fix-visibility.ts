@@ -96,6 +96,72 @@ export function showFixedBadge(row: {
   return Boolean(row.redirectsAppliedAt);
 }
 
+// FIXED, OR ONLY PARTLY FIXED? (v1.81)
+//
+// WHAT WAS WRONG. showFixedBadge is a boolean, and both apply paths set
+// redirects_applied_at whenever a single <loc> changed. So an apply that rewrote
+// every URL of a pattern and one that rewrote twelve of 579,034 drew the same
+// grey "Fixed" chip.
+//
+// That gap is not exotic, it is the normal case on a wide pattern: a URL is only
+// rewritten when a confirmed destination or an AGREED per-shape rule reaches it
+// (buildRedirectApplyRewriter), and a pattern that mixes several URL families
+// distils no single rule and few agreed shapes. On the reported session the
+// operator fixed several patterns, saw several Fixed chips, downloaded the
+// sitemap and found the old URLs still in it — every one of those chips was
+// telling the literal truth and none of them was answering the question.
+//
+// NULL COUNTS MEAN "NOT MEASURED", NOT "NOTHING SKIPPED". Rows fixed before
+// migration 052 have no measurement, and guessing one from total_urls would
+// report a shortfall on a complete apply — that column is an extrapolation, and
+// one describing the PRE-fix files. So an unmeasured row keeps the plain "Fixed"
+// chip it has always had: no claim, rather than a wrong one.
+export type FixedBadgeState = "none" | "partial" | "full";
+
+export function fixedBadgeState(row: {
+  redirectsAppliedAt?: string | null;
+  redirectsSkippedLocs?: number | null;
+}): FixedBadgeState {
+  if (!row.redirectsAppliedAt) {
+    return "none";
+  }
+
+  return (row.redirectsSkippedLocs ?? 0) > 0 ? "partial" : "full";
+}
+
+// The chip's words. Here rather than in the JSX for the reason the rest of this
+// module is here: results/page.tsx has no component test harness, so a rule left
+// in the markup is a rule nothing can assert.
+export function fixedBadgeLabel(state: FixedBadgeState): string | null {
+  if (state === "none") {
+    return null;
+  }
+
+  return state === "partial" ? "Partly fixed" : "Fixed";
+}
+
+// The sentence under the chip, naming both halves of the measurement. Returns
+// null when there is nothing qualified to say — an unmeasured row, or a complete
+// fix, neither of which needs a caveat.
+export function fixedBadgeDetail(row: {
+  redirectsAppliedAt?: string | null;
+  redirectsAppliedLocs?: number | null;
+  redirectsSkippedLocs?: number | null;
+}): string | null {
+  if (fixedBadgeState(row) !== "partial") {
+    return null;
+  }
+
+  const applied = row.redirectsAppliedLocs ?? 0;
+  const skipped = row.redirectsSkippedLocs ?? 0;
+
+  return `${applied.toLocaleString("en-US")} of ${(
+    applied + skipped
+  ).toLocaleString("en-US")} URLs in this pattern were updated; ${skipped.toLocaleString(
+    "en-US"
+  )} were left unchanged.`;
+}
+
 // Do this pattern's URL counts predate its last fix?
 //
 // THE ROOT CAUSE OF THE REPORTED CONFUSION. apply-redirects rewrites the <loc>

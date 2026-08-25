@@ -97,7 +97,15 @@ app.addHook("onResponse", async (request, reply) => {
 
 await app.register(cors, {
   origin: true,
-  exposedHeaders: ["content-disposition"]
+  // A response header the browser does not expose is a header the client cannot
+  // read at all — content-disposition carries the download's filename, and the
+  // x-pattern-files-* pair (v1.81) carries "4 of 187 files", which is the sentence
+  // that stops a one-file download from being read as the whole pattern.
+  exposedHeaders: [
+    "content-disposition",
+    "x-pattern-files-total",
+    "x-pattern-files-edited"
+  ]
 });
 await app.register(multipart, {
   limits: {

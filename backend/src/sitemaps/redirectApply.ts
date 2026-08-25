@@ -16,6 +16,11 @@ import {
 } from "./rewriteLocs.js";
 import { deriveRedirectRule, type RedirectRule } from "./redirectRule.js";
 import {
+  emptySkippedReport,
+  tallySkippedInScope,
+  type SkippedReport
+} from "./applyCoverage.js";
+import {
   applyStructureFilterToRewriter,
   urlMatchesStructureFilters,
   type ResolvedStructureFilter
@@ -95,6 +100,11 @@ export type RedirectFileRewrite = {
   // "the rule matched nothing" from "no file was ever read" — those look
   // identical in rewrittenLocCount and mean completely different things.
   filesScanned: number;
+  // The pattern's URLs this rewrite did NOT change, counted in the same pass
+  // (v1.81). Empty when the caller passed no patternTemplate to measure against.
+  // See applyCoverage: rewrittenLocCount alone made a 12-of-579,034 apply read
+  // exactly like a complete one.
+  skipped: SkippedReport;
 };
 
 // Rewrite the source XML files for a pattern's redirect fixes: every <loc>
@@ -134,9 +144,13 @@ export async function rewriteRedirectSourceFilesOnDisk(
     // URLs the operator set to Skip or Delete (v1.73). The rule would otherwise
     // sweep them anyway — see buildRedirectApplyRewriter.
     excludeUrls?: Set<string> | null;
+    // The pattern's template (v1.81). Supplied ONLY so the pass can also count
+    // the pattern's URLs it leaves alone — it never changes what is rewritten.
+    // Omitted = no tally, and the result reports an empty one.
+    patternTemplate?: string | null;
   }
 ): Promise<RedirectFileRewrite> {
-  const rewriteUrl = applyStructureFilterToRewriter(
+  const scopedRewriter = applyStructureFilterToRewriter(
     buildRedirectApplyRewriter(
       options.replacements,
       options.rule ?? null,
@@ -145,6 +159,15 @@ export async function rewriteRedirectSourceFilesOnDisk(
     ),
     options.structureFilters ?? null
   );
+  // ONE tally across every file of this apply, wrapped OUTSIDE the structure
+  // guard so a URL the operator scoped out is counted as a pattern member left
+  // unchanged — which is what it is, and what they need to see.
+  const coverage = options.patternTemplate
+    ? tallySkippedInScope(scopedRewriter, {
+        template: options.patternTemplate
+      })
+    : null;
+  const rewriteUrl = coverage ? coverage.rewriter : scopedRewriter;
   const selectedSet = new Set(options.selectedDisplayFiles);
   const filesResult = await client.query<{
     id: string;
@@ -163,7 +186,8 @@ export async function rewriteRedirectSourceFilesOnDisk(
     oldFilePaths: [],
     newFilePaths: [],
     rewrittenLocCount: 0,
-    filesScanned: 0
+    filesScanned: 0,
+    skipped: emptySkippedReport()
   };
 
   for (const file of filesResult.rows) {
@@ -233,6 +257,10 @@ export async function rewriteRedirectSourceFilesOnDisk(
       result.oldFilePaths.push(inputPath);
     }
     result.rewrittenLocCount += rewrittenLocCount;
+  }
+
+  if (coverage) {
+    result.skipped = coverage.report();
   }
 
   return result;

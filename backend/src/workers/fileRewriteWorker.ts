@@ -13,6 +13,11 @@ import {
 } from "../sitemaps/transformStructure.js";
 import { applyShapeFilterToRewriter } from "../sitemaps/shapeFilter.js";
 import {
+  emptySkippedReport,
+  tallySkippedInScope,
+  type SkippedReport
+} from "../sitemaps/applyCoverage.js";
+import {
   applyStructureFilterToRewriter,
   type ResolvedStructureFilter
 } from "../sitemaps/structureClusters.js";
@@ -75,6 +80,17 @@ export type FileRewriteSpec =
       // use them: the sequential branch passed null and this one had nowhere
       // to put them. (v1.79)
       shapeRules?: [string, RedirectRule][] | null;
+      // The pattern's template (v1.81), carried ONLY so this thread can also
+      // count the pattern's URLs the rewrite leaves alone. It changes nothing
+      // about what is rewritten; omitted, the result reports an empty tally and
+      // this worker behaves byte-for-byte as it did before.
+      //
+      // Measured HERE rather than in a second pass on the main thread because
+      // the rewrite already streams every <loc> of every file — recounting them
+      // afterwards would double the disk work on a 6.58M-loc session, and a
+      // separate scan could disagree with the rewrite about what counts as a
+      // <loc> or as a pattern member.
+      patternTemplate?: string | null;
     }
   // Pattern structure transform (v1.48). The RAW structure strings cross the
   // thread edge, not the parsed form — parseStructure is cheap, deterministic and
@@ -100,7 +116,13 @@ export type FileRewriteInput = {
   spec: FileRewriteSpec;
 };
 
-export type FileRewriteResult = { rewrittenCount: number };
+export type FileRewriteResult = {
+  rewrittenCount: number;
+  // The pattern's URLs this file left unchanged (v1.81). Always present; empty
+  // unless the spec asked for the tally. Folded across files by the caller with
+  // mergeSkippedReports.
+  skipped: SkippedReport;
+};
 
 function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
   if (spec.kind === "patternTemplate") {
@@ -150,12 +172,26 @@ function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
 export default async function fileRewrite(
   input: FileRewriteInput
 ): Promise<FileRewriteResult> {
+  const rewriter = buildRewriter(input.spec);
+  // Only apply-redirects measures its shortfall — it is the only path whose reach
+  // is bounded by what was verified rather than by what the rule can express, and
+  // so the only one where "rewrote N" needs "left M" beside it to mean anything.
+  const coverage =
+    input.spec.kind === "redirectApply" && input.spec.patternTemplate
+      ? tallySkippedInScope(rewriter, {
+          template: input.spec.patternTemplate
+        })
+      : null;
+
   const rewrittenCount = await rewriteSitemapLocFile({
     inputPath: input.inputPath,
     outputPath: input.outputPath,
     isGzip: input.isGzip,
-    rewriteUrl: buildRewriter(input.spec)
+    rewriteUrl: coverage ? coverage.rewriter : rewriter
   });
 
-  return { rewrittenCount };
+  return {
+    rewrittenCount,
+    skipped: coverage ? coverage.report() : emptySkippedReport()
+  };
 }

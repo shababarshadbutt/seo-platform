@@ -40,6 +40,16 @@ process.env.REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
 const uploadDir = mkdtempSync(path.join(os.tmpdir(), "apply-parity-itest-"));
 
 process.env.UPLOAD_DIR = uploadDir;
+// BEFORE ANY IMPORT READS IT. FILE_REWRITE_PARALLEL_THRESHOLD is captured at
+// module load in jobs/fileRewritePool.ts, so setting it later — which this test
+// used to do, just above the inject() below — had no effect at all: the route
+// still saw the default 25, this 30-file pattern queued itself, and the assertion
+// that it ran inline failed every time. Together with the column typo in the seed
+// (occurrences -> occurrence_count) that meant this parity guard had never once
+// executed. Set here, where process.env assignments already happen for exactly
+// this reason.
+process.env.FILE_REWRITE_PARALLEL_THRESHOLD =
+  process.env.FILE_REWRITE_PARALLEL_THRESHOLD ?? "1000";
 
 const BASE = "https://example.com";
 const TEMPLATE = "/product/{param}/{param}";
@@ -84,10 +94,22 @@ function buildFiles(sessionId: string): BuiltFile[] {
       locs.push(`  <url><loc>${url}</loc></url>`);
     }
 
-    const display = `part-${fileIndex}.xml`;
+    // THE DISPLAY NAME KEEPS THE ROLE PREFIX. displaySourceFilename() strips the
+    // session id and any copy-on-write marker but DELIBERATELY leaves
+    // "current-"/"legacy-" in place — that is how the UI tells the two roles
+    // apart (see sitemaps/filenames.ts). pattern_file_occurrences.source_file
+    // holds that same value in production.
+    //
+    // This fixture used to seed occurrences as "part-0.xml" while storing the
+    // file as "<sid>-current-part-0.xml", so every display lookup missed, the
+    // apply resolved ZERO target files, and the test reported it as the queued
+    // job reading sampled_urls alone. Three other defects in this harness
+    // (a column that does not exist, an env var set after it is read, and
+    // fixed_file_path treated as a path) meant it had never run to find out.
+    const display = `current-part-${fileIndex}.xml`;
 
     files.push({
-      stored: `${sessionId}-current-${display}`,
+      stored: `${sessionId}-${display}`,
       display,
       xml:
         '<?xml version="1.0" encoding="UTF-8"?>\n' +
@@ -171,6 +193,18 @@ test("the inline route and the queued job rewrite identical bytes", async (t) =>
   const { closePreGenerateZipQueue } = await import(
     "../queue/preGenerateZipQueue.js"
   );
+  // EVERY queue routes/sessions.ts opens, not just one. Each holds a live Redis
+  // connection, and an unclosed one keeps the event loop alive after the
+  // assertions have passed — the run then sits until the outer timeout kills it
+  // and reports the FILE as failed while the test inside it succeeded.
+  const { closeSitemapQueue } = await import("../queue/sitemapQueue.js");
+  const { closeBulkReplaceQueue } = await import(
+    "../queue/bulkReplaceQueue.js"
+  );
+  const { closePublishQueue } = await import("../queue/publishQueue.js");
+  const { closeMaintenanceQueue } = await import(
+    "../queue/maintenanceQueue.js"
+  );
   const { sessionRoutes } = await import("../routes/sessions.js");
   const Fastify = (await import("fastify")).default;
 
@@ -184,7 +218,11 @@ test("the inline route and the queued job rewrite identical bytes", async (t) =>
     }
 
     await destroyFileRewritePool().catch(() => {});
+    await closeSitemapQueue().catch(() => {});
+    await closeBulkReplaceQueue().catch(() => {});
+    await closePublishQueue().catch(() => {});
     await closePreGenerateZipQueue().catch(() => {});
+    await closeMaintenanceQueue().catch(() => {});
     await closePool().catch(() => {});
     rmSync(uploadDir, { recursive: true, force: true });
   });
@@ -231,7 +269,7 @@ test("the inline route and the queued job rewrite identical bytes", async (t) =>
       // bug rather than expose one.
       await pool.query(
         `
-          INSERT INTO pattern_file_occurrences (pattern_id, source_file, occurrences)
+          INSERT INTO pattern_file_occurrences (pattern_id, source_file, occurrence_count)
           VALUES ($1, $2, $3)
         `,
         [patternId, file.display, URLS_PER_FILE]
@@ -299,11 +337,18 @@ test("the inline route and the queued job rewrite identical bytes", async (t) =>
 
       assert.ok(row, `no sitemap_files row survived for ${file.display}`);
 
-      const onDisk = row.fixed_file_path ?? path.join(uploadDir, row.filename);
-
+      // ALWAYS the CURRENT filename. sitemap_files.filename is repointed at the
+      // rewritten copy and fixed_file_path preserves the PRE-fix original for
+      // undo — so preferring fixed_file_path, as this used to, read the file as
+      // it was BEFORE the apply this function exists to measure. It is also a
+      // bare stored name rather than a path, so it resolved against the process
+      // CWD and threw ENOENT the moment an apply actually succeeded.
       byDisplay.set(
         file.display,
-        readFileSync(onDisk, "utf8").replace(new RegExp(sessionId, "g"), "SID")
+        readFileSync(path.join(uploadDir, row.filename), "utf8").replace(
+          new RegExp(sessionId, "g"),
+          "SID"
+        )
       );
     }
 
@@ -338,11 +383,8 @@ test("the inline route and the queued job rewrite identical bytes", async (t) =>
     await app.close().catch(() => {});
   });
 
-  // Forced inline: the threshold is read at module load, so the route decides by
-  // file span. 30 files is over the default 25, which is exactly why this test
-  // has to pin the path rather than hope for it.
-  process.env.FILE_REWRITE_PARALLEL_THRESHOLD = "1000";
-
+  // Forced inline by the threshold pinned at the top of this file — it is read
+  // at module load, so setting it here (as this line used to) is too late.
   const response = await app.inject({
     method: "POST",
     url: `/api/sessions/${viaRoute.sessionId}/patterns/${viaRoute.patternId}/apply-redirects`,

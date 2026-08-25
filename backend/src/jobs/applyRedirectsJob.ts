@@ -22,6 +22,12 @@ import { applyFileScope } from "../sitemaps/applyFileScope.js";
 import { resolveApplyInputs } from "../sitemaps/redirectApply.js";
 import { applyStructureFilterToRewriter } from "../sitemaps/structureClusters.js";
 import {
+  emptySkippedReport,
+  mergeSkippedReports,
+  tallySkippedInScope,
+  type SkippedReport
+} from "../sitemaps/applyCoverage.js";
+import {
   FILE_REWRITE_PARALLEL_THRESHOLD,
   runFileRewriteJob
 } from "./fileRewritePool.js";
@@ -81,6 +87,17 @@ async function markApplyJob(
   }
 }
 
+// The wire form of a shortfall report, snake_cased to match every other jsonb
+// payload the status endpoints hand back. Kept as one function so the queued job
+// and the inline route cannot describe the same measurement two ways.
+function skippedPayload(report: SkippedReport) {
+  return {
+    skipped_in_scope: report.skippedInScope,
+    by_shape: report.byShape,
+    shapes_truncated: report.shapesTruncated
+  };
+}
+
 export async function processApplyRedirectsJob(
   data: ApplyRedirectsJobData,
   logger: FastifyBaseLogger
@@ -113,8 +130,14 @@ async function runApplyRedirectsJob(
   // <loc> it can transform — including the structures the user excluded.
   const structureFilters = data.structure_filters ?? null;
 
-  const patternResult = await pool.query<{ source_role: string }>(
-    "SELECT source_role FROM patterns WHERE id = $1",
+  // template joins the select for v1.81: the shortfall tally has to know which
+  // <loc>s belong to this pattern, or "left unchanged" would count every other
+  // pattern's URLs sharing the same file.
+  const patternResult = await pool.query<{
+    source_role: string;
+    template: string;
+  }>(
+    "SELECT source_role, template FROM patterns WHERE id = $1",
     [patternId]
   );
 
@@ -137,6 +160,7 @@ async function runApplyRedirectsJob(
   }
 
   const sourceRole = patternResult.rows[0].source_role;
+  const patternTemplate = patternResult.rows[0].template;
 
   // EVERY INPUT THIS APPLY REWRITES WITH, from the one builder the route also
   // calls (v1.79). What used to be here read sampled_urls and nothing else: no
@@ -197,8 +221,8 @@ async function runApplyRedirectsJob(
     // exactly this distinction for the inline path.
     await markApplyJob(
       data.job_row_id,
-      "status = 'COMPLETED', items_changed = 0, files_done = 0, completed_at = now()",
-      [],
+      "status = 'COMPLETED', items_changed = 0, files_done = 0, skipped = $2::jsonb, completed_at = now()",
+      [JSON.stringify(skippedPayload(emptySkippedReport()))],
       logger
     );
 
@@ -252,6 +276,10 @@ async function runApplyRedirectsJob(
   // Files finished, for the progress row. Incremented inside processFile so both
   // the parallel and the sequential path count the same way.
   let filesDone = 0;
+  // Per-file shortfall reports, folded once at the end (v1.81). Collected rather
+  // than merged as they arrive because merging re-sorts and re-caps the whole
+  // histogram, and doing that 187 times to answer it once is work for nothing.
+  const skippedReports: SkippedReport[] = [];
 
   // Swap in the rewritten copy for one file and preserve its pre-fix original
   // for undo — main-thread DB writes only, even when rewrites ran in parallel.
@@ -294,11 +322,14 @@ async function runApplyRedirectsJob(
 
   const processFile = async (
     file: SitemapFileRow,
+    // Returns BOTH halves of the measurement (v1.81): what this file changed, and
+    // which of the pattern's URLs in it were left alone. One return value so the
+    // parallel and sequential branches cannot report one without the other.
     runRewrite: (input: {
       inputPath: string;
       outputPath: string;
       isGzip: boolean;
-    }) => Promise<number>
+    }) => Promise<{ rewrittenCount: number; skipped: SkippedReport }>
   ) => {
     const inputPath = path.join(config.uploadDir, file.filename);
 
@@ -320,7 +351,12 @@ async function runApplyRedirectsJob(
     let rewrittenCount = 0;
 
     try {
-      rewrittenCount = await runRewrite({ inputPath, outputPath, isGzip });
+      const outcome = await runRewrite({ inputPath, outputPath, isGzip });
+
+      rewrittenCount = outcome.rewrittenCount;
+      // Recorded even when the file changed nothing: a file full of pattern URLs
+      // that none of them matched is exactly the evidence the operator needs.
+      skippedReports.push(outcome.skipped);
     } catch (error) {
       await unlink(outputPath).catch(() => {});
       throw error;
@@ -382,9 +418,10 @@ async function runApplyRedirectsJob(
               rule: effectiveRule,
               shapeRules: Array.from(shapeRules.entries()),
               excludeUrls,
-              structureFilters
+              structureFilters,
+              patternTemplate
             }
-          }).then((result) => result.rewrittenCount)
+          })
         )
       )
     );
@@ -402,13 +439,27 @@ async function runApplyRedirectsJob(
     );
 
     for (const file of targets) {
-      await processFile(file, (input) =>
-        rewriteSitemapLocFile({ ...input, rewriteUrl: rewriter })
-      );
+      // A FRESH tally per file, matching what the pooled branch does — one
+      // wrapper reused across files would fold every file into one report and
+      // the two branches would then disagree about the same apply.
+      await processFile(file, async (input) => {
+        const coverage = tallySkippedInScope(rewriter, {
+          template: patternTemplate
+        });
+        const rewrittenCount = await rewriteSitemapLocFile({
+          ...input,
+          rewriteUrl: coverage.rewriter
+        });
+
+        return { rewrittenCount, skipped: coverage.report() };
+      });
     }
   }
 
   await invalidateSessionZipCache(sessionId);
+
+  // ONE fold, at the end. See skippedReports above for why it is not incremental.
+  const skipped = mergeSkippedReports(skippedReports);
 
   // Mark the pattern as fixed, which is what draws the "Fixed" badge in the
   // results table (migration 046).
@@ -421,10 +472,28 @@ async function runApplyRedirectsJob(
   // "0 URLs updated" under a success tick, next to a grey Fixed chip.
   //
   // A pattern is fixed when a URL changed. Nothing else counts.
+  //
+  // AND HOW MUCH OF IT (v1.81). "Fixed" was drawn identically for an apply that
+  // rewrote every URL and one that rewrote twelve of 579,034, which is what made
+  // the reported session read as "it fixed one pattern and missed the rest". The
+  // coverage columns are written in the SAME statement as the timestamp, so a
+  // Fixed chip can never exist without the numbers that qualify it.
   if (rewrittenLocCount > 0) {
     await pool.query(
-      "UPDATE patterns SET redirects_applied_at = now() WHERE id = $1",
-      [patternId]
+      `
+        UPDATE patterns
+        SET redirects_applied_at = now(),
+            redirects_applied_locs = $2,
+            redirects_skipped_locs = $3,
+            redirects_skipped_shapes = $4::jsonb
+        WHERE id = $1
+      `,
+      [
+        patternId,
+        rewrittenLocCount,
+        skipped.skippedInScope,
+        JSON.stringify(skipped.byShape)
+      ]
     );
   }
 
@@ -436,8 +505,8 @@ async function runApplyRedirectsJob(
   // a failure would be the older bug in reverse.
   await markApplyJob(
     data.job_row_id,
-    "status = 'COMPLETED', items_changed = $2, completed_at = now()",
-    [rewrittenLocCount],
+    "status = 'COMPLETED', items_changed = $2, skipped = $3::jsonb, completed_at = now()",
+    [rewrittenLocCount, JSON.stringify(skippedPayload(skipped))],
     logger
   );
 
@@ -445,7 +514,11 @@ async function runApplyRedirectsJob(
     {
       session_id: sessionId,
       pattern_id: patternId,
-      rewritten_loc_count: rewrittenLocCount
+      rewritten_loc_count: rewrittenLocCount,
+      // Logged beside the count it qualifies. On the reported session this line
+      // alone would have answered the question the screenshots were asking.
+      skipped_in_scope: skipped.skippedInScope,
+      skipped_shapes: skipped.byShape.length
     },
     "apply-redirects job complete"
   );

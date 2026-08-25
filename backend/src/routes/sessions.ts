@@ -182,6 +182,8 @@ import {
   applyOutcomeMessage,
   classifyApplyOutcome
 } from "../sitemaps/applyOutcome.js";
+import { emptySkippedReport } from "../sitemaps/applyCoverage.js";
+import { valueShape } from "../sitemaps/transformDryRun.js";
 import { applyFileScope, shouldQueueApply } from "../sitemaps/applyFileScope.js";
 import { parseShapeFilter } from "../sitemaps/shapeFilter.js";
 import {
@@ -2954,6 +2956,15 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             -- button simply disappears, which reads identically to a pattern that
             -- never needed fixing.
             redirects_applied_at,
+            -- HOW MUCH that fix covered (migration 052). Without these the chip
+            -- is drawn identically for an apply that rewrote every URL and one
+            -- that rewrote twelve of 579,034 — the state the reported session was
+            -- in when it read as "it fixed one pattern and missed the rest".
+            -- NULL on rows fixed before 052, which the frontend reads as "not
+            -- measured" and draws exactly as it did before.
+            redirects_applied_locs,
+            redirects_skipped_locs,
+            redirects_skipped_shapes,
             (
               SELECT old_template
               FROM pattern_renames
@@ -4080,21 +4091,32 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             )
         );
 
-      let downloadName: string | null = null;
+      // EVERY edited file of the pattern, not the first one that happens to exist
+      // (v1.81).
+      //
+      // WHAT WAS WRONG. This loop used to `break` on the first readable candidate
+      // and stream it alone. A pattern spanning 187 files therefore downloaded as
+      // one XML — picked by STORED filename order, which sorts on the copy-on-write
+      // marker (`-bulk-`, `-deleted-`, `-fixed-`…) and so is effectively arbitrary.
+      // The operator opened it, found the old URLs still there, and concluded the
+      // fix had not been applied. It had; they were holding one file out of
+      // hundreds, and not the one they were looking for.
+      //
+      // The single-file response is KEPT for a pattern that really does live in one
+      // file — that is the common case, it needs no unpacking, and changing it
+      // would be a regression for everyone it already serves.
+      const readable: string[] = [];
 
       for (const candidate of candidates) {
-        const candidatePath = path.join(config.uploadDir, candidate);
-
         try {
-          await access(candidatePath);
-          downloadName = candidate;
-          break;
+          await access(path.join(config.uploadDir, candidate));
+          readable.push(candidate);
         } catch {
-          // Try the next candidate file.
+          // Cleaned up or missing — nothing to include for this row.
         }
       }
 
-      if (!downloadName) {
+      if (readable.length === 0) {
         return reply.code(404).send({
           error: "Not Found",
           message:
@@ -4102,19 +4124,64 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         });
       }
 
-      const displayName = displaySourceFilename(request.params.id, downloadName);
-      const isGzip = downloadName.toLowerCase().endsWith(".gz");
+      if (readable.length === 1) {
+        const downloadName = readable[0];
+        const displayName = displaySourceFilename(
+          request.params.id,
+          downloadName
+        );
+        const isGzip = downloadName.toLowerCase().endsWith(".gz");
 
-      reply.header(
-        "content-type",
-        isGzip ? "application/gzip" : "application/xml; charset=utf-8"
-      );
+        reply.header(
+          "content-type",
+          isGzip ? "application/gzip" : "application/xml; charset=utf-8"
+        );
+        reply.header(
+          "content-disposition",
+          `attachment; filename="corrected-${displayName}"`
+        );
+        // Set on BOTH branches (v1.81). A caller that only sees them on the ZIP
+        // has to infer the single-file case from their absence, and "the header
+        // is missing" is how a UI ends up silently claiming full coverage again.
+        reply.header("x-pattern-files-total", String(targetDisplays.size));
+        reply.header("x-pattern-files-edited", "1");
+
+        return reply.send(
+          createReadStream(path.join(config.uploadDir, downloadName))
+        );
+      }
+
+      // level 0 and a plain .file() per entry, matching buildSessionZipArchive:
+      // sitemap XML is already served gzipped over the wire and these files run to
+      // gigabytes, so spending CPU to recompress them is the mistake that made the
+      // session ZIP slow (v1.27).
+      const archive = new ZipArchive({ zlib: { level: 0 } });
+
+      for (const stored of readable) {
+        archive.file(path.join(config.uploadDir, stored), {
+          name: displaySourceFilename(request.params.id, stored)
+        });
+      }
+
+      reply.header("content-type", "application/zip");
       reply.header(
         "content-disposition",
-        `attachment; filename="corrected-${displayName}"`
+        `attachment; filename="corrected-pattern-${request.params.patternId}.zip"`
       );
+      // So the operator can see at a glance that they are holding 4 of 187 files
+      // rather than assuming a corrected download is the whole pattern. A header
+      // rather than a body field because the body is the archive itself.
+      reply.header("x-pattern-files-total", String(targetDisplays.size));
+      reply.header("x-pattern-files-edited", String(readable.length));
 
-      return reply.send(createReadStream(path.join(config.uploadDir, downloadName)));
+      archive.on("error", (error) => {
+        request.log.error({ error }, "download-sitemap pattern archive error");
+        reply.raw.destroy(error);
+      });
+
+      void archive.finalize();
+
+      return reply.send(archive);
     }
   );
 
@@ -4906,6 +4973,50 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         0
       );
 
+      // THE OTHER HALF OF THE SAME TABLE (v1.81).
+      //
+      // trusted_shape_count above says how far a stratified check REACHES. Nothing
+      // said what it does not reach, so the modal could report "4 trusted shapes"
+      // over a pattern where twenty shapes disagreed and 579,022 URLs would go
+      // untouched — and the first the operator heard of it was an unchanged
+      // sitemap after a success tick.
+      //
+      // An unagreed row is not a failure: it means this shape WAS sampled and its
+      // URLs redirect inconsistently (or none of them redirected at all), which is
+      // grounds for escalating that shape rather than rewriting it. Saying so
+      // before the apply is the whole point — after it, the same information
+      // arrives as skipped_shapes on the apply response.
+      const unagreedShapeRows = await pool.query<{
+        shape: string;
+        population: number;
+        sample_size: number;
+      }>(
+        `
+          SELECT shape, population, sample_size
+          FROM pattern_shape_rules
+          WHERE pattern_id = $1 AND (agreed = false OR rule IS NULL)
+          ORDER BY population DESC
+        `,
+        [request.params.patternId]
+      );
+      // A REAL URL per shape, taken from the candidate rows already in memory —
+      // "/a/a-a-9999/" identifies nothing to a reviewer looking at a sitemap. Free
+      // because the list is loaded either way; a shape with no candidate on this
+      // page simply has no example rather than costing a query.
+      const exampleByShape = new Map<string, string>();
+
+      for (const candidate of candidates) {
+        try {
+          const shape = valueShape(new URL(candidate.url).pathname);
+
+          if (!exampleByShape.has(shape)) {
+            exampleByShape.set(shape, candidate.url);
+          }
+        } catch {
+          // Unparseable rows are not classifiable and are not examples.
+        }
+      }
+
       // THE SHORTLIST A HUMAN CHOOSES FROM (v1.71).
       //
       // `rule` above is deriveRedirectRule's answer to "is there ONE unambiguous
@@ -4936,6 +5047,16 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // from the measured count above so the label can name both.
         shape_extrapolated_count: extrapolatedCount,
         trusted_shape_count: shapeRuleRows.rowCount ?? 0,
+        // Shapes a stratified check sampled and could NOT distil a rule for, so
+        // the modal can name what an apply will leave behind BEFORE it runs
+        // (v1.81). Biggest first — the shape that costs the most URLs is the one
+        // worth escalating.
+        unagreed_shapes: unagreedShapeRows.rows.map((row) => ({
+          shape: row.shape,
+          population: Number(row.population),
+          sample_size: Number(row.sample_size),
+          example: exampleByShape.get(row.shape) ?? null
+        })),
         // How many rows the review preview holds (bounded by the pattern_urls
         // sample pool) — distinct from pattern_total_urls, the real rewrite scope.
         preview_count: candidates.length,
@@ -5143,22 +5264,50 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // So: if a run is already going, hand back ITS row and say so. The client
         // follows the live run instead of a corpse, and nobody is told their
         // settings were applied when they were dropped.
+        //
+        // BOTH HALVES OF THIS TEST WERE TOO LOOSE (v1.81), and together they told
+        // an operator their fix had been applied when it had not been enqueued at
+        // all.
+        //
+        //   * the row lookup matched ANY apply-redirects row in the session, so
+        //     pattern A's caller could be handed pattern B's run;
+        //   * the queue lookup only asked whether a job EXISTS, and a completed one
+        //     does — removeOnComplete keeps the last 100 — so this was true forever
+        //     after the first apply on a pattern.
+        //
+        // Applying several patterns one after another is the normal way this tool
+        // is used, and it is precisely the sequence that satisfies both. So: scope
+        // the row to this pattern (migration 052), and ask the job what STATE it is
+        // in, the way reusableSingletonJob already does before reusing one.
         const runningRow = await pool.query<{ id: string }>(
           `
             SELECT j.id
               FROM maintenance_jobs j
              WHERE j.session_id = $1
+               AND j.pattern_id = $2
                AND j.kind = 'apply-redirects'
                AND j.status IN ('PENDING', 'RUNNING')
              ORDER BY j.started_at DESC
              LIMIT 1
           `,
-          [request.params.id]
+          [request.params.id, request.params.patternId]
         );
+        const existingJob = await bulkReplaceQueue
+          .getJob(`apply-redirects-${request.params.patternId}`)
+          .catch(() => null);
+        const existingState = existingJob
+          ? await existingJob.getState().catch(() => "unknown")
+          : null;
+        // Anything that has settled is not a run to attach to. Unknown counts as
+        // finished: enqueueApplyRedirectsJob removes a settled singleton and adds a
+        // fresh one, so guessing "not running" costs at worst a duplicate enqueue
+        // that the singleton then collapses — while guessing "running" silently
+        // drops the operator's fix, which is the failure being fixed here.
         const alreadyRunning =
-          (await bulkReplaceQueue
-            .getJob(`apply-redirects-${request.params.patternId}`)
-            .catch(() => null)) !== null;
+          existingState !== null &&
+          existingState !== "completed" &&
+          existingState !== "failed" &&
+          existingState !== "unknown";
 
         if (alreadyRunning && runningRow.rowCount && runningRow.rowCount > 0) {
           return reply.send({
@@ -5176,11 +5325,11 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // file span, which is exactly what the job will walk.
         const jobRow = await pool.query<{ id: string }>(
           `
-            INSERT INTO maintenance_jobs (session_id, kind, files_total)
-            VALUES ($1, 'apply-redirects', $2)
+            INSERT INTO maintenance_jobs (session_id, pattern_id, kind, files_total)
+            VALUES ($1, $2, 'apply-redirects', $3)
             RETURNING id
           `,
-          [request.params.id, patternFileSpan]
+          [request.params.id, request.params.patternId, patternFileSpan]
         );
         const jobRowId = jobRow.rows[0].id;
 
@@ -5318,6 +5467,10 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
         let rewrittenLocCount = 0;
         let filesScanned = 0;
+        // The pattern's URLs this apply leaves alone (v1.81). Empty until the
+        // rewrite runs, which is the honest default: an apply that opened no file
+        // has not established that anything was missed.
+        let skipped = emptySkippedReport();
 
         // Rewrite when there are confirmed exact replacements to apply, a rule
         // to widen across the pattern's files, OR per-shape rules from a
@@ -5332,23 +5485,44 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             rule: widen ? inferredRule : null,
             structureFilters: redirectStructureFilters,
             shapeRules,
-            excludeUrls: excludeSet
+            excludeUrls: excludeSet,
+            // Measures the shortfall in the same pass; changes nothing about
+            // what is rewritten (v1.81 — see applyCoverage).
+            patternTemplate
           });
 
           filesToDeleteOnError = rewrite.newFilePaths;
           filesToDeleteAfterCommit = rewrite.oldFilePaths;
           rewrittenLocCount = rewrite.rewrittenLocCount;
           filesScanned = rewrite.filesScanned;
+          skipped = rewrite.skipped;
         }
 
         // A pattern is fixed when a URL changed, and not otherwise (v1.74). The
         // inline path never stamped this at all, so a small pattern fixed here
         // showed no Fixed badge while the queued path stamped even a zero-change
         // run — the same flag unreliable in both directions.
+        //
+        // AND HOW MUCH OF IT (v1.81). Written in the SAME statement as the
+        // timestamp, so the chip and the numbers that qualify it are set or not
+        // set together — a Fixed chip with no coverage beside it is exactly the
+        // state that made a twelve-of-579,034 apply look finished.
         if (rewrittenLocCount > 0) {
           await client.query(
-            "UPDATE patterns SET redirects_applied_at = now() WHERE id = $1",
-            [request.params.patternId]
+            `
+              UPDATE patterns
+              SET redirects_applied_at = now(),
+                  redirects_applied_locs = $2,
+                  redirects_skipped_locs = $3,
+                  redirects_skipped_shapes = $4::jsonb
+              WHERE id = $1
+            `,
+            [
+              request.params.patternId,
+              rewrittenLocCount,
+              skipped.skippedInScope,
+              JSON.stringify(skipped.byShape)
+            ]
           );
         }
 
@@ -5376,7 +5550,10 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           replacementCount: replacements.size,
           widened: widen,
           filesScanned,
-          previouslyFixed: Boolean(patternResult.rows[0].redirects_applied_at)
+          previouslyFixed: Boolean(patternResult.rows[0].redirects_applied_at),
+          // Turns a bare "applied" into "partially applied" when pattern URLs
+          // were left behind (v1.81).
+          skippedInScope: skipped.skippedInScope
         });
 
         return reply.send({
@@ -5392,8 +5569,17 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           outcome,
           outcome_message: applyOutcomeMessage(
             outcome,
-            rewrittenLocCount || updated
-          )
+            rewrittenLocCount || updated,
+            skipped.skippedInScope
+          ),
+          // WHAT WAS LEFT BEHIND, and enough of it to act on (v1.81). The count
+          // answers "did this finish?"; the shapes answer "which URLs?", which is
+          // the question an operator looking at an unchanged sitemap is actually
+          // asking. Bounded top-N, with `shapes_truncated` saying so rather than
+          // implying the list is exhaustive.
+          skipped_in_scope: skipped.skippedInScope,
+          skipped_shapes: skipped.byShape,
+          skipped_shapes_truncated: skipped.shapesTruncated
         });
       } catch (error) {
         await client.query("ROLLBACK");
@@ -6875,9 +7061,16 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         files_done: number;
         items_changed: string;
         error: string | null;
+        skipped: unknown;
       }>(
         `
-          SELECT id, kind, status, files_total, files_done, items_changed, error
+          SELECT id, kind, status, files_total, files_done, items_changed, error,
+                 -- What the run LEFT BEHIND (v1.81), so a queued apply can report
+                 -- the same shortfall the inline one returns in its response body.
+                 -- Without it the two paths tell the operator different things
+                 -- about the same operation, which is the divergence v1.75 and
+                 -- v1.79 were each spent closing once already.
+                 skipped
           FROM maintenance_jobs
           WHERE id = $1 AND session_id = $2 AND kind = 'apply-redirects'
         `,
