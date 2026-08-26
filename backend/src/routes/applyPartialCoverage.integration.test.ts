@@ -267,8 +267,13 @@ test("an apply that reaches part of a pattern reports the remainder", async (t) 
   // 4. Grouped by shape, with real URLs — 3345/9541 share a four-digit run,
   // 12191/88123 share a five-digit one. A reviewer reads the examples, never the
   // shape keys.
-  const shapes: Array<{ shape: string; count: number; example: string }> =
-    body.skipped_shapes;
+  const shapes: Array<{
+    shape: string;
+    count: number;
+    example: string;
+    examples: string[];
+    files: number;
+  }> = body.skipped_shapes;
 
   assert.equal(shapes.length, 2);
   assert.equal(shapes[0].count, 2, "biggest group first");
@@ -298,5 +303,111 @@ test("an apply that reaches part of a pattern reports the remainder", async (t) 
     Number(coverage.rows[0].redirects_skipped_locs),
     SKIPPED.length,
     "the shortfall is stored beside the timestamp, not only returned"
+  );
+
+  // ---- v1.84: the operator resolves one group, and ONLY that group ---------
+  //
+  // Everything above is the reported dead end: the report names the groups it
+  // could not fix and stops. This is the way out. The operator edits real URLs
+  // of one group into what they should be, the server distils a rule from those
+  // pairs, and the next apply covers that group.
+  //
+  // The second half of the assertion matters more than the first: the OTHER
+  // group must come through byte-identical. A rule saved for one shape that
+  // quietly rewrote its neighbours would be the v1.68 overreach wearing a new
+  // hat, and on a 10M-URL pattern nobody would notice until the sitemap shipped.
+
+  // Per-shape examples are what the dialog puts in front of the operator to
+  // edit, so the test uses them rather than reaching for the fixture — if the
+  // tally ever stopped populating them, the editor would have nothing to show.
+  assert.ok(
+    shapes[0].examples.length >= 2,
+    "the group must offer several real URLs to edit"
+  );
+  assert.ok(shapes[0].files >= 1, "and say how many files it spans");
+
+  const chosen = shapes[0];
+  const other = shapes[1];
+  const asDestination = (url: string) =>
+    url.replace("/nsn/nsn-parts-", "/nsn/nsn-parts/page-2-");
+
+  const saved = await app.inject({
+    method: "POST",
+    url:
+      "/api/sessions/" + sessionId + "/patterns/" + patternId + "/shape-rule",
+    payload: {
+      shape: chosen.shape,
+      pairs: chosen.examples.map((url: string) => ({
+        source: url,
+        dest: asDestination(url)
+      }))
+    }
+  });
+
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.equal(saved.json().source, "operator");
+
+  // Stored as ASSERTED, never as measured: sample_size 0 means nothing was
+  // probed, and source distinguishes it from a stratum that agreed.
+  const storedRule = await pool.query<{
+    source: string;
+    agreed: boolean;
+    sample_size: number;
+    rule: unknown;
+  }>(
+    "SELECT source, agreed, sample_size, rule FROM pattern_shape_rules WHERE pattern_id = $1",
+    [patternId]
+  );
+
+  assert.equal(storedRule.rowCount, 1);
+  assert.equal(storedRule.rows[0].source, "operator");
+  assert.equal(storedRule.rows[0].agreed, true);
+  assert.equal(storedRule.rows[0].sample_size, 0);
+  assert.ok(storedRule.rows[0].rule, "an operator row must carry a rule");
+
+  // An operator rule must never masquerade as a fetched URL — the distinction
+  // migration 051 spent two releases restoring.
+  const leaked = await pool.query(
+    "SELECT 1 FROM verified_urls WHERE pattern_id = $1",
+    [patternId]
+  );
+
+  assert.equal(leaked.rowCount, 0, "nothing was written to verified_urls");
+
+  const second = await app.inject({
+    method: "POST",
+    url:
+      "/api/sessions/" +
+      sessionId +
+      "/patterns/" +
+      patternId +
+      "/apply-redirects",
+    payload: {}
+  });
+
+  assert.equal(second.statusCode, 200, second.body);
+
+  const afterFiles = await pool.query<{ filename: string }>(
+    "SELECT filename FROM sitemap_files WHERE session_id = $1",
+    [sessionId]
+  );
+  const after = readFileSync(
+    path.join(uploadDir, afterFiles.rows[0].filename),
+    "utf8"
+  );
+
+  for (const url of chosen.examples) {
+    assert.ok(
+      after.includes(asDestination(url)),
+      url + " should have been rewritten by the rule the operator supplied"
+    );
+    assert.ok(!after.includes(url), url + " should no longer be present");
+  }
+
+  // THE GUARD. The other shape shares a prefix with the one that was fixed, so a
+  // rule applied pattern-wide instead of shape-wide would have taken it too.
+  assert.ok(
+    after.includes(other.example),
+    other.example + " must be untouched — its group has no rule"
   );
 });

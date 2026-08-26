@@ -42,8 +42,18 @@ export type SkippedShape = {
   shape: string;
   count: number;
   // One real URL of this shape, so the UI can show the operator something they
-  // recognise instead of "/a/a-a-9999/".
+  // recognise instead of "/a/a-a-9999/". Always examples[0] — derived rather
+  // than tracked separately so the two can never disagree.
   example: string;
+  // Up to EXAMPLES_PER_SHAPE real URLs (v1.84). The Review dialog asks the
+  // operator to edit these into what they SHOULD be and derives a rule from the
+  // pairs, which is why one is not enough: deriveRedirectRule needs more than a
+  // single pair before it can tell a real transformation from a coincidence.
+  examples: string[];
+  // How many distinct FILES this shape was skipped in (v1.84). The operator
+  // sees "285,851 URLs · 42 files" before approving a rule, because the URL
+  // count alone does not convey the blast radius of getting it wrong.
+  files: number;
 };
 
 export type SkippedReport = {
@@ -64,8 +74,31 @@ export type SkippedReport = {
 // side in the modal and a different cap in each would be a puzzle.
 export const SKIPPED_SHAPE_LIMIT = 25;
 
+// Real URLs kept per shape. Three because that is what the rule editor needs:
+// one pair can be reproduced by infinitely many rules, and a handful lets
+// deriveRedirectRule reject an edit that only works for the example in front of
+// the operator. More would be noise in a dialog row.
+export const EXAMPLES_PER_SHAPE = 3;
+
 export function emptySkippedReport(): SkippedReport {
   return { skippedInScope: 0, byShape: [], shapesTruncated: false };
+}
+
+// Fold b's examples into a's, keeping order and stopping at the cap.
+function mergeExamples(into: string[], from: readonly string[]): string[] {
+  const merged = [...into];
+
+  for (const example of from) {
+    if (merged.length >= EXAMPLES_PER_SHAPE) {
+      break;
+    }
+
+    if (!merged.includes(example)) {
+      merged.push(example);
+    }
+  }
+
+  return merged;
 }
 
 // Merge one file's report into a running total. Used by the callers that walk
@@ -78,7 +111,10 @@ export function emptySkippedReport(): SkippedReport {
 export function mergeSkippedReports(
   reports: Iterable<SkippedReport>
 ): SkippedReport {
-  const counts = new Map<string, { count: number; example: string }>();
+  const counts = new Map<
+    string,
+    { count: number; examples: string[]; files: number }
+  >();
   let skippedInScope = 0;
   let truncated = false;
 
@@ -91,10 +127,17 @@ export function mergeSkippedReports(
 
       if (existing) {
         existing.count += entry.count;
+        existing.examples = mergeExamples(existing.examples, entry.examples);
+        // SUMMED, and that is only right because each report being folded here
+        // describes a DIFFERENT file — which is the contract of the per-file
+        // callers (applyRedirectsJob and the worker pool). Folding two reports
+        // covering the same file would double-count it.
+        existing.files += entry.files;
       } else {
         counts.set(entry.shape, {
           count: entry.count,
-          example: entry.example
+          examples: [...entry.examples],
+          files: entry.files
         });
       }
     }
@@ -104,7 +147,9 @@ export function mergeSkippedReports(
     .map(([shape, entry]) => ({
       shape,
       count: entry.count,
-      example: entry.example
+      example: entry.examples[0] ?? "",
+      examples: entry.examples,
+      files: entry.files
     }))
     .sort((a, b) => b.count - a.count || a.shape.localeCompare(b.shape));
 
@@ -129,12 +174,33 @@ export function mergeSkippedReports(
 // counted here as skipped. That is deliberate and it is the honest reading: the
 // operator narrowed the edit, and those URLs really are pattern members this
 // apply did not change.
+// `beginFile` exists because the two apply paths tally at different
+// granularities and both must produce the same per-shape FILE count.
+// applyRedirectsJob makes a fresh tally per file and merges the reports;
+// redirectApply deliberately keeps ONE tally across every file of the apply (see
+// its comment). Without a file boundary the second could only ever report "1".
+//
+// Callers that already tally per file need not call it: the unnamed default
+// bucket yields files = 1 for every shape seen, which is exactly right for a
+// report describing one file.
 export function tallySkippedInScope(
   rewriter: LocUrlRewriter,
   options: { template: string; shapeLimit?: number }
-): { rewriter: LocUrlRewriter; report: () => SkippedReport } {
+): {
+  rewriter: LocUrlRewriter;
+  beginFile: (fileKey: string) => void;
+  report: () => SkippedReport;
+} {
   const shapeLimit = options.shapeLimit ?? SKIPPED_SHAPE_LIMIT;
-  const shapes = new Map<string, { count: number; example: string }>();
+  // files is a Set, not a counter, so the same file cannot be counted twice when
+  // its <loc>s are interleaved or revisited. Bounded by the pattern's FILE count
+  // (hundreds), not by its URL population (millions) — which is why this one is
+  // safe to keep whole while the shape histogram above is capped.
+  const shapes = new Map<
+    string,
+    { count: number; examples: string[]; files: Set<string> }
+  >();
+  let currentFile = "";
   let skippedInScope = 0;
   let overflowed = false;
 
@@ -166,8 +232,17 @@ export function tallySkippedInScope(
 
     if (existing) {
       existing.count += 1;
+      existing.files.add(currentFile);
+
+      if (existing.examples.length < EXAMPLES_PER_SHAPE) {
+        existing.examples.push(url);
+      }
     } else if (shapes.size < shapeLimit) {
-      shapes.set(shape, { count: 1, example: url });
+      shapes.set(shape, {
+        count: 1,
+        examples: [url],
+        files: new Set([currentFile])
+      });
     } else {
       // Past the cap the histogram stops growing and says so, rather than
       // implying the list below is everything.
@@ -179,13 +254,18 @@ export function tallySkippedInScope(
 
   return {
     rewriter: wrapped,
+    beginFile: (fileKey: string) => {
+      currentFile = fileKey;
+    },
     report: () => ({
       skippedInScope,
       byShape: Array.from(shapes.entries())
         .map(([shape, entry]) => ({
           shape,
           count: entry.count,
-          example: entry.example
+          example: entry.examples[0] ?? "",
+          examples: entry.examples,
+          files: entry.files.size
         }))
         .sort((a, b) => b.count - a.count || a.shape.localeCompare(b.shape)),
       shapesTruncated: overflowed

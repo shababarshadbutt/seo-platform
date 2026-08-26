@@ -5,7 +5,8 @@ import {
   SKIPPED_SHAPE_LIMIT,
   emptySkippedReport,
   mergeSkippedReports,
-  tallySkippedInScope
+  tallySkippedInScope,
+  EXAMPLES_PER_SHAPE
 } from "./applyCoverage.js";
 import type { LocUrlRewriter } from "./rewriteLocs.js";
 
@@ -110,18 +111,92 @@ test("an untruncated report does not claim truncation", () => {
   assert.equal(report().shapesTruncated, false);
 });
 
+test("one tally across many files counts the files a shape spans", () => {
+  // THE redirectApply PATH. It deliberately keeps a single tally for the whole
+  // apply, so without beginFile every shape would report "1 file" however many
+  // it really spanned — and the dialog shows that number as the blast radius the
+  // operator approves a rule against.
+  const { rewriter, report } = tallySkippedInScope(rewriterFor({}), {
+    template: "/nsn/{param}/"
+  });
+
+  const seen = report;
+
+  const tally = tallySkippedInScope(rewriterFor({}), {
+    template: "/nsn/{param}/"
+  });
+
+  tally.beginFile("current-a.xml");
+  tally.rewriter("https://x.test/nsn/a-1/");
+  tally.rewriter("https://x.test/nsn/a-2/");
+  tally.beginFile("current-b.xml");
+  tally.rewriter("https://x.test/nsn/a-3/");
+
+  const shape = tally.report().byShape[0];
+
+  assert.equal(shape.count, 3);
+  assert.equal(shape.files, 2, "three URLs, but only two files");
+  // Examples accumulate across files, capped, and stay in encounter order so the
+  // operator sees stable URLs between runs.
+  assert.deepEqual(shape.examples, [
+    "https://x.test/nsn/a-1/",
+    "https://x.test/nsn/a-2/",
+    "https://x.test/nsn/a-3/"
+  ]);
+  assert.equal(shape.example, shape.examples[0]);
+
+  // And the per-file callers, which never call beginFile, still get 1.
+  rewriter("https://x.test/nsn/a-1/");
+  assert.equal(seen().byShape[0].files, 1);
+});
+
+test("examples per shape are capped", () => {
+  const tally = tallySkippedInScope(rewriterFor({}), {
+    template: "/nsn/{param}/"
+  });
+
+  for (let index = 0; index < 10; index += 1) {
+    tally.rewriter(`https://x.test/nsn/a-${index}/`);
+  }
+
+  const shape = tally.report().byShape[0];
+
+  assert.equal(shape.count, 10, "the count is never capped");
+  assert.equal(shape.examples.length, EXAMPLES_PER_SHAPE);
+});
+
 test("merging folds per-file reports without losing the cap or the flag", () => {
   const merged = mergeSkippedReports([
     {
       skippedInScope: 3,
-      byShape: [{ shape: "/a/a-9999/", count: 3, example: "u1" }],
+      byShape: [
+        {
+          shape: "/a/a-9999/",
+          count: 3,
+          example: "u1",
+          examples: ["u1"],
+          files: 1
+        }
+      ],
       shapesTruncated: false
     },
     {
       skippedInScope: 5,
       byShape: [
-        { shape: "/a/a-9999/", count: 4, example: "u2" },
-        { shape: "/a/a-99/", count: 1, example: "u3" }
+        {
+          shape: "/a/a-9999/",
+          count: 4,
+          example: "u2",
+          examples: ["u2"],
+          files: 1
+        },
+        {
+          shape: "/a/a-99/",
+          count: 1,
+          example: "u3",
+          examples: ["u3"],
+          files: 1
+        }
       ],
       shapesTruncated: true
     }
@@ -133,6 +208,13 @@ test("merging folds per-file reports without losing the cap or the flag", () => 
   // The FIRST example seen wins, so the URL shown stays stable across re-runs
   // rather than depending on which file finished last.
   assert.equal(merged.byShape[0].example, "u1");
+  // Examples from both files are kept, up to the cap — the rule editor needs
+  // more than one pair before deriveRedirectRule can reject a rule that only
+  // works for the URL the operator happens to be looking at.
+  assert.deepEqual(merged.byShape[0].examples, ["u1", "u2"]);
+  // Two per-file reports saw this shape, so it spans two files. This is the
+  // number the dialog shows as blast radius next to the URL count.
+  assert.equal(merged.byShape[0].files, 2);
   assert.equal(merged.shapesTruncated, true, "truncation is sticky");
 });
 
@@ -144,7 +226,9 @@ test("merging re-caps a list assembled from many files", () => {
     byShape: Array.from({ length: 10 }, (_, index) => ({
       shape: `/a/${file}-${index}/`,
       count: 1,
-      example: `u${file}-${index}`
+      example: `u${file}-${index}`,
+      examples: [`u${file}-${index}`],
+      files: 1
     })),
     shapesTruncated: false
   }));

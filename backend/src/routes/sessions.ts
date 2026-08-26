@@ -5128,6 +5128,154 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     }
   );
 
+  // AN OPERATOR-ASSERTED RULE FOR ONE SHAPE GROUP (v1.84).
+  //
+  // THE PROBLEM IT SOLVES. On the reported session a fix reached 8 of 10,427,507
+  // URLs. The pattern /{param}/{param}/{param}/ had swallowed several unrelated
+  // families (>100 distinct first segments parameterises the position), so the
+  // confirmed pairs disagree, deriveRedirectRule returns null pattern-wide, every
+  // stratum comes back unagreed, and only the exactly-confirmed URLs rewrote.
+  // That is apply-redirects behaving correctly — it refuses to rewrite what
+  // nobody measured (v1.68) — but it left the operator who could SEE the right
+  // rewrite for 285,851 of those URLs with no way to say so.
+  //
+  // WHY IT NEEDS NO CHANGE TO THE APPLY PATH. redirectApply already loads every
+  // agreed row of pattern_shape_rules and hands them to the rewriter. A row
+  // written here is picked up by the next apply with nothing else to teach it.
+  //
+  // PROVENANCE IS THE WHOLE CARE HERE. Migration 051 keeps two words apart —
+  // verified_urls means FETCHED, pattern_shape_rules means INFERRED from a sample
+  // this big — and records that two releases were spent removing an earlier
+  // conflation. This row is neither: it is ASSERTED. It is written with
+  // source = 'operator' (053) so nothing can later read it as a probe that
+  // agreed, and sample_size / population stay 0 because nothing was sampled.
+  app.post<{
+    Params: PatternParams;
+    Body: {
+      shape?: unknown;
+      rule?: unknown;
+      pairs?: unknown;
+      authored_by?: unknown;
+    };
+  }>(
+    "/api/sessions/:id/patterns/:patternId/shape-rule",
+    async (request, reply) => {
+      const patternResult = await pool.query<{ template: string }>(
+        "SELECT template FROM patterns WHERE session_id = $1 AND id = $2",
+        [request.params.id, request.params.patternId]
+      );
+
+      if (patternResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "pattern not found" });
+      }
+
+      const shape = request.body?.shape;
+
+      if (typeof shape !== "string" || shape.length === 0) {
+        return reply.code(400).send(badRequest("shape is required"));
+      }
+
+      // Two ways in, one outcome. `pairs` is what the dialog sends: the operator
+      // edited real URLs of this shape into what they should be, and the SERVER
+      // distils the rule with the same deriveRedirectRule everything else uses —
+      // so a rule authored by hand and one derived from a probe are the same kind
+      // of object, and neither can express something the rewriter cannot honour.
+      // `rule` is the Advanced escape hatch for someone who wants to write it.
+      let rule: RedirectRule | null = null;
+
+      if (request.body?.rule !== undefined) {
+        rule = parseRedirectRule(request.body.rule);
+
+        if (!rule) {
+          return reply.code(400).send(badRequest("rule is not a valid rewrite rule"));
+        }
+      } else if (Array.isArray(request.body?.pairs)) {
+        const pairs: Array<{ source: string; dest: string }> = [];
+
+        for (const entry of request.body.pairs) {
+          const source = (entry as { source?: unknown })?.source;
+          const dest = (entry as { dest?: unknown })?.dest;
+
+          if (typeof source !== "string" || typeof dest !== "string") {
+            return reply
+              .code(400)
+              .send(badRequest("pairs must be {source, dest} strings"));
+          }
+
+          if (source !== dest) {
+            pairs.push({ source, dest });
+          }
+        }
+
+        if (pairs.length === 0) {
+          return reply
+            .code(400)
+            .send(
+              badRequest(
+                "none of the examples were changed — edit at least one into what it should be"
+              )
+            );
+        }
+
+        rule = deriveRedirectRule(pairs);
+
+        // deriveRedirectRule returning null is not a failure to report as an
+        // error and move on from: it means the edits describe more than one
+        // change, so no single rule can reproduce them. Saying so is the honest
+        // answer, and it is the same refusal that produced the empty state this
+        // whole dialog exists to resolve.
+        if (!rule) {
+          return reply
+            .code(400)
+            .send(
+              badRequest(
+                "these examples do not describe one consistent change, so no single rule can cover the group — edit them to match, or split the change"
+              )
+            );
+        }
+      } else {
+        return reply
+          .code(400)
+          .send(badRequest("either rule or pairs is required"));
+      }
+
+      // sample_size and population are 0 BY DESIGN for an operator row and mean
+      // "nothing was probed" — not "a probe of size 0 agreed". The group's real
+      // size is what the apply's coverage report says, which is where the dialog
+      // reads it from; storing a guess here would put a number next to the word
+      // "sample" that no sampling produced.
+      await pool.query(
+        `
+          INSERT INTO pattern_shape_rules
+            (pattern_id, shape, rule, sample_size, population, agreed, source,
+             authored_by, authored_at)
+          VALUES ($1, $2, $3::jsonb, 0, 0, true, 'operator', $4, now())
+          ON CONFLICT (pattern_id, shape) DO UPDATE
+          SET rule = EXCLUDED.rule,
+              sample_size = 0,
+              population = 0,
+              agreed = true,
+              source = 'operator',
+              authored_by = EXCLUDED.authored_by,
+              authored_at = now(),
+              measured_at = now()
+        `,
+        [
+          request.params.patternId,
+          shape,
+          JSON.stringify(rule),
+          typeof request.body?.authored_by === "string"
+            ? request.body.authored_by
+            : null
+        ]
+      );
+
+      return { shape, rule, source: "operator" as const };
+    }
+  );
+
   app.post<{
     Params: PatternParams;
     Body: {

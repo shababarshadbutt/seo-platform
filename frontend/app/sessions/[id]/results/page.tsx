@@ -234,6 +234,7 @@ import {
 } from "@/lib/fix-visibility";
 import { applyScopeNote } from "@/lib/apply-scope-note";
 import { skippedShapeLines, skippedSummary } from "@/lib/skipped-shapes";
+import { UnfixedGroupsDialog } from "@/components/unfixed-groups-dialog";
 import {
   sourceFileEmptinessMessage,
   sourceFileLoadErrorMessage
@@ -939,7 +940,23 @@ export default function ResultsDashboardPage({
     // Stays until dismissed. A four-second toast is fine for "12 URLs updated"
     // and useless for a list somebody has to read and act on.
     sticky?: boolean;
+    // Everything the Review dialog needs to reopen this shortfall (v1.84). The
+    // toast lists the groups; per-group buttons do not belong in a toast, so it
+    // carries the handle and the dialog does the work.
+    review?: {
+      patternId: string;
+      template: string;
+      shapes: SkippedShape[];
+    };
   } | null>(null);
+  // The Review unfixed groups dialog (v1.84). Opened from the toast above, and
+  // the only place a group can be resolved.
+  const [reviewGroups, setReviewGroups] = useState<{
+    patternId: string;
+    template: string;
+    shapes: SkippedShape[];
+  } | null>(null);
+
   const [renameRow, setRenameRow] = useState<PatternRow | null>(null);
   const [renameValue, setRenameValue] = useState("");
   // Helper-note state for the Update Pattern modal's auto pre-population (v1.41).
@@ -3179,7 +3196,15 @@ export default function ResultsDashboardPage({
   //
   // Polls rather than streams, matching the delete/restore flow — the same
   // maintenance_jobs row, the same cadence, no new transport for one screen.
-  async function pollQueuedApply(jobRowId: string, filesTotal: number) {
+  // patternId/template are PASSED IN rather than read from fixRow when the job
+  // finishes: a queued apply outlives the modal, so by then the operator may
+  // have closed it or opened another pattern, and the Review dialog would then
+  // be handed the wrong pattern's identity — or none at all.
+  async function pollQueuedApply(
+    jobRowId: string,
+    filesTotal: number,
+    pattern: { id: string; template: string }
+  ) {
     // Long enough for the widest pattern seen (187 files, several minutes) with
     // room to spare, short enough that a worker killed mid-run stops being
     // polled. Reaching it is reported as "still running", never as success.
@@ -3252,7 +3277,12 @@ export default function ResultsDashboardPage({
             details: skippedShapeLines(job.skipped?.by_shape ?? [], {
               truncated: job.skipped?.shapes_truncated
             }),
-            sticky: true
+            sticky: true,
+            review: {
+              patternId: pattern.id,
+              template: pattern.template,
+              shapes: job.skipped?.by_shape ?? []
+            }
           });
 
           return;
@@ -3417,7 +3447,10 @@ export default function ResultsDashboardPage({
           return;
         }
 
-        void pollQueuedApply(jobRowId, result.files_total ?? 0);
+        void pollQueuedApply(jobRowId, result.files_total ?? 0, {
+          id: fixRow.id,
+          template: fixRow.template
+        });
         return;
       }
 
@@ -3463,6 +3496,11 @@ export default function ResultsDashboardPage({
           details: skippedShapeLines(result.skipped_shapes ?? [], {
             truncated: result.skipped_shapes_truncated
           }),
+          review: {
+            patternId: fixRow.id,
+            template: fixRow.template,
+            shapes: result.skipped_shapes ?? []
+          },
           // Held open: this is a list to read and act on, not a confirmation to
           // glance at.
           sticky: true
@@ -8847,15 +8885,32 @@ export default function ResultsDashboardPage({
                     ))}
                   </ul>
                 ) : null}
-                {findReplaceToast.sticky ? (
-                  <button
-                    type="button"
-                    className="mt-2 text-xs font-semibold text-muted-foreground underline hover:text-foreground"
-                    onClick={() => setFindReplaceToast(null)}
-                  >
-                    Dismiss
-                  </button>
-                ) : null}
+                <div className="mt-2 flex items-center gap-3">
+                  {/* The way out of the dead end (v1.84). The toast lists which
+                      groups were left unfixed; this opens the place they can be
+                      resolved. Per-group buttons do not belong in a toast. */}
+                  {findReplaceToast.review &&
+                  findReplaceToast.review.shapes.length > 0 ? (
+                    <button
+                      type="button"
+                      className="text-xs font-semibold text-primary underline hover:text-primary/80"
+                      onClick={() => {
+                        setReviewGroups(findReplaceToast.review ?? null);
+                      }}
+                    >
+                      Review unfixed groups
+                    </button>
+                  ) : null}
+                  {findReplaceToast.sticky ? (
+                    <button
+                      type="button"
+                      className="text-xs font-semibold text-muted-foreground underline hover:text-foreground"
+                      onClick={() => setFindReplaceToast(null)}
+                    >
+                      Dismiss
+                    </button>
+                  ) : null}
+                </div>
               </div>
             </div>
           </div>
@@ -8874,6 +8929,30 @@ export default function ResultsDashboardPage({
               </div>
             </div>
           </div>
+        ) : null}
+
+        {reviewGroups ? (
+          <UnfixedGroupsDialog
+            sessionId={params.id}
+            patternId={reviewGroups.patternId}
+            template={reviewGroups.template}
+            shapes={reviewGroups.shapes}
+            open
+            onOpenChange={(next) => {
+              if (!next) {
+                setReviewGroups(null);
+              }
+            }}
+            // Re-runs the SAME apply. Saving a rule and applying it stay
+            // separate acts: the apply already picks up every agreed rule for
+            // the pattern, so there is nothing for the dialog to pass it — and
+            // a dialog that quietly rewrote files on Save would be a worse
+            // version of the overreach this whole feature is careful about.
+            onApply={() => {
+              setFindReplaceToast(null);
+              void handleAcceptFixes();
+            }}
+          />
         ) : null}
 
         <BulkReplaceDialog

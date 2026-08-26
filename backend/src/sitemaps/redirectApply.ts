@@ -198,6 +198,11 @@ export async function rewriteRedirectSourceFilesOnDisk(
 
     const displayName = displaySourceFilename(options.sessionId, file.filename);
 
+    // This path keeps ONE tally across every file (see above), so it has to tell
+    // the tally which file it is on — otherwise every shape would report a file
+    // count of 1 no matter how many files it actually spans.
+    coverage?.beginFile(displayName);
+
     if (selectedSet.size > 0 && !selectedSet.has(displayName)) {
       continue;
     }

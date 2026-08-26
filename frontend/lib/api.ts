@@ -176,7 +176,47 @@ export type SkippedShape = {
   shape: string;
   count: number;
   example: string;
+  // Up to three real URLs of this group (v1.84). The Review dialog asks the
+  // operator to edit these into what they should be and derives a rule from the
+  // pairs — one example is not enough for deriveRedirectRule to tell a real
+  // transformation from a coincidence. Optional so a response from an older
+  // backend still renders.
+  examples?: string[];
+  // How many distinct files this group spans (v1.84) — the blast radius shown
+  // beside the URL count before an operator approves a rule.
+  files?: number;
 };
+
+// A rewrite rule an operator asserted for one shape group (v1.84).
+//
+// Sent as `pairs` — real URLs edited into what they should be — and the SERVER
+// distils the rule with the same deriveRedirectRule a probe would use, so a
+// hand-authored rule and a measured one are the same kind of object. `rule` is
+// the Advanced escape hatch for someone who would rather write it directly.
+export type ShapeRuleResult = {
+  shape: string;
+  rule: { kind: "replace"; find: string; replace: string } | { kind: "insert"; prefix: string; insert: string };
+  source: "operator";
+};
+
+export async function saveShapeRule(
+  sessionId: string,
+  patternId: string,
+  body:
+    | { shape: string; pairs: Array<{ source: string; dest: string }> }
+    | { shape: string; rule: ShapeRuleResult["rule"] }
+): Promise<ShapeRuleResult> {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/shape-rule`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    }
+  );
+
+  return readJsonResponse<ShapeRuleResult>(response);
+}
 
 export type SampledUrl = {
   id: string;
