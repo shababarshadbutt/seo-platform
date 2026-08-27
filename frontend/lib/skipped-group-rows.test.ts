@@ -316,3 +316,87 @@ test("a group nobody has answered has no rule to doubt", () => {
     null
   );
 });
+
+
+// ---------------------------------------------------------------------------
+// "These URLs are already correct — leave them" (v1.87)
+// ---------------------------------------------------------------------------
+
+const markedRows = (extra: Parameters<typeof buildSkippedGroupRows>[0] = []) =>
+  buildSkippedGroupRows(
+    [shape({ count: 30 }), ...extra],
+    new Map<string, ShapeRuleState>([
+      ["/a/a-9999/", { kind: "no-change", authoredAt: "2026-08-27T10:00:00Z" }]
+    ])
+  );
+
+test("a group marked leave-as-it-is is answered, but not applicable", () => {
+  // Both halves matter. Answered, so it stops sitting under "still needs an
+  // answer" pass after pass — the complaint. Not applicable, so nothing counts it
+  // into what Apply will fix, because the answer is that nothing should happen.
+  const [row] = markedRows();
+
+  assert.equal(row.rule.kind, "no-change");
+  assert.equal(row.applicable, false);
+});
+
+test("it lands in its own pile, not with the answered or the outstanding", () => {
+  const rows = markedRows([shape({ shape: "/b/b-99/", count: 5 })]);
+  const { unresolved, resolved, leftAsIs } = partitionSkippedGroupRows(rows);
+
+  assert.deepEqual(leftAsIs.map((row) => row.shape), ["/a/a-9999/"]);
+  assert.deepEqual(unresolved.map((row) => row.shape), ["/b/b-99/"]);
+  assert.deepEqual(resolved, []);
+});
+
+test("Apply ignores it: no URLs, no groups, and still blocked if it is all there is", () => {
+  // THE ASSERTION THAT MATTERS MOST. If a marked group leaked into the apply
+  // scope, the footer would promise to fix URLs that nobody asked to be touched —
+  // the v1.68 overreach this whole area exists to prevent.
+  const rows = markedRows();
+
+  assert.equal(describeApplyScope(rows), "Will fix 0 URLs across 0 groups.");
+  assert.equal(
+    applyBlockedReason(rows),
+    "No group has a rule yet — set the result for one from its examples."
+  );
+});
+
+test("select-all does not tick a group that has been left as it is", () => {
+  // Selection chooses what the next edit is saved for, and a settled group has no
+  // next edit. Leaving it ticked would quietly fold it into the following bulk
+  // save and overwrite the decision.
+  const rows = markedRows([shape({ shape: "/b/b-99/", count: 5 })]);
+  const { unresolved } = partitionSkippedGroupRows(rows);
+
+  assert.deepEqual(unresolved.map((row) => row.shape), ["/b/b-99/"]);
+});
+
+test("a deliberately unchanged group is never accused of a rule that did not fit", () => {
+  // It came back unfixed because somebody asked for it to. Reporting the intended
+  // outcome as a problem would be the caveat firing on exactly the wrong row.
+  const [row] = markedRows();
+
+  assert.equal(describeUnmatchedRule(row, "2026-08-27T11:00:00Z"), null);
+});
+
+test("the header keeps the real shortfall and says how much of it is on purpose", () => {
+  // The count is NOT reduced: those URLs genuinely were not rewritten, and
+  // shrinking the number to look better is the flattering arithmetic v1.81 exists
+  // to prevent. It is qualified instead.
+  const rows = markedRows([shape({ shape: "/b/b-99/", count: 15 })]);
+
+  assert.equal(
+    unresolvedSummary({ skippedInScope: 45, rows }),
+    "45 URLs in this pattern are still unfixed. 30 of them are in groups you marked as already correct. The 2 biggest groups the last fix could not reach are listed below."
+  );
+});
+
+test("with nothing marked the header says nothing about marking", () => {
+  const rows = buildSkippedGroupRows([shape({ count: 45 })], noRules);
+
+  assert.equal(
+    unresolvedSummary({ skippedInScope: 45, rows }),
+    "45 URLs in this pattern are still unfixed. The one group the last fix could not reach is listed below."
+  );
+});

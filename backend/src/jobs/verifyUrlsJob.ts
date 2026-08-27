@@ -168,6 +168,71 @@ async function upsertVerifiedBatch(
   );
 }
 
+// Record one stratum's verdict against its shape.
+//
+// A PROBE ONLY EVER OVERWRITES A PROBE (v1.87). Extracted so the rule below is
+// one statement with a test against it rather than a clause buried in a loop.
+//
+// TWO BUGS, both live before this. The upsert set rule/sample_size/population/
+// agreed and NOT source, so re-verifying a pattern that carried an operator's
+// answer:
+//
+//   1) SILENTLY REPLACED IT with measured values while the row still read
+//      source = 'operator'. That is the loop v1.86 exists to break, reopened from
+//      the other end: the operator's rule vanished and the group came back
+//      looking unanswered.
+//
+//   2) COULD FAIL THE WHOLE VERIFICATION JOB. An unagreed stratum writes
+//      rule = NULL, agreed = false (051), and migration 053 constrains
+//      "source <> 'operator' OR (rule IS NOT NULL AND agreed = true)". So that
+//      write violated the CHECK and threw — a crash reachable by re-checking any
+//      pattern somebody had answered by hand.
+//
+// The WHERE clause fixes both: a row a human wrote — a rule, or a v1.87 "leave
+// these alone" mark — is left exactly as it is, and the probe's verdict for that
+// shape is dropped rather than applied. That is the right precedence and not
+// merely the safe one: probing is what already failed on these patterns (their
+// strata come back unagreed, which is why a fix reached 8 URLs of ten million),
+// and the operator's answer is the unlock v1.84 was built to provide. An operator
+// who wants to change their mind edits the group in the dialog, which now shows
+// them what they said.
+//
+// `source` is also stated on INSERT rather than left to the column default, so a
+// new row says what it is at the point it is created.
+export async function upsertSampledShapeRule(
+  patternId: string,
+  verdict: {
+    shape: string;
+    rule: unknown;
+    sampleSize: number;
+    population: number;
+    agreed: boolean;
+  }
+) {
+  await pool.query(
+    `
+      INSERT INTO pattern_shape_rules
+        (pattern_id, shape, rule, sample_size, population, agreed, source)
+      VALUES ($1, $2, $3::jsonb, $4, $5, $6, 'sampled')
+      ON CONFLICT (pattern_id, shape) DO UPDATE
+      SET rule = EXCLUDED.rule,
+          sample_size = EXCLUDED.sample_size,
+          population = EXCLUDED.population,
+          agreed = EXCLUDED.agreed,
+          measured_at = now()
+      WHERE pattern_shape_rules.source = 'sampled'
+    `,
+    [
+      patternId,
+      verdict.shape,
+      verdict.rule ? JSON.stringify(verdict.rule) : null,
+      verdict.sampleSize,
+      verdict.population,
+      verdict.agreed
+    ]
+  );
+}
+
 export async function processVerifyUrlsJob(
   data: VerifyUrlsJobData,
   logger: FastifyBaseLogger
@@ -711,27 +776,7 @@ export async function processVerifyUrlsJob(
       const shapePatternId = patterns[0].id;
 
       for (const verdict of verdicts) {
-        await pool.query(
-          `
-            INSERT INTO pattern_shape_rules
-              (pattern_id, shape, rule, sample_size, population, agreed)
-            VALUES ($1, $2, $3::jsonb, $4, $5, $6)
-            ON CONFLICT (pattern_id, shape) DO UPDATE
-            SET rule = EXCLUDED.rule,
-                sample_size = EXCLUDED.sample_size,
-                population = EXCLUDED.population,
-                agreed = EXCLUDED.agreed,
-                measured_at = now()
-          `,
-          [
-            shapePatternId,
-            verdict.shape,
-            verdict.rule ? JSON.stringify(verdict.rule) : null,
-            verdict.sampleSize,
-            verdict.population,
-            verdict.agreed
-          ]
-        );
+        await upsertSampledShapeRule(shapePatternId, verdict);
       }
 
       const coverage = coverageFromVerdicts(verdicts);

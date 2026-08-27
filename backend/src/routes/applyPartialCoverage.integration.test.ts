@@ -620,4 +620,171 @@ test("an apply that reaches part of a pattern reports the remainder", async (t) 
     Number(afterNoop.rows[0].redirects_skipped_locs) < SKIPPED.length,
     "the persisted shortfall must reflect this run, not the first one"
   );
+
+  // ---- v1.87: "these URLs are already correct — leave them" ----------------
+  //
+  // The third answer. v1.86 gave a group two states — it has a rule, or nobody
+  // has said anything — and a group that needs NO rewrite fitted neither, so it
+  // sat under "still needs an answer" for ever and every pass re-examined it.
+  //
+  // The apply already left such a group alone; what is asserted here is that the
+  // DECISION is recorded, that it cannot reach the rewriter, and that it is
+  // mutually exclusive with a rule.
+  const marked = await app.inject({
+    method: "POST",
+    url:
+      "/api/sessions/" + sessionId + "/patterns/" + patternId + "/shape-rule",
+    payload: { shapes: [unmatchable], no_change: true }
+  });
+
+  assert.equal(marked.statusCode, 200, marked.body);
+  assert.equal(marked.json().source, "no_change");
+  assert.equal(marked.json().rule, null, "a mark carries no rewrite");
+
+  // MUTUAL EXCLUSIVITY, and it is the reason this shares one row with the rule
+  // rather than living in a table of its own. `unmatchable` was carrying an
+  // operator rule from the section above; marking it must REPLACE that, not sit
+  // beside it, or something would later have to decide which of two contradictory
+  // answers wins.
+  const markedRow = await pool.query<{
+    source: string;
+    rule: unknown;
+    agreed: boolean;
+    sample_size: number;
+  }>(
+    `
+      SELECT source, rule, agreed, sample_size
+      FROM pattern_shape_rules
+      WHERE pattern_id = $1 AND shape = $2
+    `,
+    [patternId, unmatchable]
+  );
+
+  assert.equal(markedRow.rowCount, 1, "one row, not two");
+  assert.equal(markedRow.rows[0].source, "no_change");
+  assert.equal(markedRow.rows[0].rule, null, "the old rule is gone, not kept");
+  assert.equal(
+    markedRow.rows[0].agreed,
+    false,
+    "a mark agrees to nothing — this is what keeps it away from the rewriter"
+  );
+  assert.equal(Number(markedRow.rows[0].sample_size), 0);
+
+  // AND THE DIALOG CAN READ IT BACK. The v1.86 GET filtered on rule IS NOT NULL,
+  // which would have hidden every one of these rows and put the group straight
+  // back under "still needs an answer" — losing the only thing this records.
+  const withMarks = await app.inject({
+    method: "GET",
+    url:
+      "/api/sessions/" + sessionId + "/patterns/" + patternId + "/shape-rules"
+  });
+
+  assert.equal(withMarks.statusCode, 200, withMarks.body);
+
+  const markedRead = (
+    withMarks.json().rules as Array<{ shape: string; source: string }>
+  ).find((row) => row.shape === unmatchable);
+
+  assert.ok(markedRead, "a no_change row must survive the read filter");
+  assert.equal(markedRead?.source, "no_change");
+
+  // ---- the mark cannot rewrite anything -----------------------------------
+  //
+  // Mark a group that DOES have matchable URLs, then apply, and assert its URLs
+  // are byte-identical afterwards. `chosen` was already rewritten earlier, so the
+  // subject here is `other`, whose destination form is what a rule would produce.
+  const markedOther = await app.inject({
+    method: "POST",
+    url:
+      "/api/sessions/" + sessionId + "/patterns/" + patternId + "/shape-rule",
+    payload: { shapes: [other.shape], no_change: true }
+  });
+
+  assert.equal(markedOther.statusCode, 200, markedOther.body);
+
+  const beforeMarkApply = readFileSync(
+    path.join(uploadDir, finalFiles.rows[0].filename),
+    "utf8"
+  );
+
+  const afterMark = await app.inject({
+    method: "POST",
+    url:
+      "/api/sessions/" +
+      sessionId +
+      "/patterns/" +
+      patternId +
+      "/apply-redirects",
+    payload: {}
+  });
+
+  assert.equal(afterMark.statusCode, 200, afterMark.body);
+
+  const markFiles = await pool.query<{ filename: string }>(
+    "SELECT filename FROM sitemap_files WHERE session_id = $1",
+    [sessionId]
+  );
+  const afterMarkContents = readFileSync(
+    path.join(uploadDir, markFiles.rows[0].filename),
+    "utf8"
+  );
+
+  assert.equal(
+    afterMarkContents,
+    beforeMarkApply,
+    "an apply over marked groups must not change a single byte"
+  );
+
+  // ---- the undo returns the group to unanswered ---------------------------
+  //
+  // The mark is persisted, so it has to be reversible from the same place — and
+  // it DELETES the row rather than writing a "not marked" one, because the
+  // absence of a row is already how this table spells "nobody has said anything".
+  const undone = await app.inject({
+    method: "POST",
+    url:
+      "/api/sessions/" + sessionId + "/patterns/" + patternId + "/shape-rule",
+    payload: { shapes: [other.shape], no_change: false }
+  });
+
+  assert.equal(undone.statusCode, 200, undone.body);
+
+  const goneRow = await pool.query(
+    "SELECT 1 FROM pattern_shape_rules WHERE pattern_id = $1 AND shape = $2",
+    [patternId, other.shape]
+  );
+
+  assert.equal(goneRow.rowCount, 0, "undo removes the row entirely");
+
+  const badFlag = await app.inject({
+    method: "POST",
+    url:
+      "/api/sessions/" + sessionId + "/patterns/" + patternId + "/shape-rule",
+    payload: { shapes: [other.shape], no_change: "yes" }
+  });
+
+  assert.equal(badFlag.statusCode, 400, "no_change must be a boolean");
+
+  // ---- migration 055's invariant is enforced by the DATABASE --------------
+  //
+  // The write path assigns rule = NULL itself, so this asserts the constraint
+  // rather than the route: no future caller can produce a "leave these alone" row
+  // that secretly carries a rewrite the apply would honour.
+  await assert.rejects(
+    () =>
+      pool.query(
+        `
+          INSERT INTO pattern_shape_rules
+            (pattern_id, shape, rule, sample_size, population, agreed, source)
+          VALUES ($1, $2, $3::jsonb, 0, 0, true, 'no_change')
+        `,
+        [
+          patternId,
+          "/some/other-shape-9999/",
+          JSON.stringify({ kind: "replace", find: "a", replace: "b" })
+        ]
+      ),
+    /no_change_has_no_rule/,
+    "a no_change row carrying a rule must be rejected by the CHECK"
+  );
 });

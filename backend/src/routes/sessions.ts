@@ -5159,6 +5159,11 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       shapes?: unknown;
       rule?: unknown;
       pairs?: unknown;
+      // "These URLs are already correct — leave them" (v1.87). A third answer
+      // beside `rule` and `pairs`, and the only one that records a decision NOT
+      // to rewrite. Also the undo: no_change = false clears whatever the group
+      // was carrying and returns it to unanswered.
+      no_change?: unknown;
       authored_by?: unknown;
     };
   }>(
@@ -5199,6 +5204,85 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
       if (shapes.length === 0) {
         return reply.code(400).send(badRequest("shape or shapes is required"));
+      }
+
+      // "LEAVE THESE ALONE — THEY ARE ALREADY CORRECT" (v1.87).
+      //
+      // Handled BEFORE any rule handling because there is no rule to derive: the
+      // operator is asserting the absence of one. On the reported pattern several
+      // groups needed no rewrite at all, and with only "has a rule" and "nothing
+      // yet" to choose from they stayed indistinguishable from groups nobody had
+      // looked at — so every pass re-examined them.
+      //
+      // NOTHING ABOUT THE REWRITE CHANGES. The apply already leaves a group with
+      // no rule alone; migration 055's CHECK guarantees this row holds neither a
+      // rule nor agreement, so redirectApply's "agreed = true AND rule IS NOT
+      // NULL" cannot see it. What is added is only the RECORD of the decision,
+      // which is the whole value: it is what stops the group coming back.
+      if (request.body?.no_change !== undefined) {
+        if (typeof request.body.no_change !== "boolean") {
+          return reply
+            .code(400)
+            .send(badRequest("no_change must be true or false"));
+        }
+
+        // FALSE IS THE UNDO, and it DELETES rather than writing a "not marked"
+        // row. The absence of a row is already how this table spells "nobody has
+        // said anything about this shape", and inventing a second way to say it
+        // would leave two states the dialog has to treat as one.
+        if (!request.body.no_change) {
+          await pool.query(
+            `
+              DELETE FROM pattern_shape_rules
+              WHERE pattern_id = $1
+                AND shape = ANY($2::text[])
+                AND source = 'no_change'
+            `,
+            [request.params.patternId, shapes]
+          );
+
+          return { shape: shapes[0], shapes, rule: null, source: null };
+        }
+
+        // EVERY COLUMN IS ASSIGNED, including the ones being cleared. A group can
+        // arrive here holding an operator rule — the operator changed their mind —
+        // and UNIQUE (pattern_id, shape) means this is an UPDATE of that row, not
+        // a second row beside it. Leaving `rule` alone would produce a row that
+        // says "no rewrite wanted" while still carrying the rewrite, which
+        // migration 055's CHECK would reject outright; the mutual exclusivity is
+        // the reason both answers share one endpoint and one row.
+        await pool.query(
+          `
+            INSERT INTO pattern_shape_rules
+              (pattern_id, shape, rule, sample_size, population, agreed, source,
+               authored_by, authored_at)
+            SELECT $1, shape, NULL, 0, 0, false, 'no_change', $3, now()
+            FROM UNNEST($2::text[]) AS shape
+            ON CONFLICT (pattern_id, shape) DO UPDATE
+            SET rule = NULL,
+                sample_size = 0,
+                population = 0,
+                agreed = false,
+                source = 'no_change',
+                authored_by = EXCLUDED.authored_by,
+                authored_at = now(),
+                measured_at = now()
+          `,
+          [
+            request.params.patternId,
+            shapes,
+            typeof request.body?.authored_by === "string"
+              ? request.body.authored_by
+              : null
+          ]
+        );
+
+        return {
+          shape: shapes[0],
+          shapes,
+          rule: null,
+          source: "no_change" as const
+        };
       }
 
       // Two ways in, one outcome. `pairs` is what the dialog sends: the operator
@@ -5365,19 +5449,30 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         `
           SELECT shape, rule, source, agreed, sample_size, population, authored_at
           FROM pattern_shape_rules
-          WHERE pattern_id = $1 AND rule IS NOT NULL
+          WHERE pattern_id = $1
+            AND (rule IS NOT NULL OR source = 'no_change')
           ORDER BY shape
         `,
         [request.params.patternId]
       );
 
       return {
-        // UNAGREED ROWS ARE INCLUDED, and flagged. A stratified probe that came
-        // back unagreed is exactly the state that produced the shortfall this
-        // dialog exists for, and the apply skips those rows (redirectApply
-        // filters on agreed = true). Hiding them would tell the operator nothing
-        // is known about a group that has in fact already been measured and
-        // found inconsistent.
+        // WHAT THE FILTER ABOVE DOES, precisely, because two of the three things
+        // this table can hold are returned and one is not:
+        //
+        //   * a RULE (sampled or operator) — returned, with its provenance;
+        //   * a NO_CHANGE mark (v1.87) — returned, and it carries no rule by
+        //     constraint, which is why the filter has to name it explicitly
+        //     rather than relying on `rule IS NOT NULL`;
+        //   * an UNAGREED sampled row — NOT returned. It has no rule (051: rule
+        //     is NULL when agreed = false), the apply skips it, and the dialog's
+        //     toRuleState drops it anyway, so it would render as "Nothing yet"
+        //     either way.
+        //
+        // That last exclusion loses something real — "this shape was measured and
+        // its URLs disagreed" is more useful than "nothing yet", and it is the
+        // finding that justifies escalating the shape. Surfacing it is a UI
+        // change, not a query change, and is deliberately not made here.
         rules: result.rows.map((row) => ({
           shape: row.shape,
           rule: row.rule,

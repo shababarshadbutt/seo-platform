@@ -33,7 +33,13 @@ export type ShapeRuleState =
   // only way to tell a rule that an apply has already tried and failed to match
   // from one saved thirty seconds ago that nothing has run against yet. See
   // describeUnmatchedRule.
-  | { kind: "operator"; summary: string; authoredAt?: string | null };
+  | { kind: "operator"; summary: string; authoredAt?: string | null }
+  // Asserted by a human that this group needs NO rewrite — its URLs are already
+  // correct (v1.87). A FOURTH kind for the same reason there are three: it is not
+  // "none" (somebody looked, and decided), and it is not a rule (there is nothing
+  // to apply). Collapsing it into either is what left an already-correct group
+  // sitting under "still needs an answer" pass after pass.
+  | { kind: "no-change"; authoredAt?: string | null };
 
 export type SkippedGroupRow = {
   shape: string;
@@ -46,6 +52,11 @@ export type SkippedGroupRow = {
   // Can this row be included in "Apply selected"? Only with a rule behind it —
   // applying a group nobody has resolved would rewrite nothing and report
   // success, which is the failure v1.81 exists to make impossible.
+  //
+  // A "no-change" group is therefore NOT applicable (v1.87), and that is the
+  // point: it has been answered, but the answer is "do nothing". Everything
+  // keyed on `applicable` — the Apply footer, the blocked reason — then treats it
+  // correctly with no changes of their own.
   applicable: boolean;
 };
 
@@ -83,7 +94,7 @@ export function buildSkippedGroupRows(
             ? [shape.example]
             : [],
       rule,
-      applicable: rule.kind !== "none"
+      applicable: rule.kind === "measured" || rule.kind === "operator"
     };
   });
 }
@@ -150,25 +161,38 @@ export function describeApplyScope(rows: readonly SkippedGroupRow[]): string {
 // coverage report with its count intact. Indistinguishable from an unanswered
 // group, that is a loop — retype the rule, apply, see the group again, retype it.
 // Splitting the two is what makes a second pass about the remainder.
+//
+// AND A THIRD PILE (v1.87): groups a human has looked at and decided need no
+// rewrite at all. Those were the remaining way to be stuck under "still needs an
+// answer" for ever — the apply was always going to leave them alone, but nothing
+// recorded that anybody had decided so, and "already correct" and "not yet looked
+// at" rendered identically.
 export function partitionSkippedGroupRows(rows: readonly SkippedGroupRow[]): {
   unresolved: SkippedGroupRow[];
   resolved: SkippedGroupRow[];
+  leftAsIs: SkippedGroupRow[];
 } {
   const unresolved: SkippedGroupRow[] = [];
   const resolved: SkippedGroupRow[] = [];
+  const leftAsIs: SkippedGroupRow[] = [];
 
   for (const row of rows) {
-    // Keyed on `applicable` rather than on rule.kind directly: it is the same
+    // `applicable` is still what decides RESOLVED, because it is the same
     // question the Apply footer asks ("would this row contribute to the next
-    // apply?"), and two predicates that must agree are better as one.
+    // apply?") and two predicates that must agree are better as one. A
+    // deliberately-unchanged group answers no to that and is still answered,
+    // which is exactly why it needs its own pile rather than a third value of a
+    // boolean.
     if (row.applicable) {
       resolved.push(row);
+    } else if (row.rule.kind === "no-change") {
+      leftAsIs.push(row);
     } else {
       unresolved.push(row);
     }
   }
 
-  return { unresolved, resolved };
+  return { unresolved, resolved, leftAsIs };
 }
 
 // The header line: how much is STILL unfixed, and whether this list is all of it.
@@ -188,13 +212,29 @@ export function unresolvedSummary(input: {
     ? ", and there are more groups than could be listed"
     : "";
 
+  // WHAT OF THE REMAINDER IS THERE ON PURPOSE (v1.87). Once a group can be marked
+  // "already correct", a flat "45 URLs are still unfixed" over-states the problem:
+  // some of those URLs are unfixed because somebody decided they should be. The
+  // count itself stays honest — those URLs really were not rewritten, and shrinking
+  // it would be the kind of flattering arithmetic v1.81 exists to prevent — so the
+  // number is kept and qualified instead.
+  const marked = input.rows
+    .filter((row) => row.rule.kind === "no-change")
+    .reduce((total, row) => total + row.urls, 0);
+  const deliberate =
+    marked > 0
+      ? ` ${marked.toLocaleString("en-US")} of them ${
+          marked === 1 ? "is" : "are"
+        } in groups you marked as already correct.`
+      : "";
+
   if (input.skippedInScope === null) {
-    return `${listed}${truncated}.`;
+    return `${listed}${truncated}.${deliberate}`;
   }
 
   return `${input.skippedInScope.toLocaleString("en-US")} URL${
     input.skippedInScope === 1 ? "" : "s"
-  } in this pattern are still unfixed. ${listed}${truncated}.`;
+  } in this pattern are still unfixed.${deliberate} ${listed}${truncated}.`;
 }
 
 // The caveat for a group that HAS a rule and came back unfixed ANYWAY.
@@ -217,6 +257,13 @@ export function unresolvedSummary(input: {
 // when the residue on screen was measured — the moment of the apply that produced
 // it. With either timestamp missing this says nothing, because an unfalsifiable
 // claim about which came first is exactly what should not be put on screen.
+//
+// A "LEAVE AS IT IS" GROUP IS EXCLUDED TOO (v1.87), by the `applicable` guard
+// below rather than by a clause of its own. Such a group came back unfixed because
+// somebody asked for it to, so telling them "the last fix did not change these"
+// would be reporting the intended outcome as a problem. Noting it here because the
+// exclusion is a consequence of that predicate rather than something visible on
+// the line itself.
 export function describeUnmatchedRule(
   row: SkippedGroupRow,
   measuredAt?: string | null

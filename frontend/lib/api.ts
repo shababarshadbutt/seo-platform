@@ -193,14 +193,23 @@ export type SkippedShape = {
 // distils the rule with the same deriveRedirectRule a probe would use, so a
 // hand-authored rule and a measured one are the same kind of object. `rule` is
 // the Advanced escape hatch for someone who would rather write it directly.
+export type RedirectRuleShape =
+  | { kind: "replace"; find: string; replace: string }
+  | { kind: "insert"; prefix: string; insert: string };
+
 export type ShapeRuleResult = {
   shape: string;
   // Every shape the rule was saved for (v1.85). One edit can resolve many
   // groups: the reported pattern had 24 sharing one prefix and one correct
   // change between them.
   shapes?: string[];
-  rule: { kind: "replace"; find: string; replace: string } | { kind: "insert"; prefix: string; insert: string };
-  source: "operator";
+  // NULL for the two answers that carry no rewrite (v1.87): a "leave these
+  // alone" mark, and its undo.
+  rule: RedirectRuleShape | null;
+  // "no_change" is a human saying this group needs no rewrite; null is the undo,
+  // which removes the row entirely — the absence of a row is already how the
+  // table spells "nobody has said anything about this shape".
+  source: "operator" | "no_change" | null;
 };
 
 export async function saveShapeRule(
@@ -208,7 +217,12 @@ export async function saveShapeRule(
   patternId: string,
   body:
     | { shapes: string[]; pairs: Array<{ source: string; dest: string }> }
-    | { shapes: string[]; rule: ShapeRuleResult["rule"] }
+    | { shapes: string[]; rule: RedirectRuleShape }
+    // "These URLs are already correct — leave them" (v1.87), and false to undo.
+    // Deliberately the SAME endpoint: it writes the same unique row, and mutual
+    // exclusivity between a rule and a mark is enforced there rather than being
+    // a convention two callers have to keep.
+    | { shapes: string[]; no_change: boolean }
 ): Promise<ShapeRuleResult> {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/shape-rule`),
@@ -239,7 +253,8 @@ export async function saveShapeRule(
 // unagreed probe result is a real third state — measured, and found inconsistent.
 export type ShapeRuleRecord = {
   shape: string;
-  rule: ShapeRuleResult["rule"] | null;
+  // NULL for a "leave these alone" mark (v1.87), which is a row with no rewrite.
+  rule: RedirectRuleShape | null;
   source: string;
   agreed: boolean;
   sample_size: NumberLike;
