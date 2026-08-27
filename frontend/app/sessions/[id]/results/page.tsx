@@ -224,9 +224,12 @@ import {
 } from "@/lib/transform-coverage";
 import {
   fixActionState,
+  canReviewUnfixedGroups,
   fixedBadgeDetail,
   fixedBadgeLabel,
   fixedBadgeState,
+  REVIEW_UNFIXED_GROUPS_LABEL,
+  reviewUnfixedGroupsTitle,
   hasStaleCountsAfterFix,
   showFixedBadge,
   showCheckButton,
@@ -295,6 +298,28 @@ type PatternRow = {
   originalTemplate: string | null;
   transformOriginalTemplate: string | null;
   hasRedirects: boolean;
+};
+
+// Everything the Review unfixed groups dialog needs to open on a shortfall.
+//
+// ONE TYPE, TWO DOORS (v1.86). The toast carries it, and so does the Partly fixed
+// chip — which matters because the toast used to be the only way in. Dismiss it or
+// reload the page and the shortfall became unreachable, even though the groups had
+// been persisted to patterns.redirects_skipped_shapes all along and were already
+// being read into PatternRow. They were simply never used.
+//
+// skippedInScope and shapesTruncated travel with the shapes because the dialog's
+// header states the remainder, and summing the rows would get it wrong: the backend
+// caps the histogram at its 25 biggest groups, so the sum is a floor, not a total.
+type ReviewGroupsHandle = {
+  patternId: string;
+  template: string;
+  shapes: SkippedShape[];
+  skippedInScope: number | null;
+  shapesTruncated?: boolean;
+  // When this residue was measured, so the dialog can tell a rule an apply has
+  // already failed to match from one saved since.
+  measuredAt: string | null;
 };
 
 type SamplesByPattern = Record<string, SampledUrl[]>;
@@ -943,19 +968,13 @@ export default function ResultsDashboardPage({
     // Everything the Review dialog needs to reopen this shortfall (v1.84). The
     // toast lists the groups; per-group buttons do not belong in a toast, so it
     // carries the handle and the dialog does the work.
-    review?: {
-      patternId: string;
-      template: string;
-      shapes: SkippedShape[];
-    };
+    review?: ReviewGroupsHandle;
   } | null>(null);
-  // The Review unfixed groups dialog (v1.84). Opened from the toast above, and
-  // the only place a group can be resolved.
-  const [reviewGroups, setReviewGroups] = useState<{
-    patternId: string;
-    template: string;
-    shapes: SkippedShape[];
-  } | null>(null);
+  // The Review unfixed groups dialog (v1.84). Opened from the toast above, from
+  // the Partly fixed chip (v1.86), and the only place a group can be resolved.
+  const [reviewGroups, setReviewGroups] = useState<ReviewGroupsHandle | null>(
+    null
+  );
 
   const [renameRow, setRenameRow] = useState<PatternRow | null>(null);
   const [renameValue, setRenameValue] = useState("");
@@ -1847,6 +1866,43 @@ export default function ResultsDashboardPage({
                 <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
               )}
               {fixedBadgeLabel(fixedBadgeState(row.original))}
+            </button>
+            ) : null}
+            {/* THE WAY BACK INTO THE SHORTFALL (v1.86). The toast that first
+                reported it is long gone by now — dismissed, or lost to a reload —
+                and it was the only door. The groups themselves were persisted all
+                along (migration 052) and already sitting on this row; nothing had
+                ever read them. Beside the chip rather than inside it because the
+                chip opens the Fix modal, and these are two different questions:
+                "what did this fix do?" and "what did it not do?". */}
+            {canReviewUnfixedGroups(row.original) ? (
+            <button
+              type="button"
+              data-testid="pattern-review-unfixed"
+              aria-label={`Review the URL groups the fix left unchanged in ${row.original.template}`}
+              title={reviewUnfixedGroupsTitle(row.original)}
+              className="inline-flex items-center gap-1 rounded-md border border-amber-300 bg-white px-2 py-0.5 text-xs font-semibold text-amber-700 hover:bg-amber-50"
+              onClick={(event) => {
+                event.stopPropagation();
+                setFindReplaceToast(null);
+                setReviewGroups({
+                  patternId: row.original.id,
+                  template: row.original.template,
+                  shapes: row.original.redirectsSkippedShapes,
+                  skippedInScope: row.original.redirectsSkippedLocs,
+                  // The apply that produced this persisted list is the one that
+                  // stamped the row, so its timestamp is when the list was
+                  // measured.
+                  measuredAt: row.original.redirectsAppliedAt,
+                  // The persisted histogram carries no truncation flag of its own
+                  // (052 stores the capped list, not the fact that it was capped),
+                  // so this deliberately says nothing rather than claiming the
+                  // list is complete.
+                  shapesTruncated: undefined
+                });
+              }}
+            >
+              {REVIEW_UNFIXED_GROUPS_LABEL}
             </button>
             ) : null}
             {/* THE ACTION, INDEPENDENT OF THE BADGE (v1.74). The badge used to
@@ -3281,7 +3337,10 @@ export default function ResultsDashboardPage({
             review: {
               patternId: pattern.id,
               template: pattern.template,
-              shapes: job.skipped?.by_shape ?? []
+              shapes: job.skipped?.by_shape ?? [],
+              skippedInScope,
+              shapesTruncated: job.skipped?.shapes_truncated,
+              measuredAt: new Date().toISOString()
             }
           });
 
@@ -3358,10 +3417,24 @@ export default function ResultsDashboardPage({
   //
   // `pattern` is passed in rather than read from fixRow because a queued apply
   // outlives the modal.
+  //
+  // IT ALSO RETURNS THE REMAINDER (v1.86), so the Review dialog can stay open and
+  // redraw with what is STILL unfixed instead of closing and leaving the operator
+  // to find the next toast. Returning it from here rather than having the caller
+  // re-derive it keeps one answer to "what is left": the toast and the dialog are
+  // then incapable of disagreeing about the same apply.
+  //
+  // NULL MEANS "NOT KNOWN HERE" — a queued apply that has not landed yet. The
+  // dialog says so; treating it as "nothing left" would present the old list as a
+  // fresh one, which is the class of stale-count confusion this area keeps hitting.
   async function reportApplyOutcome(
     result: Awaited<ReturnType<typeof applyPatternRedirects>>,
     pattern: { id: string; template: string }
-  ) {
+  ): Promise<{
+    shapes: SkippedShape[];
+    skippedInScope: number | null;
+    shapesTruncated?: boolean;
+  } | null> {
     if (result.queued) {
       // Wide fix routed to a background job — no synchronous result.
       //
@@ -3389,14 +3462,14 @@ export default function ResultsDashboardPage({
         // Older backend: no row to poll, so keep the previous behaviour rather
         // than leaving the user with a toast and nothing at all.
         window.setTimeout(() => void loadResults({ silent: true }), 6000);
-        return;
+        return null;
       }
 
       void pollQueuedApply(jobRowId, result.files_total ?? 0, {
         id: pattern.id,
         template: pattern.template
       });
-      return;
+      return null;
     }
 
     await loadResults({ silent: true });
@@ -3444,14 +3517,21 @@ export default function ResultsDashboardPage({
         review: {
           patternId: pattern.id,
           template: pattern.template,
-          shapes: result.skipped_shapes ?? []
+          shapes: result.skipped_shapes ?? [],
+          skippedInScope,
+          shapesTruncated: result.skipped_shapes_truncated,
+          measuredAt: new Date().toISOString()
         },
         // Held open: this is a list to read and act on, not a confirmation to
         // glance at.
         sticky: true
       });
 
-      return;
+      return {
+        shapes: result.skipped_shapes ?? [],
+        skippedInScope,
+        shapesTruncated: result.skipped_shapes_truncated
+      };
     }
 
     setFindReplaceToast({
@@ -3467,6 +3547,16 @@ export default function ResultsDashboardPage({
               : ""
           }${scopeNote ? ` ${scopeNote}` : ""}`
     });
+
+    // A complete apply, or one that changed nothing. Either way the shortfall
+    // report is the authority on what is left — an empty list here is what lets
+    // the dialog say "every group in this pattern is fixed" rather than keeping
+    // rows on screen that the last run just resolved.
+    return {
+      shapes: result.skipped_shapes ?? [],
+      skippedInScope,
+      shapesTruncated: result.skipped_shapes_truncated
+    };
   }
 
   async function handleAcceptFixes() {
@@ -8967,6 +9057,9 @@ export default function ResultsDashboardPage({
             patternId={reviewGroups.patternId}
             template={reviewGroups.template}
             shapes={reviewGroups.shapes}
+            skippedInScope={reviewGroups.skippedInScope}
+            shapesTruncated={reviewGroups.shapesTruncated}
+            measuredAt={reviewGroups.measuredAt}
             open
             onOpenChange={(next) => {
               if (!next) {
@@ -8998,7 +9091,12 @@ export default function ResultsDashboardPage({
                   pattern.id
                 );
 
-                await reportApplyOutcome(result, pattern);
+                // Handed straight back to the dialog, which stays open and
+                // redraws with what is STILL unfixed (v1.86). It closed before,
+                // so the only way to see the new remainder was to go and read the
+                // toast — and after a second pass on a wide pattern that is the
+                // question the operator has.
+                return await reportApplyOutcome(result, pattern);
               } catch (nextError) {
                 setFindReplaceToast({
                   tone: "error",
@@ -9007,6 +9105,10 @@ export default function ResultsDashboardPage({
                     "Unable to apply redirect fixes."
                   )
                 });
+
+                // Rethrown so the dialog reports the failure inline instead of
+                // redrawing as though the apply had succeeded with nothing left.
+                throw nextError;
               } finally {
                 setIsFixing(false);
               }

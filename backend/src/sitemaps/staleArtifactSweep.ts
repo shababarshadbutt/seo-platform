@@ -3,6 +3,8 @@ import path from "node:path";
 
 import type { FastifyBaseLogger } from "fastify";
 
+import { pool } from "../db/pool.js";
+
 // Defined HERE rather than alongside the queue constants: the queue module builds a
 // BullMQ Queue (and a Redis connection) at import time, so importing a number from
 // it would drag Redis into every consumer — including this module's unit tests,
@@ -170,6 +172,27 @@ async function sweepCleanerRuns(
       await rm(dir, { recursive: true, force: true });
       removed += 1;
       bytes += size;
+
+      // THE INDEX ROW GOES WITH THE TREE (v1.86). cleaner_runs names finished runs
+      // so a handoff token survives a restart and the Migration page can offer one
+      // instead of making the operator clean the site again. This sweep is the one
+      // thing that can delete a directory the row still points at, so leaving the
+      // row behind would leave that picker advertising a run whose bytes are gone.
+      //
+      // The row is keyed by the DIRECTORY NAME (routes/cleaner.ts indexes each run
+      // as path.basename of its working directory), which is why this stays
+      // filesystem-driven — it still consults no table to decide WHAT to delete,
+      // it only tidies up after itself.
+      try {
+        await pool.query("DELETE FROM cleaner_runs WHERE run_id = $1::uuid", [
+          entry.name
+        ]);
+      } catch {
+        // Never fail a successful reclaim over the bookkeeping: the bytes are
+        // gone, which is the point, and the listing route drops rows whose
+        // directory it cannot stat anyway.
+      }
+
       logger.warn(
         {
           run_dir: entry.name,

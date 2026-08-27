@@ -222,6 +222,43 @@ export async function saveShapeRule(
   return readJsonResponse<ShapeRuleResult>(response);
 }
 
+// The rules a pattern ALREADY has (v1.86).
+//
+// WHY READING THEM BACK MATTERS. saveShapeRule shipped without a counterpart, so
+// the Review unfixed groups dialog reset its rule map to empty on every open and
+// every row read "Nothing yet" even with an agreed rule already stored. Combined
+// with the server's documented trade-off — a rule is saved for every shape asked
+// for WITHOUT checking it transforms each one, so a group it cannot match comes
+// back in the next coverage report with its count intact — that made an answered
+// group indistinguishable from an unanswered one, and an operator could retype the
+// same failing rule indefinitely.
+//
+// `source` is carried through rather than flattened to a boolean: sampled means
+// distilled from a probe, operator means asserted by a human, and the dialog says
+// which. `agreed` is here because the apply only honours agreed rows, so an
+// unagreed probe result is a real third state — measured, and found inconsistent.
+export type ShapeRuleRecord = {
+  shape: string;
+  rule: ShapeRuleResult["rule"] | null;
+  source: string;
+  agreed: boolean;
+  sample_size: NumberLike;
+  population: NumberLike;
+  authored_at?: string | null;
+};
+
+export async function getShapeRules(
+  sessionId: string,
+  patternId: string
+): Promise<ShapeRuleRecord[]> {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/shape-rules`)
+  );
+  const body = await readJsonResponse<{ rules?: ShapeRuleRecord[] }>(response);
+
+  return body.rules ?? [];
+}
+
 export type SampledUrl = {
   id: string;
   pattern_id: string;
@@ -3510,6 +3547,39 @@ export async function getCleanerHandoff(token: string) {
   );
 
   return readJsonResponse<CleanerHandoff>(response);
+}
+
+// A cleaned run still available for reuse (v1.86).
+//
+// WHY THIS LIST EXISTS. The handoff token lived only in the Cleaner page's React
+// state and in a query parameter the Migration page deliberately strips from the
+// URL as soon as it loads. Nothing persisted it, so reloading that tab — or losing
+// its connection — left an empty form and a cleaned sitemap that was still on disk
+// and impossible to name. The only way forward was to clean the whole site again,
+// which on an 11.5M-URL site is a long job to repeat for a dropped connection.
+export type CleanerRun = {
+  download_token: string;
+  domain: string;
+  zip_filename: string;
+  file_count: number;
+  url_count: number;
+  created_at: string;
+};
+
+export type CleanerRunList = {
+  runs: CleanerRun[];
+  // How long runs are kept, from the server's own TTL, so the picker can say so
+  // without a second copy of the number to keep in step.
+  retention_ms?: NumberLike;
+};
+
+export async function listCleanerRuns(): Promise<CleanerRunList> {
+  const response = await fetchWithTimeout(backendUrl("/api/cleaner/runs"), {
+    cache: "no-store"
+  });
+  const body = await readJsonResponse<CleanerRunList>(response);
+
+  return { runs: body.runs ?? [], retention_ms: body.retention_ms };
 }
 
 // Download one cleaned file (by index) from a cleaner run token and return it as

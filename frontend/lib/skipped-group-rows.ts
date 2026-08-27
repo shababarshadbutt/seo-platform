@@ -23,12 +23,17 @@ import type { SkippedShape } from "./api";
 export type ShapeRuleState =
   | { kind: "none" }
   // Distilled from a stratified probe of this group.
-  | { kind: "measured"; summary: string }
+  | { kind: "measured"; summary: string; authoredAt?: string | null }
   // Asserted by a human. Deliberately a SEPARATE kind rather than a flag on
   // "measured": migration 051 spent two releases restoring the difference
   // between fetched, inferred, and — since v1.84 — asserted, and a UI that
   // renders all three the same way would quietly undo that.
-  | { kind: "operator"; summary: string };
+  //
+  // authoredAt is WHEN, and it is load-bearing rather than decorative: it is the
+  // only way to tell a rule that an apply has already tried and failed to match
+  // from one saved thirty seconds ago that nothing has run against yet. See
+  // describeUnmatchedRule.
+  | { kind: "operator"; summary: string; authoredAt?: string | null };
 
 export type SkippedGroupRow = {
   shape: string;
@@ -128,6 +133,112 @@ export function describeApplyScope(rows: readonly SkippedGroupRow[]): string {
   return `Will fix ${urls.toLocaleString("en-US")} URL${
     urls === 1 ? "" : "s"
   } across ${resolved.length} group${resolved.length === 1 ? "" : "s"}.`;
+}
+
+// STILL OUTSTANDING vs ALREADY ANSWERED (v1.86).
+//
+// WHAT WAS WRONG. Every group the last apply declined came back as one flat list
+// with no memory of what had been said about it, because nothing read the saved
+// rules back. So the second pass looked exactly like the first: the operator could
+// not see which groups they had already resolved, "select every group" ticked the
+// answered ones too, and a bulk save then overwrote answers that were already
+// right.
+//
+// It is worse than redundant work, because of the trade-off the save endpoint
+// documents: a rule is stored for every shape asked for WITHOUT checking that it
+// transforms each one, so a group the rule cannot match REAPPEARS in the next
+// coverage report with its count intact. Indistinguishable from an unanswered
+// group, that is a loop — retype the rule, apply, see the group again, retype it.
+// Splitting the two is what makes a second pass about the remainder.
+export function partitionSkippedGroupRows(rows: readonly SkippedGroupRow[]): {
+  unresolved: SkippedGroupRow[];
+  resolved: SkippedGroupRow[];
+} {
+  const unresolved: SkippedGroupRow[] = [];
+  const resolved: SkippedGroupRow[] = [];
+
+  for (const row of rows) {
+    // Keyed on `applicable` rather than on rule.kind directly: it is the same
+    // question the Apply footer asks ("would this row contribute to the next
+    // apply?"), and two predicates that must agree are better as one.
+    if (row.applicable) {
+      resolved.push(row);
+    } else {
+      unresolved.push(row);
+    }
+  }
+
+  return { unresolved, resolved };
+}
+
+// The header line: how much is STILL unfixed, and whether this list is all of it.
+//
+// The count comes from the apply's own skippedInScope rather than from summing the
+// rows, and the difference matters: the backend caps the histogram at the 25
+// biggest groups (SKIPPED_SHAPE_LIMIT), so adding up what is on screen would
+// under-report the remainder and quietly imply the list is exhaustive. That is the
+// class of claim v1.81 exists to stop making.
+export function unresolvedSummary(input: {
+  skippedInScope: number | null;
+  rows: readonly SkippedGroupRow[];
+  shapesTruncated?: boolean;
+}): string {
+  const listed = `The ${input.rows.length === 1 ? "one group" : `${input.rows.length} biggest groups`} the last fix could not reach ${input.rows.length === 1 ? "is" : "are"} listed below`;
+  const truncated = input.shapesTruncated
+    ? ", and there are more groups than could be listed"
+    : "";
+
+  if (input.skippedInScope === null) {
+    return `${listed}${truncated}.`;
+  }
+
+  return `${input.skippedInScope.toLocaleString("en-US")} URL${
+    input.skippedInScope === 1 ? "" : "s"
+  } in this pattern are still unfixed. ${listed}${truncated}.`;
+}
+
+// The caveat for a group that HAS a rule and came back unfixed ANYWAY.
+//
+// This is the save endpoint's documented trade-off finally saying so on screen. It
+// stores a rule for every shape requested without checking it matches each one, on
+// the grounds that the next coverage report will catch it — which is true, and
+// useless to an operator who cannot see that the group they are looking at is the
+// one that already failed. Naming it turns a silent loop into an instruction.
+//
+// IT MUST NOT FIRE ON A RULE NOTHING HAS RUN AGAINST YET, which is why this takes
+// a time and not just a row. A rule saved a moment ago moves the row straight into
+// "already answered", and telling the operator right then that "the last fix did
+// not change these" would be false — and worse than merely noisy, because it would
+// send them back to re-edit a rule that is very likely correct. That is the same
+// wasted loop from the other direction.
+//
+// So the claim is only made when the rule PREDATES the measurement in front of us:
+// the rule existed, an apply ran, and the group still came back. `measuredAt` is
+// when the residue on screen was measured — the moment of the apply that produced
+// it. With either timestamp missing this says nothing, because an unfalsifiable
+// claim about which came first is exactly what should not be put on screen.
+export function describeUnmatchedRule(
+  row: SkippedGroupRow,
+  measuredAt?: string | null
+): string | null {
+  if (!row.applicable || row.rule.kind === "none") {
+    return null;
+  }
+
+  const authoredAt = row.rule.authoredAt;
+
+  if (!authoredAt || !measuredAt) {
+    return null;
+  }
+
+  const authored = Date.parse(authoredAt);
+  const measured = Date.parse(measuredAt);
+
+  if (Number.isNaN(authored) || Number.isNaN(measured) || authored >= measured) {
+    return null;
+  }
+
+  return "A rule is set, but the last fix did not change these — it may not fit this group. Edit the examples to match what these URLs should become.";
 }
 
 // Total URLs the current selection would cover.

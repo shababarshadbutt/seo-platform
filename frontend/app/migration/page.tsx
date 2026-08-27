@@ -19,6 +19,7 @@ import {
   LinkIcon,
   Loader2,
   Search,
+  History,
   Sparkles,
   UploadCloud,
   X,
@@ -37,9 +38,11 @@ import {
   getRuntimeConfig,
   ingestCleanerRun,
   getSystemDiskUsage,
+  listCleanerRuns,
   previewSitemapUrl,
   submitSitemapUrls,
   type CleanerHandoffFile,
+  type CleanerRun,
   type SftpPullProgressEvent,
   type SitemapUrlPreview,
   type CleanerIngestProgress,
@@ -61,6 +64,12 @@ import {
   CardHeader,
   CardTitle
 } from "@/components/ui/card";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { UploadRejections } from "@/components/upload-rejections";
@@ -74,6 +83,65 @@ const MAX_CONCURRENT_UPLOADS = 3;
 const LARGE_UPLOAD_WARNING_THRESHOLD = 500;
 const SITEMAP_URL_FETCH_ERROR =
   "Could not fetch sitemap — check the URL and try again";
+
+// The bare hostname of a cleaned domain, for a default session name. Falls back to
+// the string as given: the domain comes from a Cleaner run and is normally a full
+// URL, but a value that will not parse is better shown than replaced with nothing.
+//
+// Shared by both handoff doors (v1.86) so an arrival from the Cleaner and a run
+// picked from the list cannot end up named two different ways.
+function hostLabelFor(domain: string): string {
+  try {
+    return new URL(domain).hostname;
+  } catch {
+    return domain;
+  }
+}
+
+// How long ago, in the coarsest unit that is still useful. These runs live for
+// hours, so minutes and hours are the whole range worth expressing.
+function describeAge(iso: string, now: number): string {
+  const then = Date.parse(iso);
+
+  if (Number.isNaN(then)) {
+    return "";
+  }
+
+  const minutes = Math.max(0, Math.round((now - then) / 60_000));
+
+  if (minutes < 1) {
+    return "just now";
+  }
+
+  if (minutes < 60) {
+    return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  }
+
+  const hours = Math.round(minutes / 60);
+
+  return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+}
+
+// "kept for 2 hours", from the server's own TTL rather than a second copy of the
+// number here — the retention was raised once already and a hardcoded string would
+// have been the thing that got left behind.
+function describeRetention(ms: number | null): string | null {
+  if (!ms || ms <= 0) {
+    return null;
+  }
+
+  const hours = Math.round(ms / 3_600_000);
+
+  if (hours >= 1) {
+    return `Cleaned sitemaps are kept for ${hours} hour${hours === 1 ? "" : "s"}.`;
+  }
+
+  const minutes = Math.max(1, Math.round(ms / 60_000));
+
+  return `Cleaned sitemaps are kept for ${minutes} minute${
+    minutes === 1 ? "" : "s"
+  }.`;
+}
 
 // Third source alongside manual upload and fetch-from-URL: pull a domain's
 // whole sitemap set from the AWS Transfer Family SFTP location.
@@ -307,6 +375,23 @@ export default function Home() {
     fileCount: number;
   } | null>(null);
   const [isLoadingHandoff, setIsLoadingHandoff] = useState(false);
+  // CLEANED SITEMAPS STILL AVAILABLE (v1.86).
+  //
+  // WHY THIS EXISTS. The handoff above arrives as a query parameter that the
+  // effect below deliberately strips from the URL the moment it loads — right,
+  // because a token in the address bar gets pasted and shared, but nothing
+  // persisted it. So a reload of this tab, or a dropped connection during the
+  // ingest, left an empty form and a cleaned sitemap that was still sitting on the
+  // uploads volume with no way left to name it. Cleaning an 11.5M-URL site again
+  // for a lost tab is a long job, and the files were never the thing that was
+  // missing. This is the list of them.
+  const [cleanerRuns, setCleanerRuns] = useState<CleanerRun[]>([]);
+  const [cleanerRunsLoading, setCleanerRunsLoading] = useState(false);
+  const [cleanerRunsError, setCleanerRunsError] = useState("");
+  const [cleanerRunsLoaded, setCleanerRunsLoaded] = useState(false);
+  const [cleanerRetentionMs, setCleanerRetentionMs] = useState<number | null>(
+    null
+  );
   const handoffStartedRef = useRef(false);
   // Set once a Cleaner handoff has loaded successfully; consumed by the
   // auto-start effect below. The ref is what makes it fire exactly once even
@@ -443,13 +528,7 @@ export default function Home() {
         // browser memory and re-uploaded as multipart, which doubled the transfer,
         // held the whole set in the tab, and put the handoff behind every
         // request-size limit between the browser and the app.
-        let hostLabel = handoff.domain;
-
-        try {
-          hostLabel = new URL(handoff.domain).hostname;
-        } catch {
-          hostLabel = handoff.domain;
-        }
+        const hostLabel = hostLabelFor(handoff.domain);
 
         setBaseUrl(handoff.domain);
         setSourceMode("file");
@@ -961,6 +1040,60 @@ export default function Home() {
       );
     } finally {
       setSftpLoading(false);
+    }
+  }
+
+  // Loaded lazily when the picker opens, mirroring loadSftpDomains: neither list
+  // is worth a request on every visit to this page, and both are cheap enough to
+  // fetch fresh each time it is opened rather than caching something that expires.
+  async function loadCleanerRuns() {
+    setCleanerRunsLoading(true);
+    setCleanerRunsError("");
+
+    try {
+      const result = await listCleanerRuns();
+
+      setCleanerRuns(result.runs);
+      setCleanerRetentionMs(
+        result.retention_ms === undefined || result.retention_ms === null
+          ? null
+          : Number(result.retention_ms)
+      );
+      setCleanerRunsLoaded(true);
+    } catch (error) {
+      setCleanerRunsError(
+        friendlyApiErrorMessage(error, "Could not list cleaned sitemaps.")
+      );
+    } finally {
+      setCleanerRunsLoading(false);
+    }
+  }
+
+  // Pick a cleaned run as this analysis's source.
+  //
+  // IT SETS EXACTLY WHAT THE URL HANDOFF SETS and nothing more, so there is one
+  // way to be in the handoff state rather than two that can diverge — the banner,
+  // hasValidSource and the ingest branch in startAnalysis all keep working with no
+  // knowledge that this second door exists.
+  //
+  // IT DOES NOT AUTO-SUBMIT, unlike the arrival-from-Cleaner path. That path
+  // auto-starts because the operator just pressed a button meaning "take this to
+  // Migration" and the analysis is the obvious next step. Choosing a run from a
+  // list of several is a different act: they may want to check the sample size or
+  // the session name first, and starting a long analysis out from under them
+  // because they opened a menu would be the surprise, not the convenience.
+  function useCleanerRun(run: CleanerRun) {
+    setSourceMode("file");
+    setSelectedFiles([]);
+    setBaseUrl(run.domain);
+    setCleanerHandoff({
+      token: run.download_token,
+      domain: run.domain,
+      fileCount: run.file_count
+    });
+
+    if (sessionName.trim().length === 0) {
+      setSessionName(`Cleaned sitemaps — ${hostLabelFor(run.domain)}`);
     }
   }
 
@@ -1706,6 +1839,107 @@ export default function Home() {
                             />
                             Upload folder
                           </Button>
+                          {/* THE WAY BACK TO AN ALREADY-CLEANED SITEMAP (v1.86).
+                              Beside the upload controls because it is the same
+                              question they answer — where do the files come from
+                              — and the answer "the clean I just ran" was the one
+                              with no button. */}
+                          <DropdownMenu
+                            onOpenChange={(open) => {
+                              if (open) {
+                                void loadCleanerRuns();
+                              }
+                            }}
+                          >
+                            <DropdownMenuTrigger asChild>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                data-testid="use-cleaned-sitemap"
+                                title="Use a sitemap the Cleaner has already produced"
+                                onClick={(event) => event.stopPropagation()}
+                              >
+                                {cleanerRunsLoading ? (
+                                  <Loader2
+                                    className="mr-2 h-4 w-4 animate-spin"
+                                    aria-hidden="true"
+                                  />
+                                ) : (
+                                  <History
+                                    className="mr-2 h-4 w-4"
+                                    aria-hidden="true"
+                                  />
+                                )}
+                                Use a cleaned sitemap
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent
+                              align="end"
+                              className="max-w-sm"
+                              onClick={(event) => event.stopPropagation()}
+                            >
+                              {cleanerRunsLoading ? (
+                                <p className="px-2 py-1.5 text-xs text-slate-500">
+                                  Listing cleaned sitemaps…
+                                </p>
+                              ) : null}
+
+                              {cleanerRunsError ? (
+                                <div className="px-2 py-1.5">
+                                  <p className="text-xs text-amber-700">
+                                    {cleanerRunsError}
+                                  </p>
+                                  <button
+                                    type="button"
+                                    className="mt-1 text-xs font-semibold text-indigo-600 underline"
+                                    onClick={() => void loadCleanerRuns()}
+                                  >
+                                    Try again
+                                  </button>
+                                </div>
+                              ) : null}
+
+                              {!cleanerRunsLoading &&
+                              !cleanerRunsError &&
+                              cleanerRuns.length === 0 &&
+                              cleanerRunsLoaded ? (
+                                <p className="px-2 py-1.5 text-xs text-slate-500">
+                                  No cleaned sitemaps are available. Run the
+                                  Sitemap Cleaner first.
+                                </p>
+                              ) : null}
+
+                              {cleanerRuns.map((run) => (
+                                <DropdownMenuItem
+                                  key={run.download_token}
+                                  onSelect={() => useCleanerRun(run)}
+                                >
+                                  <span className="flex flex-col gap-0.5">
+                                    <span className="text-sm font-semibold">
+                                      {hostLabelFor(run.domain)}
+                                    </span>
+                                    <span className="text-xs text-slate-500">
+                                      {formatCount(run.file_count)} file
+                                      {run.file_count === 1 ? "" : "s"} ·{" "}
+                                      {formatCount(run.url_count)} URL
+                                      {run.url_count === 1 ? "" : "s"} ·{" "}
+                                      {describeAge(run.created_at, Date.now())}
+                                    </span>
+                                  </span>
+                                </DropdownMenuItem>
+                              ))}
+
+                              {cleanerRuns.length > 0 &&
+                              describeRetention(cleanerRetentionMs) ? (
+                                <>
+                                  <div className="my-1 h-px bg-slate-100" />
+                                  <p className="px-2 py-1.5 text-xs text-slate-500">
+                                    {describeRetention(cleanerRetentionMs)}
+                                  </p>
+                                </>
+                              ) : null}
+                            </DropdownMenuContent>
+                          </DropdownMenu>
                         </div>
                       </div>
                       {folderXmlCount !== null ? (

@@ -7,7 +7,10 @@ import {
   describeApplyScope,
   describeReach,
   describeRule,
+  describeUnmatchedRule,
+  partitionSkippedGroupRows,
   selectedReach,
+  unresolvedSummary,
   type ShapeRuleState
 } from "./skipped-group-rows";
 
@@ -154,5 +157,162 @@ test("rule wording matches the Fix modal's existing phrasing", () => {
   assert.equal(
     describeRule({ kind: "insert", prefix: "/rfq", insert: "/parts" }),
     'insert "/parts" after "/rfq"'
+  );
+});
+
+
+// ---------------------------------------------------------------------------
+// The remainder view (v1.86)
+// ---------------------------------------------------------------------------
+
+test("answered groups are separated from the ones still outstanding", () => {
+  // The whole point of the second pass. Before this, both came back in one flat
+  // list and an operator could not tell which groups they had already resolved.
+  const rows = buildSkippedGroupRows(
+    [shape({ count: 40050 }), shape({ shape: "/b/b-99/", count: 13615 })],
+    new Map<string, ShapeRuleState>([
+      ["/a/a-9999/", { kind: "operator", summary: "x" }]
+    ])
+  );
+
+  const { unresolved, resolved } = partitionSkippedGroupRows(rows);
+
+  assert.deepEqual(
+    resolved.map((row) => row.shape),
+    ["/a/a-9999/"]
+  );
+  assert.deepEqual(
+    unresolved.map((row) => row.shape),
+    ["/b/b-99/"]
+  );
+});
+
+test("the partition agrees with what the Apply footer counts", () => {
+  // Two predicates that must not drift: `applicable` decides both whether a row
+  // contributes to the apply and which side of this split it lands on.
+  const rows = buildSkippedGroupRows(
+    [shape(), shape({ shape: "/b/b-99/" })],
+    new Map<string, ShapeRuleState>([
+      ["/b/b-99/", { kind: "measured", summary: "x" }]
+    ])
+  );
+  const { resolved } = partitionSkippedGroupRows(rows);
+
+  assert.equal(
+    resolved.length,
+    rows.filter((row) => row.applicable).length
+  );
+});
+
+test("a measured-but-unagreed group counts as unanswered", () => {
+  // buildSkippedGroupRows only ever sees agreed rules — the dialog drops the rest
+  // before building rows — so a group with no usable rule must sit on the
+  // outstanding side however much is known about it. The apply skips unagreed
+  // rows, and a row the apply will skip is not an answer.
+  const rows = buildSkippedGroupRows([shape()], noRules);
+  const { unresolved, resolved } = partitionSkippedGroupRows(rows);
+
+  assert.equal(unresolved.length, 1);
+  assert.equal(resolved.length, 0);
+});
+
+test("the header states the remainder from the apply, not from the rows", () => {
+  // The backend caps the histogram at its 25 biggest groups, so summing the rows
+  // would under-report the shortfall and imply the list is exhaustive — the exact
+  // claim v1.81 exists to stop making.
+  const rows = buildSkippedGroupRows([shape({ count: 2836 })], noRules);
+
+  assert.equal(
+    unresolvedSummary({ skippedInScope: 10363824, rows }),
+    "10,363,824 URLs in this pattern are still unfixed. The one group the last fix could not reach is listed below."
+  );
+});
+
+test("the header says so when there are more groups than could be listed", () => {
+  const rows = buildSkippedGroupRows(
+    [shape(), shape({ shape: "/b/b-99/" })],
+    noRules
+  );
+
+  assert.equal(
+    unresolvedSummary({
+      skippedInScope: 10363824,
+      rows,
+      shapesTruncated: true
+    }),
+    "10,363,824 URLs in this pattern are still unfixed. The 2 biggest groups the last fix could not reach are listed below, and there are more groups than could be listed."
+  );
+});
+
+test("an unmeasured remainder makes no claim about how many URLs are left", () => {
+  // Reopened from the persisted histogram, which carries the groups without a
+  // trustworthy total. No number beats a wrong one.
+  const rows = buildSkippedGroupRows([shape()], noRules);
+
+  assert.equal(
+    unresolvedSummary({ skippedInScope: null, rows }),
+    "The one group the last fix could not reach is listed below."
+  );
+});
+
+const ruledRow = (authoredAt: string | null) =>
+  buildSkippedGroupRows(
+    [shape()],
+    new Map<string, ShapeRuleState>([
+      ["/a/a-9999/", { kind: "operator", summary: "x", authoredAt }]
+    ])
+  )[0];
+
+test("a rule that predates the fix, on a group that came back, says it may not fit", () => {
+  // The save endpoint's documented trade-off, finally visible. It stores a rule
+  // for every shape asked for without checking it transforms each one, so a group
+  // it cannot match reappears with its count intact — and an operator who cannot
+  // see that retypes the same failing rule forever.
+  assert.match(
+    describeUnmatchedRule(
+      ruledRow("2026-08-27T10:00:00Z"),
+      "2026-08-27T11:00:00Z"
+    ) ?? "",
+    /did not change these/
+  );
+});
+
+test("a rule saved SINCE the fix makes no such claim", () => {
+  // The false-positive that matters. A rule saved a moment ago moves its row
+  // straight into "already answered", and telling the operator right then that
+  // the last fix did not change these would be untrue — and would send them back
+  // to re-edit a rule that is probably correct. That is the same wasted loop from
+  // the other direction.
+  assert.equal(
+    describeUnmatchedRule(
+      ruledRow("2026-08-27T11:30:00Z"),
+      "2026-08-27T11:00:00Z"
+    ),
+    null
+  );
+});
+
+test("with either timestamp missing, nothing is claimed about which came first", () => {
+  // An unfalsifiable claim is exactly what should not go on screen. A sampled rule
+  // has no authored_at, and a shortfall reopened from a row that was never stamped
+  // has no measurement time.
+  assert.equal(
+    describeUnmatchedRule(ruledRow(null), "2026-08-27T11:00:00Z"),
+    null
+  );
+  assert.equal(describeUnmatchedRule(ruledRow("2026-08-27T10:00:00Z"), null), null);
+  assert.equal(
+    describeUnmatchedRule(ruledRow("nonsense"), "2026-08-27T11:00:00Z"),
+    null
+  );
+});
+
+test("a group nobody has answered has no rule to doubt", () => {
+  // There is nothing to caveat, and the row already reads "Nothing yet".
+  const [unansweredRow] = buildSkippedGroupRows([shape()], noRules);
+
+  assert.equal(
+    describeUnmatchedRule(unansweredRow, "2026-08-27T11:00:00Z"),
+    null
   );
 });

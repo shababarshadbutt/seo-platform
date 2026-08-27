@@ -2,12 +2,14 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 
 import {
+  canReviewUnfixedGroups,
   fixActionState,
   fixButtonState,
   fixedBadgeDetail,
   fixedBadgeLabel,
   fixedBadgeState,
   hasStaleCountsAfterFix,
+  reviewUnfixedGroupsTitle,
   showCheckButton,
   showFixButton,
   showFixedBadge
@@ -304,4 +306,73 @@ test("the detail line states both halves, and only when it is qualified", () => 
     null
   );
   assert.equal(fixedBadgeDetail({ redirectsAppliedAt: null }), null);
+});
+
+
+// ---------------------------------------------------------------------------
+// The persistent way back into a shortfall (v1.86)
+// ---------------------------------------------------------------------------
+
+test("a partly fixed pattern with groups on record can reopen its shortfall", () => {
+  // The gap this closes: the toast that first reported the shortfall was the only
+  // door, and dismissing it or reloading the page shut it for good — while the
+  // groups sat persisted in redirects_skipped_shapes the whole time.
+  assert.equal(
+    canReviewUnfixedGroups({
+      redirectsAppliedAt: "2026-08-21T02:30:00Z",
+      redirectsSkippedLocs: 579022,
+      redirectsSkippedShapes: [{ shape: "/a/a-9999/" }]
+    }),
+    true
+  );
+});
+
+test("no groups on record offers no review, however big the shortfall", () => {
+  // Rows fixed before migration 052 have a shortfall and no histogram. A link
+  // that opens an empty dialog reads as a broken feature, which is worse than
+  // offering nothing at all.
+  assert.equal(
+    canReviewUnfixedGroups({
+      redirectsAppliedAt: "2026-08-21T02:30:00Z",
+      redirectsSkippedLocs: 579022,
+      redirectsSkippedShapes: []
+    }),
+    false
+  );
+  assert.equal(
+    canReviewUnfixedGroups({
+      redirectsAppliedAt: "2026-08-21T02:30:00Z",
+      redirectsSkippedLocs: 579022,
+      redirectsSkippedShapes: null
+    }),
+    false
+  );
+});
+
+test("a complete fix and an unfixed pattern have no shortfall to review", () => {
+  // Keyed on the same partial state the amber chip is, so the link can never
+  // appear beside a chip that says the pattern is done.
+  assert.equal(
+    canReviewUnfixedGroups({
+      redirectsAppliedAt: "2026-08-21T02:30:00Z",
+      redirectsSkippedLocs: 0,
+      redirectsSkippedShapes: [{ shape: "/a/a-9999/" }]
+    }),
+    false
+  );
+  assert.equal(
+    canReviewUnfixedGroups({
+      redirectsAppliedAt: null,
+      redirectsSkippedLocs: 100,
+      redirectsSkippedShapes: [{ shape: "/a/a-9999/" }]
+    }),
+    false
+  );
+});
+
+test("the review link names the number of URLs at stake", () => {
+  assert.equal(
+    reviewUnfixedGroupsTitle({ redirectsSkippedLocs: 10363824 }),
+    "Say what should happen to the 10,363,824 URLs this fix left unchanged"
+  );
 });

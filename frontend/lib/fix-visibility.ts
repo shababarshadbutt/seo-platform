@@ -162,6 +162,49 @@ export function fixedBadgeDetail(row: {
   )} were left unchanged.`;
 }
 
+// CAN THIS ROW REOPEN ITS SHORTFALL? (v1.86)
+//
+// WHAT WAS WRONG. The unfixed-groups review had exactly one door: a button on the
+// toast a partial apply produced. Dismiss that toast — or reload the page, or come
+// back tomorrow — and the shortfall became unreachable, with no way back short of
+// re-running the fix to regenerate the same toast.
+//
+// The data was never the problem. Both apply paths persist the group histogram to
+// patterns.redirects_skipped_shapes (migration 052), and the results page has been
+// reading it into PatternRow.redirectsSkippedShapes the whole time without ever
+// using it. This predicate is what finally spends it.
+//
+// GATED ON THE GROUPS, NOT ON THE COUNTS. A row can report a shortfall with an
+// empty histogram — rows fixed before migration 052 have no measurement at all,
+// and a truncated write could leave the count without the list. Offering a review
+// that opens an empty dialog is worse than offering nothing, so the list itself is
+// the condition.
+export function canReviewUnfixedGroups(row: {
+  redirectsAppliedAt?: string | null;
+  redirectsSkippedLocs?: number | null;
+  redirectsSkippedShapes?: unknown[] | null;
+}): boolean {
+  return (
+    fixedBadgeState(row) === "partial" &&
+    Array.isArray(row.redirectsSkippedShapes) &&
+    row.redirectsSkippedShapes.length > 0
+  );
+}
+
+// The review link's words. Here rather than in the JSX for the reason the rest of
+// this module is here: results/page.tsx has no component test harness.
+export const REVIEW_UNFIXED_GROUPS_LABEL = "Review unfixed groups";
+
+export function reviewUnfixedGroupsTitle(row: {
+  redirectsSkippedLocs?: number | null;
+}): string {
+  const skipped = row.redirectsSkippedLocs ?? 0;
+
+  return `Say what should happen to the ${skipped.toLocaleString(
+    "en-US"
+  )} URLs this fix left unchanged`;
+}
+
 // Do this pattern's URL counts predate its last fix?
 //
 // THE ROOT CAUSE OF THE REPORTED CONFUSION. apply-redirects rewrites the <loc>

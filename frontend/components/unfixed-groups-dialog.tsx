@@ -1,17 +1,26 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Loader2 } from "lucide-react";
 
-import { saveShapeRule, type SkippedShape } from "@/lib/api";
+import {
+  getShapeRules,
+  saveShapeRule,
+  type ShapeRuleRecord,
+  type SkippedShape
+} from "@/lib/api";
 import {
   applyBlockedReason,
   buildSkippedGroupRows,
   describeApplyScope,
   describeReach,
   describeRule,
+  describeUnmatchedRule,
+  partitionSkippedGroupRows,
   selectedReach,
-  type ShapeRuleState
+  unresolvedSummary,
+  type ShapeRuleState,
+  type SkippedGroupRow
 } from "@/lib/skipped-group-rows";
 import { Button } from "@/components/ui/button";
 import {
@@ -36,22 +45,80 @@ import {
 // the pairs with the same deriveRedirectRule a probe would use — so a rule
 // somebody typed and a rule that was measured are the same kind of object, and
 // neither can express something the rewriter would refuse to honour.
+//
+// AND SINCE v1.86 IT IS A VIEW OF THE REMAINDER, not a fresh start every time.
+// Three things made a second pass repeat the first:
+//
+//   * it never read the saved rules back, so a group that had already been
+//     answered read "Nothing yet" exactly like one nobody had touched;
+//   * select-all ticked those answered groups too, so a bulk save overwrote
+//     answers that were already correct;
+//   * Apply closed the dialog and the group list never refreshed, so seeing what
+//     was left meant finding the next toast.
+//
+// The first of those was the one that could loop forever. The save endpoint
+// stores a rule for every shape asked for WITHOUT checking that it transforms
+// each one — deliberately, because the next coverage report catches it — so a
+// group the rule cannot match reappears with its count intact. Unable to tell
+// that group from an unanswered one, an operator retypes the rule that already
+// failed. The dialog now says which groups carry a rule, and says when one of
+// them came back anyway.
+
+type Residue = {
+  shapes: SkippedShape[];
+  skippedInScope: number | null;
+  shapesTruncated?: boolean;
+  measuredAt?: string | null;
+};
 
 type Props = {
   sessionId: string;
   patternId: string;
   template: string;
   shapes: SkippedShape[];
+  // The apply's own count of what it left behind, and whether the group list was
+  // capped. Reported rather than summed from `shapes` — the backend caps the
+  // histogram at its 25 biggest groups, so a sum would under-report and imply the
+  // list is complete.
+  skippedInScope?: number | null;
+  shapesTruncated?: boolean;
+  // WHEN the residue on screen was measured — the apply that produced it. The
+  // caveat on an answered group that came back anyway is only honest if the rule
+  // predates the measurement, so this is what makes that claim checkable rather
+  // than assumed. Null when unknown, and then no such claim is made.
+  measuredAt?: string | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  // Re-run the fix. The dialog does not apply anything itself: saving a rule and
-  // applying it are separate acts, and the apply already knows how to pick up
-  // every agreed rule for the pattern.
-  onApply: () => void;
+  // Re-run the fix and RESOLVE WITH WHAT IS STILL LEFT (v1.86). The dialog still
+  // does not apply anything itself — saving a rule and applying it stay separate
+  // acts, and the apply already knows how to pick up every agreed rule for the
+  // pattern — but it now stays open and shows the new remainder, so one dialog
+  // carries fix → see what is left → fix again. Resolving null means the outcome
+  // is not known here (a queued apply that has not landed), which the dialog says
+  // rather than implying the list is current.
+  onApply: () => Promise<Residue | null>;
 };
 
-function formatNumber(value: number) {
-  return new Intl.NumberFormat("en-US").format(value);
+// A stored rule as the row model wants it.
+//
+// KEEPS THE THREE WORDS APART. Migrations 051 and 053 spent two releases
+// separating fetched from inferred from asserted, and record that an earlier
+// conflation took two releases to undo. `operator` is an assertion, `sampled` is a
+// measurement, and an unagreed row is a measurement that came back inconsistent —
+// which is exactly the state that produces these shortfalls, so it must not be
+// dressed up as an answer.
+function toRuleState(record: ShapeRuleRecord): ShapeRuleState | null {
+  if (!record.rule || !record.agreed) {
+    return null;
+  }
+
+  return {
+    kind: record.source === "operator" ? "operator" : "measured",
+    summary: describeRule(record.rule),
+    // Carried through so the "this rule may not fit" caveat can tell a rule an
+    // apply has already failed to match from one saved moments ago.
+    authoredAt: record.authored_at ?? null
+  };
 }
 
 export function UnfixedGroupsDialog({
@@ -59,6 +126,9 @@ export function UnfixedGroupsDialog({
   patternId,
   template,
   shapes,
+  skippedInScope = null,
+  shapesTruncated = false,
+  measuredAt = null,
   open,
   onOpenChange,
   onApply
@@ -69,6 +139,49 @@ export function UnfixedGroupsDialog({
   const [drafts, setDrafts] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [loadingRules, setLoadingRules] = useState(false);
+  const [applying, setApplying] = useState(false);
+  // What the last in-dialog apply reported, so pressing Fix has a visible result
+  // instead of the dialog simply redrawing with fewer rows.
+  const [applyNote, setApplyNote] = useState("");
+  const [showResolved, setShowResolved] = useState(false);
+  // The residue is STATE, not the prop, so an apply can replace it in place. The
+  // prop seeds it and remains the truth for a freshly opened dialog.
+  const [residue, setResidue] = useState<Residue>({
+    shapes,
+    skippedInScope,
+    shapesTruncated,
+    measuredAt
+  });
+
+  const loadRules = useCallback(async () => {
+    setLoadingRules(true);
+
+    try {
+      const records = await getShapeRules(sessionId, patternId);
+
+      setRules(() => {
+        const next = new Map<string, ShapeRuleState>();
+
+        for (const record of records) {
+          const state = toRuleState(record);
+
+          if (state) {
+            next.set(record.shape, state);
+          }
+        }
+
+        return next;
+      });
+    } catch {
+      // A pattern with no rules yet is the common case and not an error worth a
+      // banner; a genuine failure degrades to the pre-v1.86 behaviour of showing
+      // every group as unanswered, which is wrong but not misleading — the rows
+      // still say what they say and saving still works.
+    } finally {
+      setLoadingRules(false);
+    }
+  }, [patternId, sessionId]);
 
   // Reopening on a different pattern must not show the previous one's answers.
   useEffect(() => {
@@ -81,16 +194,35 @@ export function UnfixedGroupsDialog({
     setEditing(null);
     setDrafts([]);
     setError("");
-  }, [open, patternId]);
+    setApplyNote("");
+    setShowResolved(false);
+    setResidue({ shapes, skippedInScope, shapesTruncated, measuredAt });
+    void loadRules();
+    // shapes/skippedInScope/shapesTruncated are deliberately NOT dependencies: they
+    // seed the residue on open and must not clobber a refresh mid-session, which is
+    // what re-running this on a new prop identity would do.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, patternId, loadRules]);
 
   const rows = useMemo(
-    () => buildSkippedGroupRows(shapes, rules),
-    [shapes, rules]
+    () => buildSkippedGroupRows(residue.shapes, rules),
+    [residue.shapes, rules]
+  );
+  const { unresolved, resolved } = useMemo(
+    () => partitionSkippedGroupRows(rows),
+    [rows]
   );
   const blocked = applyBlockedReason(rows);
-  const reach = selectedReach(rows, selected);
-  const allSelected = rows.length > 0 && selected.size === rows.length;
+  const busy = saving || applying;
+  // Select-all covers the OUTSTANDING groups only. Ticking chooses what an edit is
+  // saved for, so including groups that already have the right answer would let one
+  // bulk save overwrite work that was already done — the opposite of what a second
+  // pass is for.
+  const allSelected =
+    unresolved.length > 0 &&
+    unresolved.every((row) => selected.has(row.shape));
   const editingRow = rows.find((row) => row.shape === editing) ?? null;
+  const selectedCount = selected.size;
 
   function openEditor(shape: string, examples: string[]) {
     setEditing(shape);
@@ -99,6 +231,20 @@ export function UnfixedGroupsDialog({
     // is a small change to something already on screen.
     setDrafts([...examples]);
     setError("");
+  }
+
+  function toggle(shape: string) {
+    setSelected((current) => {
+      const next = new Set(current);
+
+      if (next.has(shape)) {
+        next.delete(shape);
+      } else {
+        next.add(shape);
+      }
+
+      return next;
+    });
   }
 
   async function save(bulk: boolean) {
@@ -162,6 +308,124 @@ export function UnfixedGroupsDialog({
     }
   }
 
+  // Fix, then show what is STILL left — without closing (v1.86).
+  async function apply() {
+    setApplying(true);
+    setError("");
+    setApplyNote("");
+
+    try {
+      const next = await onApply();
+
+      if (!next) {
+        // A queued apply whose outcome is not known here. Saying so is the honest
+        // answer: silently leaving the old list on screen would present a stale
+        // remainder as a fresh one.
+        setApplyNote(
+          "The fix is running in the background. This list will not update until it finishes — reopen it then to see what is left."
+        );
+
+        return;
+      }
+
+      // Stamped NOW when the caller did not date it: this residue was measured by
+      // the apply that just returned, and that timestamp is what lets a rule saved
+      // before it be told apart from one saved after.
+      setResidue({
+        ...next,
+        measuredAt: next.measuredAt ?? new Date().toISOString()
+      });
+      setSelected(new Set());
+      setEditing(null);
+      // Re-read the rules too: the apply may have consumed some, and a group that
+      // came back despite having one is precisely what the caveat needs to flag.
+      await loadRules();
+
+      const remaining = next.shapes.length;
+
+      setApplyNote(
+        remaining === 0
+          ? "Every group in this pattern is fixed. Download the sitemap to confirm the change."
+          : `${remaining} group${remaining === 1 ? "" : "s"} ${
+              remaining === 1 ? "is" : "are"
+            } still unfixed.`
+      );
+    } catch (nextError) {
+      setError(
+        nextError instanceof Error ? nextError.message : "The fix failed to run."
+      );
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  function renderRow(row: SkippedGroupRow, selectable: boolean) {
+    const caveat = describeUnmatchedRule(row, residue.measuredAt);
+
+    return (
+      <tr key={row.shape} className="border-t align-top">
+        <td className="px-3 py-2">
+          {selectable ? (
+            <input
+              type="checkbox"
+              aria-label={`Select ${row.shape}`}
+              className="mt-1 h-4 w-4 rounded border-slate-300"
+              checked={selected.has(row.shape)}
+              disabled={busy}
+              onChange={() => toggle(row.shape)}
+            />
+          ) : null}
+        </td>
+        <td className="max-w-[280px] px-3 py-2">
+          <span className="block break-all font-mono text-xs">
+            {row.examples[0] ?? row.shape}
+          </span>
+          {/* THE GROUP'S OWN PATTERN, on screen rather than in a tooltip. The
+              example says which URLs these are; the shape says what they have in
+              common, which is what the rule has to describe. It was reachable
+              only by hovering the cell. */}
+          <span className="mt-0.5 block break-all font-mono text-[11px] text-muted-foreground">
+            {row.shape}
+          </span>
+        </td>
+        <td className="whitespace-nowrap px-3 py-2 font-medium">
+          {describeReach(row)}
+        </td>
+        <td className="px-3 py-2">
+          {row.rule.kind === "none" ? (
+            <span className="text-muted-foreground">
+              Nothing yet — these stay as they are
+            </span>
+          ) : (
+            <span className="space-y-0.5">
+              <span className="block font-mono text-xs">
+                {row.rule.summary}
+              </span>
+              <span className="block text-[11px] uppercase tracking-wide text-muted-foreground">
+                {row.rule.kind === "operator" ? "You set this" : "Measured"}
+              </span>
+              {caveat ? (
+                <span className="block text-[11px] text-amber-700">
+                  {caveat}
+                </span>
+              ) : null}
+            </span>
+          )}
+        </td>
+        <td className="whitespace-nowrap px-3 py-2 text-right">
+          <button
+            type="button"
+            className="text-xs font-semibold text-primary underline hover:text-primary/80 disabled:no-underline disabled:opacity-50"
+            disabled={busy}
+            onClick={() => openEditor(row.shape, row.examples)}
+          >
+            {row.rule.kind === "none" ? "Set the result" : "Edit"}
+          </button>
+        </td>
+      </tr>
+    );
+  }
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-4xl">
@@ -169,12 +433,27 @@ export function UnfixedGroupsDialog({
           <DialogTitle>Unfixed URL groups</DialogTitle>
         </DialogHeader>
 
-        <p className="text-sm text-muted-foreground">
-          These URLs are in{" "}
-          <code className="font-mono text-xs">{template}</code> but the fix left
-          them alone, because nothing yet says where they should go. Set the
-          result for a group, then run the fix again.
-        </p>
+        <div className="space-y-1">
+          <p className="text-sm text-muted-foreground">
+            These URLs are in{" "}
+            <code className="font-mono text-xs">{template}</code> but the fix
+            left them alone, because nothing yet says where they should go. Set
+            the result for a group, then run the fix again.
+          </p>
+          <p className="text-sm font-medium">
+            {unresolvedSummary({
+              skippedInScope: residue.skippedInScope,
+              rows,
+              shapesTruncated: residue.shapesTruncated
+            })}
+          </p>
+        </div>
+
+        {applyNote ? (
+          <p className="rounded-md border border-primary/40 bg-primary/5 px-3 py-2 text-sm">
+            {applyNote}
+          </p>
+        ) : null}
 
         <div className="max-h-[420px] overflow-y-auto rounded-md border">
           <table className="w-full text-sm">
@@ -183,22 +462,25 @@ export function UnfixedGroupsDialog({
                 <th className="w-8 px-3 py-2">
                   {/* Select all — the "fix all" entry point. Indeterminate when
                       only some are ticked, so it never claims a state it is
-                      not in. */}
+                      not in. It covers the OUTSTANDING groups only; see
+                      allSelected above for why. */}
                   <input
                     type="checkbox"
-                    aria-label="Select every group"
+                    aria-label="Select every unfixed group"
                     className="h-4 w-4 rounded border-slate-300"
                     checked={allSelected}
+                    disabled={busy || unresolved.length === 0}
                     ref={(node) => {
                       if (node) {
-                        node.indeterminate = selected.size > 0 && !allSelected;
+                        node.indeterminate =
+                          selected.size > 0 && !allSelected;
                       }
                     }}
                     onChange={() =>
                       setSelected(
                         allSelected
                           ? new Set()
-                          : new Set(rows.map((row) => row.shape))
+                          : new Set(unresolved.map((row) => row.shape))
                       )
                     }
                   />
@@ -210,66 +492,55 @@ export function UnfixedGroupsDialog({
               </tr>
             </thead>
             <tbody>
-              {rows.map((row) => (
-                <tr key={row.shape} className="border-t align-top">
-                  <td className="px-3 py-2">
-                    <input
-                      type="checkbox"
-                      aria-label={`Select ${row.shape}`}
-                      className="mt-1 h-4 w-4 rounded border-slate-300"
-                      checked={selected.has(row.shape)}
-                      onChange={() =>
-                        setSelected((current) => {
-                          const next = new Set(current);
+              {loadingRules && rows.length > 0 ? (
+                <tr className="border-t">
+                  <td colSpan={5} className="px-3 py-2 text-xs text-muted-foreground">
+                    <Loader2 className="mr-2 inline h-3.5 w-3.5 animate-spin" />
+                    Checking which of these already have a rule…
+                  </td>
+                </tr>
+              ) : null}
 
-                          if (next.has(row.shape)) {
-                            next.delete(row.shape);
-                          } else {
-                            next.add(row.shape);
-                          }
+              {rows.length === 0 ? (
+                <tr className="border-t">
+                  <td colSpan={5} className="px-3 py-6 text-center text-sm text-muted-foreground">
+                    No unfixed groups are left in this pattern.
+                  </td>
+                </tr>
+              ) : null}
 
-                          return next;
-                        })
-                      }
-                    />
+              {unresolved.length > 0 ? (
+                <tr className="border-t bg-muted/30">
+                  <td colSpan={5} className="px-3 py-1.5 text-xs font-semibold uppercase tracking-wide">
+                    Still needs an answer ({unresolved.length})
                   </td>
-                  <td className="max-w-[280px] px-3 py-2" title={row.shape}>
-                    <span className="block break-all font-mono text-xs">
-                      {row.examples[0] ?? row.shape}
-                    </span>
-                  </td>
-                  <td className="whitespace-nowrap px-3 py-2 font-medium">
-                    {describeReach(row)}
-                  </td>
-                  <td className="px-3 py-2">
-                    {row.rule.kind === "none" ? (
-                      <span className="text-muted-foreground">
-                        Nothing yet — these stay as they are
-                      </span>
-                    ) : (
-                      <span className="space-y-0.5">
-                        <span className="block font-mono text-xs">
-                          {row.rule.summary}
-                        </span>
-                        <span className="block text-[11px] uppercase tracking-wide text-muted-foreground">
-                          {row.rule.kind === "operator"
-                            ? "You set this"
-                            : "Measured"}
-                        </span>
-                      </span>
-                    )}
-                  </td>
-                  <td className="whitespace-nowrap px-3 py-2 text-right">
+                </tr>
+              ) : null}
+              {unresolved.map((row) => renderRow(row, true))}
+
+              {/* ALREADY ANSWERED, collapsed and out of the way but never hidden.
+                  Removing them would lose the one thing that stops the loop: a
+                  group that HAS a rule and came back unfixed anyway is visible
+                  here, with the caveat saying the rule may not fit it. */}
+              {resolved.length > 0 ? (
+                <tr className="border-t bg-muted/30">
+                  <td colSpan={5} className="px-3 py-1.5">
                     <button
                       type="button"
-                      className="text-xs font-semibold text-primary underline hover:text-primary/80"
-                      onClick={() => openEditor(row.shape, row.examples)}
+                      className="text-xs font-semibold uppercase tracking-wide text-primary"
+                      onClick={() => setShowResolved((current) => !current)}
                     >
-                      {row.rule.kind === "none" ? "Set the result" : "Edit"}
+                      {showResolved ? "▾" : "▸"} Already answered (
+                      {resolved.length} group{resolved.length === 1 ? "" : "s"} ·{" "}
+                      {resolved
+                        .reduce((total, row) => total + row.urls, 0)
+                        .toLocaleString("en-US")}{" "}
+                      URLs)
                     </button>
                   </td>
                 </tr>
-              ))}
+              ) : null}
+              {showResolved ? resolved.map((row) => renderRow(row, true)) : null}
             </tbody>
           </table>
         </div>
@@ -313,7 +584,7 @@ export function UnfixedGroupsDialog({
                 variant="outline"
                 size="sm"
                 onClick={() => setEditing(null)}
-                disabled={saving}
+                disabled={busy}
               >
                 Cancel
               </Button>
@@ -322,7 +593,7 @@ export function UnfixedGroupsDialog({
                 variant="outline"
                 size="sm"
                 onClick={() => void save(false)}
-                disabled={saving}
+                disabled={busy}
               >
                 {saving ? (
                   <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
@@ -332,18 +603,20 @@ export function UnfixedGroupsDialog({
               {/* The bulk action, and the one the reported case needed: 24
                   groups sharing one prefix and one correct change between them.
                   Only offered when it would do something more than the button
-                  beside it. */}
-              {selected.size > 1 ? (
+                  beside it. The URL count is on it so a save that reaches
+                  hundreds of thousands of URLs says so before it is pressed. */}
+              {selectedCount > 1 ? (
                 <Button
                   type="button"
                   size="sm"
                   onClick={() => void save(true)}
-                  disabled={saving}
+                  disabled={busy}
                 >
                   {saving ? (
                     <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
                   ) : null}
-                  Save for all {selected.size} selected groups
+                  Save for all {selectedCount} selected groups (
+                  {selectedReach(rows, selected).toLocaleString("en-US")} URLs)
                 </Button>
               ) : null}
             </div>
@@ -362,17 +635,18 @@ export function UnfixedGroupsDialog({
               type="button"
               variant="outline"
               onClick={() => onOpenChange(false)}
+              disabled={busy}
             >
               Close
             </Button>
             <Button
               type="button"
-              disabled={blocked !== null}
-              onClick={() => {
-                onOpenChange(false);
-                onApply();
-              }}
+              disabled={blocked !== null || busy}
+              onClick={() => void apply()}
             >
+              {applying ? (
+                <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+              ) : null}
               Fix selected groups
             </Button>
           </div>

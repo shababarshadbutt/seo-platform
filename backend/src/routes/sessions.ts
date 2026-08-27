@@ -5319,6 +5319,78 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     }
   );
 
+  // THE RULES THIS PATTERN ALREADY HAS (v1.86).
+  //
+  // WHAT WAS WRONG. The POST above existed with no counterpart, so the Review
+  // unfixed groups dialog had no way to learn what it had already been told. It
+  // reset its rule map to empty on every open, and every row therefore read
+  // "Nothing yet — these stay as they are" even with an agreed rule for that
+  // shape sitting in this table.
+  //
+  // That is not merely cosmetic, because of the trade-off the POST documents
+  // above: a rule is saved for every shape asked for WITHOUT checking it
+  // transforms each one, so a group the rule cannot match reappears in the next
+  // coverage report with its count intact. With no way to read the rule back,
+  // that group is indistinguishable from one nobody has answered — so the
+  // operator retypes the rule that already failed, and can do so forever. This
+  // endpoint is what makes the second pass about the REMAINDER.
+  //
+  // IT REPORTS `source` RATHER THAN FLATTENING IT. Migration 051 and 053 spent
+  // two releases keeping fetched, inferred and asserted apart; a read path that
+  // returned them all as "has a rule" would quietly undo that, so the caller
+  // gets the column and decides how to say it.
+  app.get<{ Params: PatternParams }>(
+    "/api/sessions/:id/patterns/:patternId/shape-rules",
+    async (request, reply) => {
+      const patternResult = await pool.query(
+        "SELECT id FROM patterns WHERE session_id = $1 AND id = $2",
+        [request.params.id, request.params.patternId]
+      );
+
+      if (patternResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "pattern not found" });
+      }
+
+      const result = await pool.query<{
+        shape: string;
+        rule: RedirectRule | null;
+        source: string;
+        agreed: boolean;
+        sample_size: number;
+        population: number;
+        authored_at: Date | null;
+      }>(
+        `
+          SELECT shape, rule, source, agreed, sample_size, population, authored_at
+          FROM pattern_shape_rules
+          WHERE pattern_id = $1 AND rule IS NOT NULL
+          ORDER BY shape
+        `,
+        [request.params.patternId]
+      );
+
+      return {
+        // UNAGREED ROWS ARE INCLUDED, and flagged. A stratified probe that came
+        // back unagreed is exactly the state that produced the shortfall this
+        // dialog exists for, and the apply skips those rows (redirectApply
+        // filters on agreed = true). Hiding them would tell the operator nothing
+        // is known about a group that has in fact already been measured and
+        // found inconsistent.
+        rules: result.rows.map((row) => ({
+          shape: row.shape,
+          rule: row.rule,
+          source: row.source,
+          agreed: row.agreed,
+          sample_size: row.sample_size,
+          population: row.population,
+          authored_at: row.authored_at ? row.authored_at.toISOString() : null
+        }))
+      };
+    }
+  );
+
   app.post<{
     Params: PatternParams;
     Body: {
@@ -5768,6 +5840,51 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             [
               request.params.patternId,
               rewrittenLocCount,
+              skipped.skippedInScope,
+              JSON.stringify(skipped.byShape)
+            ]
+          );
+        } else if (
+          // A RE-APPLY THAT CHANGED NOTHING STILL MEASURED SOMETHING (v1.86).
+          //
+          // The branch above is the only writer of the coverage columns, so a
+          // second apply that rewrote no <loc> left the FIRST apply's numbers
+          // and group list on the row. Those are now read after the fact — the
+          // Partly fixed chip offers a way back into the unfixed-groups dialog
+          // and seeds it from redirects_skipped_shapes — so stale values are no
+          // longer merely untidy: they reopen a list of groups that may already
+          // have been resolved.
+          //
+          // BOTH INVARIANTS THE BRANCH ABOVE DEFENDS ARE KEPT. redirects_applied_at
+          // is deliberately NOT touched here, so "a pattern is fixed when a URL
+          // changed, and not otherwise" (v1.74) still holds; and this only ever
+          // runs for a pattern ALREADY stamped, so a coverage figure can still
+          // never appear without the chip it qualifies (v1.81).
+          //
+          // filesScanned > 0 is the guard that makes this a measurement rather
+          // than an assumption: a run that opened no file measured nothing, and
+          // overwriting a real tally with its zeros would report a complete fix
+          // on a pattern nobody looked at.
+          patternResult.rows[0].redirects_applied_at &&
+          filesScanned > 0
+        ) {
+          // ONLY THE SKIPPED SIDE IS REWRITTEN. redirects_applied_locs is left
+          // exactly as it was, and that is the point of a separate statement
+          // rather than reusing the one above: this branch runs precisely when
+          // rewrittenLocCount is 0, so writing it would replace a real "1,143,944
+          // updated" with a zero and make a pattern that WAS fixed report that
+          // nothing had ever been applied to it. Nothing new was applied, so the
+          // applied figure is already correct; what changed is how much is still
+          // outstanding, which is the half being measured again.
+          await client.query(
+            `
+              UPDATE patterns
+              SET redirects_skipped_locs = $2,
+                  redirects_skipped_shapes = $3::jsonb
+              WHERE id = $1
+            `,
+            [
+              request.params.patternId,
               skipped.skippedInScope,
               JSON.stringify(skipped.byShape)
             ]
@@ -7502,10 +7619,12 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         return reply.code(400).send(badRequest("a cleaner token is required"));
       }
 
-      const run = getCleanerRun(token);
+      const run = await getCleanerRun(token);
 
       if (!run) {
-        // Runs expire after an hour, taking their working directory with them.
+        // Runs expire after two hours, taking their working directory with them.
+        // Since v1.86 the lookup also consults the durable index, so this is a
+        // genuine expiry rather than the API having been restarted underneath it.
         return reply.code(404).send({
           error: "Not Found",
           message:

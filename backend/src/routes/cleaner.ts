@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, rm, stat } from "node:fs/promises";
+import { mkdir, readdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { randomUUID } from "node:crypto";
@@ -15,6 +15,7 @@ import type {
 import { ZipArchive } from "archiver";
 
 import { config, sftpConfigError } from "../config.js";
+import { pool } from "../db/pool.js";
 import {
   assertSafeDomain,
   downloadSftpFiles,
@@ -40,16 +41,28 @@ import {
   type RunFrame
 } from "../sitemaps/cleanerRuns.js";
 
-// The Sitemap Cleaner is stateless — nothing is written to the DB. Uploads and
-// generated files ARE spilled to disk (a per-run working directory under the
-// uploads volume) rather than held in memory, so a large file set never blows
-// the heap. The only server-side state is a short-lived in-memory cache mapping
-// each run's download token to the on-disk paths of its ZIP + cleaned files
-// (plus the domain), which the SSE→download split and the "hand off to
-// Migration" flow (v1.37 Fix 2) reuse without a re-upload. TTL is 1 hour so the
-// handoff token stays valid long enough for the user to start a migration; when
-// it expires the whole working directory is deleted.
-const RUN_TTL_MS = 60 * 60 * 1000;
+// Uploads and generated files are spilled to disk (a per-run working directory
+// under the uploads volume) rather than held in memory, so a large file set never
+// blows the heap. The in-memory cache below maps each run's download token to the
+// on-disk paths of its ZIP + cleaned files (plus the domain), which the
+// SSE→download split and the "hand off to Migration" flow (v1.37 Fix 2) reuse
+// without a re-upload. When the TTL expires the whole working directory is deleted.
+//
+// THE CLEANER IS NO LONGER ENTIRELY STATELESS (v1.86). It still writes no cleaned
+// data to the database, but each finished run is now INDEXED there (migration 054)
+// so a token survives an API restart and the Migration page can list what is
+// available. The cache is now a fast path in front of that index rather than the
+// only record of a run — see getCleanerRun.
+//
+// TWO HOURS, raised from one. The window has to cover the gap this release exists
+// to close: an operator hands off to Migration, the tab loses its connection or is
+// reloaded, and they come back to pick the run up again. An hour was measured
+// against a single uninterrupted hand-off; it is the interruption that needs the
+// slack. Two hours stays well inside the 6-hour staleArtifactSweep backstop, whose
+// own comment sizes it as "longest plausible run + that retention" — with the
+// longest measured SFTP pull at ~25 minutes, 2h + that still clears 6h comfortably,
+// so the backstop keeps its documented margin and does not move.
+const RUN_TTL_MS = 2 * 60 * 60 * 1000;
 
 // Keepalive comment ping cadence for the SSE stream. During a long clean (e.g.
 // 196 files) no progress data may flow for a while; without a periodic byte a
@@ -107,15 +120,183 @@ function storeRun(token: string, run: CachedRun) {
   const timer = setTimeout(() => {
     runCache.delete(token);
     discardDir(run.dir);
+    // The row goes with the bytes. Leaving it behind would leave the picker
+    // offering a run whose files this very timer just deleted — the listing
+    // route checks the directory too, but the authority on "this run is over"
+    // is whatever removed it, so it says so rather than relying on the reader.
+    void forgetCleanerRun(token);
   }, RUN_TTL_MS);
   timer.unref?.();
+}
+
+// Index a finished run so it outlives this process (v1.86, migration 054).
+//
+// BEST-EFFORT ON PURPOSE. A clean that succeeded must not be reported as failed
+// because the index write did not land: the ZIP is on disk and the token is in the
+// cache, so everything the caller is about to be told still works in this process.
+// Losing the row costs the run its restart-survival and its place in the picker,
+// which is worth a warning and not worth an error frame.
+async function rememberCleanerRun(entry: {
+  runId: string;
+  token: string;
+  domain: string;
+  subfolder: string;
+  zipFilename: string;
+  outDir: string;
+  fileCount: number;
+  urlCount: number;
+  log: FastifyBaseLogger;
+}) {
+  try {
+    await pool.query(
+      `
+        INSERT INTO cleaner_runs
+          (run_id, download_token, domain, subfolder, zip_filename, out_dir,
+           file_count, url_count, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now() + ($9 || ' milliseconds')::interval)
+        ON CONFLICT (run_id) DO NOTHING
+      `,
+      [
+        entry.runId,
+        entry.token,
+        entry.domain,
+        entry.subfolder || null,
+        entry.zipFilename,
+        entry.outDir,
+        entry.fileCount,
+        entry.urlCount,
+        String(RUN_TTL_MS)
+      ]
+    );
+  } catch (error) {
+    entry.log.warn(
+      { error, run_id: entry.runId },
+      "cleaner: could not index run for reuse (run still usable in this process)"
+    );
+  }
+}
+
+async function forgetCleanerRun(token: string) {
+  try {
+    await pool.query("DELETE FROM cleaner_runs WHERE download_token = $1", [
+      token
+    ]);
+  } catch {
+    // Nothing to do and nothing to report: the row is advisory, the listing
+    // route verifies the directory anyway, and staleArtifactSweep will clear it.
+  }
 }
 
 // Look up a completed run by its handoff token. Exported so the Migration side
 // can ingest the cleaned files DIRECTLY off disk instead of shipping them to the
 // browser and back — see /api/sessions/:id/sources/cleaner.
-export function getCleanerRun(token: string) {
-  return runCache.get(token);
+//
+// ASYNC SINCE v1.86, because a cache miss is no longer the end of the story. The
+// cache is process-local, so before this an API restart turned every outstanding
+// token into a 404 — with the cleaned bytes still sitting on the uploads volume,
+// unreachable because nothing remembered their paths. On a miss we now ask the
+// index (migration 054) and rebuild the entry from the directory it names.
+//
+// THE DIRECTORY IS THE AUTHORITY, not the row. staleArtifactSweep removes trees by
+// age without consulting any table, so a row can name a directory that is gone; a
+// rehydrate that cannot read the outputs reports a miss and drops the row rather
+// than handing back an entry whose files would 404 one layer down.
+export async function getCleanerRun(
+  token: string
+): Promise<CachedRun | undefined> {
+  const cached = runCache.get(token);
+
+  if (cached) {
+    return cached;
+  }
+
+  let row;
+
+  try {
+    const result = await pool.query<{
+      domain: string;
+      zip_filename: string;
+      out_dir: string;
+      remaining_ms: number;
+    }>(
+      `
+        SELECT domain, zip_filename, out_dir,
+               floor(extract(epoch from (expires_at - now())) * 1000)::bigint
+                 AS remaining_ms
+        FROM cleaner_runs
+        WHERE download_token = $1 AND expires_at > now()
+      `,
+      [token]
+    );
+
+    row = result.rows[0];
+  } catch {
+    return undefined;
+  }
+
+  if (!row) {
+    return undefined;
+  }
+
+  // The run directory is the parent of out/: the ZIP is written beside it, and it
+  // is what discardDir removes wholesale.
+  const runDir = path.dirname(row.out_dir);
+  const zipPath = path.join(runDir, row.zip_filename);
+  let files: CleanerOutputFile[];
+
+  try {
+    const names = await readdir(row.out_dir);
+
+    // Sorted so the handoff INDICES are stable across a rehydrate. The metadata
+    // route and the bytes route index into the same filtered list, so an order
+    // that varied between processes would hand back file 3 of the previous
+    // listing — the quietest possible way to ingest the wrong sitemap.
+    files = names
+      .filter((name) => isXmlName(name) || name === REPORT_FILENAME)
+      .sort()
+      .map((name) => ({ filename: name, path: path.join(row.out_dir, name) }));
+  } catch {
+    void forgetCleanerRun(token);
+
+    return undefined;
+  }
+
+  if (files.length === 0) {
+    void forgetCleanerRun(token);
+
+    return undefined;
+  }
+
+  const entry: CachedRun = {
+    dir: runDir,
+    zipPath,
+    filename: row.zip_filename,
+    domain: row.domain,
+    files
+  };
+
+  // Re-armed on the STORED deadline, not on a fresh full TTL. storeRun's timer
+  // owned the directory's life and it died with the old process, so something has
+  // to take that job over — but calling storeRun here would grant another two
+  // hours from now, and a run would then live forever as long as anyone kept
+  // looking at it. expires_at is the deadline; this only reconnects a timer to it.
+  runCache.set(token, entry);
+
+  const remaining = Number(row.remaining_ms);
+  const timer = setTimeout(
+    () => {
+      runCache.delete(token);
+      discardDir(entry.dir);
+      void forgetCleanerRun(token);
+    },
+    // Clamped: the row was filtered on expires_at > now(), so this is positive,
+    // but a clock adjustment between the two must not turn into a negative delay
+    // that fires immediately and deletes a run somebody is mid-ingest on.
+    Math.max(remaining, 60_000)
+  );
+  timer.unref?.();
+
+  return entry;
 }
 
 function isXmlName(name: string) {
@@ -230,6 +411,34 @@ async function cleanPackageAndFinish(options: {
       filename: zipFilename,
       domain,
       files
+    });
+
+    // …and index it so it survives this process (v1.86). Written HERE, in the
+    // helper both sources funnel through, for the reason the helper exists: an
+    // upload-sourced run and an SFTP-sourced run must not differ in what they
+    // leave behind.
+    //
+    // run_id IS THE DIRECTORY NAME, taken from the path rather than from
+    // options.runId. Both callers already name the working directory after their
+    // own run id, but only the detached SFTP path passes that id down here — so
+    // minting a fresh one for the upload path would have indexed a run under an id
+    // matching no directory on disk, and staleArtifactSweep (which walks the
+    // filesystem and knows nothing but directory names) could never have matched
+    // the row to the tree it was deleting. Deriving it keeps the two in step by
+    // construction instead of by coincidence.
+    await rememberCleanerRun({
+      runId: path.basename(runDir),
+      token,
+      domain,
+      subfolder,
+      zipFilename,
+      outDir,
+      // The handoff file list, not every output: the ZIP also carries
+      // duplicates-report.csv, and counting that as a cleaned sitemap would make
+      // the picker offer "492 files" for 491 sitemaps.
+      fileCount: handoffFiles(files).length,
+      urlCount: result.clean_urls_remaining,
+      log
     });
 
     timer.mark("done");
@@ -610,11 +819,94 @@ export async function cleanerRoutes(app: FastifyInstance) {
     }
   );
 
+  // THE CLEANED SITEMAPS STILL AVAILABLE (v1.86).
+  //
+  // WHY THIS EXISTS. Cleaning an 11.5M-URL site is a long job, and the only handle
+  // on the result was a token the browser held in React state and the Migration
+  // page deliberately strips from the URL. Lose the tab — a reload, a dropped
+  // connection — and the cleaned files were still on the uploads volume with no way
+  // to name them, so the only way forward was to clean the whole site again. This
+  // is the way back in: the Migration page lists what is available and picks one.
+  //
+  // THE DIRECTORY IS CHECKED, NOT TRUSTED FROM THE ROW. staleArtifactSweep removes
+  // trees by age and consults no table, so a row can outlive its bytes. Offering
+  // such a run would produce a picker entry that 404s on selection — worse than not
+  // listing it, because it looks like the feature is broken rather than like the run
+  // has expired. Rows whose output is gone are dropped as they are found.
+  app.get("/api/cleaner/runs", async () => {
+    let rows;
+
+    try {
+      const result = await pool.query<{
+        download_token: string;
+        domain: string;
+        zip_filename: string;
+        out_dir: string;
+        file_count: number;
+        url_count: string;
+        created_at: Date;
+      }>(
+        `
+          SELECT download_token, domain, zip_filename, out_dir, file_count,
+                 url_count, created_at
+          FROM cleaner_runs
+          WHERE expires_at > now()
+          ORDER BY created_at DESC
+          LIMIT 25
+        `
+      );
+
+      rows = result.rows;
+    } catch (error) {
+      app.log.warn({ error }, "cleaner: could not list runs");
+
+      return { runs: [] };
+    }
+
+    const runs: Array<{
+      download_token: string;
+      domain: string;
+      zip_filename: string;
+      file_count: number;
+      url_count: number;
+      created_at: string;
+    }> = [];
+
+    for (const row of rows) {
+      try {
+        const info = await stat(row.out_dir);
+
+        if (!info.isDirectory()) {
+          continue;
+        }
+      } catch {
+        // Swept, or the volume was replaced. Forget it so the next listing does
+        // not pay for the same stat again.
+        void forgetCleanerRun(row.download_token);
+        continue;
+      }
+
+      runs.push({
+        download_token: row.download_token,
+        domain: row.domain,
+        zip_filename: row.zip_filename,
+        file_count: row.file_count,
+        // bigint arrives as a string from pg; the picker wants to format it.
+        url_count: Number(row.url_count),
+        created_at: row.created_at.toISOString()
+      });
+    }
+
+    // retention_ms so the picker can state how long these are kept without
+    // hardcoding a number that would then have to be changed in two places.
+    return { runs, retention_ms: RUN_TTL_MS };
+  });
+
   // Stream a previously generated ZIP by its one-time token.
   app.get<{ Params: { token: string } }>(
     "/api/cleaner/download/:token",
     async (request, reply) => {
-      const entry = runCache.get(request.params.token);
+      const entry = await getCleanerRun(request.params.token);
 
       if (!entry) {
         return reply.code(404).send({
@@ -657,7 +949,7 @@ export async function cleanerRoutes(app: FastifyInstance) {
   app.get<{ Params: { token: string } }>(
     "/api/cleaner/report/:token",
     async (request, reply) => {
-      const entry = runCache.get(request.params.token);
+      const entry = await getCleanerRun(request.params.token);
       const file = entry?.files.find(
         (candidate) => candidate.filename === REPORT_FILENAME
       );
@@ -703,7 +995,7 @@ export async function cleanerRoutes(app: FastifyInstance) {
   app.get<{ Params: { token: string } }>(
     "/api/cleaner/handoff/:token",
     async (request, reply) => {
-      const entry = runCache.get(request.params.token);
+      const entry = await getCleanerRun(request.params.token);
 
       if (!entry) {
         return reply.code(404).send({
@@ -730,7 +1022,7 @@ export async function cleanerRoutes(app: FastifyInstance) {
   app.get<{ Params: { token: string; index: string } }>(
     "/api/cleaner/handoff/:token/file/:index",
     async (request, reply) => {
-      const entry = runCache.get(request.params.token);
+      const entry = await getCleanerRun(request.params.token);
 
       if (!entry) {
         return reply.code(404).send({

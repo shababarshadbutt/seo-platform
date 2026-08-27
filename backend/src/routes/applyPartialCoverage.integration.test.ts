@@ -495,4 +495,129 @@ test("an apply that reaches part of a pattern reports the remainder", async (t) 
   );
 
   assert.equal(stored2.rowCount, 1, "the row exists even though it matches nothing");
+
+  // ---- v1.86: the dialog can READ BACK what it has already been told -------
+  //
+  // The trade-off just asserted above is exactly why this endpoint had to exist.
+  // A group whose rule cannot transform it keeps reappearing in the coverage
+  // report — correct, and indistinguishable from a group nobody has answered
+  // unless the saved rules can be read back. Without that, the operator retypes
+  // the rule that already failed, applies, sees the group again, and loops.
+  const readBack = await app.inject({
+    method: "GET",
+    url:
+      "/api/sessions/" + sessionId + "/patterns/" + patternId + "/shape-rules"
+  });
+
+  assert.equal(readBack.statusCode, 200, readBack.body);
+
+  const rules = readBack.json().rules as Array<{
+    shape: string;
+    rule: unknown;
+    source: string;
+    agreed: boolean;
+    sample_size: number;
+  }>;
+
+  // Every rule saved above comes back, including the unmatchable one — which is
+  // the whole point: that group is the one the dialog has to be able to flag.
+  const byShape = new Map(rules.map((row) => [row.shape, row]));
+
+  assert.ok(byShape.has(chosen.shape), "the resolved group's rule is readable");
+  assert.ok(byShape.has(other.shape), "and the bulk-saved group's");
+  assert.ok(
+    byShape.has(unmatchable),
+    "and the one whose rule matches nothing, so the dialog can say so"
+  );
+
+  // PROVENANCE SURVIVES THE ROUND TRIP. A read path that flattened these to
+  // "has a rule" would undo what migrations 051 and 053 spent two releases
+  // establishing, so the columns come through unchanged.
+  assert.equal(byShape.get(chosen.shape)?.source, "operator");
+  assert.equal(byShape.get(chosen.shape)?.agreed, true);
+  assert.equal(Number(byShape.get(chosen.shape)?.sample_size), 0);
+  assert.ok(byShape.get(chosen.shape)?.rule, "the rule itself is returned");
+
+  const missingPattern = await app.inject({
+    method: "GET",
+    url:
+      "/api/sessions/" +
+      sessionId +
+      "/patterns/00000000-0000-0000-0000-000000000000/shape-rules"
+  });
+
+  assert.equal(missingPattern.statusCode, 404, "an unknown pattern is a 404");
+
+  // ---- v1.86: a re-apply that changes nothing still refreshes the residue --
+  //
+  // WHAT WAS WRONG. The coverage columns were written only when a <loc> actually
+  // changed, so the numbers and the group list on the row were whatever the LAST
+  // apply that rewrote something had left there. That is now read back — the
+  // Partly fixed chip reopens the unfixed-groups dialog from
+  // redirects_skipped_shapes — so a stale list puts groups that have already been
+  // resolved back in front of the operator.
+  const before = await pool.query<{
+    redirects_applied_at: Date;
+    redirects_applied_locs: number;
+  }>(
+    "SELECT redirects_applied_at, redirects_applied_locs FROM patterns WHERE id = $1",
+    [patternId]
+  );
+
+  // Everything this pattern can reach has now been rewritten, so this apply
+  // changes nothing — the exact case that used to leave the columns untouched.
+  const noop = await app.inject({
+    method: "POST",
+    url:
+      "/api/sessions/" +
+      sessionId +
+      "/patterns/" +
+      patternId +
+      "/apply-redirects",
+    payload: {}
+  });
+
+  assert.equal(noop.statusCode, 200, noop.body);
+  assert.equal(
+    noop.json().rewritten_loc_count,
+    0,
+    "this apply must rewrite nothing for the assertion below to mean anything"
+  );
+
+  const afterNoop = await pool.query<{
+    redirects_applied_at: Date;
+    redirects_applied_locs: number;
+    redirects_skipped_locs: number;
+  }>(
+    `
+      SELECT redirects_applied_at, redirects_applied_locs, redirects_skipped_locs
+      FROM patterns WHERE id = $1
+    `,
+    [patternId]
+  );
+
+  // THE TIMESTAMP IS UNTOUCHED. "A pattern is fixed when a URL changed, and not
+  // otherwise" (v1.74) still holds — this run changed nothing and must not
+  // re-stamp the pattern as freshly fixed.
+  assert.equal(
+    afterNoop.rows[0].redirects_applied_at.getTime(),
+    before.rows[0].redirects_applied_at.getTime(),
+    "a no-op apply must not re-stamp redirects_applied_at"
+  );
+
+  // AND THE APPLIED COUNT IS UNTOUCHED. Writing this run's zero would report
+  // that a pattern which was demonstrably fixed had never been applied to.
+  assert.equal(
+    Number(afterNoop.rows[0].redirects_applied_locs),
+    Number(before.rows[0].redirects_applied_locs),
+    "a no-op apply must not overwrite the applied count with its own zero"
+  );
+
+  // BUT THE SHORTFALL IS NOW CURRENT. It was SKIPPED.length when only one URL
+  // had a destination; those groups have since been rewritten, so what is left
+  // is smaller than it was.
+  assert.ok(
+    Number(afterNoop.rows[0].redirects_skipped_locs) < SKIPPED.length,
+    "the persisted shortfall must reflect this run, not the first one"
+  );
 });
