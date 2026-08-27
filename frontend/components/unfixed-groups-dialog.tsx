@@ -7,6 +7,7 @@ import { saveShapeRule, type SkippedShape } from "@/lib/api";
 import {
   applyBlockedReason,
   buildSkippedGroupRows,
+  describeApplyScope,
   describeReach,
   describeRule,
   selectedReach,
@@ -86,8 +87,9 @@ export function UnfixedGroupsDialog({
     () => buildSkippedGroupRows(shapes, rules),
     [shapes, rules]
   );
-  const blocked = applyBlockedReason(rows, selected);
+  const blocked = applyBlockedReason(rows);
   const reach = selectedReach(rows, selected);
+  const allSelected = rows.length > 0 && selected.size === rows.length;
   const editingRow = rows.find((row) => row.shape === editing) ?? null;
 
   function openEditor(shape: string, examples: string[]) {
@@ -99,7 +101,7 @@ export function UnfixedGroupsDialog({
     setError("");
   }
 
-  async function save() {
+  async function save(bulk: boolean) {
     if (!editingRow) {
       return;
     }
@@ -112,24 +114,40 @@ export function UnfixedGroupsDialog({
         source,
         dest: drafts[index] ?? source
       }));
+      // The shapes this edit resolves: just the group being edited, or every
+      // ticked group when the operator chose the bulk action. One request either
+      // way, so a bulk set cannot land half-applied.
+      const targets = bulk
+        ? rows.filter((row) => selected.has(row.shape)).map((row) => row.shape)
+        : [editingRow.shape];
       const result = await saveShapeRule(sessionId, patternId, {
-        shape: editingRow.shape,
+        shapes: targets,
         pairs
       });
 
       setRules((current) => {
         const next = new Map(current);
 
-        next.set(editingRow.shape, {
-          kind: "operator",
-          summary: describeRule(result.rule)
-        });
+        for (const target of result.shapes ?? targets) {
+          next.set(target, {
+            kind: "operator",
+            summary: describeRule(result.rule)
+          });
+        }
 
         return next;
       });
       // Saving is consent to include it — anything else means ticking the row a
       // second time to say what you just said.
-      setSelected((current) => new Set(current).add(editingRow.shape));
+      setSelected((current) => {
+        const next = new Set(current);
+
+        for (const target of targets) {
+          next.add(target);
+        }
+
+        return next;
+      });
       setEditing(null);
     } catch (nextError) {
       // The message that matters most is the server's refusal when the edits
@@ -162,7 +180,29 @@ export function UnfixedGroupsDialog({
           <table className="w-full text-sm">
             <thead className="sticky top-0 bg-muted/60 text-left text-xs uppercase text-muted-foreground">
               <tr>
-                <th className="w-8 px-3 py-2" />
+                <th className="w-8 px-3 py-2">
+                  {/* Select all — the "fix all" entry point. Indeterminate when
+                      only some are ticked, so it never claims a state it is
+                      not in. */}
+                  <input
+                    type="checkbox"
+                    aria-label="Select every group"
+                    className="h-4 w-4 rounded border-slate-300"
+                    checked={allSelected}
+                    ref={(node) => {
+                      if (node) {
+                        node.indeterminate = selected.size > 0 && !allSelected;
+                      }
+                    }}
+                    onChange={() =>
+                      setSelected(
+                        allSelected
+                          ? new Set()
+                          : new Set(rows.map((row) => row.shape))
+                      )
+                    }
+                  />
+                </th>
                 <th className="px-3 py-2">Example URL</th>
                 <th className="px-3 py-2">Affects</th>
                 <th className="px-3 py-2">What will happen</th>
@@ -277,22 +317,45 @@ export function UnfixedGroupsDialog({
               >
                 Cancel
               </Button>
-              <Button type="button" size="sm" onClick={save} disabled={saving}>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void save(false)}
+                disabled={saving}
+              >
                 {saving ? (
                   <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
                 ) : null}
                 Save for this group
               </Button>
+              {/* The bulk action, and the one the reported case needed: 24
+                  groups sharing one prefix and one correct change between them.
+                  Only offered when it would do something more than the button
+                  beside it. */}
+              {selected.size > 1 ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={() => void save(true)}
+                  disabled={saving}
+                >
+                  {saving ? (
+                    <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                  ) : null}
+                  Save for all {selected.size} selected groups
+                </Button>
+              ) : null}
             </div>
           </div>
         ) : null}
 
         <DialogFooter className="items-center sm:justify-between">
+          {/* Says what Apply covers — every RESOLVED group — not what is
+              ticked. Ticking chooses what an edit is saved for; conflating the
+              two is how a button quietly includes groups resolved earlier. */}
           <p className="text-xs text-muted-foreground">
-            {blocked ??
-              `Ready to fix ${formatNumber(reach)} URL${
-                reach === 1 ? "" : "s"
-              } in ${selected.size} group${selected.size === 1 ? "" : "s"}.`}
+            {blocked ?? describeApplyScope(rows)}
           </p>
           <div className="flex gap-2">
             <Button

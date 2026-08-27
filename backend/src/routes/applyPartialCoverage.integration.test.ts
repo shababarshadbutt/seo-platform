@@ -410,4 +410,89 @@ test("an apply that reaches part of a pattern reports the remainder", async (t) 
     after.includes(other.example),
     other.example + " must be untouched — its group has no rule"
   );
+
+  // ---- v1.85: one edit resolves MANY groups -------------------------------
+  //
+  // The reported case was 24 groups sharing /cage-code-lookup/ with one correct
+  // change between them, resolved one at a time. This is the bulk path: one set
+  // of pairs, several shapes, one request.
+  const bulk = await app.inject({
+    method: "POST",
+    url:
+      "/api/sessions/" + sessionId + "/patterns/" + patternId + "/shape-rule",
+    payload: {
+      shapes: [chosen.shape, other.shape],
+      pairs: chosen.examples.map((url: string) => ({
+        source: url,
+        dest: asDestination(url)
+      }))
+    }
+  });
+
+  assert.equal(bulk.statusCode, 200, bulk.body);
+  assert.deepEqual(bulk.json().shapes, [chosen.shape, other.shape]);
+
+  const bulkRows = await pool.query<{ shape: string; source: string }>(
+    "SELECT shape, source FROM pattern_shape_rules WHERE pattern_id = $1 ORDER BY shape",
+    [patternId]
+  );
+
+  assert.equal(bulkRows.rowCount, 2, "a row per shape, from one request");
+  assert.ok(bulkRows.rows.every((row) => row.source === "operator"));
+
+  const third = await app.inject({
+    method: "POST",
+    url:
+      "/api/sessions/" +
+      sessionId +
+      "/patterns/" +
+      patternId +
+      "/apply-redirects",
+    payload: {}
+  });
+
+  assert.equal(third.statusCode, 200, third.body);
+
+  const finalFiles = await pool.query<{ filename: string }>(
+    "SELECT filename FROM sitemap_files WHERE session_id = $1",
+    [sessionId]
+  );
+  const finalContents = readFileSync(
+    path.join(uploadDir, finalFiles.rows[0].filename),
+    "utf8"
+  );
+
+  // ONE apply now covers BOTH groups — the second group's URLs were untouched
+  // by the previous apply and are rewritten by this one.
+  assert.ok(
+    finalContents.includes(asDestination(other.example)),
+    other.example + " should be rewritten once its group has a rule too"
+  );
+  assert.ok(!finalContents.includes(other.example));
+
+  // AND THE DOCUMENTED CONSEQUENCE of saving for every selected shape without
+  // checking that the rule matches each one: a shape the rule cannot transform
+  // still gets its row. It is not silent — the apply's own coverage report is
+  // computed from what the rewriter actually declined, so such a group keeps
+  // being reported as unfixed instead of vanishing into a false "resolved".
+  const unmatchable = "/nsn/nothing-of-this-shape-9999/";
+
+  const saved2 = await app.inject({
+    method: "POST",
+    url:
+      "/api/sessions/" + sessionId + "/patterns/" + patternId + "/shape-rule",
+    payload: {
+      shapes: [unmatchable],
+      rule: { kind: "replace", find: "zzz-not-present", replace: "qqq" }
+    }
+  });
+
+  assert.equal(saved2.statusCode, 200, "it saves regardless, by design");
+
+  const stored2 = await pool.query(
+    "SELECT 1 FROM pattern_shape_rules WHERE pattern_id = $1 AND shape = $2",
+    [patternId, unmatchable]
+  );
+
+  assert.equal(stored2.rowCount, 1, "the row exists even though it matches nothing");
 });

@@ -3338,6 +3338,137 @@ export default function ResultsDashboardPage({
     }
   }
 
+  // WHAT AN APPLY DID, reported in ONE place (v1.85).
+  //
+  // WHY IT IS EXTRACTED. The Review-unfixed-groups dialog (v1.84) needs to run
+  // an apply too, and wiring it to handleAcceptFixes was the bug that shipped:
+  // that handler opens with a five-way guard on Fix MODAL state — fixRow,
+  // fixCount, fixAcceptUncounted — and fixRow is set to null right after the
+  // request, before the toast carrying the dialog's entry point is even shown.
+  // So the dialog's Apply button called a function that returned at its first
+  // line: no request, no error, no toast. The operator saved a rule for 40,050
+  // URLs, pressed Fix, downloaded the sitemap, and found it byte-identical.
+  //
+  // Those guards are right for the button whose disabled state mirrors them and
+  // wrong for every other caller, so the shared part is the REPORTING, not the
+  // handler. Both entry points now build their own request and hand the result
+  // here — the same reason this codebase keeps one builder for the inline and
+  // queued apply paths: two copies of "what happened" drift, and then the two
+  // entry points tell the operator different things about one operation.
+  //
+  // `pattern` is passed in rather than read from fixRow because a queued apply
+  // outlives the modal.
+  async function reportApplyOutcome(
+    result: Awaited<ReturnType<typeof applyPatternRedirects>>,
+    pattern: { id: string; template: string }
+  ) {
+    if (result.queued) {
+      // Wide fix routed to a background job — no synchronous result.
+      //
+      // THIS USED TO BE A TOAST AND ONE REFRESH SIX SECONDS LATER (v1.78 fixes
+      // it). The job takes minutes on a wide pattern, so that refresh always
+      // landed on unchanged data, and a job that had actually died looked
+      // exactly the same: the operator reported it as "the background job is
+      // collapsing". It was never reporting anything. Now the job drives a
+      // maintenance_jobs row and this polls it to the end.
+      setFindReplaceToast({
+        tone: result.already_running ? "error" : "success",
+        message: result.already_running
+          ? // The singleton job was reused, so THIS request's rules and scope
+            // were dropped. Saying "applying" here would credit the operator
+            // with an edit that is not happening. (v1.79)
+            "An apply is already running on this pattern — following it. Your selection was not applied; wait for it to finish, then accept again."
+          : `Applying redirect fixes across ${formatNumber(
+              result.files_total ?? 0
+            )} files in the background…`
+      });
+
+      const jobRowId = result.job_row_id;
+
+      if (!jobRowId) {
+        // Older backend: no row to poll, so keep the previous behaviour rather
+        // than leaving the user with a toast and nothing at all.
+        window.setTimeout(() => void loadResults({ silent: true }), 6000);
+        return;
+      }
+
+      void pollQueuedApply(jobRowId, result.files_total ?? 0, {
+        id: pattern.id,
+        template: pattern.template
+      });
+      return;
+    }
+
+    await loadResults({ silent: true });
+    // rewritten_loc_count is the authoritative number of <loc>s actually
+    // changed on disk (the whole-pattern rule reaches far beyond the reviewed
+    // sample). Fall back to updated+inferred only if it is somehow absent.
+    const changed =
+      result.rewritten_loc_count ??
+      (result.updated ?? 0) + (result.inferred_applied ?? 0);
+    // WHY, when nothing changed (v1.74). This used to report "0 URLs updated
+    // to their redirect destinations" with a success tick — the same sentence
+    // for "there was nothing to apply", "the rule is wrong", and "this pattern
+    // was already fixed", which are three situations needing opposite next
+    // steps. The server classifies it now; the tone follows.
+    const nothingChanged = changed === 0;
+    // How much of the pattern the rewrite actually opened (v1.75). "10 URLs
+    // updated" was true while 183 of 187 files were never read, and nothing
+    // said so — see applyScopeNote.
+    const scopeNote = applyScopeNote({
+      filesScanned: result.files_scanned,
+      patternFileCount: result.pattern_file_count
+    });
+
+    // WHAT IT DID NOT DO (v1.81). Real work landing used to print one cheerful
+    // sentence whether it had rewritten the whole pattern or twelve URLs of
+    // 579,034 — and the reported session was the second, which is why the
+    // downloaded sitemap still had the old paths in it. A partial apply is not
+    // a failure and must not read as one; it is unfinished, and it has to say
+    // so and name what is left.
+    const skippedInScope = result.skipped_in_scope ?? 0;
+    const isPartial = !nothingChanged && skippedInScope > 0;
+
+    if (isPartial) {
+      setFindReplaceToast({
+        tone: "warning",
+        message: skippedSummary({
+          applied: changed,
+          skipped: skippedInScope,
+          filesEdited: result.files_scanned ?? null,
+          filesInPattern: result.pattern_file_count ?? null
+        }),
+        details: skippedShapeLines(result.skipped_shapes ?? [], {
+          truncated: result.skipped_shapes_truncated
+        }),
+        review: {
+          patternId: pattern.id,
+          template: pattern.template,
+          shapes: result.skipped_shapes ?? []
+        },
+        // Held open: this is a list to read and act on, not a confirmation to
+        // glance at.
+        sticky: true
+      });
+
+      return;
+    }
+
+    setFindReplaceToast({
+      tone: nothingChanged ? "error" : "success",
+      message: nothingChanged
+        ? result.outcome_message ??
+          "Nothing was changed. Re-analyse the session to see the current URLs."
+        : `${formatNumber(changed)} URL${
+            changed === 1 ? "" : "s"
+          } updated to their redirect destinations${
+            result.inferred_applied
+              ? ` (${formatNumber(result.inferred_applied)} by inferred rule)`
+              : ""
+          }${scopeNote ? ` ${scopeNote}` : ""}`
+    });
+  }
+
   async function handleAcceptFixes() {
     // fixAcceptUncounted here as well as on the button (v1.76): this is the one
     // path that rewrites files pattern-wide, and "the label could not say what
@@ -3417,110 +3548,9 @@ export default function ResultsDashboardPage({
 
       setFixRow(null);
 
-      if (result.queued) {
-        // Wide fix routed to a background job — no synchronous result.
-        //
-        // THIS USED TO BE A TOAST AND ONE REFRESH SIX SECONDS LATER (v1.78 fixes
-        // it). The job takes minutes on a wide pattern, so that refresh always
-        // landed on unchanged data, and a job that had actually died looked
-        // exactly the same: the operator reported it as "the background job is
-        // collapsing". It was never reporting anything. Now the job drives a
-        // maintenance_jobs row and this polls it to the end.
-        setFindReplaceToast({
-          tone: result.already_running ? "error" : "success",
-          message: result.already_running
-            ? // The singleton job was reused, so THIS request's rules and scope
-              // were dropped. Saying "applying" here would credit the operator
-              // with an edit that is not happening. (v1.79)
-              "An apply is already running on this pattern — following it. Your selection was not applied; wait for it to finish, then accept again."
-            : `Applying redirect fixes across ${formatNumber(
-                result.files_total ?? 0
-              )} files in the background…`
-        });
-
-        const jobRowId = result.job_row_id;
-
-        if (!jobRowId) {
-          // Older backend: no row to poll, so keep the previous behaviour rather
-          // than leaving the user with a toast and nothing at all.
-          window.setTimeout(() => void loadResults({ silent: true }), 6000);
-          return;
-        }
-
-        void pollQueuedApply(jobRowId, result.files_total ?? 0, {
-          id: fixRow.id,
-          template: fixRow.template
-        });
-        return;
-      }
-
-      await loadResults({ silent: true });
-      // rewritten_loc_count is the authoritative number of <loc>s actually
-      // changed on disk (the whole-pattern rule reaches far beyond the reviewed
-      // sample). Fall back to updated+inferred only if it is somehow absent.
-      const changed =
-        result.rewritten_loc_count ??
-        (result.updated ?? 0) + (result.inferred_applied ?? 0);
-      // WHY, when nothing changed (v1.74). This used to report "0 URLs updated
-      // to their redirect destinations" with a success tick — the same sentence
-      // for "there was nothing to apply", "the rule is wrong", and "this pattern
-      // was already fixed", which are three situations needing opposite next
-      // steps. The server classifies it now; the tone follows.
-      const nothingChanged = changed === 0;
-      // How much of the pattern the rewrite actually opened (v1.75). "10 URLs
-      // updated" was true while 183 of 187 files were never read, and nothing
-      // said so — see applyScopeNote.
-      const scopeNote = applyScopeNote({
-        filesScanned: result.files_scanned,
-        patternFileCount: result.pattern_file_count
-      });
-
-      // WHAT IT DID NOT DO (v1.81). Real work landing used to print one cheerful
-      // sentence whether it had rewritten the whole pattern or twelve URLs of
-      // 579,034 — and the reported session was the second, which is why the
-      // downloaded sitemap still had the old paths in it. A partial apply is not
-      // a failure and must not read as one; it is unfinished, and it has to say
-      // so and name what is left.
-      const skippedInScope = result.skipped_in_scope ?? 0;
-      const isPartial = !nothingChanged && skippedInScope > 0;
-
-      if (isPartial) {
-        setFindReplaceToast({
-          tone: "warning",
-          message: skippedSummary({
-            applied: changed,
-            skipped: skippedInScope,
-            filesEdited: result.files_scanned ?? null,
-            filesInPattern: result.pattern_file_count ?? null
-          }),
-          details: skippedShapeLines(result.skipped_shapes ?? [], {
-            truncated: result.skipped_shapes_truncated
-          }),
-          review: {
-            patternId: fixRow.id,
-            template: fixRow.template,
-            shapes: result.skipped_shapes ?? []
-          },
-          // Held open: this is a list to read and act on, not a confirmation to
-          // glance at.
-          sticky: true
-        });
-
-        return;
-      }
-
-      setFindReplaceToast({
-        tone: nothingChanged ? "error" : "success",
-        message: nothingChanged
-          ? result.outcome_message ??
-            "Nothing was changed. Re-analyse the session to see the current URLs."
-          : `${formatNumber(changed)} URL${
-              changed === 1 ? "" : "s"
-            } updated to their redirect destinations${
-              result.inferred_applied
-                ? ` (${formatNumber(result.inferred_applied)} by inferred rule)`
-                : ""
-            }${scopeNote ? ` ${scopeNote}` : ""}`
+      await reportApplyOutcome(result, {
+        id: fixRow.id,
+        template: fixRow.template
       });
     } catch (nextError) {
       setFindReplaceToast({
@@ -8943,14 +8973,43 @@ export default function ResultsDashboardPage({
                 setReviewGroups(null);
               }
             }}
-            // Re-runs the SAME apply. Saving a rule and applying it stay
-            // separate acts: the apply already picks up every agreed rule for
-            // the pattern, so there is nothing for the dialog to pass it — and
-            // a dialog that quietly rewrote files on Save would be a worse
-            // version of the overreach this whole feature is careful about.
-            onApply={() => {
+            // Runs the apply DIRECTLY (v1.85), not through handleAcceptFixes.
+            //
+            // That handler guards on Fix-modal state that is already gone by the
+            // time this dialog can be opened — see reportApplyOutcome — so
+            // calling it did nothing at all, silently. This sends the request
+            // itself and reports through the shared reporter, which means a
+            // failure here surfaces as a failure instead of as nothing.
+            //
+            // No selection arguments: the apply picks up every agreed rule for
+            // the pattern, which is exactly the set the operator has resolved.
+            onApply={async () => {
+              const pattern = {
+                id: reviewGroups.patternId,
+                template: reviewGroups.template
+              };
+
               setFindReplaceToast(null);
-              void handleAcceptFixes();
+              setIsFixing(true);
+
+              try {
+                const result = await applyPatternRedirects(
+                  params.id,
+                  pattern.id
+                );
+
+                await reportApplyOutcome(result, pattern);
+              } catch (nextError) {
+                setFindReplaceToast({
+                  tone: "error",
+                  message: friendlyApiErrorMessage(
+                    nextError,
+                    "Unable to apply redirect fixes."
+                  )
+                });
+              } finally {
+                setIsFixing(false);
+              }
             }}
           />
         ) : null}

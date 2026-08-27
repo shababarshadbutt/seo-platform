@@ -98,30 +98,36 @@ export function describeReach(row: SkippedGroupRow): string {
   }`;
 }
 
-// Why "Apply selected" is disabled, in words, or null when it is enabled.
+// Why Apply is disabled, in words, or null when it is enabled.
 //
 // A DISABLED BUTTON THAT DOES NOT SAY WHY is the thing this replaces: the
-// operator in the reported session was already looking at a dialog that would
-// not act and would not explain itself.
+// operator in the reported session was looking at a dialog that would not act
+// and would not explain itself.
+//
+// IT KEYS ON WHAT THE APPLY ACTUALLY COVERS (v1.85), which is every group that
+// has a rule — not the ticked ones. The first version blocked while any TICKED
+// group was unresolved, so ticking all 24 to look at them disabled the button
+// even though one group was ready to go, and the message told the operator to
+// resolve 23 more. Selection chooses what an edit is SAVED for; the apply then
+// rewrites everything resolved, and the footer below says so rather than leaving
+// it to be discovered.
 export function applyBlockedReason(
-  rows: readonly SkippedGroupRow[],
-  selected: ReadonlySet<string>
+  rows: readonly SkippedGroupRow[]
 ): string | null {
-  if (selected.size === 0) {
-    return "Tick a group to apply it.";
-  }
+  return rows.some((row) => row.applicable)
+    ? null
+    : "No group has a rule yet — set the result for one from its examples.";
+}
 
-  const unresolved = rows.filter(
-    (row) => selected.has(row.shape) && !row.applicable
-  );
+// What Apply will do, for the footer. Counts every RESOLVED group, because that
+// is what the apply covers.
+export function describeApplyScope(rows: readonly SkippedGroupRow[]): string {
+  const resolved = rows.filter((row) => row.applicable);
+  const urls = resolved.reduce((total, row) => total + row.urls, 0);
 
-  if (unresolved.length === 0) {
-    return null;
-  }
-
-  return unresolved.length === 1
-    ? "One selected group has no rule yet — check it, or set the result from its examples."
-    : `${unresolved.length} selected groups have no rule yet — check them, or set the result from their examples.`;
+  return `Will fix ${urls.toLocaleString("en-US")} URL${
+    urls === 1 ? "" : "s"
+  } across ${resolved.length} group${resolved.length === 1 ? "" : "s"}.`;
 }
 
 // Total URLs the current selection would cover.

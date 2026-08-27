@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   applyBlockedReason,
   buildSkippedGroupRows,
+  describeApplyScope,
   describeReach,
   describeRule,
   selectedReach,
@@ -86,21 +87,50 @@ test("examples fall back to the single example when the list is absent", () => {
   ]);
 });
 
-test("the disabled Apply button explains itself", () => {
-  // A dialog that will not act and will not say why is what this replaces.
-  const rows = buildSkippedGroupRows(
+test("Apply is blocked only when NOTHING is resolved, and says why", () => {
+  // THE DEAD END THIS REPLACES. The first version blocked while any TICKED group
+  // was unresolved, so ticking all 24 groups just to look at them disabled the
+  // button — and the message told the operator to go and resolve 23 more, even
+  // though one was ready to apply.
+  const nothingResolved = buildSkippedGroupRows(
+    [shape(), shape({ shape: "/b/b-99/" })],
+    noRules
+  );
+
+  assert.match(applyBlockedReason(nothingResolved)!, /No group has a rule yet/);
+
+  const oneResolved = buildSkippedGroupRows(
     [shape(), shape({ shape: "/b/b-99/" })],
     new Map<string, ShapeRuleState>([
       ["/b/b-99/", { kind: "operator", summary: "x" }]
     ])
   );
 
-  assert.equal(applyBlockedReason(rows, new Set()), "Tick a group to apply it.");
-  assert.match(
-    applyBlockedReason(rows, new Set(["/a/a-9999/"]))!,
-    /One selected group has no rule yet/
+  // One group resolved is enough — selection has nothing to do with it.
+  assert.equal(applyBlockedReason(oneResolved), null);
+});
+
+test("the footer counts what the apply covers, not what is ticked", () => {
+  // The apply picks up every agreed rule for the pattern, so a footer that
+  // counted the ticked rows would under- or over-state what is about to change.
+  const rows = buildSkippedGroupRows(
+    [shape({ count: 40050 }), shape({ shape: "/b/b-99/", count: 13615 })],
+    new Map<string, ShapeRuleState>([
+      ["/a/a-9999/", { kind: "operator", summary: "x" }]
+    ])
   );
-  assert.equal(applyBlockedReason(rows, new Set(["/b/b-99/"])), null);
+
+  assert.equal(describeApplyScope(rows), "Will fix 40,050 URLs across 1 group.");
+
+  const both = buildSkippedGroupRows(
+    [shape({ count: 40050 }), shape({ shape: "/b/b-99/", count: 13615 })],
+    new Map<string, ShapeRuleState>([
+      ["/a/a-9999/", { kind: "operator", summary: "x" }],
+      ["/b/b-99/", { kind: "operator", summary: "x" }]
+    ])
+  );
+
+  assert.equal(describeApplyScope(both), "Will fix 53,665 URLs across 2 groups.");
 });
 
 test("selected reach sums groups, which are disjoint by construction", () => {

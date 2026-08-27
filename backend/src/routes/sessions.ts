@@ -5153,6 +5153,10 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     Params: PatternParams;
     Body: {
       shape?: unknown;
+      // MANY shapes, one rule (v1.85). The reported pattern had 24 groups all
+      // sharing /cage-code-lookup/ and one correct change between them;
+      // resolving them one at a time was 24 round trips to say the same thing.
+      shapes?: unknown;
       rule?: unknown;
       pairs?: unknown;
       authored_by?: unknown;
@@ -5171,10 +5175,30 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           .send({ error: "Not Found", message: "pattern not found" });
       }
 
-      const shape = request.body?.shape;
+      // One shape or many — `shape` is the degenerate case of `shapes`, and both
+      // are accepted so the single-group Save and the bulk one are the same
+      // endpoint rather than two that could drift about what a rule means.
+      const rawShapes = Array.isArray(request.body?.shapes)
+        ? request.body.shapes
+        : request.body?.shape !== undefined
+          ? [request.body.shape]
+          : [];
+      const shapes: string[] = [];
 
-      if (typeof shape !== "string" || shape.length === 0) {
-        return reply.code(400).send(badRequest("shape is required"));
+      for (const entry of rawShapes) {
+        if (typeof entry !== "string" || entry.length === 0) {
+          return reply
+            .code(400)
+            .send(badRequest("shapes must be non-empty strings"));
+        }
+
+        if (!shapes.includes(entry)) {
+          shapes.push(entry);
+        }
+      }
+
+      if (shapes.length === 0) {
+        return reply.code(400).send(badRequest("shape or shapes is required"));
       }
 
       // Two ways in, one outcome. `pairs` is what the dialog sends: the operator
@@ -5246,12 +5270,24 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // size is what the apply's coverage report says, which is where the dialog
       // reads it from; storing a guess here would put a number next to the word
       // "sample" that no sampling produced.
+      // One statement for every shape, so a bulk set cannot land half-applied
+      // and leave the operator looking at a dialog where some rows took the rule
+      // and some did not.
+      //
+      // THE RULE IS SAVED FOR EVERY SHAPE ASKED FOR, without checking that it
+      // transforms each one. That is deliberate and it has a consequence worth
+      // knowing: a group the rule does not match gets an agreed rule that
+      // rewrites nothing, and the dialog will show it as resolved. It is
+      // self-correcting rather than silent — the next apply's coverage report
+      // counts what the rewriter actually declined, so that group simply
+      // reappears in the unfixed list with its count intact.
       await pool.query(
         `
           INSERT INTO pattern_shape_rules
             (pattern_id, shape, rule, sample_size, population, agreed, source,
              authored_by, authored_at)
-          VALUES ($1, $2, $3::jsonb, 0, 0, true, 'operator', $4, now())
+          SELECT $1, shape, $3::jsonb, 0, 0, true, 'operator', $4, now()
+          FROM UNNEST($2::text[]) AS shape
           ON CONFLICT (pattern_id, shape) DO UPDATE
           SET rule = EXCLUDED.rule,
               sample_size = 0,
@@ -5264,7 +5300,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         `,
         [
           request.params.patternId,
-          shape,
+          shapes,
           JSON.stringify(rule),
           typeof request.body?.authored_by === "string"
             ? request.body.authored_by
@@ -5272,7 +5308,14 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         ]
       );
 
-      return { shape, rule, source: "operator" as const };
+      // `shape` is still returned for a single-shape request so the existing
+      // caller does not have to change; `shapes` is the general answer.
+      return {
+        shape: shapes[0],
+        shapes,
+        rule,
+        source: "operator" as const
+      };
     }
   );
 

@@ -195,6 +195,10 @@ export type SkippedShape = {
 // the Advanced escape hatch for someone who would rather write it directly.
 export type ShapeRuleResult = {
   shape: string;
+  // Every shape the rule was saved for (v1.85). One edit can resolve many
+  // groups: the reported pattern had 24 sharing one prefix and one correct
+  // change between them.
+  shapes?: string[];
   rule: { kind: "replace"; find: string; replace: string } | { kind: "insert"; prefix: string; insert: string };
   source: "operator";
 };
@@ -203,8 +207,8 @@ export async function saveShapeRule(
   sessionId: string,
   patternId: string,
   body:
-    | { shape: string; pairs: Array<{ source: string; dest: string }> }
-    | { shape: string; rule: ShapeRuleResult["rule"] }
+    | { shapes: string[]; pairs: Array<{ source: string; dest: string }> }
+    | { shapes: string[]; rule: ShapeRuleResult["rule"] }
 ): Promise<ShapeRuleResult> {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/shape-rule`),
