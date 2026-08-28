@@ -602,45 +602,6 @@ export function UnfixedGroupsDialog({
           </p>
         ) : null}
 
-        {/* THE BULK MARK, and it lives HERE rather than beside the bulk save
-            (v1.87). That one sits inside the editor panel, which only exists once
-            a group is being edited — right for an action that saves an edit, wrong
-            for this one: marking a group already-correct involves no editing at
-            all, so requiring an editor to be open first would be a step that
-            exists only to reach a button.
-
-            Offered from ONE selected group upward, unlike the bulk save. The bulk
-            save needs two before it does anything the per-row button does not; a
-            selection bar here is also how the operator confirms what is ticked
-            before acting on it. */}
-        {selectedMarkable.length > 0 ? (
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
-            <p className="text-xs text-slate-600">
-              {selectedMarkable.length} group
-              {selectedMarkable.length === 1 ? "" : "s"} selected ·{" "}
-              {selectedReach(rows, selected).toLocaleString("en-US")} URLs
-            </p>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              disabled={busy}
-              title="Record that these groups are already correct, so they stop being listed as outstanding"
-              onClick={() =>
-                void markNoChange(
-                  selectedMarkable.map((row) => row.shape),
-                  true
-                )
-              }
-            >
-              {saving ? (
-                <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
-              ) : null}
-              Leave all {selectedMarkable.length} as they are
-            </Button>
-          </div>
-        ) : null}
-
         <div className="max-h-[420px] overflow-y-auto rounded-md border">
           <table className="w-full text-sm">
             <thead className="sticky top-0 bg-muted/60 text-left text-xs uppercase text-muted-foreground">
@@ -844,6 +805,43 @@ export function UnfixedGroupsDialog({
             {blocked ?? describeApplyScope(rows)}
           </p>
           <div className="flex gap-2">
+            {/* THE BULK MARK, in the footer (v1.88).
+                
+                It began as a selection bar above the table, which was the one
+                unconditional change this dialog made to the layout it had before
+                — and the operator asked for that layout back. The footer already
+                exists, so putting it here adds no chrome and shifts nothing.
+                
+                NOT beside the bulk SAVE, which lives inside the editor panel:
+                that panel only exists once a group is being edited, which is
+                right for an action that saves an edit and wrong for this one.
+                Marking a group already-correct involves no editing at all, so
+                requiring an editor to be open first would be a step that exists
+                only to reach a button.
+                
+                Offered from ONE group upward, unlike the bulk save, which needs
+                two before it does more than the per-row button does. The count is
+                on the label so it never promises work it will not do: rows already
+                marked are excluded from it. */}
+            {selectedMarkable.length > 0 ? (
+              <Button
+                type="button"
+                variant="outline"
+                disabled={busy}
+                title="Record that these groups are already correct, so they stop being listed as outstanding"
+                onClick={() =>
+                  void markNoChange(
+                    selectedMarkable.map((row) => row.shape),
+                    true
+                  )
+                }
+              >
+                {saving ? (
+                  <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                ) : null}
+                Leave {selectedMarkable.length} as {selectedMarkable.length === 1 ? "it is" : "they are"}
+              </Button>
+            ) : null}
             <Button
               type="button"
               variant="outline"

@@ -1890,9 +1890,13 @@ export default function ResultsDashboardPage({
                   template: row.original.template,
                   shapes: row.original.redirectsSkippedShapes,
                   skippedInScope: row.original.redirectsSkippedLocs,
-                  // The apply that produced this persisted list is the one that
-                  // stamped the row, so its timestamp is when the list was
-                  // measured.
+                  // When the persisted list was measured, as far as this row can
+                  // say. On a pattern whose fix landed, the apply that wrote the
+                  // list is the one that stamped it. On a pattern where nothing
+                  // was ever rewritten this is NULL (v1.88 persists the shortfall
+                  // without stamping a fix), and null is the honest answer: the
+                  // "this rule may not fit" caveat then makes no claim about which
+                  // came first rather than guessing.
                   measuredAt: row.original.redirectsAppliedAt,
                   // The persisted histogram carries no truncation flag of its own
                   // (052 stores the capped list, not the fact that it was capped),
@@ -3356,7 +3360,29 @@ export default function ResultsDashboardPage({
                   changed === 1 ? "" : "s"
                 } updated to their redirect destinations across ${formatNumber(
                   job.files_total || filesTotal
-                )} files.`
+                )} files.`,
+          // The queued half of the v1.88 zero-change door — see the inline path in
+          // reportApplyOutcome. The gate above needs changed > 0, so a background
+          // apply that rewrote nothing while skipping URLs in scope offered no way
+          // into the review dialog either. Same rule here: the tone and the
+          // sentence stay honest about having changed nothing, and only the way
+          // out is added.
+          ...(changed === 0 && skippedInScope > 0
+            ? {
+                details: skippedShapeLines(job.skipped?.by_shape ?? [], {
+                  truncated: job.skipped?.shapes_truncated
+                }),
+                sticky: true,
+                review: {
+                  patternId: pattern.id,
+                  template: pattern.template,
+                  shapes: job.skipped?.by_shape ?? [],
+                  skippedInScope,
+                  shapesTruncated: job.skipped?.shapes_truncated,
+                  measuredAt: new Date().toISOString()
+                }
+              }
+            : {})
         });
         return;
       }
@@ -3545,7 +3571,36 @@ export default function ResultsDashboardPage({
             result.inferred_applied
               ? ` (${formatNumber(result.inferred_applied)} by inferred rule)`
               : ""
-          }${scopeNote ? ` ${scopeNote}` : ""}`
+          }${scopeNote ? ` ${scopeNote}` : ""}`,
+      // A RUN THAT CHANGED NOTHING STILL EARNS A WAY OUT (v1.88).
+      //
+      // isPartial above requires changed > 0, so an apply that rewrote NOTHING
+      // while leaving millions of URLs in scope fell through to this bare error
+      // toast with no review payload — and the "Partly fixed" chip needs a
+      // timestamp that only a non-zero rewrite stamps. Both doors shut, on
+      // exactly the patterns that need the dialog MOST: the ones where nothing
+      // can be rewritten until somebody says what these URLs should become.
+      //
+      // THE TONE AND THE MESSAGE DO NOT SOFTEN. The run genuinely changed
+      // nothing, and dressing that up as partial success is the v1.74 bug in
+      // reverse. Only the way out is added.
+      ...(nothingChanged && skippedInScope > 0
+        ? {
+            details: skippedShapeLines(result.skipped_shapes ?? [], {
+              truncated: result.skipped_shapes_truncated
+            }),
+            review: {
+              patternId: pattern.id,
+              template: pattern.template,
+              shapes: result.skipped_shapes ?? [],
+              skippedInScope,
+              shapesTruncated: result.skipped_shapes_truncated,
+              measuredAt: new Date().toISOString()
+            },
+            // A list to act on, like the partial case above.
+            sticky: true
+          }
+        : {})
     });
 
     // A complete apply, or one that changed nothing. Either way the shortfall
@@ -6437,6 +6492,62 @@ export default function ResultsDashboardPage({
                       {fixUnagreedShapes.length - 5 === 1 ? "" : "s"}.
                     </p>
                   ) : null}
+                  {/* THE DOOR THAT DID NOT EXIST (v1.88).
+                      
+                      This panel has named the groups an apply will leave behind
+                      since v1.81 — and offered nothing to do about them, which is
+                      the same "Dismiss only" dead end v1.84 fixed one level later
+                      for the POST-apply report. It matters more here, because the
+                      post-apply doors all require an apply that rewrote at least
+                      one URL: on a pattern with no confirmed destinations, Accept
+                      is disabled outright (fixCount === 0), so no apply can run,
+                      so no shortfall is ever measured and the review dialog was
+                      unreachable. That is the reported case.
+                      
+                      Reuses the SAME dialog and the data already on screen — no
+                      apply, no new endpoint, no new scan. "Leave as it is" works
+                      fully from here because marking derives no rule and needs no
+                      examples; "Set the result" works too, with one example rather
+                      than three, and the server's refusal when edits do not
+                      describe one consistent change is unchanged. */}
+                  <button
+                    type="button"
+                    data-testid="fix-review-unagreed"
+                    className="mt-2 inline-flex items-center gap-1 rounded-md border border-amber-400 bg-white px-2 py-1 text-xs font-semibold text-amber-800 hover:bg-amber-100"
+                    onClick={() => {
+                      if (!fixRow) {
+                        return;
+                      }
+
+                      setReviewGroups({
+                        patternId: fixRow.id,
+                        template: fixRow.template,
+                        // population is the group's real size; example is a real
+                        // URL when the review page happened to carry one, and the
+                        // shape itself is the only honest fallback.
+                        shapes: fixUnagreedShapes.map((entry) => ({
+                          shape: entry.shape,
+                          count: entry.population,
+                          example: entry.example ?? entry.shape,
+                          examples: entry.example ? [entry.example] : [],
+                          // Not known here. describeReach renders URLs alone when
+                          // files is absent, which is why it tolerates null at all.
+                          files: undefined
+                        })),
+                        // NULL, not a sum of the rows: these are the unagreed
+                        // groups, not the whole shortfall an apply would report,
+                        // so stating a total would invent one.
+                        skippedInScope: null,
+                        shapesTruncated: undefined,
+                        // No apply has run, so there is no measurement for a rule
+                        // to have failed against — the "may not fit" caveat must
+                        // stay silent rather than accuse a rule nothing has tried.
+                        measuredAt: null
+                      });
+                    }}
+                  >
+                    Review these groups
+                  </button>
                   {fixLooksLikeReorder ? (
                     <p className="mt-1">
                       These redirects move whole path segments around, which this

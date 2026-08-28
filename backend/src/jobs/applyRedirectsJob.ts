@@ -133,16 +133,11 @@ async function runApplyRedirectsJob(
   // template joins the select for v1.81: the shortfall tally has to know which
   // <loc>s belong to this pattern, or "left unchanged" would count every other
   // pattern's URLs sharing the same file.
-  // redirects_applied_at joins the select for v1.86: a re-apply that rewrites
-  // nothing still measures what is outstanding, and whether this pattern was
-  // ALREADY stamped is what decides if that measurement may be written back
-  // without inventing a "Fixed" state (see the coverage stamp below).
   const patternResult = await pool.query<{
     source_role: string;
     template: string;
-    redirects_applied_at: Date | null;
   }>(
-    "SELECT source_role, template, redirects_applied_at FROM patterns WHERE id = $1",
+    "SELECT source_role, template FROM patterns WHERE id = $1",
     [patternId]
   );
 
@@ -500,7 +495,7 @@ async function runApplyRedirectsJob(
         JSON.stringify(skipped.byShape)
       ]
     );
-  } else if (patternResult.rows[0].redirects_applied_at && filesDone > 0) {
+  } else if (filesDone > 0) {
     // A RE-APPLY THAT CHANGED NOTHING STILL MEASURED SOMETHING (v1.86).
     //
     // Mirrors the inline route, and for the same reason: the branch above was the
@@ -511,11 +506,16 @@ async function runApplyRedirectsJob(
     // resolved back in front of the operator.
     //
     // redirects_applied_at is deliberately NOT touched, so "a pattern is fixed
-    // when a URL changed, and nothing else counts" still holds; and this only
-    // runs for an ALREADY stamped pattern, so coverage still cannot appear
-    // without the chip it qualifies. redirects_applied_locs is left alone too —
+    // when a URL changed, and nothing else counts" still holds; coverage still
+    // cannot appear without the chip it qualifies, because fixedBadgeState draws
+    // none without that timestamp. redirects_applied_locs is left alone too —
     // this branch runs precisely when nothing was rewritten, and writing its zero
     // would report that a pattern which was fixed had never been applied to.
+    //
+    // NO LONGER LIMITED TO AN ALREADY-STAMPED PATTERN (v1.88), matching the
+    // inline route: a first apply that rewrote nothing while leaving URLs in
+    // scope persisted no shortfall, so the row had nothing to offer a review of.
+    // Measuring a shortfall and having landed a fix are different facts.
     //
     // filesDone > 0 keeps this a measurement rather than an assumption: a run
     // that opened no file measured nothing, and its zeros must not overwrite a

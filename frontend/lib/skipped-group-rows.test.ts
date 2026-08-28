@@ -400,3 +400,89 @@ test("with nothing marked the header says nothing about marking", () => {
     "45 URLs in this pattern are still unfixed. The one group the last fix could not reach is listed below."
   );
 });
+
+
+// ---------------------------------------------------------------------------
+// Seeded from the Fix modal's unagreed groups, before any apply (v1.88)
+// ---------------------------------------------------------------------------
+//
+// The dialog's other door hands it an apply's shortfall report. This one hands it
+// `unagreed_shapes` from the redirect-candidates endpoint, which is what makes the
+// review reachable on a pattern where Accept is disabled and no apply can run at
+// all. That payload knows a group's population and one example, and knows nothing
+// about file counts or a pattern-wide total — so these pin that the row model says
+// nothing it was not told.
+
+const fromUnagreed = (population: number, example: string | null) =>
+  buildSkippedGroupRows(
+    [
+      {
+        shape: "/a/a-9999/",
+        count: population,
+        example: example ?? "/a/a-9999/",
+        examples: example ? [example] : [],
+        files: undefined
+      }
+    ],
+    noRules
+  );
+
+test("with no file count known, reach reports URLs alone", () => {
+  // files is absent from unagreed_shapes. buildSkippedGroupRows maps that to null
+  // rather than 0 precisely so nothing claims the group spans no files.
+  const [row] = fromUnagreed(40050, "https://x.test/a/b-1/");
+
+  assert.equal(row.files, null);
+  assert.equal(describeReach(row), "40,050 URLs");
+});
+
+test("with no pattern-wide total, the header claims no total", () => {
+  // skippedInScope is null from this door: these are the unagreed groups, not the
+  // whole shortfall an apply would report. Summing the rows to fill the gap would
+  // invent a number and imply the list is exhaustive.
+  const rows = fromUnagreed(40050, "https://x.test/a/b-1/");
+
+  const summary = unresolvedSummary({ skippedInScope: null, rows });
+
+  assert.equal(
+    summary,
+    "The one group the last fix could not reach is listed below."
+  );
+  assert.ok(!summary.includes("40,050"));
+});
+
+test("a group can still be left as it is with only one example", () => {
+  // The point of this door. Marking derives no rule and needs no examples, so the
+  // thin payload is no obstacle — which is why "Leave as it is" is fully usable
+  // here even though "Set the result" has a single pair to reason from.
+  const rows = buildSkippedGroupRows(
+    [
+      {
+        shape: "/a/a-9999/",
+        count: 40050,
+        example: "https://x.test/a/b-1/",
+        examples: ["https://x.test/a/b-1/"]
+      }
+    ],
+    new Map<string, ShapeRuleState>([["/a/a-9999/", { kind: "no-change" }]])
+  );
+  const { unresolved, leftAsIs } = partitionSkippedGroupRows(rows);
+
+  assert.deepEqual(unresolved, []);
+  assert.equal(leftAsIs.length, 1);
+  assert.equal(leftAsIs[0].applicable, false);
+});
+
+test("a group with no example at all still renders from its shape", () => {
+  // `example` is null when no row on the review page happened to carry that shape.
+  // The shape is the only honest fallback, and a row that cannot render is worse
+  // than one identified by its pattern.
+  const [row] = fromUnagreed(12, null);
+
+  // buildSkippedGroupRows falls back to `example` when `examples` is empty, and
+  // the caller sets `example` to the shape in that case — so the editor still has
+  // one line to work from rather than none, and the row is identified by its
+  // pattern instead of blank.
+  assert.deepEqual(row.examples, ["/a/a-9999/"]);
+  assert.equal(describeReach(row), "12 URLs");
+});

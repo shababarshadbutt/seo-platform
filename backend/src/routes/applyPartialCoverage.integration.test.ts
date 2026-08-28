@@ -621,6 +621,86 @@ test("an apply that reaches part of a pattern reports the remainder", async (t) 
     "the persisted shortfall must reflect this run, not the first one"
   );
 
+  // ---- v1.88: a shortfall is recorded even when NOTHING was rewritten ------
+  //
+  // THE REPORTED BUG. Every door into the review dialog required an apply that had
+  // rewritten at least one URL: the toasts gate on changed > 0, and the row's
+  // review link used to require redirects_applied_at, which is stamped only by a
+  // non-zero rewrite. So on a pattern where no rule covers anything yet — an apply
+  // rewrites nothing and leaves the whole pattern in scope — nothing was persisted
+  // and the dialog could never be opened. Those are exactly the patterns that need
+  // it, because saying what the URLs should become is the only way forward.
+  //
+  // Asserted on a SEPARATE, never-stamped pattern so the state is the real one:
+  // no fix has ever landed here.
+  const freshPatternResult = await pool.query<{ id: string }>(
+    `
+      INSERT INTO patterns (session_id, template, total_urls, status)
+      VALUES ($1, '/nsn/{param}', $2, 'BAD')
+      RETURNING id
+    `,
+    [sessionId, allUrls.length]
+  );
+  const freshPatternId = freshPatternResult.rows[0].id;
+
+  const freshApply = await app.inject({
+    method: "POST",
+    url:
+      "/api/sessions/" +
+      sessionId +
+      "/patterns/" +
+      freshPatternId +
+      "/apply-redirects",
+    payload: {}
+  });
+
+  assert.equal(freshApply.statusCode, 200, freshApply.body);
+  assert.equal(
+    freshApply.json().rewritten_loc_count,
+    0,
+    "nothing is confirmed on this pattern, so nothing can be rewritten"
+  );
+
+  const freshRow = await pool.query<{
+    redirects_applied_at: Date | null;
+    redirects_applied_locs: number | null;
+    redirects_skipped_locs: number | null;
+    redirects_skipped_shapes: unknown[] | null;
+  }>(
+    `
+      SELECT redirects_applied_at, redirects_applied_locs,
+             redirects_skipped_locs, redirects_skipped_shapes
+      FROM patterns WHERE id = $1
+    `,
+    [freshPatternId]
+  );
+
+  // THE SHORTFALL IS ON RECORD, which is what gives the row something to review.
+  assert.ok(
+    Number(freshRow.rows[0].redirects_skipped_locs) > 0,
+    "the shortfall must be persisted even though nothing was rewritten"
+  );
+  assert.ok(
+    Array.isArray(freshRow.rows[0].redirects_skipped_shapes) &&
+      freshRow.rows[0].redirects_skipped_shapes.length > 0,
+    "and so must the group list the dialog is seeded from"
+  );
+
+  // AND THE PATTERN IS STILL NOT "FIXED". Both invariants this release must not
+  // break: redirects_applied_at means "a URL changed" (v1.74), so it stays NULL and
+  // fixedBadgeState draws no chip; and applied_locs stays NULL rather than being
+  // given a 0 that would claim a measurement nobody took.
+  assert.equal(
+    freshRow.rows[0].redirects_applied_at,
+    null,
+    "a run that changed nothing must never stamp the pattern as fixed"
+  );
+  assert.equal(
+    freshRow.rows[0].redirects_applied_locs,
+    null,
+    "nor invent an applied count for a fix that never happened"
+  );
+
   // ---- v1.87: "these URLs are already correct — leave them" ----------------
   //
   // The third answer. v1.86 gave a group two states — it has a rule, or nobody

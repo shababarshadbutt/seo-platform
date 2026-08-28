@@ -5952,15 +5952,22 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           //
           // BOTH INVARIANTS THE BRANCH ABOVE DEFENDS ARE KEPT. redirects_applied_at
           // is deliberately NOT touched here, so "a pattern is fixed when a URL
-          // changed, and not otherwise" (v1.74) still holds; and this only ever
-          // runs for a pattern ALREADY stamped, so a coverage figure can still
-          // never appear without the chip it qualifies (v1.81).
+          // changed, and not otherwise" (v1.74) still holds; and a coverage
+          // figure still never appears without the chip it qualifies, because
+          // fixedBadgeState draws no chip at all without that timestamp (v1.81).
+          //
+          // NO LONGER LIMITED TO AN ALREADY-STAMPED PATTERN (v1.88). It was, and
+          // that shut the last door on the patterns needing the review most: a
+          // FIRST apply that rewrote nothing while leaving millions of URLs in
+          // scope persisted no shortfall at all, so there was nothing for the row
+          // to offer a review of and nothing to seed the dialog from. Measuring a
+          // shortfall and having landed a fix are simply different facts, and
+          // storing the first only when the second is true is what conflated them.
           //
           // filesScanned > 0 is the guard that makes this a measurement rather
           // than an assumption: a run that opened no file measured nothing, and
           // overwriting a real tally with its zeros would report a complete fix
           // on a pattern nobody looked at.
-          patternResult.rows[0].redirects_applied_at &&
           filesScanned > 0
         ) {
           // ONLY THE SKIPPED SIDE IS REWRITTEN. redirects_applied_locs is left
@@ -5971,6 +5978,11 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           // nothing had ever been applied to it. Nothing new was applied, so the
           // applied figure is already correct; what changed is how much is still
           // outstanding, which is the half being measured again.
+          //
+          // On a NEVER-stamped pattern that column stays NULL, which is the right
+          // reading: nothing has ever been applied here, and 0 would claim a
+          // measurement was taken. fixedBadgeState keys on the timestamp, so such
+          // a row still draws no chip — it gains only a review link.
           await client.query(
             `
               UPDATE patterns

@@ -179,13 +179,42 @@ export function fixedBadgeDetail(row: {
 // and a truncated write could leave the count without the list. Offering a review
 // that opens an empty dialog is worse than offering nothing, so the list itself is
 // the condition.
+//
+// AND NOT GATED ON HAVING BEEN FIXED (v1.88). It was — the predicate required
+// fixedBadgeState() === "partial", which needs redirects_applied_at, which is
+// stamped only when a URL actually changed. That closed the door on precisely the
+// patterns needing the review MOST: one where an apply rewrote NOTHING because no
+// rule covers anything yet, leaving millions of URLs in scope and no way to say
+// what they should become. The reported case could not open the dialog at all.
+//
+// "Has this pattern a measured shortfall to review?" and "did a fix land here?"
+// are different questions, and answering the first with the second is what made
+// the review unreachable. A row with groups and no timestamp now offers the
+// review and still draws NO chip, because fixedBadgeState keys on the timestamp —
+// so v1.81's rule that coverage never appears without the chip it qualifies is
+// untouched.
 export function canReviewUnfixedGroups(row: {
+  // The other two are accepted and UNUSED on purpose: callers pass a whole
+  // pattern row, and narrowing the parameter to the one field consulted would
+  // reject them. Naming them here also records that they were deliberately
+  // dropped from the condition rather than forgotten.
   redirectsAppliedAt?: string | null;
   redirectsSkippedLocs?: number | null;
   redirectsSkippedShapes?: unknown[] | null;
 }): boolean {
+  // BOTH HALVES OF THE MEASUREMENT MUST AGREE that something is outstanding.
+  //
+  // The list alone is not enough: a COMPLETE fix writes skipped_locs = 0 and an
+  // empty histogram in the same statement, so a row carrying 0 skipped beside a
+  // non-empty list is inconsistent data, and offering to review groups on a
+  // pattern that reports nothing left is the "link that opens a dialog saying
+  // everything is fine" version of a broken feature.
+  //
+  // The count alone is not enough either, which is why the list is still checked:
+  // rows fixed before migration 052 have a shortfall and no histogram at all, and
+  // that link would open an empty dialog.
   return (
-    fixedBadgeState(row) === "partial" &&
+    (row.redirectsSkippedLocs ?? 0) > 0 &&
     Array.isArray(row.redirectsSkippedShapes) &&
     row.redirectsSkippedShapes.length > 0
   );
