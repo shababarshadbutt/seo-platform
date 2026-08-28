@@ -162,37 +162,33 @@ export function describeApplyScope(rows: readonly SkippedGroupRow[]): string {
 // group, that is a loop — retype the rule, apply, see the group again, retype it.
 // Splitting the two is what makes a second pass about the remainder.
 //
-// AND A THIRD PILE (v1.87): groups a human has looked at and decided need no
-// rewrite at all. Those were the remaining way to be stuck under "still needs an
-// answer" for ever — the apply was always going to leave them alone, but nothing
-// recorded that anybody had decided so, and "already correct" and "not yet looked
-// at" rendered identically.
+// STILL TWO PILES, and a "leave it alone" mark belongs in the second (v1.89).
+// v1.87 gave such a group a third pile of its own; the operator asked for the two
+// they already had. It is an ANSWER — somebody looked and decided — so "already
+// answered" is where it goes, and the dialog needs no new section to say so.
+//
+// THE ONE THING THAT MUST NOT FOLLOW FROM THAT: it is answered but NOT applicable.
+// `applicable` is what the Apply footer and its blocked reason key on, so a marked
+// group is still never counted into "Will fix N URLs" and never rewritten. Whether
+// a group has been dealt with and whether the next apply should touch it are two
+// questions, and this function is deliberately the only place that maps one to the
+// other.
 export function partitionSkippedGroupRows(rows: readonly SkippedGroupRow[]): {
   unresolved: SkippedGroupRow[];
-  resolved: SkippedGroupRow[];
-  leftAsIs: SkippedGroupRow[];
+  answered: SkippedGroupRow[];
 } {
   const unresolved: SkippedGroupRow[] = [];
-  const resolved: SkippedGroupRow[] = [];
-  const leftAsIs: SkippedGroupRow[] = [];
+  const answered: SkippedGroupRow[] = [];
 
   for (const row of rows) {
-    // `applicable` is still what decides RESOLVED, because it is the same
-    // question the Apply footer asks ("would this row contribute to the next
-    // apply?") and two predicates that must agree are better as one. A
-    // deliberately-unchanged group answers no to that and is still answered,
-    // which is exactly why it needs its own pile rather than a third value of a
-    // boolean.
-    if (row.applicable) {
-      resolved.push(row);
-    } else if (row.rule.kind === "no-change") {
-      leftAsIs.push(row);
+    if (row.applicable || row.rule.kind === "no-change") {
+      answered.push(row);
     } else {
       unresolved.push(row);
     }
   }
 
-  return { unresolved, resolved, leftAsIs };
+  return { unresolved, answered };
 }
 
 // The header line: how much is STILL unfixed, and whether this list is all of it.
@@ -212,29 +208,18 @@ export function unresolvedSummary(input: {
     ? ", and there are more groups than could be listed"
     : "";
 
-  // WHAT OF THE REMAINDER IS THERE ON PURPOSE (v1.87). Once a group can be marked
-  // "already correct", a flat "45 URLs are still unfixed" over-states the problem:
-  // some of those URLs are unfixed because somebody decided they should be. The
-  // count itself stays honest — those URLs really were not rewritten, and shrinking
-  // it would be the kind of flattering arithmetic v1.81 exists to prevent — so the
-  // number is kept and qualified instead.
-  const marked = input.rows
-    .filter((row) => row.rule.kind === "no-change")
-    .reduce((total, row) => total + row.urls, 0);
-  const deliberate =
-    marked > 0
-      ? ` ${marked.toLocaleString("en-US")} of them ${
-          marked === 1 ? "is" : "are"
-        } in groups you marked as already correct.`
-      : "";
-
+  // ONE SENTENCE, and no arithmetic about what was marked (v1.89). v1.87 appended
+  // "N of them are in groups you marked as already correct"; the operator asked for
+  // the plain v1.86 line back. The count itself was always honest and still is —
+  // those URLs genuinely were not rewritten, and shrinking the number to look
+  // better is the flattering arithmetic v1.81 exists to prevent.
   if (input.skippedInScope === null) {
-    return `${listed}${truncated}.${deliberate}`;
+    return `${listed}${truncated}.`;
   }
 
   return `${input.skippedInScope.toLocaleString("en-US")} URL${
     input.skippedInScope === 1 ? "" : "s"
-  } in this pattern are still unfixed.${deliberate} ${listed}${truncated}.`;
+  } in this pattern are still unfixed. ${listed}${truncated}.`;
 }
 
 // The caveat for a group that HAS a rule and came back unfixed ANYWAY.

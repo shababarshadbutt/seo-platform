@@ -224,12 +224,9 @@ import {
 } from "@/lib/transform-coverage";
 import {
   fixActionState,
-  canReviewUnfixedGroups,
   fixedBadgeDetail,
   fixedBadgeLabel,
   fixedBadgeState,
-  REVIEW_UNFIXED_GROUPS_LABEL,
-  reviewUnfixedGroupsTitle,
   hasStaleCountsAfterFix,
   showFixedBadge,
   showCheckButton,
@@ -1866,47 +1863,6 @@ export default function ResultsDashboardPage({
                 <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
               )}
               {fixedBadgeLabel(fixedBadgeState(row.original))}
-            </button>
-            ) : null}
-            {/* THE WAY BACK INTO THE SHORTFALL (v1.86). The toast that first
-                reported it is long gone by now — dismissed, or lost to a reload —
-                and it was the only door. The groups themselves were persisted all
-                along (migration 052) and already sitting on this row; nothing had
-                ever read them. Beside the chip rather than inside it because the
-                chip opens the Fix modal, and these are two different questions:
-                "what did this fix do?" and "what did it not do?". */}
-            {canReviewUnfixedGroups(row.original) ? (
-            <button
-              type="button"
-              data-testid="pattern-review-unfixed"
-              aria-label={`Review the URL groups the fix left unchanged in ${row.original.template}`}
-              title={reviewUnfixedGroupsTitle(row.original)}
-              className="inline-flex items-center gap-1 rounded-md border border-amber-300 bg-white px-2 py-0.5 text-xs font-semibold text-amber-700 hover:bg-amber-50"
-              onClick={(event) => {
-                event.stopPropagation();
-                setFindReplaceToast(null);
-                setReviewGroups({
-                  patternId: row.original.id,
-                  template: row.original.template,
-                  shapes: row.original.redirectsSkippedShapes,
-                  skippedInScope: row.original.redirectsSkippedLocs,
-                  // When the persisted list was measured, as far as this row can
-                  // say. On a pattern whose fix landed, the apply that wrote the
-                  // list is the one that stamped it. On a pattern where nothing
-                  // was ever rewritten this is NULL (v1.88 persists the shortfall
-                  // without stamping a fix), and null is the honest answer: the
-                  // "this rule may not fit" caveat then makes no claim about which
-                  // came first rather than guessing.
-                  measuredAt: row.original.redirectsAppliedAt,
-                  // The persisted histogram carries no truncation flag of its own
-                  // (052 stores the capped list, not the fact that it was capped),
-                  // so this deliberately says nothing rather than claiming the
-                  // list is complete.
-                  shapesTruncated: undefined
-                });
-              }}
-            >
-              {REVIEW_UNFIXED_GROUPS_LABEL}
             </button>
             ) : null}
             {/* THE ACTION, INDEPENDENT OF THE BADGE (v1.74). The badge used to
@@ -6492,62 +6448,6 @@ export default function ResultsDashboardPage({
                       {fixUnagreedShapes.length - 5 === 1 ? "" : "s"}.
                     </p>
                   ) : null}
-                  {/* THE DOOR THAT DID NOT EXIST (v1.88).
-                      
-                      This panel has named the groups an apply will leave behind
-                      since v1.81 — and offered nothing to do about them, which is
-                      the same "Dismiss only" dead end v1.84 fixed one level later
-                      for the POST-apply report. It matters more here, because the
-                      post-apply doors all require an apply that rewrote at least
-                      one URL: on a pattern with no confirmed destinations, Accept
-                      is disabled outright (fixCount === 0), so no apply can run,
-                      so no shortfall is ever measured and the review dialog was
-                      unreachable. That is the reported case.
-                      
-                      Reuses the SAME dialog and the data already on screen — no
-                      apply, no new endpoint, no new scan. "Leave as it is" works
-                      fully from here because marking derives no rule and needs no
-                      examples; "Set the result" works too, with one example rather
-                      than three, and the server's refusal when edits do not
-                      describe one consistent change is unchanged. */}
-                  <button
-                    type="button"
-                    data-testid="fix-review-unagreed"
-                    className="mt-2 inline-flex items-center gap-1 rounded-md border border-amber-400 bg-white px-2 py-1 text-xs font-semibold text-amber-800 hover:bg-amber-100"
-                    onClick={() => {
-                      if (!fixRow) {
-                        return;
-                      }
-
-                      setReviewGroups({
-                        patternId: fixRow.id,
-                        template: fixRow.template,
-                        // population is the group's real size; example is a real
-                        // URL when the review page happened to carry one, and the
-                        // shape itself is the only honest fallback.
-                        shapes: fixUnagreedShapes.map((entry) => ({
-                          shape: entry.shape,
-                          count: entry.population,
-                          example: entry.example ?? entry.shape,
-                          examples: entry.example ? [entry.example] : [],
-                          // Not known here. describeReach renders URLs alone when
-                          // files is absent, which is why it tolerates null at all.
-                          files: undefined
-                        })),
-                        // NULL, not a sum of the rows: these are the unagreed
-                        // groups, not the whole shortfall an apply would report,
-                        // so stating a total would invent one.
-                        skippedInScope: null,
-                        shapesTruncated: undefined,
-                        // No apply has run, so there is no measurement for a rule
-                        // to have failed against — the "may not fit" caveat must
-                        // stay silent rather than accuse a rule nothing has tried.
-                        measuredAt: null
-                      });
-                    }}
-                  >
-                    Review these groups
-                  </button>
                   {fixLooksLikeReorder ? (
                     <p className="mt-1">
                       These redirects move whole path segments around, which this

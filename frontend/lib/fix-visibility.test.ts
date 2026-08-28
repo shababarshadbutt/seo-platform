@@ -2,14 +2,12 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 
 import {
-  canReviewUnfixedGroups,
   fixActionState,
   fixButtonState,
   fixedBadgeDetail,
   fixedBadgeLabel,
   fixedBadgeState,
   hasStaleCountsAfterFix,
-  reviewUnfixedGroupsTitle,
   showCheckButton,
   showFixButton,
   showFixedBadge
@@ -309,97 +307,3 @@ test("the detail line states both halves, and only when it is qualified", () => 
 });
 
 
-// ---------------------------------------------------------------------------
-// The persistent way back into a shortfall (v1.86)
-// ---------------------------------------------------------------------------
-
-test("a partly fixed pattern with groups on record can reopen its shortfall", () => {
-  // The gap this closes: the toast that first reported the shortfall was the only
-  // door, and dismissing it or reloading the page shut it for good — while the
-  // groups sat persisted in redirects_skipped_shapes the whole time.
-  assert.equal(
-    canReviewUnfixedGroups({
-      redirectsAppliedAt: "2026-08-21T02:30:00Z",
-      redirectsSkippedLocs: 579022,
-      redirectsSkippedShapes: [{ shape: "/a/a-9999/" }]
-    }),
-    true
-  );
-});
-
-test("no groups on record offers no review, however big the shortfall", () => {
-  // Rows fixed before migration 052 have a shortfall and no histogram. A link
-  // that opens an empty dialog reads as a broken feature, which is worse than
-  // offering nothing at all.
-  assert.equal(
-    canReviewUnfixedGroups({
-      redirectsAppliedAt: "2026-08-21T02:30:00Z",
-      redirectsSkippedLocs: 579022,
-      redirectsSkippedShapes: []
-    }),
-    false
-  );
-  assert.equal(
-    canReviewUnfixedGroups({
-      redirectsAppliedAt: "2026-08-21T02:30:00Z",
-      redirectsSkippedLocs: 579022,
-      redirectsSkippedShapes: null
-    }),
-    false
-  );
-});
-
-test("a complete fix has no shortfall to review", () => {
-  // The link must never appear on a pattern reporting nothing left. A complete fix
-  // writes skipped_locs = 0 and an empty histogram in one statement, so 0 beside a
-  // non-empty list is inconsistent data rather than a state to act on.
-  assert.equal(
-    canReviewUnfixedGroups({
-      redirectsAppliedAt: "2026-08-21T02:30:00Z",
-      redirectsSkippedLocs: 0,
-      redirectsSkippedShapes: [{ shape: "/a/a-9999/" }]
-    }),
-    false
-  );
-});
-
-test("a pattern whose fix rewrote NOTHING can still review its shortfall", () => {
-  // THE v1.88 CHANGE, and the reported bug. This used to be false: the predicate
-  // required fixedBadgeState() === "partial", which needs redirects_applied_at,
-  // which is stamped only when a URL actually changed. So the patterns needing the
-  // review MOST — the ones where no rule covers anything yet, so an apply rewrites
-  // nothing and leaves millions of URLs in scope — were the ones that could never
-  // open it.
-  //
-  // "Has this pattern a measured shortfall?" and "did a fix land here?" are
-  // different questions. Answering the first with the second is what shut the door.
-  assert.equal(
-    canReviewUnfixedGroups({
-      redirectsAppliedAt: null,
-      redirectsSkippedLocs: 100,
-      redirectsSkippedShapes: [{ shape: "/a/a-9999/" }]
-    }),
-    true
-  );
-});
-
-test("and such a row still draws no Fixed chip", () => {
-  // The other half of the same change: the review link is decoupled from the chip,
-  // NOT bolted onto it. v1.81's rule that coverage never appears without the chip
-  // it qualifies survives because fixedBadgeState keys on the timestamp.
-  assert.equal(
-    fixedBadgeState({
-      redirectsAppliedAt: null,
-      redirectsSkippedLocs: 100
-    }),
-    "none"
-  );
-  assert.equal(fixedBadgeLabel("none"), null);
-});
-
-test("the review link names the number of URLs at stake", () => {
-  assert.equal(
-    reviewUnfixedGroupsTitle({ redirectsSkippedLocs: 10363824 }),
-    "Say what should happen to the 10,363,824 URLs this fix left unchanged"
-  );
-});

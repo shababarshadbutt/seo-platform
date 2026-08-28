@@ -153,7 +153,6 @@ export function UnfixedGroupsDialog({
   // instead of the dialog simply redrawing with fewer rows.
   const [applyNote, setApplyNote] = useState("");
   const [showResolved, setShowResolved] = useState(false);
-  const [showLeftAsIs, setShowLeftAsIs] = useState(false);
   // The residue is STATE, not the prop, so an apply can replace it in place. The
   // prop seeds it and remains the truth for a freshly opened dialog.
   const [residue, setResidue] = useState<Residue>({
@@ -205,7 +204,6 @@ export function UnfixedGroupsDialog({
     setError("");
     setApplyNote("");
     setShowResolved(false);
-    setShowLeftAsIs(false);
     setResidue({ shapes, skippedInScope, shapesTruncated, measuredAt });
     void loadRules();
     // shapes/skippedInScope/shapesTruncated are deliberately NOT dependencies: they
@@ -218,7 +216,7 @@ export function UnfixedGroupsDialog({
     () => buildSkippedGroupRows(residue.shapes, rules),
     [residue.shapes, rules]
   );
-  const { unresolved, resolved, leftAsIs } = useMemo(
+  const { unresolved, answered } = useMemo(
     () => partitionSkippedGroupRows(rows),
     [rows]
   );
@@ -234,17 +232,6 @@ export function UnfixedGroupsDialog({
     unresolved.every((row) => selected.has(row.shape));
   const editingRow = rows.find((row) => row.shape === editing) ?? null;
   const selectedCount = selected.size;
-  // Ticked groups that a bulk "leave as it is" would actually change. A group
-  // already marked is excluded so the button's count never promises work it will
-  // not do — the same reason the footer counts what the apply covers rather than
-  // what is ticked.
-  const selectedMarkable = useMemo(
-    () =>
-      rows.filter(
-        (row) => selected.has(row.shape) && row.rule.kind !== "no-change"
-      ),
-    [rows, selected]
-  );
 
   function openEditor(shape: string, examples: string[]) {
     setEditing(shape);
@@ -350,9 +337,10 @@ export function UnfixedGroupsDialog({
   // that somebody DECIDED so, which is the only thing that keeps the group out of
   // "still needs an answer" on the next pass.
   //
-  // `shapesToMark` is passed in rather than read off `selected` so the per-row
-  // button and the bulk button are the same code path — one request either way, so
-  // a bulk mark cannot land half-applied, exactly as with the bulk save above.
+  // Takes a list rather than a single shape even though only the per-row button
+  // calls it now (v1.89 removed the bulk one): the endpoint is the many-shapes
+  // form either way, so one request per press, and nothing here would have to
+  // change if a bulk caller comes back.
   async function markNoChange(shapesToMark: string[], noChange: boolean) {
     if (shapesToMark.length === 0) {
       return;
@@ -531,43 +519,37 @@ export function UnfixedGroupsDialog({
           )}
         </td>
         <td className="whitespace-nowrap px-3 py-2 text-right">
-          {row.rule.kind === "no-change" ? (
-            // THE UNDO. The mark is persisted, so it has to be reversible from the
-            // same place it was made — otherwise a mis-click is permanent and the
-            // group is invisible under a collapsed section.
+          <span className="inline-flex items-center gap-3">
             <button
               type="button"
               className="text-xs font-semibold text-primary underline hover:text-primary/80 disabled:no-underline disabled:opacity-50"
               disabled={busy}
-              onClick={() => void markNoChange([row.shape], false)}
+              onClick={() => openEditor(row.shape, row.examples)}
             >
-              Needs a fix
+              {row.rule.kind === "none" ? "Set the result" : "Edit"}
             </button>
-          ) : (
-            <span className="inline-flex items-center gap-3">
-              <button
-                type="button"
-                className="text-xs font-semibold text-primary underline hover:text-primary/80 disabled:no-underline disabled:opacity-50"
-                disabled={busy}
-                onClick={() => openEditor(row.shape, row.examples)}
-              >
-                {row.rule.kind === "none" ? "Set the result" : "Edit"}
-              </button>
-              {/* BESIDE "Set the result", as asked for, and deliberately NOT
-                  styled like it. This is the answer for a group that needs no
-                  work, so it must not compete with the primary action for
-                  attention — slate, no underline until hover. */}
-              <button
-                type="button"
-                className="text-xs font-medium text-slate-500 hover:text-slate-700 hover:underline disabled:opacity-50"
-                disabled={busy}
-                title="These URLs are already correct — record that and stop listing this group as outstanding"
-                onClick={() => void markNoChange([row.shape], true)}
-              >
-                Leave as it is
-              </button>
-            </span>
-          )}
+            {/* THE ONE ADDITION TO THE v1.86 DIALOG (v1.89).
+                
+                Beside "Set the result", as asked, and deliberately NOT styled like
+                it: this is the answer for a group that needs no work, so it must
+                not compete with the primary action for attention — slate, no
+                underline until hover.
+                
+                Offered on an ALREADY-MARKED row too, which is what makes it its own
+                undo: pressing "Set the result" there opens the editor and saving a
+                rule replaces the mark (one row per shape, so the two are mutually
+                exclusive in the database). v1.87 had a separate "Needs a fix"
+                button for that; it was one of the extras taken back out. */}
+            <button
+              type="button"
+              className="text-xs font-medium text-slate-500 hover:text-slate-700 hover:underline disabled:opacity-50"
+              disabled={busy || row.rule.kind === "no-change"}
+              title="These URLs are already correct — record that and stop listing this group as outstanding"
+              onClick={() => void markNoChange([row.shape], true)}
+            >
+              Leave as it is
+            </button>
+          </span>
         </td>
       </tr>
     );
@@ -668,8 +650,12 @@ export function UnfixedGroupsDialog({
               {/* ALREADY ANSWERED, collapsed and out of the way but never hidden.
                   Removing them would lose the one thing that stops the loop: a
                   group that HAS a rule and came back unfixed anyway is visible
-                  here, with the caveat saying the rule may not fit it. */}
-              {resolved.length > 0 ? (
+                  here, with the caveat saying the rule may not fit it.
+                  
+                  A group marked "leave as it is" lands here too (v1.89) rather
+                  than in a section of its own — it has been answered, and the
+                  answer is that nothing should happen to it. */}
+              {answered.length > 0 ? (
                 <tr className="border-t bg-muted/30">
                   <td colSpan={5} className="px-3 py-1.5">
                     <button
@@ -678,8 +664,8 @@ export function UnfixedGroupsDialog({
                       onClick={() => setShowResolved((current) => !current)}
                     >
                       {showResolved ? "▾" : "▸"} Already answered (
-                      {resolved.length} group{resolved.length === 1 ? "" : "s"} ·{" "}
-                      {resolved
+                      {answered.length} group{answered.length === 1 ? "" : "s"} ·{" "}
+                      {answered
                         .reduce((total, row) => total + row.urls, 0)
                         .toLocaleString("en-US")}{" "}
                       URLs)
@@ -687,34 +673,7 @@ export function UnfixedGroupsDialog({
                   </td>
                 </tr>
               ) : null}
-              {showResolved ? resolved.map((row) => renderRow(row, true)) : null}
-
-              {/* LEFT AS THEY ARE — collapsed, and kept out of the selectable
-                  rows above rather than deleted from the list. The group is still
-                  genuinely unfixed and still counted in the shortfall, so hiding
-                  it would make the dialog disagree with the report that sent the
-                  operator here. It carries its own undo. */}
-              {leftAsIs.length > 0 ? (
-                <tr className="border-t bg-muted/30">
-                  <td colSpan={5} className="px-3 py-1.5">
-                    <button
-                      type="button"
-                      className="text-xs font-semibold uppercase tracking-wide text-slate-500"
-                      onClick={() => setShowLeftAsIs((current) => !current)}
-                    >
-                      {showLeftAsIs ? "▾" : "▸"} Left as they are (
-                      {leftAsIs.length} group{leftAsIs.length === 1 ? "" : "s"} ·{" "}
-                      {leftAsIs
-                        .reduce((total, row) => total + row.urls, 0)
-                        .toLocaleString("en-US")}{" "}
-                      URLs)
-                    </button>
-                  </td>
-                </tr>
-              ) : null}
-              {showLeftAsIs
-                ? leftAsIs.map((row) => renderRow(row, false))
-                : null}
+              {showResolved ? answered.map((row) => renderRow(row, true)) : null}
             </tbody>
           </table>
         </div>
@@ -805,43 +764,10 @@ export function UnfixedGroupsDialog({
             {blocked ?? describeApplyScope(rows)}
           </p>
           <div className="flex gap-2">
-            {/* THE BULK MARK, in the footer (v1.88).
-                
-                It began as a selection bar above the table, which was the one
-                unconditional change this dialog made to the layout it had before
-                — and the operator asked for that layout back. The footer already
-                exists, so putting it here adds no chrome and shifts nothing.
-                
-                NOT beside the bulk SAVE, which lives inside the editor panel:
-                that panel only exists once a group is being edited, which is
-                right for an action that saves an edit and wrong for this one.
-                Marking a group already-correct involves no editing at all, so
-                requiring an editor to be open first would be a step that exists
-                only to reach a button.
-                
-                Offered from ONE group upward, unlike the bulk save, which needs
-                two before it does more than the per-row button does. The count is
-                on the label so it never promises work it will not do: rows already
-                marked are excluded from it. */}
-            {selectedMarkable.length > 0 ? (
-              <Button
-                type="button"
-                variant="outline"
-                disabled={busy}
-                title="Record that these groups are already correct, so they stop being listed as outstanding"
-                onClick={() =>
-                  void markNoChange(
-                    selectedMarkable.map((row) => row.shape),
-                    true
-                  )
-                }
-              >
-                {saving ? (
-                  <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
-                ) : null}
-                Leave {selectedMarkable.length} as {selectedMarkable.length === 1 ? "it is" : "they are"}
-              </Button>
-            ) : null}
+            {/* NO BULK MARK BUTTON (v1.89). v1.88 put one here, and before that a
+                selection bar above the table; both are gone. Marking is per-row
+                only, which is the whole of what was asked for. The footer is back
+                to Close and Fix, as in v1.86. */}
             <Button
               type="button"
               variant="outline"

@@ -175,10 +175,10 @@ test("answered groups are separated from the ones still outstanding", () => {
     ])
   );
 
-  const { unresolved, resolved } = partitionSkippedGroupRows(rows);
+  const { unresolved, answered } = partitionSkippedGroupRows(rows);
 
   assert.deepEqual(
-    resolved.map((row) => row.shape),
+    answered.map((row) => row.shape),
     ["/a/a-9999/"]
   );
   assert.deepEqual(
@@ -196,10 +196,10 @@ test("the partition agrees with what the Apply footer counts", () => {
       ["/b/b-99/", { kind: "measured", summary: "x" }]
     ])
   );
-  const { resolved } = partitionSkippedGroupRows(rows);
+  const { answered } = partitionSkippedGroupRows(rows);
 
   assert.equal(
-    resolved.length,
+    answered.length,
     rows.filter((row) => row.applicable).length
   );
 });
@@ -210,10 +210,10 @@ test("a measured-but-unagreed group counts as unanswered", () => {
   // outstanding side however much is known about it. The apply skips unagreed
   // rows, and a row the apply will skip is not an answer.
   const rows = buildSkippedGroupRows([shape()], noRules);
-  const { unresolved, resolved } = partitionSkippedGroupRows(rows);
+  const { unresolved, answered } = partitionSkippedGroupRows(rows);
 
   assert.equal(unresolved.length, 1);
-  assert.equal(resolved.length, 0);
+  assert.equal(answered.length, 0);
 });
 
 test("the header states the remainder from the apply, not from the rows", () => {
@@ -340,13 +340,29 @@ test("a group marked leave-as-it-is is answered, but not applicable", () => {
   assert.equal(row.applicable, false);
 });
 
-test("it lands in its own pile, not with the answered or the outstanding", () => {
+test("it counts as ANSWERED, alongside the groups that carry a rule", () => {
+  // v1.87 gave it a third pile; v1.89 folds it into "already answered", which is
+  // the section the dialog already had. Somebody looked and decided, so it is an
+  // answer — the answer just happens to be that nothing should happen.
   const rows = markedRows([shape({ shape: "/b/b-99/", count: 5 })]);
-  const { unresolved, resolved, leftAsIs } = partitionSkippedGroupRows(rows);
+  const { unresolved, answered } = partitionSkippedGroupRows(rows);
 
-  assert.deepEqual(leftAsIs.map((row) => row.shape), ["/a/a-9999/"]);
+  assert.deepEqual(answered.map((row) => row.shape), ["/a/a-9999/"]);
   assert.deepEqual(unresolved.map((row) => row.shape), ["/b/b-99/"]);
-  assert.deepEqual(resolved, []);
+});
+
+test("but it is still NOT applicable, so Apply leaves it alone", () => {
+  // THE LOAD-BEARING DISTINCTION, and the reason folding the piles is safe.
+  // "Answered" is a display grouping; `applicable` is what the apply acts on. If
+  // merging the two piles had merged these two questions, a group somebody marked
+  // as already-correct would have been counted into "Will fix N URLs" and then
+  // rewritten — approving a change nobody asked for.
+  const rows = markedRows([shape({ shape: "/b/b-99/", count: 5 })]);
+  const { answered } = partitionSkippedGroupRows(rows);
+
+  assert.equal(answered[0].rule.kind, "no-change");
+  assert.equal(answered[0].applicable, false);
+  assert.equal(describeApplyScope(rows), "Will fix 0 URLs across 0 groups.");
 });
 
 test("Apply ignores it: no URLs, no groups, and still blocked if it is all there is", () => {
@@ -380,19 +396,21 @@ test("a deliberately unchanged group is never accused of a rule that did not fit
   assert.equal(describeUnmatchedRule(row, "2026-08-27T11:00:00Z"), null);
 });
 
-test("the header keeps the real shortfall and says how much of it is on purpose", () => {
-  // The count is NOT reduced: those URLs genuinely were not rewritten, and
-  // shrinking the number to look better is the flattering arithmetic v1.81 exists
-  // to prevent. It is qualified instead.
+test("the header says nothing extra about what was marked", () => {
+  // v1.87 appended "30 of them are in groups you marked as already correct"; v1.89
+  // takes that back out. The count was always honest and still is — those URLs
+  // genuinely were not rewritten — it just is not annotated.
   const rows = markedRows([shape({ shape: "/b/b-99/", count: 15 })]);
+  const summary = unresolvedSummary({ skippedInScope: 45, rows });
 
   assert.equal(
-    unresolvedSummary({ skippedInScope: 45, rows }),
-    "45 URLs in this pattern are still unfixed. 30 of them are in groups you marked as already correct. The 2 biggest groups the last fix could not reach are listed below."
+    summary,
+    "45 URLs in this pattern are still unfixed. The 2 biggest groups the last fix could not reach are listed below."
   );
+  assert.ok(!summary.includes("marked"));
 });
 
-test("with nothing marked the header says nothing about marking", () => {
+test("and the singular form reads correctly", () => {
   const rows = buildSkippedGroupRows([shape({ count: 45 })], noRules);
 
   assert.equal(
@@ -466,11 +484,11 @@ test("a group can still be left as it is with only one example", () => {
     ],
     new Map<string, ShapeRuleState>([["/a/a-9999/", { kind: "no-change" }]])
   );
-  const { unresolved, leftAsIs } = partitionSkippedGroupRows(rows);
+  const { unresolved, answered } = partitionSkippedGroupRows(rows);
 
   assert.deepEqual(unresolved, []);
-  assert.equal(leftAsIs.length, 1);
-  assert.equal(leftAsIs[0].applicable, false);
+  assert.equal(answered.length, 1);
+  assert.equal(answered[0].applicable, false);
 });
 
 test("a group with no example at all still renders from its shape", () => {
