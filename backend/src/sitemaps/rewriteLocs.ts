@@ -52,7 +52,10 @@ export function buildLocMapRewriter(
 //   2. otherwise the general derived rule (deriveRedirectRule) via
 //      applyRedirectRule, which reaches EVERY matching URL in a file — not just
 //      a pre-enumerated subset;
-//   3. otherwise null (the loc passes through byte-for-byte).
+//   3. otherwise a per-shape rule for this URL's valueShape (v1.69);
+//   4. otherwise the operator's pattern-wide rule, if one is set AND this URL's
+//      pathname matches the pattern's template (v1.90);
+//   5. otherwise null (the loc passes through byte-for-byte).
 // This is the core of the fix for the capped-pattern_urls bug: because the rule
 // is a pure transform over each <loc> streamed from disk, the rewrite reaches
 // all real occurrences regardless of how many rows the bounded pattern_urls
@@ -87,11 +90,32 @@ export function buildRedirectApplyRewriter(
   //
   // Checked FIRST, before the exact map: an exclusion is the operator's explicit
   // "leave this alone", and it outranks even a confirmed destination.
-  excludeUrls?: Set<string> | null
+  excludeUrls?: Set<string> | null,
+  // THE OPERATOR'S ANSWER FOR THE WHOLE PATTERN (v1.90), consulted LAST.
+  //
+  // WHY IT IS NOT JUST ANOTHER ENTRY IN `rule` ABOVE. Two differences, and both
+  // are the reason this parameter exists rather than being folded into that list:
+  //
+  //   * PRECEDENCE. `rule` outranks the per-shape map, because it was distilled
+  //     from every sample rather than one stratum. This is the opposite kind of
+  //     thing — a catch-all somebody typed for the groups nothing else covers —
+  //     so a rule measured or asserted for ONE shape must beat it. It is tried
+  //     only after byShape misses;
+  //   * SCOPE. `rule` is applied to every <loc> in the scanned files, which is
+  //     survivable because it is distilled from that pattern's own confirmed
+  //     pairs and its literal find string rarely occurs elsewhere. A human-typed
+  //     sweep has no such accident protecting it: "aviation/" appears in URLs of
+  //     half a dozen other patterns sharing these 653 sitemap files, and the
+  //     dialog that collects this rule says, in so many words, "these URLs are in
+  //     /aviation/{param}/{param}/{param}". So this one is TEMPLATE-GATED, and
+  //     the template is not optional — carrying them together is what makes an
+  //     ungated pattern-wide sweep unrepresentable rather than merely avoided.
+  patternFallback?: { rule: RedirectRule; template: string } | null
 ): LocUrlRewriter {
   const byShape = shapeRules ?? null;
   const rules = rule === null ? [] : Array.isArray(rule) ? rule : [rule];
   const excluded = excludeUrls ?? null;
+  const fallback = patternFallback ?? null;
 
   return (url: string) => {
     if (excluded !== null && excluded.has(url)) {
@@ -115,20 +139,42 @@ export function buildRedirectApplyRewriter(
       }
     }
 
-    if (byShape) {
-      let pathname: string;
+    // ONE parse of the pathname for both of the remaining lookups. They used to
+    // be one block, so the try/catch bailed out of the function; now that a
+    // second consumer follows it, a malformed <loc> has to leave BOTH alone
+    // rather than the first one it reaches.
+    let pathname: string | null = null;
 
+    if (byShape !== null || fallback !== null) {
       try {
         pathname = new URL(url).pathname;
       } catch {
+        // Not a URL either lookup could classify. Passing it through unchanged
+        // is the only honest answer.
         return null;
       }
+    }
 
+    if (byShape !== null && pathname !== null) {
       const shapeRule = byShape.get(valueShape(pathname));
 
       if (shapeRule) {
         return applyRedirectRule(url, shapeRule);
       }
+    }
+
+    // LAST, AND ONLY INSIDE THE PATTERN. Every guard above has declined, so this
+    // URL is one of the ones the report was calling unfixed — which is exactly
+    // what this rule was typed to answer. The template check is what keeps the
+    // sweep inside the pattern the operator was looking at when they typed it;
+    // without it the same rule would edit the neighbouring patterns that share
+    // these files, which is the v1.68 overreach this area exists to prevent.
+    if (fallback !== null && pathname !== null) {
+      if (!pathMatchesTemplate(pathname, fallback.template)) {
+        return null;
+      }
+
+      return applyRedirectRule(url, fallback.rule);
     }
 
     return null;

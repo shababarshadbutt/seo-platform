@@ -209,7 +209,12 @@ export type ShapeRuleResult = {
   // "no_change" is a human saying this group needs no rewrite; null is the undo,
   // which removes the row entirely — the absence of a row is already how the
   // table spells "nobody has said anything about this shape".
-  source: "operator" | "no_change" | null;
+  // "operator_pattern" is the same assertion at PATTERN scope (v1.90) — a
+  // separate value, not a flag, because the server stores it as a separate
+  // provenance so no reader can mistake its reach.
+  source: "operator" | "operator_pattern" | "no_change" | null;
+  // Echoed for a pattern-wide write so the caller knows which row it landed on.
+  scope?: "pattern";
 };
 
 export async function saveShapeRule(
@@ -223,6 +228,15 @@ export async function saveShapeRule(
     // exclusivity between a rule and a mark is enforced there rather than being
     // a convention two callers have to keep.
     | { shapes: string[]; no_change: boolean }
+    // "THIS ANSWER IS FOR EVERY URL IN THE PATTERN" (v1.90), and its undo.
+    //
+    // No `shapes`, because the whole reason this scope exists is that no list of
+    // shapes can cover the pattern: the coverage report names 25 groups per pass
+    // out of thousands, so answering group by group never terminates on a pattern
+    // this wide. Same endpoint again, same derivation from the same edited
+    // examples — only the reach differs.
+    | { scope: "pattern"; pairs: Array<{ source: string; dest: string }> }
+    | { scope: "pattern"; clear: true }
 ): Promise<ShapeRuleResult> {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/shape-rule`),
@@ -262,16 +276,35 @@ export type ShapeRuleRecord = {
   authored_at?: string | null;
 };
 
+// The pattern-wide answer, read back (v1.90). Separate from the per-shape rules
+// for the same reason the server keeps it in a separate provenance: it is not a
+// group, nothing in a coverage report will ever match it, and a caller that
+// folded it into the list would hold a rule keyed on a shape that does not exist.
+export type PatternRuleRecord = {
+  rule: RedirectRuleShape;
+  source: string;
+  authored_at?: string | null;
+};
+
 export async function getShapeRules(
   sessionId: string,
   patternId: string
-): Promise<ShapeRuleRecord[]> {
+): Promise<{ rules: ShapeRuleRecord[]; patternRule: PatternRuleRecord | null }> {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/patterns/${patternId}/shape-rules`)
   );
-  const body = await readJsonResponse<{ rules?: ShapeRuleRecord[] }>(response);
+  const body = await readJsonResponse<{
+    rules?: ShapeRuleRecord[];
+    pattern_rule?: PatternRuleRecord | null;
+  }>(response);
 
-  return body.rules ?? [];
+  return {
+    rules: body.rules ?? [],
+    // Absent on an older backend, which is not the same as "none set" but is
+    // indistinguishable from it here — and degrades to the pre-v1.90 dialog
+    // rather than to a wrong claim.
+    patternRule: body.pattern_rule ?? null
+  };
 }
 
 export type SampledUrl = {

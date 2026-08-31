@@ -312,6 +312,37 @@ test("the inline route and the queued job rewrite identical bytes", async (t) =>
       }
     }
 
+    // A PATTERN-WIDE OPERATOR RULE (v1.90), in the shared fixture so both runs
+    // carry it and any drift shows up as a byte difference below.
+    //
+    // WHY IT BELONGS IN THIS TEST. The odd "/item-a" half of the population has
+    // no verified destination and no per-shape rule, so before v1.90 nothing
+    // could reach it — the file header calls it "reachable only through an agreed
+    // per-shape rule", but no such rule was ever seeded, so half the population
+    // was simply unreachable and both paths agreed on leaving it alone. That is
+    // exactly the reported dead end: a pattern whose groups outnumber anything an
+    // operator can answer one at a time. One rule at pattern scope covers it.
+    //
+    // Filed under the sentinel shape with its own provenance — resolveApplyInputs
+    // filters per-shape rules on `source` precisely so this row cannot land in a
+    // map keyed on valueShape, where "*" could never match.
+    await pool.query(
+      `
+        INSERT INTO pattern_shape_rules
+          (pattern_id, shape, rule, sample_size, population, agreed, source,
+           authored_at)
+        VALUES ($1, '*', $2::jsonb, 0, 0, true, 'operator_pattern', now())
+      `,
+      [
+        patternId,
+        JSON.stringify({
+          kind: "replace",
+          find: "/product/catalog/",
+          replace: "/catalog/product/"
+        })
+      ]
+    );
+
     return { sessionId, patternId, files };
   }
 
@@ -417,6 +448,20 @@ test("the inline route and the queued job rewrite identical bytes", async (t) =>
     changedInJob > 2,
     `the queued job rewrote only ${changedInJob} files — it is reading sampled_urls alone again`
   );
+
+  // 1b. THE PATTERN-WIDE RULE REACHED THE HALF NOTHING ELSE COULD (v1.90).
+  //
+  //    The odd "/item-a" URLs have no verified destination and no per-shape rule.
+  //    Before v1.90 they were unreachable and every file kept them verbatim; now
+  //    the one rule at pattern scope covers them. Asserted on the JOB's output,
+  //    because the queued path is the one a wide pattern takes and the one that
+  //    has twice been found blind to a capability the route already had.
+  for (const [display, xml] of jobBytes) {
+    assert.ok(
+      !xml.includes("/product/catalog/item-a"),
+      `${display} still holds URLs only the pattern-wide rule can reach — the queued path is not applying it`
+    );
+  }
 
   // 2. And they must agree exactly. This is the guard: any capability added to
   //    one path and not the other shows up here as a byte difference.

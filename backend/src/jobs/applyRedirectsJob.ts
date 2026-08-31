@@ -196,6 +196,10 @@ async function runApplyRedirectsJob(
 
   const replacements = inputs.replacements;
   const shapeRules = inputs.shapeRules;
+  // The operator's one answer for every URL of this pattern (v1.90). Lowest
+  // precedence, and scoped to patternTemplate by the rewriter — see
+  // buildRedirectApplyRewriter.
+  const patternRule = inputs.patternRule;
   // Held as an array for the worker-thread spec (it crosses a structuredClone
   // boundary) and as a Set for the in-process rewriter.
   const excludeUrls = data.exclude_urls ?? null;
@@ -210,7 +214,17 @@ async function runApplyRedirectsJob(
   // shapeRules counts as something to do (v1.79). Without it a pattern whose
   // only reach is a stratified verification bailed out here having rewritten
   // nothing — and reported success. The inline route always counted them.
-  if (replacements.size === 0 && !effectiveRule && shapeRules.size === 0) {
+  // patternRule counts as something to do for the same reason shapeRules had to
+  // be added here in v1.79: it can be a pattern's ONLY reach. Left out, an apply
+  // whose whole instruction was the operator's pattern-wide rule would bail out
+  // having rewritten nothing and report COMPLETED with items_changed = 0 — a
+  // success message over an untouched sitemap.
+  if (
+    replacements.size === 0 &&
+    !effectiveRule &&
+    shapeRules.size === 0 &&
+    !patternRule
+  ) {
     logger.info(
       { session_id: sessionId, pattern_id: patternId },
       "apply-redirects job: nothing to rewrite"
@@ -244,7 +258,10 @@ async function runApplyRedirectsJob(
       sampledFiles: [],
       occurrenceFiles: occurrenceResult.rows.map((row) => row.source_file),
       hasReplacements: replacements.size > 0,
-      hasRule: effectiveRule !== null || shapeRules.size > 0
+      // A pattern-wide rule sweeps, so it needs every file the pattern's URLs
+      // live in — the same widening a derived rule asks for.
+      hasRule:
+        effectiveRule !== null || shapeRules.size > 0 || patternRule !== null
     })
   );
 
@@ -419,7 +436,8 @@ async function runApplyRedirectsJob(
               shapeRules: Array.from(shapeRules.entries()),
               excludeUrls,
               structureFilters,
-              patternTemplate
+              patternTemplate,
+              patternRule
             }
           })
         )
@@ -433,7 +451,11 @@ async function runApplyRedirectsJob(
         replacements,
         effectiveRule,
         shapeRules,
-        excludeSet
+        excludeSet,
+        // patternRule, on BOTH branches (v1.90). The two branches of this `if`
+        // are the divergence v1.79 was written to close and v1.77 made load-
+        // bearing; adding a capability to one of them is the whole bug.
+        patternRule ? { rule: patternRule, template: patternTemplate } : null
       ),
       structureFilters
     );

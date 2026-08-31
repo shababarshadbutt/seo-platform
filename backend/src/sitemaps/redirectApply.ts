@@ -17,6 +17,7 @@ import {
 import { deriveRedirectRule, type RedirectRule } from "./redirectRule.js";
 import {
   emptySkippedReport,
+  mergeSkippedReports,
   tallySkippedInScope,
   type SkippedReport
 } from "./applyCoverage.js";
@@ -88,6 +89,19 @@ export const recomputePatternStatsSql = `
   WHERE id = $1
 `;
 
+// THE SHAPE A PATTERN-WIDE OPERATOR RULE IS FILED UNDER (v1.90).
+//
+// pattern_shape_rules is keyed on valueShape(pathname), and valueShape is only
+// ever called on a pathname, which always begins with "/" — so no real shape can
+// equal "*" and this cannot collide with a group. UNIQUE (pattern_id, shape) then
+// makes the row singular per pattern for free.
+//
+// The row is told apart by its `source` ('operator_pattern'), NOT by this string:
+// migration 056 explains why, and resolveApplyInputs below filters on source for
+// exactly that reason. This constant exists so the one value is written once
+// rather than quoted in the route, the loader and the tests separately.
+export const PATTERN_WIDE_SHAPE = "*";
+
 export type RedirectFileRewrite = {
   fixedStoredFilenames: string[];
   // Previous files safe to delete after COMMIT (intermediate fixed copies only —
@@ -147,15 +161,38 @@ export async function rewriteRedirectSourceFilesOnDisk(
     // The pattern's template (v1.81). Supplied ONLY so the pass can also count
     // the pattern's URLs it leaves alone — it never changes what is rewritten.
     // Omitted = no tally, and the result reports an empty one.
+    //
+    // SINCE v1.90 IT HAS A SECOND JOB, and that one DOES change what is
+    // rewritten: it scopes patternRule below. Both readings are the same fact —
+    // "which URLs belong to this pattern" — asked by the same predicate, which is
+    // why there is one field rather than two that could disagree.
     patternTemplate?: string | null;
+    // The operator's answer for every URL of the pattern that nothing else covers
+    // (v1.90). Lowest precedence, applied only inside patternTemplate. Null or
+    // omitted = unchanged prior behaviour.
+    patternRule?: RedirectRule | null;
   }
 ): Promise<RedirectFileRewrite> {
+  // AN UNGATED PATTERN-WIDE SWEEP IS A BUG WE REFUSE TO PERFORM, rather than one
+  // we trust the callers not to ask for. Without a template this rule would edit
+  // every <loc> in 653 shared sitemap files, including URLs of the patterns
+  // nobody was looking at — and it would look like a success. Both callers pass a
+  // template today; this is here so a third one cannot quietly not.
+  if (options.patternRule && !options.patternTemplate) {
+    throw new Error(
+      "patternRule requires patternTemplate: a pattern-wide rule must be scoped to its pattern"
+    );
+  }
+
   const scopedRewriter = applyStructureFilterToRewriter(
     buildRedirectApplyRewriter(
       options.replacements,
       options.rule ?? null,
       options.shapeRules ?? null,
-      options.excludeUrls ?? null
+      options.excludeUrls ?? null,
+      options.patternRule && options.patternTemplate
+        ? { rule: options.patternRule, template: options.patternTemplate }
+        : null
     ),
     options.structureFilters ?? null
   );
@@ -265,7 +302,15 @@ export async function rewriteRedirectSourceFilesOnDisk(
   }
 
   if (coverage) {
-    result.skipped = coverage.report();
+    // FOLDED THROUGH THE SHARED CAP even though there is only one report (v1.90).
+    // tallySkippedInScope now counts up to SKIPPED_SHAPE_COUNT_LIMIT shapes and
+    // returns all of them, because the queued path needs full per-file counts to
+    // merge; this path has no merge, so without this its response and its
+    // patterns.redirects_skipped_shapes row would carry hundreds of groups and the
+    // dialog would render them. Reusing mergeSkippedReports rather than slicing
+    // here keeps one answer to "how many groups does a human see, and when do we
+    // admit the list is short" — the two paths already differ in enough ways.
+    result.skipped = mergeSkippedReports([coverage.report()]);
   }
 
   return result;
@@ -435,6 +480,10 @@ export async function resolveApplyInputs(options: {
   rule: RedirectRule | RedirectRule[] | null;
   // Per-shape rules from a stratified verification, agreed ones only.
   shapeRules: Map<string, RedirectRule>;
+  // The operator's one rule for every URL of this pattern (v1.90), or null.
+  // Separate from shapeRules because it is a different SCOPE, not a different
+  // rule: the rewriter consults it last and only inside the pattern's template.
+  patternRule: RedirectRule | null;
   // Does the rule sweep the pattern, or only the enumerated rows?
   widen: boolean;
   // sampled_urls rows whose destination was adopted, for the response's
@@ -598,13 +647,47 @@ export async function resolveApplyInputs(options: {
     `
       SELECT shape, rule
       FROM pattern_shape_rules
-      WHERE pattern_id = $1 AND agreed = true AND rule IS NOT NULL
+      WHERE pattern_id = $1
+        AND agreed = true
+        AND rule IS NOT NULL
+        -- EXCLUDED HERE, LOADED BELOW (v1.90). A pattern-wide row satisfies both
+        -- conditions above, and its shape is the sentinel "*" — so without this
+        -- clause it would land in a map the rewriter looks up by
+        -- valueShape(pathname), where "*" can never be the key. The rule would be
+        -- stored, agreed, reported as saved, and rewrite nothing: the silent
+        -- no-op this dialog exists to stop producing.
+        AND source <> 'operator_pattern'
     `,
     [patternId]
   );
   const shapeRules = new Map<string, RedirectRule>(
     shapeRuleResult.rows.map((row) => [row.shape, row.rule])
   );
+
+  // THE PATTERN-WIDE ANSWER (v1.90).
+  //
+  // WHY IT EXISTS. Everything above is keyed on valueShape, which keeps digit-run
+  // length, so /rfq/textron-inc/95-23218/ and /rfq/bell-industries-inc/t103228-101/
+  // are different groups needing separate rules. On the reported 8.2M-URL pattern
+  // that is thousands of groups against a coverage report that surfaces 25 of
+  // them, so an operator with ONE correct answer — strip "aviation/" — had to
+  // re-state it 25 groups at a time, paying a full 653-file scan for each pass.
+  //
+  // Loaded from the same table and honoured by the same rewriter, so the only new
+  // idea is the scope. Precedence is asserted by buildRedirectApplyRewriter, not
+  // here: an answer somebody gave for one shape must still beat the catch-all.
+  const patternRuleResult = await client.query<{ rule: RedirectRule }>(
+    `
+      SELECT rule
+      FROM pattern_shape_rules
+      WHERE pattern_id = $1
+        AND source = 'operator_pattern'
+        AND agreed = true
+        AND rule IS NOT NULL
+    `,
+    [patternId]
+  );
+  const patternRule = patternRuleResult.rows[0]?.rule ?? null;
 
   // Whole-pattern widening: the rule applies to EVERY matching <loc> in the
   // pattern's files, not to a pre-enumerated subset. The confirmed exact pairs
@@ -620,6 +703,7 @@ export async function resolveApplyInputs(options: {
     candidateFiles,
     rule,
     shapeRules,
+    patternRule,
     widen,
     updatedCount: updateResult.rowCount ?? 0
   };

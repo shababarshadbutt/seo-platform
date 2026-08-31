@@ -176,6 +176,7 @@ import {
 } from "../sitemaps/redirectRule.js";
 import {
   mergeVerifiedReplacements,
+  PATTERN_WIDE_SHAPE,
   resolveApplyInputs,
   recomputePatternStatsSql,
   rewriteRedirectSourceFilesOnDisk,
@@ -5164,6 +5165,19 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // to rewrite. Also the undo: no_change = false clears whatever the group
       // was carrying and returns it to unanswered.
       no_change?: unknown;
+      // "THIS ANSWER IS FOR THE WHOLE PATTERN" (v1.90). scope: "pattern" files the
+      // derived rule once, under the sentinel shape, instead of once per shape in
+      // `shapes` — which is then ignored.
+      //
+      // WHY IT HAD TO BECOME A SCOPE AND NOT A LONGER `shapes` LIST. The
+      // reported pattern holds 8.2M URLs across thousands of valueShapes, and the
+      // coverage report can only name 25 of them per pass, so no list an operator
+      // can be handed will ever cover it. One answer at a different scope is the
+      // only shape of fix that terminates.
+      scope?: unknown;
+      // The undo for that, mirroring no_change = false: it DELETEs the row rather
+      // than writing a "cleared" one.
+      clear?: unknown;
       authored_by?: unknown;
     };
   }>(
@@ -5178,6 +5192,45 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         return reply
           .code(404)
           .send({ error: "Not Found", message: "pattern not found" });
+      }
+
+      // PATTERN SCOPE (v1.90), settled before anything reads `shapes`, because a
+      // pattern-wide answer does not have any and requiring them would make the
+      // caller invent one.
+      if (request.body?.scope !== undefined && request.body.scope !== "pattern") {
+        return reply
+          .code(400)
+          .send(badRequest('scope must be "pattern" when given'));
+      }
+
+      const patternScope = request.body?.scope === "pattern";
+
+      if (patternScope) {
+        // THE UNDO, and it DELETEs for the same reason no_change = false does:
+        // the absence of a row is already how this table spells "nobody has
+        // asserted anything at this scope", and a second spelling would leave the
+        // dialog two states to treat as one.
+        if (request.body?.clear === true) {
+          await pool.query(
+            `
+              DELETE FROM pattern_shape_rules
+              WHERE pattern_id = $1 AND source = 'operator_pattern'
+            `,
+            [request.params.patternId]
+          );
+
+          return {
+            shape: PATTERN_WIDE_SHAPE,
+            shapes: [],
+            rule: null,
+            source: null,
+            scope: "pattern" as const
+          };
+        }
+      } else if (request.body?.clear !== undefined) {
+        return reply
+          .code(400)
+          .send(badRequest('clear is only meaningful with scope: "pattern"'));
       }
 
       // One shape or many — `shape` is the degenerate case of `shapes`, and both
@@ -5202,8 +5255,23 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         }
       }
 
-      if (shapes.length === 0) {
+      if (shapes.length === 0 && !patternScope) {
         return reply.code(400).send(badRequest("shape or shapes is required"));
+      }
+
+      // no_change is a decision about ONE GROUP's URLs being already correct.
+      // "the whole pattern is already correct" is not a thing this dialog can
+      // mean — the coverage report just counted the URLs it left behind — and
+      // migration 056's CHECK would reject the row anyway, as a 500 rather than
+      // as an answer. Refusing here says which of the two the caller got wrong.
+      if (patternScope && request.body?.no_change !== undefined) {
+        return reply
+          .code(400)
+          .send(
+            badRequest(
+              'no_change applies to one group, not to a whole pattern — omit scope: "pattern"'
+            )
+          );
       }
 
       // "LEAVE THESE ALONE — THEY ARE ALREADY CORRECT" (v1.87).
@@ -5365,6 +5433,59 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // self-correcting rather than silent — the next apply's coverage report
       // counts what the rewriter actually declined, so that group simply
       // reappears in the unfixed list with its count intact.
+      // ONE ROW FOR THE WHOLE PATTERN (v1.90).
+      //
+      // Written as its own statement rather than as `shapes: ['*']` through the
+      // one below, because the two differ in the column that matters: `source`.
+      // 'operator_pattern' is what tells resolveApplyInputs to load this rule as
+      // the template-gated fallback instead of dropping it into a map keyed on
+      // valueShape, where the sentinel could never match — see migration 056.
+      //
+      // THE RULE IS DERIVED FROM ONE GROUP'S EXAMPLES AND APPLIED TO ALL OF THEM,
+      // which is the point and also the risk. It is honest about both: the
+      // rewriter tries this last, so anything with its own answer keeps it, and
+      // anything the rule cannot transform passes through and is counted in the
+      // next coverage report exactly as it is now. The operator sees the real
+      // number after the apply, not a promise before it.
+      if (patternScope) {
+        await pool.query(
+          `
+            INSERT INTO pattern_shape_rules
+              (pattern_id, shape, rule, sample_size, population, agreed, source,
+               authored_by, authored_at)
+            VALUES ($1, $2, $3::jsonb, 0, 0, true, 'operator_pattern', $4, now())
+            ON CONFLICT (pattern_id, shape) DO UPDATE
+            SET rule = EXCLUDED.rule,
+                sample_size = 0,
+                population = 0,
+                agreed = true,
+                source = 'operator_pattern',
+                authored_by = EXCLUDED.authored_by,
+                authored_at = now(),
+                measured_at = now()
+          `,
+          [
+            request.params.patternId,
+            PATTERN_WIDE_SHAPE,
+            JSON.stringify(rule),
+            typeof request.body?.authored_by === "string"
+              ? request.body.authored_by
+              : null
+          ]
+        );
+
+        return {
+          shape: PATTERN_WIDE_SHAPE,
+          // EMPTY, not ['*'] — the client uses `shapes` to mark which GROUPS it
+          // just answered, and this answered none of them individually. Handing
+          // back the sentinel would have it drawn as a row.
+          shapes: [],
+          rule,
+          source: "operator_pattern" as const,
+          scope: "pattern" as const
+        };
+      }
+
       await pool.query(
         `
           INSERT INTO pattern_shape_rules
@@ -5473,15 +5594,45 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         // its URLs disagreed" is more useful than "nothing yet", and it is the
         // finding that justifies escalating the shape. Surfacing it is a UI
         // change, not a query change, and is deliberately not made here.
-        rules: result.rows.map((row) => ({
-          shape: row.shape,
-          rule: row.rule,
-          source: row.source,
-          agreed: row.agreed,
-          sample_size: row.sample_size,
-          population: row.population,
-          authored_at: row.authored_at ? row.authored_at.toISOString() : null
-        }))
+        rules: result.rows
+          // THE PATTERN-WIDE ROW IS NOT A GROUP (v1.90). It is filed in this
+          // table under the sentinel shape "*", and the caller matches `rules`
+          // against the shapes in its coverage report — where nothing equals "*".
+          // Left in, it would be a row nothing selects, nothing renders and
+          // nothing can edit, while the answer it holds went unreported. It comes
+          // back as `pattern_rule` below instead.
+          .filter((row) => row.source !== "operator_pattern")
+          .map((row) => ({
+            shape: row.shape,
+            rule: row.rule,
+            source: row.source,
+            agreed: row.agreed,
+            sample_size: row.sample_size,
+            population: row.population,
+            authored_at: row.authored_at ? row.authored_at.toISOString() : null
+          })),
+        // The one answer that covers every URL of this pattern, or null.
+        //
+        // Reported for the same reason `rules` is (v1.86): a dialog that cannot
+        // read back what it has already been told shows an answered pattern as
+        // unanswered, and the operator restates a rule that is already saved. At
+        // this scope that mistake is worse than redundant — it reads as though
+        // pressing the button did nothing.
+        pattern_rule: (() => {
+          const row = result.rows.find(
+            (candidate) => candidate.source === "operator_pattern"
+          );
+
+          return row
+            ? {
+                rule: row.rule,
+                source: row.source,
+                authored_at: row.authored_at
+                  ? row.authored_at.toISOString()
+                  : null
+              }
+            : null;
+        })()
       };
     }
   );
@@ -5860,6 +6011,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         const replacements = inputs.replacements;
         const candidateFiles = inputs.candidateFiles;
         const shapeRules = inputs.shapeRules;
+        // The operator's one answer for every URL of this pattern (v1.90).
+        const patternRule = inputs.patternRule;
         const widen = inputs.widen;
         const inferredRule = inputs.rule;
 
@@ -5877,7 +6030,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           sampledFiles: candidateFiles,
           occurrenceFiles: occurrenceResult.rows.map((row) => row.source_file),
           hasReplacements: replacements.size > 0,
-          hasRule: widen || shapeRules.size > 0
+          // patternRule sweeps, so it needs the pattern's whole file set.
+          hasRule: widen || shapeRules.size > 0 || patternRule !== null
         });
 
         let rewrittenLocCount = 0;
@@ -5888,10 +6042,16 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         let skipped = emptySkippedReport();
 
         // Rewrite when there are confirmed exact replacements to apply, a rule
-        // to widen across the pattern's files, OR per-shape rules from a
-        // stratified verification — that last one is the whole point of v1.69:
-        // a pattern that distils no single rule can still have one per shape.
-        if (replacements.size > 0 || widen || shapeRules.size > 0) {
+        // to widen across the pattern's files, per-shape rules from a stratified
+        // verification — that one is the whole point of v1.69: a pattern that
+        // distils no single rule can still have one per shape — OR the operator's
+        // pattern-wide rule (v1.90), which can likewise be a pattern's only reach.
+        if (
+          replacements.size > 0 ||
+          widen ||
+          shapeRules.size > 0 ||
+          patternRule !== null
+        ) {
           const rewrite = await rewriteRedirectSourceFilesOnDisk(client, {
             sessionId: request.params.id,
             sourceRole,
@@ -5902,8 +6062,10 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             shapeRules,
             excludeUrls: excludeSet,
             // Measures the shortfall in the same pass; changes nothing about
-            // what is rewritten (v1.81 — see applyCoverage).
-            patternTemplate
+            // what is rewritten (v1.81 — see applyCoverage). Since v1.90 it also
+            // SCOPES patternRule below, which does.
+            patternTemplate,
+            patternRule
           });
 
           filesToDeleteOnError = rewrite.newFilePaths;

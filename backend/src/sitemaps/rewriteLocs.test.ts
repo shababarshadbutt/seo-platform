@@ -397,3 +397,191 @@ test("no exclusions changes nothing", () => {
     );
   }
 });
+
+// THE OPERATOR'S PATTERN-WIDE RULE (v1.90).
+//
+// WHAT IT IS FOR. A group here is a valueShape, which keeps digit-run LENGTH, so
+// /rfq/textron-inc/95-23218/ and /rfq/bell-industries-inc/t103228-101/ are
+// DIFFERENT groups needing separate rules. The reported 8.2M-URL pattern holds
+// thousands of them and a coverage report can name 25 per pass, so an operator
+// with one correct answer could never finish: 149,745 of 8,184,592 URLs updated,
+// then the same again. This parameter is the answer at the scope the answer
+// actually has.
+//
+// TWO PROPERTIES CARRY THE WHOLE DESIGN, and both are pinned below: it is tried
+// LAST, and it is confined to the pattern's own template.
+
+const patternWide: RedirectRule = {
+  kind: "replace",
+  find: "aviation/",
+  replace: ""
+};
+
+const AVIATION_TEMPLATE = "/aviation/{param}/{param}/{param}";
+
+test("the pattern rule fixes a URL no shape rule has ever been saved for", () => {
+  // The reported case exactly: this shape is one of the thousands that never
+  // made it into a 25-row coverage report, so nothing has an answer for it.
+  const rewrite = buildRedirectApplyRewriter(new Map(), null, null, null, {
+    rule: patternWide,
+    template: AVIATION_TEMPLATE
+  });
+
+  assert.equal(
+    rewrite("https://www.nsnfulfillment.com/aviation/rfq/zodiac-in-lhc/1024-931-0/"),
+    "https://www.nsnfulfillment.com/rfq/zodiac-in-lhc/1024-931-0/"
+  );
+  assert.equal(
+    rewrite("https://www.nsnfulfillment.com/aviation/rfq/textron-inc/95-23218/"),
+    "https://www.nsnfulfillment.com/rfq/textron-inc/95-23218/"
+  );
+});
+
+test("a URL of ANOTHER pattern in the same file is left byte-identical", () => {
+  // The reason the fallback is template-gated and the template is not optional.
+  // These 653 sitemap files are shared: "aviation/" appears in URLs belonging to
+  // patterns nobody was looking at when this rule was typed, and a sweep that
+  // edited them would be the v1.68 overreach wearing a success message. Note the
+  // rule ITSELF matches these strings — only the template stops it.
+  const rewrite = buildRedirectApplyRewriter(new Map(), null, null, null, {
+    rule: patternWide,
+    template: AVIATION_TEMPLATE
+  });
+
+  // Two segments, not four.
+  assert.equal(rewrite("https://www.nsnfulfillment.com/aviation/rfq/"), null);
+  // Five segments.
+  assert.equal(
+    rewrite("https://www.nsnfulfillment.com/aviation/rfq/a/b/c/"),
+    null
+  );
+  // Four segments, but a different literal first segment.
+  assert.equal(
+    rewrite("https://www.nsnfulfillment.com/electronic/rfq/a/b/"),
+    null
+  );
+});
+
+test("a group's own rule beats the pattern rule", () => {
+  // PRECEDENCE, and it is the whole reason this is a separate parameter rather
+  // than another entry in `rule`. An answer somebody gave for one shape — or a
+  // probe measured for it — is more specific than a catch-all typed for the
+  // groups nothing else covers, so it must win. Folding the two would let a
+  // pattern-wide sweep quietly overwrite work that was already correct.
+  const shapeRules = new Map<string, RedirectRule>([
+    ["/a/a/a-a/99-99999/", { kind: "replace", find: "/aviation/", replace: "/av/" }]
+  ]);
+  const rewrite = buildRedirectApplyRewriter(new Map(), null, shapeRules, null, {
+    rule: patternWide,
+    template: AVIATION_TEMPLATE
+  });
+
+  assert.equal(
+    rewrite("https://www.nsnfulfillment.com/aviation/rfq/textron-inc/95-23218/"),
+    "https://www.nsnfulfillment.com/av/rfq/textron-inc/95-23218/"
+  );
+  // A sibling shape with no rule of its own still gets the pattern answer.
+  assert.equal(
+    rewrite("https://www.nsnfulfillment.com/aviation/rfq/zodiac-in-lhc/1024-931-0/"),
+    "https://www.nsnfulfillment.com/rfq/zodiac-in-lhc/1024-931-0/"
+  );
+});
+
+test("a confirmed destination and an approved rule both still outrank it", () => {
+  const url = "https://www.nsnfulfillment.com/aviation/rfq/textron-inc/95-23218/";
+  const exact = new Map([[url, "https://www.nsnfulfillment.com/measured/"]]);
+  const approved: RedirectRule = {
+    kind: "replace",
+    find: "/aviation/",
+    replace: "/approved/"
+  };
+
+  assert.equal(
+    buildRedirectApplyRewriter(exact, approved, null, null, {
+      rule: patternWide,
+      template: AVIATION_TEMPLATE
+    })(url),
+    "https://www.nsnfulfillment.com/measured/"
+  );
+  assert.equal(
+    buildRedirectApplyRewriter(new Map(), approved, null, null, {
+      rule: patternWide,
+      template: AVIATION_TEMPLATE
+    })(url),
+    "https://www.nsnfulfillment.com/approved/rfq/textron-inc/95-23218/"
+  );
+});
+
+test("an exclusion blocks the pattern rule too", () => {
+  // Skip is the operator's explicit "leave this alone", and it outranks even a
+  // confirmed destination — so a sweep this wide must not be the one thing that
+  // gets past it. The database would say skipped and the file would disagree.
+  const url = "https://www.nsnfulfillment.com/aviation/rfq/textron-inc/95-23218/";
+  const fallback = { rule: patternWide, template: AVIATION_TEMPLATE };
+
+  assert.equal(
+    buildRedirectApplyRewriter(
+      new Map(),
+      null,
+      null,
+      new Set([url]),
+      fallback
+    )(url),
+    null
+  );
+  // Control: without the exclusion it fires.
+  assert.equal(
+    buildRedirectApplyRewriter(new Map(), null, null, null, fallback)(url),
+    "https://www.nsnfulfillment.com/rfq/textron-inc/95-23218/"
+  );
+});
+
+test("a rule that does not fit leaves the URL alone rather than mangling it", () => {
+  // The honest half of "saved for the whole pattern without checking it fits
+  // every group". A URL the find string does not occur in passes through, and the
+  // next coverage report counts it exactly as it does now — so the number after
+  // the apply stays true and the operator can see what is left.
+  const rewrite = buildRedirectApplyRewriter(new Map(), null, null, null, {
+    rule: { kind: "replace", find: "helicopter/", replace: "" },
+    template: AVIATION_TEMPLATE
+  });
+
+  assert.equal(
+    rewrite("https://www.nsnfulfillment.com/aviation/rfq/textron-inc/95-23218/"),
+    null
+  );
+});
+
+test("no pattern rule changes nothing", () => {
+  // The pre-v1.90 path: an absent argument and an explicit null must both behave
+  // as the four-argument form always did.
+  const shapeRules = new Map<string, RedirectRule>([
+    ["/a/a-9/", { kind: "replace", find: "old", replace: "new" }]
+  ]);
+  const url = "https://x.com/a/old-1/";
+
+  for (const fallback of [undefined, null]) {
+    assert.equal(
+      buildRedirectApplyRewriter(new Map(), null, shapeRules, null, fallback)(url),
+      "https://x.com/a/new-1/"
+    );
+  }
+});
+
+test("a malformed <loc> reaches neither the shape map nor the pattern rule", () => {
+  // These two lookups share one pathname parse since v1.90. Before, the try/catch
+  // returned from the whole function, which was correct when the shape map was
+  // last; with a second consumer after it, a junk <loc> has to leave BOTH alone
+  // rather than only the one that used to follow.
+  const shapeRules = new Map<string, RedirectRule>([
+    ["/a/", { kind: "replace", find: "a", replace: "b" }]
+  ]);
+
+  assert.equal(
+    buildRedirectApplyRewriter(new Map(), null, shapeRules, null, {
+      rule: patternWide,
+      template: AVIATION_TEMPLATE
+    })("not-a-url aviation/x"),
+    null
+  );
+});

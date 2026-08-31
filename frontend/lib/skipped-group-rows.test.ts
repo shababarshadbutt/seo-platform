@@ -504,3 +504,95 @@ test("a group with no example at all still renders from its shape", () => {
   assert.deepEqual(row.examples, ["/a/a-9999/"]);
   assert.equal(describeReach(row), "12 URLs");
 });
+
+// THE PATTERN-WIDE ANSWER, IN WORDS (v1.90).
+//
+// WHY THE COPY NEEDED CHANGING AT ALL. The footer counts the resolved groups on
+// screen, which was the honest answer while a group was the only thing anyone
+// could answer. A pattern-wide rule reaches every URL of the pattern nothing else
+// covers — including the thousands of groups a 25-row report never listed — so the
+// group arithmetic would quote 74,329 for an apply about to reach 8,034,847.
+// Under-quoting a button this wide is the same class of wrong as over-quoting it,
+// and it is the failure this feature keeps having to fix.
+
+test("with a pattern rule the footer counts the pattern, not the rows", () => {
+  const rows = buildSkippedGroupRows(
+    [{ shape: "/a/a-9/", count: 3088, example: "https://x.test/a/a-1/" }],
+    new Map()
+  );
+
+  assert.equal(
+    describeApplyScope(rows, true, 8_034_847),
+    "Will fix all 8,034,847 remaining URLs in this pattern."
+  );
+});
+
+test("without a pattern rule the footer is unchanged", () => {
+  // The pre-v1.90 sentence, pinned: the new arguments default to "no pattern
+  // rule", so every existing caller keeps the answer it had.
+  const rows = buildSkippedGroupRows(
+    [
+      { shape: "/a/a-9/", count: 100, example: "https://x.test/a/a-1/" },
+      { shape: "/a/a-99/", count: 20, example: "https://x.test/a/a-11/" }
+    ],
+    new Map([["/a/a-9/", { kind: "operator", summary: "replace" } as const]])
+  );
+
+  assert.equal(describeApplyScope(rows), "Will fix 100 URLs across 1 group.");
+});
+
+test("an unknown remainder drops the figure rather than inventing one", () => {
+  // skippedInScope is null on an older backend and while a queued apply is still
+  // running. Quoting 0, or summing the rows instead, would both be claims nothing
+  // measured — which is precisely what v1.81 exists to stop.
+  assert.equal(
+    describeApplyScope([], true, null),
+    "Will fix every remaining URL in this pattern."
+  );
+});
+
+test("a pattern rule alone is enough to enable Apply", () => {
+  // The groups on screen may all be unanswered and the apply still has the widest
+  // instruction it can be given. Blocking here would disable the button on the one
+  // state that can finish the pattern.
+  const rows = buildSkippedGroupRows(
+    [{ shape: "/a/a-9/", count: 3088, example: "https://x.test/a/a-1/" }],
+    new Map()
+  );
+
+  assert.equal(applyBlockedReason(rows), "No group has a rule yet — set the result for one from its examples.");
+  assert.equal(applyBlockedReason(rows, true), null);
+});
+
+test("a fresh pattern rule silences the per-group may-not-fit caveat", () => {
+  // That caveat means "a rule was in place, an apply ran, and this group came back
+  // anyway". A pattern rule saved AFTER the residue was measured means nothing has
+  // run against the group's real situation yet, so repeating the caveat would send
+  // the operator to re-edit a rule whose failure is no longer the live question —
+  // the same wasted loop the caveat was written to end, from the other side.
+  const row = buildSkippedGroupRows(
+    [{ shape: "/a/a-9/", count: 10, example: "https://x.test/a/a-1/" }],
+    new Map([
+      [
+        "/a/a-9/",
+        {
+          kind: "operator",
+          summary: "replace",
+          authoredAt: "2026-08-31T10:00:00.000Z"
+        } as const
+      ]
+    ])
+  )[0];
+  const measuredAt = "2026-08-31T11:00:00.000Z";
+
+  // Rule predates the measurement, no pattern rule: the caveat stands.
+  assert.ok(describeUnmatchedRule(row, measuredAt));
+  // A pattern rule saved after the measurement: nothing has been tried with it.
+  assert.equal(
+    describeUnmatchedRule(row, measuredAt, "2026-08-31T11:30:00.000Z"),
+    null
+  );
+  // A pattern rule that ALSO predates the measurement has had its chance, so the
+  // caveat is still the honest thing to say.
+  assert.ok(describeUnmatchedRule(row, measuredAt, "2026-08-31T09:00:00.000Z"));
+});

@@ -127,17 +127,44 @@ export function describeReach(row: SkippedGroupRow): string {
 // resolve 23 more. Selection chooses what an edit is SAVED for; the apply then
 // rewrites everything resolved, and the footer below says so rather than leaving
 // it to be discovered.
+// A PATTERN-WIDE RULE IS ALSO A REASON APPLY IS READY (v1.90). It covers every
+// URL of the pattern that no group's own answer covers, which is strictly more
+// than any single group — so blocking on "no group has a rule" while one is set
+// would disable the button on the one state that can finish the pattern.
 export function applyBlockedReason(
-  rows: readonly SkippedGroupRow[]
+  rows: readonly SkippedGroupRow[],
+  hasPatternRule = false
 ): string | null {
-  return rows.some((row) => row.applicable)
+  return hasPatternRule || rows.some((row) => row.applicable)
     ? null
     : "No group has a rule yet — set the result for one from its examples.";
 }
 
 // What Apply will do, for the footer. Counts every RESOLVED group, because that
 // is what the apply covers.
-export function describeApplyScope(rows: readonly SkippedGroupRow[]): string {
+//
+// WITH A PATTERN-WIDE RULE SET, THE GROUP ARITHMETIC IS THE WRONG ANSWER (v1.90).
+// The rule reaches every URL of the pattern nothing else covers — including the
+// thousands of groups that were never listed — so summing the rows on screen
+// would quote a number an order of magnitude below what the apply is about to do.
+// `skippedInScope` is the last full scan's own count of what is left, which is
+// exactly the population that rule is aimed at, so that is the number reported.
+//
+// Null when unknown (an older backend, or a queued apply not yet landed): then
+// the sentence drops the figure rather than inventing one.
+export function describeApplyScope(
+  rows: readonly SkippedGroupRow[],
+  hasPatternRule = false,
+  skippedInScope: number | null = null
+): string {
+  if (hasPatternRule) {
+    return skippedInScope === null
+      ? "Will fix every remaining URL in this pattern."
+      : `Will fix all ${skippedInScope.toLocaleString("en-US")} remaining URL${
+          skippedInScope === 1 ? "" : "s"
+        } in this pattern.`;
+  }
+
   const resolved = rows.filter((row) => row.applicable);
   const urls = resolved.reduce((total, row) => total + row.urls, 0);
 
@@ -251,7 +278,15 @@ export function unresolvedSummary(input: {
 // the line itself.
 export function describeUnmatchedRule(
   row: SkippedGroupRow,
-  measuredAt?: string | null
+  measuredAt?: string | null,
+  // A pattern-wide rule saved AFTER the measurement means every group on screen
+  // is about to be re-attempted by something that did not exist when this residue
+  // was measured (v1.90). Telling the operator their group rule "may not fit"
+  // then sends them to re-edit a rule whose failure is no longer the live
+  // question — the same wasted loop this caveat was written to end, from the
+  // other direction. Handled by the same authored-vs-measured test, because the
+  // claim being made is the same one: did anything actually run against this yet.
+  patternRuleAuthoredAt?: string | null
 ): string | null {
   if (!row.applicable || row.rule.kind === "none") {
     return null;
@@ -268,6 +303,14 @@ export function describeUnmatchedRule(
 
   if (Number.isNaN(authored) || Number.isNaN(measured) || authored >= measured) {
     return null;
+  }
+
+  if (patternRuleAuthoredAt) {
+    const patternAuthored = Date.parse(patternRuleAuthoredAt);
+
+    if (!Number.isNaN(patternAuthored) && patternAuthored >= measured) {
+      return null;
+    }
   }
 
   return "A rule is set, but the last fix did not change these — it may not fit this group. Edit the examples to match what these URLs should become.";

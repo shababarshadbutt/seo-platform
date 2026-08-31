@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  SKIPPED_SHAPE_COUNT_LIMIT,
   SKIPPED_SHAPE_LIMIT,
   emptySkippedReport,
   mergeSkippedReports,
@@ -242,4 +243,121 @@ test("merging re-caps a list assembled from many files", () => {
 
 test("an empty report merges to an empty report", () => {
   assert.deepEqual(mergeSkippedReports([]), emptySkippedReport());
+});
+
+// COUNTING AND REPORTING ARE TWO LIMITS (v1.90).
+//
+// THE BUG. They used to be one number, 25, and the tally admits a shape only
+// while it has room — with no eviction. So a report was the first 25 shapes SEEN,
+// never the 25 biggest, however the dialog worded it. On the queued path each
+// file gets its own tally and the reports are merged, so a shape was counted only
+// in the files where it happened to land inside that file's first 25.
+//
+// THE VISIBLE SYMPTOM, from the reported session: the dialog promised 74,329 URLs
+// across 25 groups and the apply rewrote 149,745 — because the rewriter fixes each
+// shape's FULL population while the numbers describing it had been clipped per
+// file. A dialog that under-quotes what it is about to do is the same class of
+// wrong as one that over-quotes it.
+
+test("the two limits are separate, and counting is the wider one", () => {
+  // Pinned rather than assumed: making them equal again silently restores the
+  // under-count, and nothing else in the suite would notice.
+  assert.ok(
+    SKIPPED_SHAPE_COUNT_LIMIT > SKIPPED_SHAPE_LIMIT,
+    "counting must admit more shapes than are reported, or the top-N is a first-N"
+  );
+});
+
+test("a shape seen after the 25th is still counted in full", () => {
+  const { rewriter, report } = tallySkippedInScope(rewriterFor({}), {
+    template: TEMPLATE
+  });
+
+  // 30 small shapes first, so the interesting one arrives well past #25.
+  //
+  // DISTINCT SHAPES COME FROM PUNCTUATION, not from longer names: valueShape
+  // collapses a whole letter run to one "a", so "aaa-1" and "a-1" are the SAME
+  // shape. Each extra "-1" adds a "-9" and makes a genuinely new one.
+  for (let index = 0; index < 30; index += 1) {
+    rewriter(`https://x.test/nsn/a${"-1".repeat(index + 1)}/`);
+  }
+
+  // Then the biggest group in the pattern. Under one limit this shape would have
+  // been refused admission entirely and vanished into a boolean.
+  for (let index = 0; index < 90; index += 1) {
+    rewriter(`https://x.test/nsn/late-${1000 + index}/`);
+  }
+
+  const result = report();
+  const late = result.byShape.find((entry) => entry.shape === "/a/a-9999/");
+
+  assert.ok(late, "a shape first seen past #25 must still be counted");
+  assert.equal(late.count, 90, "and counted in full, not partially");
+  assert.equal(result.skippedInScope, 120);
+});
+
+test("the biggest groups are the ones that survive the merge", () => {
+  // END TO END over the queued path's shape: many per-file tallies, folded. The
+  // late-arriving shape is the largest in the pattern and must lead the list.
+  const reports = [];
+
+  for (let file = 0; file < 3; file += 1) {
+    const { rewriter, report } = tallySkippedInScope(rewriterFor({}), {
+      template: TEMPLATE
+    });
+
+    for (let index = 0; index < 30; index += 1) {
+      rewriter(`https://x.test/nsn/a${"-1".repeat(index + 1)}/`);
+    }
+
+    for (let index = 0; index < 40; index += 1) {
+      rewriter(`https://x.test/nsn/late-${1000 + index}/`);
+    }
+
+    reports.push(report());
+  }
+
+  const merged = mergeSkippedReports(reports);
+
+  assert.equal(merged.byShape[0].shape, "/a/a-9999/");
+  assert.equal(merged.byShape[0].count, 120, "40 per file across 3 files");
+  assert.equal(merged.byShape[0].files, 3);
+  assert.equal(merged.byShape.length, SKIPPED_SHAPE_LIMIT);
+  assert.equal(merged.skippedInScope, 210);
+});
+
+test("a per-file report is NOT pre-capped to the reported limit", () => {
+  // The mistake this replaces, stated as a test. Capping inside report() looks
+  // harmless — the dialog shows 25 either way — but on the queued path this report
+  // describes ONE FILE and is then folded into 652 others, so a slice here hands
+  // the fold a pre-clipped view of every file and reproduces the under-count
+  // exactly. Whoever shows a report to a human caps it; the tally does not.
+  const { rewriter, report } = tallySkippedInScope(rewriterFor({}), {
+    template: TEMPLATE
+  });
+
+  for (let index = 0; index < 40; index += 1) {
+    rewriter(`https://x.test/nsn/a${"-1".repeat(index + 1)}/`);
+  }
+
+  assert.equal(report().byShape.length, 40);
+});
+
+test("past the counting limit it still stops, and still says so", () => {
+  // The bound is raised, not removed: this map is built while streaming millions
+  // of <loc>s and an unbounded histogram over them is an out-of-memory crash.
+  const { rewriter, report } = tallySkippedInScope(rewriterFor({}), {
+    template: TEMPLATE,
+    shapeLimit: 3
+  });
+
+  for (let index = 0; index < 10; index += 1) {
+    rewriter(`https://x.test/nsn/a${"-1".repeat(index + 1)}/`);
+  }
+
+  const result = report();
+
+  assert.equal(result.byShape.length, 3);
+  assert.equal(result.shapesTruncated, true, "a short list must admit it is short");
+  assert.equal(result.skippedInScope, 10, "the total is never clipped");
 });

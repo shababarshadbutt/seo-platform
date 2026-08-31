@@ -6,6 +6,7 @@ import { Loader2 } from "lucide-react";
 import {
   getShapeRules,
   saveShapeRule,
+  type PatternRuleRecord,
   type ShapeRuleRecord,
   type SkippedShape
 } from "@/lib/api";
@@ -55,6 +56,25 @@ import {
 //     answers that were already correct;
 //   * Apply closed the dialog and the group list never refreshed, so seeing what
 //     was left meant finding the next toast.
+//
+// AND SINCE v1.90 ONE ANSWER CAN COVER THE PATTERN, not just the groups on screen.
+//
+// REPORTED: all 25 groups ticked, one answer given for them — strip "aviation/" —
+// and the run reported 149,745 of 8,184,592 URLs updated across 653 of 653 files.
+// Reopening showed 25 fresh groups and 8,034,847 still unfixed.
+//
+// That was not a bug in the apply. A group is a valueShape, which keeps digit-run
+// LENGTH, so /rfq/textron-inc/95-23218/ and /rfq/bell-industries-inc/t103228-101/
+// are different groups needing separate rules; 8.2M URLs of that pattern hold
+// thousands of them, and a coverage report can only name 25 per pass. Every pass
+// paid a full 653-file scan to teach the rewriter 25 shapes. There is no list of
+// groups anybody can be handed that finishes that pattern.
+//
+// The operator's answer was never shape-specific — it was one edit that fits all
+// of them. So there is now a button that says exactly that, with the real number
+// on it, and a confirmation before it fires. It stays a SEPARATE, EXPLICIT act:
+// nothing widens beyond the ticked groups unless somebody asks for it, which is
+// the v1.68 line this whole area exists to hold.
 //
 // The first of those was the one that could loop forever. The save endpoint
 // stores a rule for every shape asked for WITHOUT checking that it transforms
@@ -129,6 +149,24 @@ function toRuleState(record: ShapeRuleRecord): ShapeRuleState | null {
   };
 }
 
+// The pattern-wide answer as the dialog wants it: the rule in the house phrasing,
+// and WHEN — which is load-bearing for the same reason it is on a group rule, see
+// describeUnmatchedRule.
+type PatternRuleState = { summary: string; authoredAt: string | null };
+
+function toPatternRuleState(
+  record: PatternRuleRecord | null
+): PatternRuleState | null {
+  if (!record?.rule) {
+    return null;
+  }
+
+  return {
+    summary: describeRule(record.rule),
+    authoredAt: record.authored_at ?? null
+  };
+}
+
 export function UnfixedGroupsDialog({
   sessionId,
   patternId,
@@ -153,6 +191,14 @@ export function UnfixedGroupsDialog({
   // instead of the dialog simply redrawing with fewer rows.
   const [applyNote, setApplyNote] = useState("");
   const [showResolved, setShowResolved] = useState(false);
+  // The one answer that covers every URL of the pattern (v1.90), read back on
+  // open like the per-group rules are — a dialog that cannot see a saved answer
+  // shows it as unsaved, and at this scope that reads as "the button did nothing".
+  const [patternRule, setPatternRule] = useState<PatternRuleState | null>(null);
+  // The confirm step for saving one. Held as state rather than a window.confirm
+  // so the rule and the count can be shown in the app's own words — this is the
+  // one action in here whose reach is the whole pattern.
+  const [confirmingPatternSave, setConfirmingPatternSave] = useState(false);
   // The residue is STATE, not the prop, so an apply can replace it in place. The
   // prop seeds it and remains the truth for a freshly opened dialog.
   const [residue, setResidue] = useState<Residue>({
@@ -166,7 +212,8 @@ export function UnfixedGroupsDialog({
     setLoadingRules(true);
 
     try {
-      const records = await getShapeRules(sessionId, patternId);
+      const { rules: records, patternRule: patternRecord } =
+        await getShapeRules(sessionId, patternId);
 
       setRules(() => {
         const next = new Map<string, ShapeRuleState>();
@@ -181,6 +228,7 @@ export function UnfixedGroupsDialog({
 
         return next;
       });
+      setPatternRule(toPatternRuleState(patternRecord));
     } catch {
       // A pattern with no rules yet is the common case and not an error worth a
       // banner; a genuine failure degrades to the pre-v1.86 behaviour of showing
@@ -204,6 +252,8 @@ export function UnfixedGroupsDialog({
     setError("");
     setApplyNote("");
     setShowResolved(false);
+    setPatternRule(null);
+    setConfirmingPatternSave(false);
     setResidue({ shapes, skippedInScope, shapesTruncated, measuredAt });
     void loadRules();
     // shapes/skippedInScope/shapesTruncated are deliberately NOT dependencies: they
@@ -220,7 +270,7 @@ export function UnfixedGroupsDialog({
     () => partitionSkippedGroupRows(rows),
     [rows]
   );
-  const blocked = applyBlockedReason(rows);
+  const blocked = applyBlockedReason(rows, patternRule !== null);
   const busy = saving || applying;
   // Select-all covers the OUTSTANDING groups only. Ticking chooses what an edit is
   // saved for, so including groups that already have the right answer would let one
@@ -324,6 +374,84 @@ export function UnfixedGroupsDialog({
         nextError instanceof Error
           ? nextError.message
           : "Could not save that rule."
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // SAVE THIS ANSWER FOR EVERY URL IN THE PATTERN (v1.90).
+  //
+  // Same edited examples, same server-side deriveRedirectRule, same refusal when
+  // they describe more than one change. The only difference is reach — and the
+  // reach is why it is a distinct button behind a confirmation rather than a
+  // wider interpretation of the bulk save beside it.
+  //
+  // WHAT IT DOES NOT DO: override anything. The rewriter consults this LAST, so a
+  // group with its own measured or asserted rule keeps it, and a group marked
+  // "leave as it is" is skipped before this is ever reached. A URL the rule cannot
+  // transform passes through and is counted in the next coverage report exactly as
+  // it is now — the number after the apply stays the honest one.
+  async function savePatternRule() {
+    if (!editingRow) {
+      return;
+    }
+
+    setSaving(true);
+    setError("");
+
+    try {
+      const pairs = editingRow.examples.map((source, index) => ({
+        source,
+        dest: drafts[index] ?? source
+      }));
+      const result = await saveShapeRule(sessionId, patternId, {
+        scope: "pattern",
+        pairs
+      });
+      const summary = result.rule ? describeRule(result.rule) : null;
+
+      if (summary) {
+        setPatternRule({
+          summary,
+          // Stamped NOW, which is after the residue on screen was measured — so
+          // the per-group "this rule may not fit" caveats correctly fall silent
+          // until an apply has actually run with this in place.
+          authoredAt: new Date().toISOString()
+        });
+      }
+
+      setConfirmingPatternSave(false);
+      setEditing(null);
+    } catch (nextError) {
+      setError(
+        nextError instanceof Error
+          ? nextError.message
+          : "Could not save that rule for the pattern."
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // The undo. DELETEs the row server-side, matching how "leave as it is" undoes
+  // itself: the absence of a row is already how "nobody has asserted anything at
+  // this scope" is spelled, in both halves.
+  async function clearPatternRule() {
+    setSaving(true);
+    setError("");
+
+    try {
+      await saveShapeRule(sessionId, patternId, {
+        scope: "pattern",
+        clear: true
+      });
+      setPatternRule(null);
+    } catch (nextError) {
+      setError(
+        nextError instanceof Error
+          ? nextError.message
+          : "Could not remove the pattern-wide rule."
       );
     } finally {
       setSaving(false);
@@ -454,7 +582,11 @@ export function UnfixedGroupsDialog({
   }
 
   function renderRow(row: SkippedGroupRow, selectable: boolean) {
-    const caveat = describeUnmatchedRule(row, residue.measuredAt);
+    const caveat = describeUnmatchedRule(
+      row,
+      residue.measuredAt,
+      patternRule?.authoredAt ?? null
+    );
 
     return (
       <tr key={row.shape} className="border-t align-top">
@@ -582,6 +714,39 @@ export function UnfixedGroupsDialog({
           <p className="rounded-md border border-primary/40 bg-primary/5 px-3 py-2 text-sm">
             {applyNote}
           </p>
+        ) : null}
+
+        {/* THE PATTERN-WIDE ANSWER, ON SCREEN WHENEVER ONE IS SET (v1.90).
+
+            Not a toast and not tucked into the footer: it is the widest thing in
+            this dialog, it survives closing and reopening, and it changes what
+            every row below is about to do. An operator must be able to see that
+            it is in force - and take it back - without applying anything first.
+
+            Amber rather than the primary tint the apply note uses, because this
+            is a standing condition to be aware of, not the result of the last
+            thing pressed. */}
+        {patternRule ? (
+          <div className="flex items-start justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2">
+            <div className="space-y-0.5">
+              <p className="text-sm font-medium text-amber-900">
+                Every URL in this pattern:{" "}
+                <span className="font-mono text-xs">{patternRule.summary}</span>
+              </p>
+              <p className="text-[11px] uppercase tracking-wide text-amber-800">
+                You set this &mdash; it covers the groups below and every group
+                not listed. A group with its own answer keeps it.
+              </p>
+            </div>
+            <button
+              type="button"
+              className="shrink-0 text-xs font-semibold text-amber-900 underline hover:no-underline disabled:opacity-50"
+              disabled={busy}
+              onClick={() => void clearPatternRule()}
+            >
+              Remove
+            </button>
+          </div>
         ) : null}
 
         <div className="max-h-[420px] overflow-y-auto rounded-md border">
@@ -753,6 +918,101 @@ export function UnfixedGroupsDialog({
                 </Button>
               ) : null}
             </div>
+
+            {/* THE WHOLE-PATTERN SAVE (v1.90), and the reason this dialog can
+                finish a pattern at all.
+
+                THE COUNT COMES FROM residue.skippedInScope, the last full scan's
+                own tally of what is left - NOT from summing the rows. Summing
+                them would quote 74,329 for an action that is about to reach
+                8,034,847, and quoting a number smaller than the truth on a
+                button this wide is the specific failure this feature keeps
+                having to fix.
+
+                SEPARATED BY A RULE and placed below the two group buttons, not
+                beside them: it is a different kind of act, and it should not be
+                the thing a hand lands on by accident. */}
+            <div className="space-y-2 border-t pt-3">
+              {confirmingPatternSave ? (
+                <div className="space-y-2">
+                  <p className="text-sm font-semibold">
+                    Apply this one change to the whole pattern?
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Every URL in{" "}
+                    <code className="font-mono text-[11px]">{template}</code>{" "}
+                    that no group already answers will get this change
+                    {residue.skippedInScope === null
+                      ? ""
+                      : ` — ${residue.skippedInScope.toLocaleString(
+                          "en-US"
+                        )} URLs`}
+                    {residue.shapesTruncated
+                      ? ", including the groups too numerous to list"
+                      : ""}
+                    . Groups with their own answer keep it, and URLs the change
+                    does not fit are left alone and reported again. You can
+                    remove it afterwards.
+                  </p>
+                  <div className="flex justify-end gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setConfirmingPatternSave(false)}
+                      disabled={busy}
+                    >
+                      Back
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={() => void savePatternRule()}
+                      disabled={busy}
+                    >
+                      {saving ? (
+                        <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                      ) : null}
+                      Yes &mdash; save it for the whole pattern
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {/* THE SECOND SENTENCE IS CONDITIONAL, because it is a claim
+                      about this pattern and not a slogan. "There are more groups
+                      than can be listed" is only true when the apply said so —
+                      shapesTruncated is that flag. On a pattern whose groups all
+                      fit on screen it would be false, and stating it anyway to
+                      make the button below look necessary is exactly the kind of
+                      flattering copy v1.81 exists to prevent. The button stays
+                      offered either way: one answer for the whole pattern is a
+                      reasonable thing to want on a small pattern too. */}
+                  <p className="text-xs text-muted-foreground">
+                    Is this the same change every group in this pattern needs?
+                    {residue.shapesTruncated
+                      ? " There are more groups than can be listed, so answering them 25 at a time will not finish."
+                      : ""}
+                  </p>
+                  <div className="flex justify-end">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setConfirmingPatternSave(true)}
+                      disabled={busy}
+                    >
+                      Save for EVERY URL in this pattern
+                      {residue.skippedInScope === null
+                        ? ""
+                        : ` (${residue.skippedInScope.toLocaleString(
+                            "en-US"
+                          )} URLs)`}
+                    </Button>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         ) : null}
 
@@ -761,7 +1021,12 @@ export function UnfixedGroupsDialog({
               ticked. Ticking chooses what an edit is saved for; conflating the
               two is how a button quietly includes groups resolved earlier. */}
           <p className="text-xs text-muted-foreground">
-            {blocked ?? describeApplyScope(rows)}
+            {blocked ??
+              describeApplyScope(
+                rows,
+                patternRule !== null,
+                residue.skippedInScope
+              )}
           </p>
           <div className="flex gap-2">
             {/* NO BULK MARK BUTTON (v1.89). v1.88 put one here, and before that a

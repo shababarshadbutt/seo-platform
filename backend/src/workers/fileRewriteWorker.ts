@@ -90,7 +90,21 @@ export type FileRewriteSpec =
       // afterwards would double the disk work on a 6.58M-loc session, and a
       // separate scan could disagree with the rewrite about what counts as a
       // <loc> or as a pattern member.
+      //
+      // SINCE v1.90 IT ALSO SCOPES patternRule below, which DOES change what is
+      // rewritten. One field for both readings on purpose — they are the same
+      // question ("is this URL a member of this pattern") asked by the same
+      // predicate, and two fields could be given two different templates.
       patternTemplate?: string | null;
+      // The operator's rule for every URL of the pattern that nothing above
+      // covers (v1.90). Consulted last and only inside patternTemplate.
+      //
+      // IT HAS TO BE HERE, and the reason is written into this file's history: a
+      // capability that exists only on the inline path is a capability the queued
+      // path silently lacks, and the queued path is the one a wide pattern takes.
+      // That is precisely how v1.79 found the job applying neither verified
+      // destinations nor per-shape rules — its payload had nowhere to put them.
+      patternRule?: RedirectRule | null;
     }
   // Pattern structure transform (v1.48). The RAW structure strings cross the
   // thread edge, not the parsed form — parseStructure is cheap, deterministic and
@@ -145,7 +159,12 @@ function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
         new Map(spec.replacements),
         spec.rule,
         spec.shapeRules ? new Map(spec.shapeRules) : null,
-        spec.excludeUrls ? new Set(spec.excludeUrls) : null
+        spec.excludeUrls ? new Set(spec.excludeUrls) : null,
+        // Both halves or neither: the rewriter takes them as one object so a
+        // pattern-wide rule cannot arrive here unscoped.
+        spec.patternRule && spec.patternTemplate
+          ? { rule: spec.patternRule, template: spec.patternTemplate }
+          : null
       ),
       spec.structureFilters ?? null
     );

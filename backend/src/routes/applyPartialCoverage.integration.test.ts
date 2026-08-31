@@ -633,15 +633,54 @@ test("an apply that reaches part of a pattern reports the remainder", async (t) 
   //
   // Asserted on a SEPARATE, never-stamped pattern so the state is the real one:
   // no fix has ever landed here.
+  //
+  // A DIFFERENT TEMPLATE FROM THE PATTERN ABOVE, and it has to be: migration 008
+  // put a UNIQUE (session_id, source_role, template) on patterns, so a second
+  // '/nsn/{param}' in this session is rejected outright.
+  //
+  // AND IT HAS THREE SEGMENTS, because by this point in the test the file has been
+  // rewritten twice: every /nsn/nsn-parts-9558/ is now /nsn/nsn-parts/page-2-9558/.
+  // A two-segment template would match nothing at all, and the shortfall this
+  // section exists to measure would be a truthful zero.
+  //
+  // (This section was written for v1.88 and had never actually executed: Docker
+  // was down on the dev machine for v1.88 AND v1.89, so every Postgres-backed
+  // test skipped, and a skip is neither pass nor fail. Both defects below were
+  // found the first time this ran again, in v1.90.)
   const freshPatternResult = await pool.query<{ id: string }>(
     `
       INSERT INTO patterns (session_id, template, total_urls, status)
-      VALUES ($1, '/nsn/{param}', $2, 'BAD')
+      VALUES ($1, '/nsn/{param}/{param}', $2, 'BAD')
       RETURNING id
     `,
     [sessionId, allUrls.length]
   );
   const freshPatternId = freshPatternResult.rows[0].id;
+
+  // AND IT NEEDS SOMETHING TO APPLY, which is the second thing this section had
+  // wrong. The branch it exercises is guarded on `filesScanned > 0` — deliberately,
+  // because "a run that opened no file measured nothing" and overwriting a real
+  // tally with its zeros would report a complete fix on a pattern nobody looked
+  // at. An apply with no confirmed pair, no rule and no shape rule short-circuits
+  // before opening anything, so it can never persist a shortfall.
+  //
+  // That is not the case v1.88 was written for either. The reported pattern had a
+  // rule that turned out to match almost nothing — the 2-of-205,442 apply — so the
+  // faithful reproduction is a rule that scans every file and transforms no URL.
+  // A pattern with NOTHING known about it still has no door into the dialog, and
+  // that limitation is recorded in v1.89 §7 rather than fixed here.
+  await pool.query(
+    `
+      INSERT INTO pattern_shape_rules
+        (pattern_id, shape, rule, sample_size, population, agreed, source,
+         authored_at)
+      VALUES ($1, '/a/a-9999/', $2::jsonb, 0, 0, true, 'operator', now())
+    `,
+    [
+      freshPatternId,
+      JSON.stringify({ kind: "replace", find: "zzz-not-present", replace: "q" })
+    ]
+  );
 
   const freshApply = await app.inject({
     method: "POST",
@@ -658,7 +697,11 @@ test("an apply that reaches part of a pattern reports the remainder", async (t) 
   assert.equal(
     freshApply.json().rewritten_loc_count,
     0,
-    "nothing is confirmed on this pattern, so nothing can be rewritten"
+    "the rule matches no URL, so nothing can be rewritten"
+  );
+  assert.ok(
+    freshApply.json().files_scanned > 0,
+    "but the files WERE opened — that is what makes the shortfall a measurement"
   );
 
   const freshRow = await pool.query<{
