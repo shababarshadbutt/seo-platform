@@ -23,6 +23,7 @@ import { config } from "../config.js";
 import { decryptSecret, encryptSecret } from "../crypto/secrets.js";
 import { pool } from "../db/pool.js";
 import { refusedHostsForSession } from "../http/hostStrategyReport.js";
+import { resolveStagingOrigin } from "../http/stagingOrigin.js";
 import { fsErrorResponse } from "../errors/fsErrors.js";
 import {
   deleteFromGSC,
@@ -231,6 +232,8 @@ type CreateSessionBody = {
   name?: string;
   base_url?: string;
   baseUrl?: string;
+  staging_base_url?: string;
+  stagingBaseUrl?: string;
   sample_size?: number;
   sampleSize?: number;
   concurrency?: number;
@@ -393,6 +396,41 @@ function parseBaseUrl(body: CreateSessionBody) {
   }
 
   return url.toString().replace(/\/$/, "");
+}
+
+// The per-session staging ORIGIN, for the 2.0 mode. Optional: absent means "derive
+// dev.<domain> from base_url at check time", which is what lets every session that
+// predates this feature be checked against staging with no backfill.
+//
+// An ORIGIN, not a URL — scheme + host + optional port, nothing else. Paths are
+// identical between the two environments (that premise is the whole feature), so a
+// path here would be silently ignored downstream; rejecting it is honest, and it
+// matches the sessions_staging_base_url_absolute CHECK constraint rather than
+// letting the database raise a less legible error.
+//
+// There is deliberately NO update route for this, exactly as there is none for
+// base_url. Immutability is what lets the effective staging origin be recomputed on
+// demand instead of persisted per run.
+function parseStagingBaseUrl(body: CreateSessionBody): string | null {
+  const value = (body.staging_base_url ?? body.stagingBaseUrl)?.trim();
+
+  if (!value) {
+    return null;
+  }
+
+  const url = new URL(value);
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("staging_base_url must be an HTTP or HTTPS URL");
+  }
+
+  if (url.pathname !== "/" && url.pathname !== "") {
+    throw new Error(
+      "staging_base_url must be an origin (scheme and host only), with no path"
+    );
+  }
+
+  return `${url.protocol}//${url.host}`;
 }
 
 function parseSitemapUrl(body: SitemapUrlBody) {
@@ -2100,6 +2138,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       }
 
       const baseUrl = parseBaseUrl(request.body ?? {});
+      const stagingBaseUrl = parseStagingBaseUrl(request.body ?? {});
       const sampleSize = parseSampleSize(request.body ?? {});
       const concurrency = parseConcurrency(request.body ?? {});
       const userAgent = parseUserAgent(request.body ?? {});
@@ -2110,12 +2149,13 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             base_url,
             sample_size,
             concurrency,
-            user_agent
+            user_agent,
+            staging_base_url
           )
-          VALUES ($1, $2, $3, $4, $5)
+          VALUES ($1, $2, $3, $4, $5, $6)
           RETURNING id
         `,
-        [name, baseUrl, sampleSize, concurrency, userAgent]
+        [name, baseUrl, sampleSize, concurrency, userAgent, stagingBaseUrl]
       );
       const sessionId = result.rows[0].id;
 
@@ -2490,6 +2530,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           sessions.id,
           sessions.name,
           sessions.base_url,
+          sessions.staging_base_url,
           sessions.sample_size,
           sessions.concurrency,
           sessions.user_agent,
@@ -2566,6 +2607,47 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       `,
       [request.params.id]
     );
+    // WHICH ENVIRONMENT the stored verdicts came from (mig 057), so the results
+    // page can say so instead of leaving a screenshot ambiguous.
+    //
+    // BOUNDED BY THE SAME LIMIT as the connectivity heuristic above, and for the
+    // same reason: an unbounded COUNT over sampled_urls is what migration 035
+    // exists to stop. This drives a banner, so a sample is enough — a session with
+    // ANY staging rows in its first CONNECTIVITY_SAMPLE_LIMIT is a session worth
+    // labelling.
+    const environmentResult = await pool.query<{
+      prod: string;
+      staging: string;
+    }>(
+      `
+        SELECT
+          COUNT(*) FILTER (WHERE NOT COALESCE(sample.checked_on_staging, false))::bigint
+            AS prod,
+          COUNT(*) FILTER (WHERE COALESCE(sample.checked_on_staging, false))::bigint
+            AS staging
+        FROM (
+          SELECT sampled_urls.checked_on_staging
+          FROM sampled_urls
+          JOIN patterns ON patterns.id = sampled_urls.pattern_id
+          WHERE patterns.session_id = $1::uuid
+          LIMIT ${CONNECTIVITY_SAMPLE_LIMIT}
+        ) AS sample
+      `,
+      [request.params.id]
+    );
+
+    session.checked_environments = {
+      prod: Number(environmentResult.rows[0]?.prod ?? 0),
+      staging: Number(environmentResult.rows[0]?.staging ?? 0)
+    };
+    // The origin 2.0 would actually probe for this session, resolved SERVER-SIDE so
+    // the frontend's copy of the derivation is only ever a preview in the New
+    // Analysis form and never an authority about an existing session.
+    session.effective_staging_base_url = resolveStagingOrigin(
+      session.base_url,
+      session.staging_base_url ?? null
+    );
+
     const connectivityTotal = Number(connectivityResult.rows[0]?.total ?? 0);
     const connectivityNoResponse = Number(
       connectivityResult.rows[0]?.no_response ?? 0

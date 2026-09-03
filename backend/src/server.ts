@@ -17,6 +17,7 @@ import { fsErrorResponse } from "./errors/fsErrors.js";
 import { sessionRoutes } from "./routes/sessions.js";
 import { verificationRoutes } from "./routes/verification.js";
 import { cleanerRoutes } from "./routes/cleaner.js";
+import { settingsRoutes } from "./routes/settings.js";
 import {
   activeRunCount,
   SERVER_EPOCH,
@@ -160,6 +161,7 @@ app.setErrorHandler((error, request, reply) => {
 await app.register(sessionRoutes);
 await app.register(verificationRoutes);
 await app.register(cleanerRoutes);
+await app.register(settingsRoutes);
 
 // `config` here is names-and-booleans only, never a value, so this stays safe on
 // an unauthenticated endpoint. It exists because a 503 naming one variable could
