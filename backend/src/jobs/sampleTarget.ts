@@ -41,6 +41,25 @@ export function targetUrlForPath(baseUrl: string, path: string) {
 // The private scheme is applied one layer down, at the moment of the request, in
 // sampleUrlCheck.runCheckWithProfile. Identity and transport are deliberately two
 // different values.
+//
+// AND FOR THE SAME REASON: DO NOT ADD THE STAGING HOST SWAP HERE. It looks like the
+// natural home for it — one function, pure, already the place base_url meets the
+// path — and it is the wrong one. The 1.90/2.0 toggle sends health checks to a
+// dev/staging host while the sitemap files stay production, so the staging host
+// must NEVER reach this return value:
+//
+//   * it becomes sampled_urls.url, which is REWRITE-PARTICIPATING — UPDATEd in
+//     lockstep with the XML by bulkReplaceJob and patternStructureJob, and
+//     cross-joined against verified_urls.url as raw text by maintenanceJobs
+//     (AND s.url = ANY($3::text[])). A dev host on one side and the prod <loc> on
+//     the other makes that match return zero rows, and delete-by-status silently
+//     stops marking anything;
+//   * collectProblemFileGroups then scans the PRODUCTION XML for strings that are
+//     not in it;
+//   * and it is what every finding, export and Fix-modal row shows the user.
+//
+// The staging swap lives with the private-scheme swap, at the moment of the
+// request: sampleUrlCheck.runCheckWithProfile, via http/stagingOrigin.ts.
 export function resolveSampleTarget(
   baseUrl: string,
   path: string,

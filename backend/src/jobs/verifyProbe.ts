@@ -6,6 +6,7 @@ import {
   rateLimitBucketFor
 } from "../http/hostRateLimiter.js";
 import { privateRouteFor } from "../http/privateRoute.js";
+import { applyStagingOrigin } from "../http/stagingOrigin.js";
 import {
   checkSampleUrl,
   type RequestProfile,
@@ -114,14 +115,28 @@ export async function probeUrl(
   // http/hostStrategyRun.ts). Passed in rather than looked up here so this module
   // stays free of Redis and the DB — and so the caller, which owns the bookkeeping,
   // is the one that decides what to do about a REFUSED host.
-  options: { profileLadder?: RequestProfile[] } = {}
+  options: {
+    profileLadder?: RequestProfile[];
+    // The staging origin for this run, or null in 1.90. See stagingOrigin.ts.
+    stagingOrigin?: string | null;
+  } = {}
 ): Promise<SampleCheckResult> {
+  const stagingOrigin = options.stagingOrigin ?? null;
   const { path, target } = verifyTargetFor(baseUrl, sourceUrl);
+  // IDENTITY stays `target`; TRANSPORT is the staged URL. In 1.90 stagingOrigin is
+  // null and these are the same string.
+  const transport = applyStagingOrigin(target, stagingOrigin);
   // The bucket comes from the RESOLVED target, which is the URL the request will
   // actually be built from — not from whatever string the caller happened to pass as
   // sourceUrl. A privately-routed host is charged to its box's shared budget instead
   // of its own hostname's.
-  const bucket = rateLimitBucketFor(target, privateRouteFor(target)?.ip ?? null);
+  //
+  // Derived from the STAGED url in 2.0: the dev box is a genuinely different origin
+  // and must not spend production's request budget (nor production spend its).
+  const bucket = rateLimitBucketFor(
+    transport,
+    privateRouteFor(transport)?.ip ?? null
+  );
 
   // checkSampleUrl never throws — failures come back classified
   // (timeout/ssl_cert/no_response), which is what we want persisted.
@@ -135,6 +150,7 @@ export async function probeUrl(
     // The learned rung first, the rung above it as the per-URL safety net. Absent =
     // today's default pair.
     profileLadder: options.profileLadder,
+    stagingOrigin,
     // Verification exists to establish each URL's OWN status so delete-by-status
     // can act on it. The follow-up HEAD on a redirect destination contributes
     // only responseMs, which verified_urls does not store — finalUrl comes from

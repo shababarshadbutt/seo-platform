@@ -76,6 +76,7 @@ function outcome(
     usedFallbackProfile: false,
     edgeServer: null,
     viaPrivateRoute: false,
+    checkedOnStaging: false,
     ...overrides
   };
 }

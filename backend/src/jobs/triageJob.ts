@@ -14,6 +14,12 @@ import {
 import type { RequestProfile } from "./sampleUrlCheck.js";
 import { resolveSampleTarget } from "./sampleTarget.js";
 import { probeUrl, verifyConcurrency } from "./verifyProbe.js";
+import { applyStagingOrigin } from "../http/stagingOrigin.js";
+import {
+  probeEnvironmentLogFields,
+  type ProbeEnvironment,
+  resolveProbeEnvironment
+} from "./probeEnvironment.js";
 import { VERIFY_PROBLEM_STATUSES } from "./verifyUrlsJob.js";
 import { createHostStrategyRun } from "../http/hostStrategyRun.js";
 import type { TriageSampleJobData } from "../queue/triageQueue.js";
@@ -37,6 +43,7 @@ type SessionRow = {
   base_url: string;
   concurrency: number;
   user_agent: string;
+  staging_base_url: string | null;
 };
 
 type PatternRow = {
@@ -62,8 +69,13 @@ async function probePlan(
   // probeUrl with full verification, so it shares the strategy too — otherwise a
   // "quick check" on a refused host would still spend ~1% of a 1.3M population
   // learning what negotiation already knows.
-  profileLadder?: RequestProfile[]
+  profileLadder?: RequestProfile[],
+  // The environment pinned by the caller for this whole triage run. Passed rather
+  // than re-read so the two probePlan calls below (plan, then triage expansion)
+  // cannot land on different servers.
+  env?: ProbeEnvironment
 ) {
+  const stagingOrigin = env?.stagingOrigin ?? null;
   const items: Array<{ label: string; url: string }> = [];
 
   for (const stratum of plan.strata) {
@@ -86,7 +98,7 @@ async function probePlan(
 
   await runWithBoundedConcurrency(
     items,
-    verifyConcurrency(session.base_url),
+    verifyConcurrency(stagingOrigin ?? session.base_url),
     async (item, index) => {
       const result = await probeUrl(
         session.base_url,
@@ -99,7 +111,7 @@ async function probePlan(
           template: pattern.template,
           sampleIndex: index
         },
-        { profileLadder }
+        { profileLadder, stagingOrigin }
       );
 
       return { label: item.label, status: result.httpStatus };
@@ -153,7 +165,7 @@ export async function processTriageSampleJob(
 
   try {
     const sessionResult = await pool.query<SessionRow>(
-      "SELECT id, base_url, concurrency, user_agent FROM sessions WHERE id = $1",
+      "SELECT id, base_url, concurrency, user_agent, staging_base_url FROM sessions WHERE id = $1",
       [sessionId]
     );
     const session = sessionResult.rows[0];
@@ -161,6 +173,15 @@ export async function processTriageSampleJob(
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
     }
+
+    // PINNED for this triage run, and passed into every probePlan call below so the
+    // plan and its expansion cannot land on different servers.
+    const env = await resolveProbeEnvironment(session);
+
+    logger.info(
+      { session_id: sessionId, ...probeEnvironmentLogFields(env) },
+      "triage sample: environment resolved"
+    );
 
     const patternResult = await pool.query<PatternRow>(
       "SELECT id, template FROM patterns WHERE id = $1 AND session_id = $2",
@@ -219,7 +240,12 @@ export async function processTriageSampleJob(
     const firstUrl = plan.strata[0]?.urls[0] ?? allUrls[0];
     const strategy = firstUrl
       ? await strategyRun.forTarget(
-          resolveSampleTarget(session.base_url, firstUrl, firstUrl)
+          // STAGED: the ladder and any REFUSED verdict belong to whichever server
+          // is actually going to be asked.
+          applyStagingOrigin(
+            resolveSampleTarget(session.base_url, firstUrl, firstUrl),
+            env.stagingOrigin
+          )
         )
       : null;
 
@@ -256,7 +282,7 @@ export async function processTriageSampleJob(
     const profileLadder = strategy?.ladder.length ? strategy.ladder : undefined;
     const tallies = new Map<string, StratumObservation>();
 
-    await probePlan(plan, session, pattern, logger, tallies, profileLadder);
+    await probePlan(plan, session, pattern, logger, tallies, profileLadder, env);
 
     // Adaptive expansion: look harder ONLY where the first round found
     // something and the estimate is too thin to quote.
@@ -283,7 +309,7 @@ export async function processTriageSampleJob(
         "triage sample: anomaly detected, expanding sample"
       );
 
-      await probePlan(expansion, session, pattern, logger, tallies, profileLadder);
+      await probePlan(expansion, session, pattern, logger, tallies, profileLadder, env);
     }
 
     const observations = Array.from(tallies.values());

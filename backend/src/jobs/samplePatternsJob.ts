@@ -13,6 +13,11 @@ import {
 } from "../http/hostRateLimiter.js";
 import { createHostStrategyRun } from "../http/hostStrategyRun.js";
 import { privateRouteFor } from "../http/privateRoute.js";
+import { applyStagingOrigin } from "../http/stagingOrigin.js";
+import {
+  probeEnvironmentLogFields,
+  resolveProbeEnvironment
+} from "./probeEnvironment.js";
 import { resolveSampleTarget } from "./sampleTarget.js";
 // Pure scoring lives in its own module so it is unit-testable without loading
 // this job (and with it a BullMQ/Redis connection). See patternScore.ts.
@@ -35,6 +40,7 @@ type SessionRow = {
   sample_size: number;
   concurrency: number;
   user_agent: string;
+  staging_base_url: string | null;
 };
 
 type PatternRow = {
@@ -189,9 +195,10 @@ async function persistPatternSamples(
             source_file,
             error_reason,
             used_fallback_profile,
-            via_private_route
+            via_private_route,
+            checked_on_staging
           )
-          VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, $12, $13)
+          VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, $12, $13, $14)
         `,
         [
           patternId,
@@ -211,7 +218,10 @@ async function persistPatternSamples(
           // Which NETWORK PATH produced it (mig 045). The public path goes through
           // the site's WAF and the private one does not, so two rows are only
           // comparable when this agrees.
-          result.viaPrivateRoute
+          result.viaPrivateRoute,
+          // And which ENVIRONMENT produced it (mig 057). Read off the result rather
+          // than the job's env so the row cannot disagree with the request made.
+          result.checkedOnStaging
         ]
       );
     }
@@ -238,10 +248,21 @@ async function persistPatternSamples(
   return score;
 }
 
-async function patternAlreadySampled(patternId: string) {
+// SCOPED TO THE ENVIRONMENT (mig 057), not just the pattern.
+//
+// This is the resume checkpoint: "this pattern already has samples, skip it". Left
+// environment-blind, a session sampled against production and then resumed after a
+// flip to 2.0 would skip every pattern and report PRODUCTION rows as the staging
+// run's results -- with the pattern's status pill and confidence score describing a
+// server that was never asked. COALESCE(..., false) keeps rows written before this
+// migration counting as production, which is what they are.
+async function patternAlreadySampled(patternId: string, checkedOnStaging: boolean) {
   const result = await pool.query(
-    "SELECT 1 FROM sampled_urls WHERE pattern_id = $1 LIMIT 1",
-    [patternId]
+    `SELECT 1 FROM sampled_urls
+     WHERE pattern_id = $1
+       AND COALESCE(checked_on_staging, false) = $2::boolean
+     LIMIT 1`,
+    [patternId, checkedOnStaging]
   );
 
   return result.rowCount !== null && result.rowCount > 0;
@@ -290,7 +311,7 @@ export async function processSamplePatternsJob(
 
   const sessionResult = await pool.query<SessionRow>(
     `
-      SELECT id, base_url, sample_size, concurrency, user_agent
+      SELECT id, base_url, sample_size, concurrency, user_agent, staging_base_url
       FROM sessions
       WHERE id = $1
     `,
@@ -301,6 +322,16 @@ export async function processSamplePatternsJob(
   if (!session) {
     throw new Error(`Session not found: ${data.session_id}`);
   }
+
+  // PINNED FOR THE WHOLE RUN. See probeEnvironment.ts — a flip mid-run must not
+  // split one session's samples across two servers. Throws when 2.0 is on with no
+  // derivable staging origin rather than quietly sampling production.
+  const env = await resolveProbeEnvironment(session);
+
+  logger.info(
+    { session_id: data.session_id, ...probeEnvironmentLogFields(env) },
+    "sample patterns: environment resolved"
+  );
 
   logger.info(
     {
@@ -367,10 +398,13 @@ export async function processSamplePatternsJob(
           continue;
         }
 
-        const probeTarget = resolveSampleTarget(
-          session.base_url,
-          probe.path,
-          probe.source_url
+        // STAGED. The strategy engine caches per host and writes host_probe_profiles
+        // per host, so negotiating against production and then probing staging would
+        // apply production's learned rung -- or its REFUSED verdict -- to a
+        // different server entirely.
+        const probeTarget = applyStagingOrigin(
+          resolveSampleTarget(session.base_url, probe.path, probe.source_url),
+          env.stagingOrigin
         );
 
         await strategyRun.forTarget(probeTarget, probeTarget);
@@ -391,7 +425,7 @@ export async function processSamplePatternsJob(
       if (
         !scopedPatternId &&
         data.resume &&
-        (await patternAlreadySampled(pattern.id))
+        (await patternAlreadySampled(pattern.id, env.isStaging))
       ) {
         skippedPatternCount += 1;
         continue;
@@ -434,10 +468,13 @@ export async function processSamplePatternsJob(
       }
 
       const patternStrategy = await strategyRun.forTarget(
-        resolveSampleTarget(
-          session.base_url,
-          firstSample.path,
-          firstSample.source_url
+        applyStagingOrigin(
+          resolveSampleTarget(
+            session.base_url,
+            firstSample.path,
+            firstSample.source_url
+          ),
+          env.stagingOrigin
         )
       );
 
@@ -499,10 +536,9 @@ export async function processSamplePatternsJob(
           // optimisation (verified_urls does not store the follow-up HEAD's
           // responseMs). Sampling still follows redirects fully — only the pacing
           // is new.
-          const target = resolveSampleTarget(
-            session.base_url,
-            sample.path,
-            sample.source_url
+          const target = applyStagingOrigin(
+            resolveSampleTarget(session.base_url, sample.path, sample.source_url),
+            env.stagingOrigin
           );
           const host = rateLimitHostKey(target);
           // A privately-routed target is charged to its BOX's budget (keyed on the
@@ -529,6 +565,7 @@ export async function processSamplePatternsJob(
             },
             {
               beforeRequest: () => acquireHostSlot(bucket.key, bucket.options),
+              stagingOrigin: env.stagingOrigin,
               // The learned rung goes FIRST, with the rung above it as the per-URL
               // safety net (ladderForRung). On a host that answers the browser
               // profile this is the whole saving: attempt #1 succeeds instead of

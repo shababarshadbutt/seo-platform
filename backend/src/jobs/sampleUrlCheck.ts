@@ -11,6 +11,11 @@ import {
   notePrivateSchemeFlip
 } from "../http/privateRoute.js";
 import { notePrivateRouteOutcome } from "../http/privateRouteHealth.js";
+import {
+  applyStagingOrigin,
+  isProdOrigin,
+  toProdIdentity
+} from "../http/stagingOrigin.js";
 import { dispatcherFor, privateDispatcherFor } from "../http/tlsDispatcher.js";
 import { SOFT_404_TEXT_SIGNALS } from "../sitemaps/softNotFound.js";
 import { hasWafBlockHeader, isMethodRejectedStatus } from "./sampleHttpStatus.js";
@@ -223,6 +228,18 @@ export type SampleCheckResult = {
   // Note the URL above is UNAFFECTED: it stays the public https identity of the
   // page. This flag is the only place the transport is recorded.
   viaPrivateRoute: boolean;
+  // TRUE when this verdict was measured against the session's STAGING origin
+  // rather than production (the 2.0 mode of the 1.90/2.0 toggle).
+  //
+  // Same argument as viaPrivateRoute one line up, one level higher: a verdict is
+  // only comparable to another verdict measured against the same SERVER. Set here
+  // rather than by each job so neither persister has to remember to derive it.
+  //
+  // And, again, the URL above is UNAFFECTED — it is the production identity in
+  // both modes. So is finalUrl: a staging Location header is mapped back to the
+  // production origin before it lands in this result, because finalUrl becomes a
+  // redirect destination written into production sitemap files.
+  checkedOnStaging: boolean;
 };
 
 type BodyPrefixResult = {
@@ -318,6 +335,15 @@ export type SampleCheckOptions = {
   // Truncated to MAX_ATTEMPTS — the two-attempt ceiling is a property of the
   // checker, not of the caller's list, so a caller cannot widen it by accident.
   profileLadder?: RequestProfile[];
+  // WHICH ENVIRONMENT to send the bytes to (the 2.0 mode). TRANSPORT, not
+  // identity — exactly the same split applyPrivateRoute makes one layer down, and
+  // applied in that order: staging picks WHICH host, private routing picks HOW to
+  // reach it.
+  //
+  // null/absent — which is what every caller passes in 1.90 mode — leaves every
+  // request in this module byte-identical to what it was before the toggle
+  // existed. That is the whole legacy guarantee; see stagingOrigin.ts.
+  stagingOrigin?: string | null;
 };
 
 // TWO ATTEMPTS, MAXIMUM — enforced here rather than trusted to callers. Worst case
@@ -598,7 +624,8 @@ export async function runCheckWithProfile(
   const {
     beforeRequest,
     skipRedirectFollow = false,
-    skipSoft404Sniff = false
+    skipSoft404Sniff = false,
+    stagingOrigin = null
   } = options;
 
   // IDENTITY vs TRANSPORT, decided once, here.
@@ -611,7 +638,17 @@ export async function runCheckWithProfile(
   //
   // With private routing off (the default) these are the same string and every line
   // below behaves exactly as it did before.
-  let routed = applyPrivateRoute(url);
+  //
+  // TWO transport steps now, and the ORDER MATTERS. Staging decides WHICH host
+  // answers (a genuinely different server, with its own certificate, its own SNI
+  // and its own WAF); private routing then decides HOW to reach whichever host
+  // that is. Composed this way, a future dev.* entry in the private host map works
+  // with no further change here.
+  //
+  // stagingOrigin is null in 1.90, applyStagingOrigin returns its argument, and
+  // this reduces to the single applyPrivateRoute(url) it has always been.
+  const stagedUrl = applyStagingOrigin(url, stagingOrigin);
+  let routed = applyPrivateRoute(stagedUrl);
   let requestUrl = routed.url;
 
   logger.info(logContext, "sample url HEAD request started");
@@ -633,7 +670,7 @@ export async function runCheckWithProfile(
   if (routed.route && isForcedTlsRedirect(requestUrl, firstResult.statusCode, firstResult.location)) {
     notePrivateSchemeFlip(new URL(requestUrl).hostname);
 
-    routed = applyPrivateRoute(url);
+    routed = applyPrivateRoute(stagedUrl);
     requestUrl = routed.url;
 
     logger.info(
@@ -725,7 +762,8 @@ export async function runCheckWithProfile(
         errorReason: null,
         usedFallbackProfile: false,
         edgeServer: firstResult.serverHeader,
-        viaPrivateRoute: routed.route !== null
+        viaPrivateRoute: routed.route !== null,
+        checkedOnStaging: stagingOrigin !== null
       };
     }
 
@@ -767,21 +805,46 @@ export async function runCheckWithProfile(
       // when a verdict came from the fallback attempt.
       usedFallbackProfile: false,
       edgeServer: firstResult.serverHeader,
-      viaPrivateRoute: routed.route !== null
+      viaPrivateRoute: routed.route !== null,
+      checkedOnStaging: stagingOrigin !== null
     };
   } else if (isRedirectStatus(firstResult.statusCode)) {
     // Resolved against the PUBLIC identity, not the request URL: finalUrl is
     // persisted, drives the redirect rules and the Fix modal, and must describe
     // where a real visitor would land — not our transport.
-    const finalUrl = resolveRedirectUrl(firstResult.location, url);
+    //
+    // That handles a RELATIVE Location for free. An ABSOLUTE one has to be mapped
+    // back explicitly, and this is the sharpest edge in the whole staging feature:
+    // finalUrl is not display-only. routes/sessions.ts hands it to
+    // applyRedirectsJob as the redirect DESTINATION WRITTEN INTO PRODUCTION
+    // SITEMAP <loc> VALUES, and verifyUrlsJob distills it into pattern_shape_rules
+    // to drive bulk rewrites. A staging origin answering
+    // "Location: https://dev.example.com/new-path" would otherwise put a dev host
+    // into the customer's production sitemap files. toProdIdentity leaves a
+    // genuine third-party destination (a CDN, a partner domain) exactly as
+    // measured, and is the identity function in 1.90.
+    const finalUrl = toProdIdentity(
+      resolveRedirectUrl(firstResult.location, url),
+      stagingOrigin,
+      url
+    );
     let responseMs = firstResult.responseMs;
 
     if (finalUrl && !skipRedirectFollow) {
+      // AND NOW THE MIRROR IMAGE OF THAT FIX. finalUrl has just been normalized to
+      // the PRODUCTION identity, so following it verbatim would send a live
+      // request to PRODUCTION in the middle of a staging run — measuring the wrong
+      // server, and touching an origin the operator did not intend to touch at
+      // all. Re-stage it first, but only when it is still on the production host:
+      // an external destination is followed publicly, exactly as before.
+      const followUrl = isProdOrigin(finalUrl, url)
+        ? applyStagingOrigin(finalUrl, stagingOrigin)
+        : finalUrl;
       // PUBLIC PATH, deliberately: private routing is scoped to the URL health
       // check itself, and a redirect destination is a different page — often on a
       // different host. Passing route: null keeps this request byte-identical to
       // what it was before this feature existed.
-      const followResult = await headOnce(finalUrl, profile, null, beforeRequest);
+      const followResult = await headOnce(followUrl, profile, null, beforeRequest);
 
       responseMs += followResult.responseMs;
     }
@@ -800,7 +863,8 @@ export async function runCheckWithProfile(
       errorReason: null,
       usedFallbackProfile: false,
       edgeServer: firstResult.serverHeader,
-      viaPrivateRoute: routed.route !== null
+      viaPrivateRoute: routed.route !== null,
+      checkedOnStaging: stagingOrigin !== null
     };
   } else {
     // BLOCKED vs FAILURE. Two high-confidence signals only — no vendor guessing,
@@ -841,7 +905,8 @@ export async function runCheckWithProfile(
       errorReason: firstResult.errorReason,
       usedFallbackProfile: false,
       edgeServer: firstResult.serverHeader,
-      viaPrivateRoute: routed.route !== null
+      viaPrivateRoute: routed.route !== null,
+      checkedOnStaging: stagingOrigin !== null
     };
   }
 

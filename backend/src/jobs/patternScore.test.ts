@@ -33,7 +33,8 @@ function result(scoreWeight: number, redirectCount = 0): SampleCheckResult {
     errorReason: null,
     usedFallbackProfile: false,
     edgeServer: null,
-    viaPrivateRoute: false
+    viaPrivateRoute: false,
+    checkedOnStaging: false
   };
 }
 

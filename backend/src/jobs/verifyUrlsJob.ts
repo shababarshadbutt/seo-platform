@@ -24,6 +24,11 @@ import {
 } from "./sampleUrlCheck.js";
 import { resolveSampleTarget } from "./sampleTarget.js";
 import { probeUrl, verifyConcurrency, verifyTargetFor } from "./verifyProbe.js";
+import { applyStagingOrigin } from "../http/stagingOrigin.js";
+import {
+  probeEnvironmentLogFields,
+  resolveProbeEnvironment
+} from "./probeEnvironment.js";
 import { rateLimitHostKey } from "../http/hostRateLimiter.js";
 import type { ResolvedHostStrategy } from "../http/hostStrategy.js";
 import { createHostStrategyRun } from "../http/hostStrategyRun.js";
@@ -72,11 +77,26 @@ export const VERIFY_PROBLEM_STATUSES = [301, 302, 307, 308, 404];
 // named parameter it interpolates. A window of 0 disables reuse, so the
 // predicate is false for every row and both queries revert to their old
 // behaviour exactly.
+//
+// $STAGING$ is the SECOND named parameter, and it exists because a verdict is only
+// reusable if it was measured against the SAME SERVER. Without it, flipping the
+// toggle to 2.0 would "reuse" production verdicts as though they described the
+// staging site — and flipping back would do the reverse, which is worse, because
+// staging numbers would then be reported as production fact. With it, a mode
+// switch makes every stored verdict non-reusable and forces a genuine re-check.
+//
+// COALESCE(..., false) is what keeps 1.90 identical to today: rows written before
+// migration 057 have NULL here and must count as production, which is what they
+// are. In 1.90 the parameter is false and the clause is true for every one of them.
+//
+// AND THIS CONSTANT IS INTERPOLATED TWICE — see the note above. Both call sites
+// must pass BOTH parameters.
 const REUSABLE_VERDICT_SQL = `
   $WINDOW$::int > 0
   AND v.checked_at IS NOT NULL
   AND v.checked_at > COALESCE(s.files_mutated_at, 'epoch'::timestamptz)
   AND v.checked_at > now() - ($WINDOW$ || ' hours')::interval
+  AND COALESCE(v.checked_on_staging, false) = $STAGING$::boolean
 `;
 
 // Persist progress every N completed checks so the status endpoint has
@@ -96,6 +116,7 @@ type SessionRow = {
   base_url: string;
   concurrency: number;
   user_agent: string;
+  staging_base_url: string | null;
 };
 
 async function markFailed(jobRowId: string, message: string) {
@@ -132,10 +153,14 @@ async function upsertVerifiedBatch(
       result.errorReason,
       Array.from(entry.sourceFiles).sort(),
       // Which network path measured this URL (mig 045).
-      result.viaPrivateRoute
+      result.viaPrivateRoute,
+      // And which ENVIRONMENT measured it (mig 057). Taken from the result rather
+      // than from the job's env so it can never disagree with the request that was
+      // actually made.
+      result.checkedOnStaging
     );
     values.push(
-      `($1, $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}::text[], now(), $${base + 8})`
+      `($1, $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}::text[], now(), $${base + 8}, $${base + 9})`
     );
   }
 
@@ -151,7 +176,8 @@ async function upsertVerifiedBatch(
         error_reason,
         source_files,
         checked_at,
-        via_private_route
+        via_private_route,
+        checked_on_staging
       )
       VALUES ${values.join(", ")}
       ON CONFLICT (session_id, url) DO UPDATE SET
@@ -162,7 +188,12 @@ async function upsertVerifiedBatch(
         error_reason = EXCLUDED.error_reason,
         source_files = EXCLUDED.source_files,
         checked_at = EXCLUDED.checked_at,
-        via_private_route = EXCLUDED.via_private_route
+        via_private_route = EXCLUDED.via_private_route,
+        -- MUST be here as well as in the INSERT. A re-check in a different
+        -- environment overwrites an existing row via this branch, and omitting the
+        -- column would leave the OLD environment's label sitting on the NEW
+        -- verdict -- exactly the ambiguity the column exists to prevent.
+        checked_on_staging = EXCLUDED.checked_on_staging
     `,
     params
   );
@@ -259,7 +290,7 @@ export async function processVerifyUrlsJob(
 
   try {
     const sessionResult = await pool.query<SessionRow>(
-      "SELECT id, base_url, concurrency, user_agent FROM sessions WHERE id = $1",
+      "SELECT id, base_url, concurrency, user_agent, staging_base_url FROM sessions WHERE id = $1",
       [sessionId]
     );
     const session = sessionResult.rows[0];
@@ -267,6 +298,17 @@ export async function processVerifyUrlsJob(
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
     }
+
+    // PINNED FOR THE WHOLE RUN, once. A toggle flipped mid-sweep must not produce a
+    // result set that is half production and half staging. Throws if 2.0 is on with
+    // no derivable staging origin, which fails the job loudly instead of silently
+    // measuring the wrong server.
+    const env = await resolveProbeEnvironment(session);
+
+    logger.info(
+      { session_id: sessionId, job_row_id: jobRowId, ...probeEnvironmentLogFields(env) },
+      "verify urls: environment resolved"
+    );
 
     const patternsResult = await pool.query<PatternRow>(
       patternIds
@@ -492,9 +534,9 @@ export async function processVerifyUrlsJob(
           JOIN sessions s ON s.id = v.session_id
           WHERE v.session_id = $1
             AND v.is_deleted_from_sitemap = false
-            AND ${REUSABLE_VERDICT_SQL.replaceAll("$WINDOW$", "$2")}
+            AND ${REUSABLE_VERDICT_SQL.replaceAll("$WINDOW$", "$2").replaceAll("$STAGING$", "$3")}
         `,
-        [sessionId, String(reuseWindowHours)]
+        [sessionId, String(reuseWindowHours), env.isStaging]
       );
 
       for (const row of reusableResult.rows) {
@@ -535,7 +577,15 @@ export async function processVerifyUrlsJob(
 
     for (const entry of notDeleted) {
       const { target } = verifyTargetFor(session.base_url, entry.url);
-      const strategy = await strategyRun.forTarget(target);
+      // STAGED, not the identity. The host strategy engine keys its cache, its
+      // host_probe_profiles row and its private-route lookup off whatever it is
+      // given, and staging is a genuinely different server with its own edge and
+      // its own WAF. Hand it the production URL during a 2.0 run and a REFUSED
+      // verdict learned from PRODUCTION would set strategy.skip for every URL --
+      // the sweep would issue zero requests and report the whole session unscored,
+      // which reads as a dead staging site rather than as a wiring bug.
+      const probeTarget = applyStagingOrigin(target, env.stagingOrigin);
+      const strategy = await strategyRun.forTarget(probeTarget);
 
       if (strategy.skip) {
         refusedByHost += 1;
@@ -552,7 +602,7 @@ export async function processVerifyUrlsJob(
       }
 
       ladderByHost.set(
-        rateLimitHostKey(target),
+        rateLimitHostKey(probeTarget),
         strategy.ladder.length ? strategy.ladder : undefined
       );
 
@@ -630,7 +680,7 @@ export async function processVerifyUrlsJob(
         // in the logs — the whole scoping fix was diagnosed from the fact that
         // urls_total, not enumeration, was the number out of proportion.
         enumerate_ms: enumerateMs,
-        concurrency: verifyConcurrency(session.base_url)
+        concurrency: verifyConcurrency(env.stagingOrigin ?? session.base_url)
       },
       "verify urls: population enumerated, checking started"
     );
@@ -660,14 +710,17 @@ export async function processVerifyUrlsJob(
       // (which sizes the SAMPLER's burst). Load is bounded separately and
       // per-request by the rate limiter inside probeUrl, so this is a throughput
       // parameter rather than a politeness one — see verifyConcurrency.
-      verifyConcurrency(session.base_url),
+      verifyConcurrency(env.stagingOrigin ?? session.base_url),
       async (entry, index) => {
         // ONE derivation per URL, shared by the ladder lookup and the outcome note
         // below. It used to be computed twice here (and wrongly — see
         // verifyTargetFor), which meant three chances for the bookkeeping key to
         // disagree with the URL actually requested.
         const host = rateLimitHostKey(
-          verifyTargetFor(session.base_url, entry.url).target
+          applyStagingOrigin(
+            verifyTargetFor(session.base_url, entry.url).target,
+            env.stagingOrigin
+          )
         );
         // The loc itself is passed as source_url, so resolveSampleTarget applies
         // the same www-equivalence rule sampling uses when base_url and the
@@ -686,7 +739,8 @@ export async function processVerifyUrlsJob(
           {
             // The learned rung leads, so on a host that needs the browser profile
             // every URL succeeds on attempt #1 instead of climbing from R0.
-            profileLadder: ladderByHost.get(host)
+            profileLadder: ladderByHost.get(host),
+            stagingOrigin: env.stagingOrigin
           }
         );
 
@@ -840,9 +894,9 @@ export async function processVerifyUrlsJob(
             -- above would otherwise delete the verdict this run just trusted.
             -- A reusable row is one measured after the files last changed, so it
             -- still describes them — which is exactly what the sweep is for.
-            AND NOT (${REUSABLE_VERDICT_SQL.replaceAll("$WINDOW$", "$4")})
+            AND NOT (${REUSABLE_VERDICT_SQL.replaceAll("$WINDOW$", "$4").replaceAll("$STAGING$", "$5")})
         `,
-        [sessionId, sweepPatternIds, runStarted, String(reuseWindowHours)]
+        [sessionId, sweepPatternIds, runStarted, String(reuseWindowHours), env.isStaging]
       );
 
       if (swept.rowCount) {
