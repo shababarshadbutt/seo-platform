@@ -201,6 +201,7 @@ import {
   parseRedirectRule,
   redirectRuleCandidates
 } from "../sitemaps/redirectRuleCandidates.js";
+import { RedirectCollisionCounter } from "../sitemaps/redirectCollisions.js";
 import { RedirectRuleImpact } from "../sitemaps/redirectRuleImpact.js";
 import { looksLikeNotFoundUrl } from "../sitemaps/softNotFound.js";
 import {
@@ -4667,6 +4668,20 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         sourceRole
       });
       const impact = new RedirectRuleImpact(rules);
+      // How many <loc> entries each rule would collapse into DUPLICATES.
+      //
+      // Only normalizeDigits rules get a counter. Every other kind is a literal
+      // edit that can collapse two URLs only by coincidence, and a counter holds a
+      // map keyed by destination — on a 1.3M-URL pattern that is the shape of
+      // allocation this project has twice hit a heap wall with, so it is not paid
+      // for rules that do not need it. (RedirectCollisionCounter itself is
+      // kind-agnostic and tested against a literal rule; the restriction is a cost
+      // decision here, not a limitation there.)
+      const collisionCounters = rules.map((rule) =>
+        rule.kind === "normalizeDigits"
+          ? new RedirectCollisionCounter(rule)
+          : null
+      );
 
       const scan = await scanPatternFiles({
         targets,
@@ -4693,11 +4708,21 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           }
 
           impact.offer(url);
+
+          for (const counter of collisionCounters) {
+            counter?.offer(url);
+          }
         }
       });
 
       return {
         ...impact.totals(),
+        // Parallel to perRule, so the UI can put the warning beside the rule that
+        // causes it. null where the kind cannot collapse URLs.
+        collisions: collisionCounters.map((counter, ruleIndex) => ({
+          ruleIndex,
+          ...(counter ? counter.totals() : null)
+        })),
         files_scanned: scan.filesScanned,
         files_skipped: scan.filesSkipped
       };
