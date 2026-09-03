@@ -62,16 +62,36 @@ export type SkippedGroupRow = {
 
 // The house phrasing for a rule, matching what the Fix modal's candidate list
 // already shows so the same rule never reads two ways in one session.
+//
+// IT IS A SWITCH, NOT A TERNARY, AND THAT MATTERS. Both this function and the Fix
+// modal's candidate list used to read `kind === "replace" ? ... : insert ...`,
+// which treats "anything that is not replace" as an insert. When the
+// normalizeDigits kind was added, that made both render
+// `insert "undefined" after "undefined"` — an operator ticking a checkbox whose
+// description was silently wrong about what it would do to their sitemap. A
+// switch with an explicit default forces the next kind to be handled too.
 export function describeRule(rule: {
   kind: string;
   find?: string;
   replace?: string;
   prefix?: string;
   insert?: string;
+  dropZeroTokens?: boolean;
 }): string {
-  return rule.kind === "replace"
-    ? `replace "${rule.find}" with "${rule.replace}"`
-    : `insert "${rule.insert}" after "${rule.prefix}"`;
+  switch (rule.kind) {
+    case "replace":
+      return `replace "${rule.find}" with "${rule.replace}"`;
+    case "insert":
+      return `insert "${rule.insert}" after "${rule.prefix}"`;
+    case "normalizeDigits":
+      // Said in the operator's terms, not the code's. "leading zeros" is the
+      // phrase the SEO team already uses for this migration.
+      return rule.dropZeroTokens
+        ? 'remove leading zeros from numbers, and drop a number left as "0"'
+        : "remove leading zeros from numbers";
+    default:
+      return rule.kind;
+  }
 }
 
 export function buildSkippedGroupRows(

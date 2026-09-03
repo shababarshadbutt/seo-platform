@@ -205,7 +205,12 @@ export type SkippedShape = {
 // the Advanced escape hatch for someone who would rather write it directly.
 export type RedirectRuleShape =
   | { kind: "replace"; find: string; replace: string }
-  | { kind: "insert"; prefix: string; insert: string };
+  | { kind: "insert"; prefix: string; insert: string }
+  // Value-based, not a literal string edit: strip zero padding from numeric path
+  // tokens, optionally dropping a token left as plain "0". See the backend's
+  // sitemaps/digitNormalization.ts. Rendered by describeRule, never by an inline
+  // ternary.
+  | { kind: "normalizeDigits"; dropZeroTokens: boolean };
 
 export type ShapeRuleResult = {
   shape: string;

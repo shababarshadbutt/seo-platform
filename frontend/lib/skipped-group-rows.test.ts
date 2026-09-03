@@ -596,3 +596,39 @@ test("a fresh pattern rule silences the per-group may-not-fit caveat", () => {
   // caveat is still the honest thing to say.
   assert.ok(describeUnmatchedRule(row, measuredAt, "2026-08-31T09:00:00.000Z"));
 });
+
+// --- describeRule across every kind ----------------------------------------
+
+// THE REGRESSION THIS FILE EXISTS TO PREVENT. describeRule used to be
+// `kind === "replace" ? ... : insert ...`, so any kind that was not "replace" was
+// described as an insert. Adding normalizeDigits made it render
+// `insert "undefined" after "undefined"` beside the checkbox that applies the rule
+// — a wrong description of a real sitemap edit. Every kind is asserted here so the
+// next one added cannot slip through the same gap.
+test("describeRule words every rule kind, and never falls through to insert", () => {
+  assert.equal(
+    describeRule({ kind: "replace", find: "-catalog", replace: "" }),
+    'replace "-catalog" with ""'
+  );
+  assert.equal(
+    describeRule({ kind: "insert", prefix: "https://s.com/", insert: "aviation/" }),
+    'insert "aviation/" after "https://s.com/"'
+  );
+  assert.equal(
+    describeRule({ kind: "normalizeDigits", dropZeroTokens: false }),
+    "remove leading zeros from numbers"
+  );
+  assert.equal(
+    describeRule({ kind: "normalizeDigits", dropZeroTokens: true }),
+    'remove leading zeros from numbers, and drop a number left as "0"'
+  );
+});
+
+// An unknown kind must not be described as an insert either. Echoing the kind is
+// unhelpful but honest; claiming it inserts something is not.
+test("an unrecognised rule kind is not described as an insert", () => {
+  const described = describeRule({ kind: "somethingNew" });
+
+  assert.ok(!described.includes("undefined"), described);
+  assert.ok(!described.startsWith("insert"), described);
+});

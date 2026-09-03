@@ -128,3 +128,103 @@ test("parseRedirectRule narrows shape and rejects junk", () => {
   assert.equal(parseRedirectRule({ kind: "replace", find: "", replace: "b" }), null);
   assert.equal(parseRedirectRule({ kind: "delete", find: "a" }), null);
 });
+
+// --- the value-based readings ----------------------------------------------
+
+// THE REPORTED CASE, and the reason this kind exists. Before, an operator looking
+// at these two pairs was offered `strip "-00"` and `strip "00"` — each reproducing
+// exactly ONE of the two, each visibly wrong on the other. Now a single rule
+// reproduces both and leads the list.
+test("zero-padded pairs put the normalization first, at full fit", () => {
+  const candidates = redirectRuleCandidates([
+    { source: "https://site.com/page-3-00/", dest: "https://site.com/page-3/" },
+    { source: "https://site.com/page-1-003/", dest: "https://site.com/page-1-3/" }
+  ]);
+
+  assert.deepEqual(candidates[0].rule, {
+    kind: "normalizeDigits",
+    dropZeroTokens: true
+  });
+  assert.equal(candidates[0].fits, 2);
+  assert.equal(candidates[0].total, 2);
+  assert.equal(candidates[0].counterExample, null);
+
+  // The literal readings are still offered — they are real readings of the
+  // evidence — but they are behind it, and each carries the counter-example that
+  // shows why.
+  const literal = candidates.filter((c) => c.rule.kind === "replace");
+
+  assert.ok(literal.length >= 1);
+  assert.ok(literal.every((c) => c.fits < 2));
+});
+
+// Offered even when the literal reading fits perfectly, because "fits the sample"
+// and "correct for the pattern" are different claims — `replace "00" -> ""` also
+// rewrites product-1002. On equal fit the normalization ranks ahead.
+test("the normalization is offered and ranked above an equally-fitting replace", () => {
+  const candidates = redirectRuleCandidates([
+    { source: "https://site.com/page-1-003/", dest: "https://site.com/page-1-3/" },
+    { source: "https://site.com/page-2-007/", dest: "https://site.com/page-2-7/" }
+  ]);
+
+  const normalize = candidates.findIndex(
+    (c) => c.rule.kind === "normalizeDigits"
+  );
+  const replace = candidates.findIndex((c) => c.rule.kind === "replace");
+
+  assert.notEqual(normalize, -1, "normalization must be offered");
+  assert.notEqual(replace, -1, "the literal reading is still offered");
+  assert.equal(candidates[normalize].fits, 2);
+  assert.equal(candidates[replace].fits, 2);
+  assert.ok(normalize < replace, "the value-based reading must come first");
+});
+
+// A pattern with no padding must not gain two dead options. They reproduce
+// nothing, so the existing fits > 0 bar removes them.
+test("unpadded evidence offers no normalization candidates", () => {
+  const candidates = redirectRuleCandidates([
+    {
+      source: "https://site.com/rfq/a/1",
+      dest: "https://site.com/aviation/rfq/a/1"
+    }
+  ]);
+
+  assert.equal(
+    candidates.some((c) => c.rule.kind === "normalizeDigits"),
+    false
+  );
+});
+
+// The authority guarantee has to extend to the new kind: a client may pick it only
+// because the server derived it from the server's own evidence.
+test("a normalization is accepted only against evidence that supports it", () => {
+  const padded = [
+    { source: "https://site.com/page-3-00/", dest: "https://site.com/page-3/" },
+    { source: "https://site.com/page-1-003/", dest: "https://site.com/page-1-3/" }
+  ];
+  const unpadded = [
+    {
+      source: "https://site.com/rfq/a/1",
+      dest: "https://site.com/aviation/rfq/a/1"
+    }
+  ];
+  const rule = { kind: "normalizeDigits", dropZeroTokens: true } as const;
+
+  assert.equal(isOfferedRule(rule, padded), true);
+  assert.equal(isOfferedRule(rule, unpadded), false);
+});
+
+test("parseRedirectRule narrows the normalization kind and rejects junk", () => {
+  assert.deepEqual(parseRedirectRule({ kind: "normalizeDigits", dropZeroTokens: true }), {
+    kind: "normalizeDigits",
+    dropZeroTokens: true
+  });
+  assert.deepEqual(parseRedirectRule({ kind: "normalizeDigits", dropZeroTokens: false }), {
+    kind: "normalizeDigits",
+    dropZeroTokens: false
+  });
+  // Not a boolean: refused rather than coerced, so a truthy string cannot pick
+  // the wider reading by accident.
+  assert.equal(parseRedirectRule({ kind: "normalizeDigits", dropZeroTokens: "true" }), null);
+  assert.equal(parseRedirectRule({ kind: "normalizeDigits" }), null);
+});

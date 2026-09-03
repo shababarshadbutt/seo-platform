@@ -44,8 +44,23 @@ export type RedirectRuleCandidate = {
 // into a rewrite of every hyphen in the URL. Given two rules that explain the
 // evidence equally well, the one with the narrower blast radius should be the
 // one a tired operator accepts by default.
+//
+// "normalizeDigits" sits between them for the same reason. It touches only
+// zero-padded numeric tokens, so its blast radius is bounded by the data rather
+// than by a needle that might occur anywhere — whereas the literal replace it
+// competes with is the documented hazard: a sample of "page-1-003 -> page-1-3"
+// diffs to `replace "00" -> ""`, which also turns "product-1002" into
+// "product-12". On equal fit the operator should see the value-based reading
+// first, because it is the one that stays correct on the URLs nobody sampled.
 function candidateRank(candidate: RedirectRuleCandidate): number {
-  return candidate.rule.kind === "insert" ? 0 : 1;
+  switch (candidate.rule.kind) {
+    case "insert":
+      return 0;
+    case "normalizeDigits":
+      return 1;
+    default:
+      return 2;
+  }
 }
 
 export function redirectRuleCandidates(
@@ -69,6 +84,22 @@ export function redirectRuleCandidates(
     if (rule && !rules.some((existing) => sameRule(existing, rule))) {
       rules.push(rule);
     }
+  }
+
+  // THE VALUE-BASED READINGS ARE ALWAYS OFFERED, not only when the literal ones
+  // disagree.
+  //
+  // diffPair can only ever propose a literal edit, so on a zero-padded pattern it
+  // proposes one that happens to be right for the sampled URLs and wrong for the
+  // rest ("page-1-003 -> page-1-3" reads as `replace "00" -> ""`, which also
+  // rewrites "product-1002"). Offering the normalization alongside it is what
+  // gives the operator the reading diffPair structurally cannot express.
+  //
+  // No guard is needed: a normalization that changes none of the sampled sources
+  // reproduces no pair, scores 0, and is dropped by the fits > 0 filter below —
+  // the same bar every other candidate clears.
+  for (const dropZeroTokens of [false, true]) {
+    rules.push({ kind: "normalizeDigits", dropZeroTokens });
   }
 
   return rules
@@ -152,6 +183,13 @@ export function parseRedirectRule(raw: unknown): RedirectRule | null {
     value.insert.length > 0
   ) {
     return { kind: "insert", prefix: value.prefix, insert: value.insert };
+  }
+
+  if (
+    value.kind === "normalizeDigits" &&
+    typeof value.dropZeroTokens === "boolean"
+  ) {
+    return { kind: "normalizeDigits", dropZeroTokens: value.dropZeroTokens };
   }
 
   return null;

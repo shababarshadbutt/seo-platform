@@ -129,6 +129,7 @@ import {
   type TransformSampleResult,
   type PublishProgressEvent
 } from "@/lib/api";
+import { describeRule } from "@/lib/skipped-group-rows";
 import { describeCheckedEnvironment } from "@/lib/checked-environment";
 import {
   convertParamToABC,
@@ -6646,9 +6647,12 @@ export default function ResultsDashboardPage({
                             />
                             <span className="min-w-0 space-y-1">
                               <span className="block font-mono text-slate-800">
-                                {candidate.rule.kind === "replace"
-                                  ? `replace "${candidate.rule.find}" with "${candidate.rule.replace}"`
-                                  : `insert "${candidate.rule.insert}" after "${candidate.rule.prefix}"`}
+                                {/* describeRule, not an inline ternary. The old
+                                    two-branch version treated "not replace" as an
+                                    insert, so a third rule kind rendered
+                                    `insert "undefined" after "undefined"` right
+                                    next to the checkbox that applies it. */}
+                                {describeRule(candidate.rule)}
                               </span>
                               <span className="block">
                                 {/* The REAL number when we have it, and the
