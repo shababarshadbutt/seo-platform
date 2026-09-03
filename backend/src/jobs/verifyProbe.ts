@@ -119,6 +119,15 @@ export async function probeUrl(
     profileLadder?: RequestProfile[];
     // The staging origin for this run, or null in 1.90. See stagingOrigin.ts.
     stagingOrigin?: string | null;
+    // Spend the extra ranged GET that sniffs a 2xx body for not-found wording.
+    //
+    // OFF by default, because for verification it is pure waste — see the long
+    // note on skipSoft404Sniff below. The normalization prober turns it ON, and
+    // needs to: it asks "does this invented URL exist?", and a site that answers
+    // every path with a styled 200 "not found" page would otherwise have every
+    // variant scored as live, and could have a whole pattern rewritten onto URLs
+    // that do not exist.
+    detectSoft404?: boolean;
   } = {}
 ): Promise<SampleCheckResult> {
   const stagingOrigin = options.stagingOrigin ?? null;
@@ -167,6 +176,6 @@ export async function probeUrl(
     // This is the biggest single lever on a large run: at the WAF-imposed 5
     // requests/second it takes a healthy-majority pattern from ~2.5 to ~5 URLs
     // checked per second. See skipSoft404Sniff in sampleUrlCheck.ts.
-    skipSoft404Sniff: true
+    skipSoft404Sniff: !options.detectSoft404
   });
 }

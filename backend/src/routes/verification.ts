@@ -12,7 +12,10 @@ import {
   samplePatternJobId,
   sitemapQueue
 } from "../queue/sitemapQueue.js";
-import { enqueueTriageSampleJob } from "../queue/triageQueue.js";
+import {
+  enqueueNormalizationProbeJob,
+  enqueueTriageSampleJob
+} from "../queue/triageQueue.js";
 import { enqueueVerifyUrlsJob } from "../queue/verificationQueue.js";
 import {
   parseStructureFilters,
@@ -920,6 +923,95 @@ export async function verificationRoutes(app: FastifyInstance) {
       });
 
       return reply.code(202).send({ run_id: runId });
+    }
+  );
+
+  // DOES THE NORMALIZED SPELLING ACTUALLY EXIST?
+  //
+  // The rebuilt site drops zero padding from numeric path tokens, and a URL alone
+  // cannot say which reading applies: "page-3-00" could be served as "page-3-0" or
+  // as "page-3". So this asks the site rather than guessing — it probes the URL as
+  // written and each normalized reading of it, and records what answered.
+  //
+  // The run writes EVIDENCE ONLY. Nothing here rewrites a sitemap; the Fix modal
+  // reads the result to rank the redirect candidates an operator ticks.
+  app.post<{ Params: PatternParams }>(
+    "/api/sessions/:id/patterns/:patternId/normalization-probe",
+    async (request, reply) => {
+      const sessionId = request.params.id;
+      const patternId = request.params.patternId;
+
+      const patternResult = await pool.query(
+        "SELECT 1 FROM patterns WHERE id = $1 AND session_id = $2",
+        [patternId, sessionId]
+      );
+
+      if (patternResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "Pattern not found" });
+      }
+
+      // Attach to an in-flight run rather than starting a second one — the same
+      // arrangement as triage above, and the same reason: the unique partial index
+      // in migration 058 is the real guard, this turns it into a clean 202.
+      const active = await pool.query<{ id: string }>(
+        `
+          SELECT id
+          FROM normalization_probe_runs
+          WHERE pattern_id = $1 AND status IN ('PENDING', 'RUNNING')
+          ORDER BY started_at DESC
+          LIMIT 1
+        `,
+        [patternId]
+      );
+
+      if (active.rows[0]) {
+        return reply.code(202).send({ run_id: active.rows[0].id });
+      }
+
+      const runRow = await pool.query<{ id: string }>(
+        `
+          INSERT INTO normalization_probe_runs (session_id, pattern_id)
+          VALUES ($1, $2)
+          RETURNING id
+        `,
+        [sessionId, patternId]
+      );
+      const runId = runRow.rows[0].id;
+
+      await enqueueNormalizationProbeJob({
+        session_id: sessionId,
+        pattern_id: patternId,
+        run_id: runId
+      });
+
+      return reply.code(202).send({ run_id: runId });
+    }
+  );
+
+  app.get<{ Params: PatternParams }>(
+    "/api/sessions/:id/patterns/:patternId/normalization-probe",
+    async (request) => {
+      const result = await pool.query(
+        `
+          SELECT id, status, candidates_total, sampled_total, requests_total,
+                 checked_on_staging, result, error, started_at, completed_at
+          FROM normalization_probe_runs
+          WHERE pattern_id = $1 AND session_id = $2
+          ORDER BY started_at DESC
+          LIMIT 1
+        `,
+        [request.params.patternId, request.params.id]
+      );
+      const run = result.rows[0] ?? null;
+
+      return {
+        run,
+        running: run
+          ? run.status === "PENDING" || run.status === "RUNNING"
+          : false
+      };
     }
   );
 

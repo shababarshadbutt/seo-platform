@@ -81,10 +81,13 @@ import {
   type VerifyUrlsJobData
 } from "./queue/verificationQueue.js";
 import {
+  NORMALIZATION_PROBE_JOB,
   TRIAGE_QUEUE_NAME,
   TRIAGE_SAMPLE_JOB,
   closeTriageQueue,
+  type NormalizationProbeJobData,
   type TriageJobName,
+  type TriageQueueJobData,
   type TriageSampleJobData
 } from "./queue/triageQueue.js";
 import {
@@ -125,6 +128,7 @@ import { destroyDryRunScanPool } from "./jobs/dryRunScanPool.js";
 import { destroyPatternPopulationPool } from "./jobs/patternPopulationPool.js";
 import { processVerifyUrlsJob } from "./jobs/verifyUrlsJob.js";
 import { processTriageSampleJob } from "./jobs/triageJob.js";
+import { processNormalizationProbeJob } from "./jobs/normalizationProbeJob.js";
 import { processCleanupUploadsJob } from "./jobs/cleanupUploadsJob.js";
 import { processExtractPatternsJob } from "./jobs/extractPatternsJob.js";
 import { processParseSitemapJob } from "./jobs/parseSitemapJob.js";
@@ -205,7 +209,7 @@ let verificationWorker: Worker<
 // is never stuck behind a multi-minute full verification. Running the two at
 // once does not double the load on the client's origin — pacing is per target
 // host and process-global (http/hostRateLimiter.ts), so they share one budget.
-let triageWorker: Worker<TriageSampleJobData, void, TriageJobName> | null = null;
+let triageWorker: Worker<TriageQueueJobData, void, TriageJobName> | null = null;
 // Download-ZIP pre-generation + daily cleanup on its own concurrency-1 queue, so
 // a heavy 1000-file archive write never starves the other workers.
 let preGenerateZipWorker: Worker<
@@ -553,11 +557,24 @@ async function start() {
         "verification worker job failed"
       );
     });
-    triageWorker = new Worker<TriageSampleJobData, void, TriageJobName>(
+    triageWorker = new Worker<TriageQueueJobData, void, TriageJobName>(
       TRIAGE_QUEUE_NAME,
       async (job) => {
         if (job.name === TRIAGE_SAMPLE_JOB) {
-          await processTriageSampleJob(job.data, app.log);
+          await processTriageSampleJob(
+            job.data as TriageSampleJobData,
+            app.log
+          );
+          return;
+        }
+
+        // Shares this queue because it is the same shape of work: per-pattern,
+        // a few dozen rate-limited probes, an operator waiting on the answer.
+        if (job.name === NORMALIZATION_PROBE_JOB) {
+          await processNormalizationProbeJob(
+            job.data as NormalizationProbeJobData,
+            app.log
+          );
           return;
         }
 

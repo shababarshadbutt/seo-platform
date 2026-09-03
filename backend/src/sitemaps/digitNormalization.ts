@@ -158,7 +158,33 @@ export function normalizeDigitsPath(
   return `${normalized}${suffix}`;
 }
 
-// The ordered, de-duplicated set of paths worth PROBING for one URL.
+// Absolute-URL split, so only the PATH is ever normalized.
+//
+// A host can legitimately carry a zero-padded label ("web-007.example.com") and a
+// port is digits too. Rewriting either would point at a different SERVER rather
+// than a different page — and callers pass whole <loc> values here, so this is not
+// hypothetical. String surgery rather than `new URL().toString()` keeps the
+// untouched half byte-for-byte what it was; these values are written into sitemap
+// files.
+const ABSOLUTE_URL = /^([a-z][a-z0-9+.-]*:\/\/[^/]+)(.*)$/i;
+
+export function normalizeDigitsUrl(url: string, dropZeroTokens: boolean): string {
+  const match = ABSOLUTE_URL.exec(url);
+
+  if (!match) {
+    // Not an absolute URL. Bare paths and pattern templates reach this too, and
+    // for those the whole string IS the path.
+    return normalizeDigitsPath(url, dropZeroTokens);
+  }
+
+  return `${match[1]}${normalizeDigitsPath(match[2], dropZeroTokens)}`;
+}
+
+// The ordered, de-duplicated set of URLs worth PROBING for one URL.
+//
+// Accepts an absolute URL or a bare path and does the right thing with either,
+// because it goes through normalizeDigitsUrl — there is deliberately no
+// path-only variant of this function for a caller to reach for by mistake.
 //
 // Empty when the path carries no zero-padded token, which is the cost guard: a URL
 // like "page-4-17/" generates nothing and so spends no requests. Only URLs the
@@ -172,7 +198,7 @@ export function normalizationVariants(path: string): NormalizationVariant[] {
   const seen = new Set<string>([path]);
 
   for (const kind of ["strip", "stripDropZero"] as const) {
-    const candidate = normalizeDigitsPath(path, kind === "stripDropZero");
+    const candidate = normalizeDigitsUrl(path, kind === "stripDropZero");
 
     if (seen.has(candidate)) {
       continue;

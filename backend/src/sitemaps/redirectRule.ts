@@ -1,4 +1,4 @@
-import { normalizeDigitsPath } from "./digitNormalization.js";
+import { normalizeDigitsUrl } from "./digitNormalization.js";
 
 // Distil a pattern's confirmed redirect samples into ONE reusable rewrite rule
 // so the "Fix Redirect URLs" modal can widen from the sampled subset to every
@@ -99,26 +99,6 @@ export function sameRule(a: RedirectRule, b: RedirectRule): boolean {
   }
 }
 
-// Normalize ONLY the path of a URL, leaving the origin byte-identical.
-//
-// applyRedirectRule receives whole <loc> values, and a host can legitimately carry
-// a zero-padded label ("web-007.example.com") or a port. Rewriting those would
-// point the sitemap at a different SERVER, not a different page. String surgery
-// rather than `new URL().toString()` so the untouched half stays byte-for-byte
-// what it was — this value is written into sitemap files.
-const ABSOLUTE_URL = /^([a-z][a-z0-9+.-]*:\/\/[^/]+)(.*)$/i;
-
-export function normalizeDigitsUrl(url: string, dropZeroTokens: boolean): string {
-  const match = ABSOLUTE_URL.exec(url);
-
-  if (!match) {
-    // Not an absolute URL: templates and paths reach this too, and for those the
-    // whole string IS the path.
-    return normalizeDigitsPath(url, dropZeroTokens);
-  }
-
-  return `${match[1]}${normalizeDigitsPath(match[2], dropZeroTokens)}`;
-}
 
 // Derive the single rule shared by every sampled pair. Returns null when
 // there are no usable pairs OR the pairs disagree (different edits) — in that

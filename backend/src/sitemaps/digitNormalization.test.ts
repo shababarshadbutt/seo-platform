@@ -4,7 +4,8 @@ import { test } from "node:test";
 import {
   hasPaddedToken,
   normalizationVariants,
-  normalizeDigitsPath
+  normalizeDigitsPath,
+  normalizeDigitsUrl
 } from "./digitNormalization.js";
 
 // THE COST GUARD, first in the file. A URL with no zero padding must generate no
@@ -107,5 +108,22 @@ test("a segment that is a single padded token still normalizes", () => {
   assert.equal(normalizeDigitsPath("/parts/007/", false), "/parts/7/");
   assert.deepEqual(normalizationVariants("/parts/007/"), [
     { kind: "strip", path: "/parts/7/" }
+  ]);
+});
+
+// THE ORIGIN IS NEVER TOUCHED. Callers pass whole <loc> values here, and a host
+// can legitimately carry a zero-padded label of its own. Rewriting it would point
+// the sitemap at a different SERVER rather than a different page — and because
+// normalizationVariants feeds the prober, getting this wrong would also send live
+// requests to a host nobody asked about.
+test("an absolute URL normalizes its path and never its host or port", () => {
+  assert.equal(
+    normalizeDigitsUrl("https://web-007.example.com/page-003/", false),
+    "https://web-007.example.com/page-3/"
+  );
+  assert.deepEqual(normalizationVariants("https://web-007.example.com/plain/"), []);
+  assert.deepEqual(normalizationVariants("https://site.com:8080/page-3-00/"), [
+    { kind: "strip", path: "https://site.com:8080/page-3-0/" },
+    { kind: "stripDropZero", path: "https://site.com:8080/page-3/" }
   ]);
 });
