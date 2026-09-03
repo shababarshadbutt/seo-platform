@@ -1411,6 +1411,17 @@ export type RedirectRuleImpactResponse = {
   // URLs more than one rule matches. Expected 0 for category-per-rule
   // shortlists; reported so a summed label can never silently over-count.
   overlapping: number;
+  // How many <loc> entries each rule would collapse into DUPLICATES. Parallel to
+  // perRule. Only normalizeDigits rules carry a count; the other kinds are
+  // literal edits that leave distinct URLs distinct, so their entry has no
+  // totals. `truncated` means the number is a floor, not an exact count.
+  collisions?: Array<{
+    ruleIndex: number;
+    scanned?: number;
+    duplicates?: number;
+    collidingDestinations?: number;
+    truncated?: boolean;
+  }>;
   files_scanned: number;
   files_skipped: number;
 };
@@ -2246,10 +2257,86 @@ export type RedirectCandidate = {
 // readings of that same evidence, ranked by how many pairs each REPRODUCES —
 // so "fits 10 of 10" means it actually reproduces all ten, not that ten pairs
 // happened to derive it. (v1.71)
+// --- normalization probing ---------------------------------------------------
+//
+// Asks the SITE which normalized spelling of a padded URL actually exists,
+// rather than inferring it from the string. Evidence only: nothing here rewrites
+// a sitemap.
+
+export type NormalizationProbeOutcome =
+  | "already_healthy"
+  | "resolved"
+  | "ambiguous"
+  | "unresolved";
+
+export type NormalizationProbedUrl = {
+  source: string;
+  original: { status: number | null; healthy: boolean };
+  variants: Array<{
+    kind: "strip" | "stripDropZero";
+    url: string;
+    status: number | null;
+    healthy: boolean;
+  }>;
+};
+
+export type NormalizationProbeRun = {
+  id: string;
+  status: string;
+  candidates_total: number;
+  sampled_total: number;
+  requests_total: number;
+  // Which environment answered. A variant proven live on staging is not proof
+  // about production — see migration 057.
+  checked_on_staging: boolean | null;
+  result: {
+    urls: NormalizationProbedUrl[];
+    totals: Record<NormalizationProbeOutcome, number>;
+    by_kind: { strip: number; stripDropZero: number };
+    pairs: Array<{ source: string; dest: string }>;
+    recommended: RedirectRuleShape | null;
+  } | null;
+  error: string | null;
+  started_at: string;
+  completed_at: string | null;
+};
+
+export async function startNormalizationProbe(
+  sessionId: string,
+  patternId: string
+): Promise<{ run_id: string }> {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/normalization-probe`
+    ),
+    { method: "POST", headers: { "content-type": "application/json" } }
+  );
+
+  return readJsonResponse<{ run_id: string }>(response);
+}
+
+export async function getNormalizationProbe(
+  sessionId: string,
+  patternId: string
+): Promise<{ run: NormalizationProbeRun | null; running: boolean }> {
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/normalization-probe`
+    ),
+    { cache: "no-store" }
+  );
+
+  return readJsonResponse<{
+    run: NormalizationProbeRun | null;
+    running: boolean;
+  }>(response);
+}
+
 export type RedirectRuleCandidate = {
-  rule:
-    | { kind: "replace"; find: string; replace: string }
-    | { kind: "insert"; prefix: string; insert: string };
+  // The SHARED union, not a second inline copy. There used to be two, and a new
+  // rule kind had to be added to both or the candidate list silently typed it
+  // wrong.
+  rule: RedirectRuleShape;
   fits: number;
   total: number;
   example: { source: string; dest: string } | null;

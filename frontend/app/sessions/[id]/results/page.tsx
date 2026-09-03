@@ -127,9 +127,16 @@ import {
   runTransformDryRun,
   type TransformDryRunResult,
   type TransformSampleResult,
-  type PublishProgressEvent
+  type PublishProgressEvent,
+  type NormalizationProbeRun,
+  startNormalizationProbe,
+  getNormalizationProbe
 } from "@/lib/api";
 import { describeRule } from "@/lib/skipped-group-rows";
+import {
+  collisionWarning,
+  normalizationProbeSummary
+} from "@/lib/normalization-probe";
 import { describeCheckedEnvironment } from "@/lib/checked-environment";
 import {
   convertParamToABC,
@@ -1167,6 +1174,11 @@ export default function ResultsDashboardPage({
   const [fixRuleImpact, setFixRuleImpact] =
     useState<RedirectRuleImpactResponse | null>(null);
   const [isCountingRuleImpact, setIsCountingRuleImpact] = useState(false);
+  // Which normalized spellings of a zero-padded URL actually exist. Measured, not
+  // inferred — see lib/normalization-probe.ts for what the run MEANS on screen.
+  const [normalizationRun, setNormalizationRun] =
+    useState<NormalizationProbeRun | null>(null);
+  const [isProbingNormalization, setIsProbingNormalization] = useState(false);
   // Verify-then-act for the Fix modal now lives in PatternVerifyPanel (v1.50),
   // which owns its own pattern-scoped verification/triage state. It used to be
   // eight pieces of state here driving a SESSION-wide verify from inside a
@@ -3002,6 +3014,15 @@ export default function ResultsDashboardPage({
     // pattern's files.
     setFixApprovedRuleIndexes(new Set());
     setFixRuleImpact(null);
+    // Probe evidence describes ONE pattern's URLs. Carrying it across would put
+    // "7 resolved" next to a pattern nobody measured — the stale-screenshot
+    // failure this project keeps having to fix.
+    //
+    // Deliberately NOT cleared when the structure scope changes: the probe samples
+    // the pattern's URL pool and its summary never claims to be scoped, so it
+    // stays true. Clearing it there would make an operator re-spend live requests
+    // against the client's server every time they touched a dropdown.
+    setNormalizationRun(null);
     setFixPage(0);
     // Opening a different pattern must not inherit the previous one's chips.
     setFixStatusFilter(new Set());
@@ -3201,6 +3222,55 @@ export default function ResultsDashboardPage({
       });
     } finally {
       setIsCountingRuleImpact(false);
+    }
+  }
+
+  // Ask the SITE which normalized spelling exists, rather than inferring it.
+  //
+  // Polled rather than awaited: the run is bounded to 20 URLs but each is two or
+  // three rate-limited requests against the client's origin, so it is seconds, not
+  // instant. The poll stops on a terminal status or when the modal closes.
+  async function handleProbeNormalization() {
+    if (!fixRow || isProbingNormalization) {
+      return;
+    }
+
+    setIsProbingNormalization(true);
+
+    try {
+      await startNormalizationProbe(params.id, fixRow.id);
+
+      const patternId = fixRow.id;
+      const deadline = Date.now() + 120_000;
+
+      for (;;) {
+        const status = await getNormalizationProbe(params.id, patternId);
+
+        setNormalizationRun(status.run);
+
+        if (!status.running) {
+          break;
+        }
+
+        if (Date.now() > deadline) {
+          // Stop polling, keep whatever the run last reported. The row is still
+          // in the database, so re-opening the check picks it up rather than
+          // starting a second run against the client's server.
+          break;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    } catch (nextError) {
+      setFindReplaceToast({
+        tone: "error",
+        message: friendlyApiErrorMessage(
+          nextError,
+          "Unable to check which normalized spellings exist."
+        )
+      });
+    } finally {
+      setIsProbingNormalization(false);
     }
   }
 
@@ -3915,6 +3985,13 @@ export default function ResultsDashboardPage({
   // would claim pattern-wide scope and "only the sampled URLs are listed" inches
   // apart. (v1.66)
   const fixBanner = fixModalBanner(fixScope);
+  // What the probe run means on screen. Pure, and tested in
+  // lib/normalization-probe.test.ts — nothing under app/ is ever run by
+  // `npm test`, so wording left inline here could not be pinned.
+  const normalizationSummary = normalizationProbeSummary(
+    normalizationRun,
+    isProbingNormalization
+  );
   // What "Accept Selected Changes" targets, which is not the same as how many
   // rows are selected — the banner above the button already said so and the
   // button disagreed with it. See lib/fix-accept-count.ts. (v1.53)
@@ -6607,6 +6684,82 @@ export default function ResultsDashboardPage({
                       pass, with a dry run first and no URL checking at all.
                     </p>
                   ) : null}
+                  {/* ZERO-PADDED URLS ARE A MEASURED QUESTION, NOT A DERIVED
+                      ONE. "page-3-00" could be served as "page-3-0" or as
+                      "page-3", and the URL cannot say which — so this asks the
+                      site. It is a button rather than automatic because each
+                      sampled URL costs two or three rate-limited requests
+                      against the client's origin. */}
+                  <div className="mb-2 rounded border border-slate-200 bg-white/70 px-2 py-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-slate-700">
+                        Zero-padded URLs
+                      </span>
+                      <button
+                        type="button"
+                        className="rounded border border-slate-300 bg-white px-2 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+                        disabled={isProbingNormalization}
+                        onClick={() => void handleProbeNormalization()}
+                      >
+                        {isProbingNormalization
+                          ? "Checking…"
+                          : "Check normalized spellings"}
+                      </button>
+                    </div>
+                    {normalizationSummary.show ? (
+                      <div
+                        className={cn(
+                          "mt-1.5 rounded px-2 py-1.5 text-xs",
+                          normalizationSummary.tone === "warning"
+                            ? "bg-amber-50 text-amber-900"
+                            : normalizationSummary.tone === "info"
+                              ? "bg-emerald-50 text-emerald-900"
+                              : "bg-slate-50 text-slate-700"
+                        )}
+                      >
+                        <p className="font-semibold">
+                          {normalizationSummary.headline}
+                        </p>
+                        <p className="mt-0.5">{normalizationSummary.detail}</p>
+                        {/* THE HUMAN-IN-THE-LOOP LIST. More than one spelling
+                            answered, so the tool shows what it found and stops.
+                            Which spelling a sitemap should carry is an SEO
+                            judgement — canonical, indexed, linked — and a status
+                            code does not settle it. */}
+                        {normalizationSummary.ambiguous.length > 0 ? (
+                          <ul className="mt-1.5 space-y-1">
+                            {normalizationSummary.ambiguous.map((url) => (
+                              <li
+                                key={url.source}
+                                className="break-all font-mono text-[11px]"
+                              >
+                                <span className="text-slate-600">
+                                  {url.source}
+                                </span>
+                                {url.original.healthy ? (
+                                  <span className="text-amber-700">
+                                    {" "}
+                                    · works as written
+                                  </span>
+                                ) : null}
+                                {url.variants
+                                  .filter((variant) => variant.healthy)
+                                  .map((variant) => (
+                                    <span
+                                      key={variant.url}
+                                      className="text-amber-700"
+                                    >
+                                      {" · "}
+                                      {variant.url} works
+                                    </span>
+                                  ))}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
                   <ul className="space-y-1.5">
                     {fixRuleCandidates.map((candidate, index) => {
                       const ticked = fixApprovedRuleIndexes.has(index);
@@ -6700,6 +6853,17 @@ export default function ResultsDashboardPage({
                                     · confirmed destination is{" "}
                                   </span>
                                   {candidate.counterExample.expected}
+                                </span>
+                              ) : null}
+                              {/* THE DUPLICATE WARNING. This rule kind is a
+                                  function of a digit run's value, so several
+                                  spellings collapse onto one URL — and
+                                  rewriteLocs does not de-duplicate, so the file
+                                  would carry the same <loc> twice. Shown before
+                                  the tick, not after the apply. */}
+                              {collisionWarning(fixRuleImpact, index) ? (
+                                <span className="block rounded bg-amber-50 px-1.5 py-1 text-[11px] font-semibold text-amber-900">
+                                  {collisionWarning(fixRuleImpact, index)}
                                 </span>
                               ) : null}
                             </span>
