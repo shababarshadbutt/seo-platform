@@ -17,6 +17,30 @@ Covers:
   **is** flagged;
 - the History page renders the storage-reclamation panel.
 
+## staging-check-mode.mjs
+
+The 1.90 / 2.0 URL-check toggle. Covers:
+
+- the toggle **renders in the navbar** with both modes labelled by ENVIRONMENT,
+  not as bare version numbers (next to a version pill reading `v1.90`, a bare
+  "1.90" is unreadable);
+- the **Staging Base URL** field previews the derived `dev.<domain>` as its
+  placeholder while you type a Base URL, and is available even while the toggle
+  sits at 1.90 (a session created at 1.90 must still be able to carry one);
+- switching **to** 2.0 **confirms first**, and the dialog states all three true
+  things: the blast radius, that re-checking replaces stored production results,
+  and that the setting is global;
+- confirming **actually persists** 2.0 server-side.
+
+It sets the mode back to 1.90 on the way out — a check that silently left every
+health check pointed at staging would be worse than no check.
+
+Needs only the standard stack below (no SFTP source):
+
+```sh
+SHOT_DIR=./shots node e2e/staging-check-mode.mjs
+```
+
 ### Running it
 
 ```sh

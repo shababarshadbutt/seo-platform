@@ -1513,7 +1513,10 @@ export default function Home() {
                       session created while the toggle sat at 1.90 could never be
                       checked against staging later, and the field is an override,
                       not a mode. */}
-                  <div className="space-y-2">
+                  {/* col-start-2 so it sits directly UNDER Base URL, the field it
+                      modifies, rather than flowing into the left column under
+                      Session name -- which reads as if it belonged to the name. */}
+                  <div className="space-y-2 sm:col-start-2">
                     <label
                       htmlFor="staging-base-url"
                       className="text-sm font-semibold text-slate-700"
