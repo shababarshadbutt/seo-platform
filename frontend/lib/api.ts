@@ -2285,7 +2285,10 @@ export type NormalizationProbeRun = {
   status: string;
   candidates_total: number;
   sampled_total: number;
-  requests_total: number;
+  // URL PROBES, not HTTP requests: each probe costs two at the origin (HEAD plus
+  // either the soft-404 body GET or the escalation retry). Named for what it
+  // counts.
+  probes_total: number;
   // Which environment answered. A variant proven live on staging is not proof
   // about production — see migration 057.
   checked_on_staging: boolean | null;

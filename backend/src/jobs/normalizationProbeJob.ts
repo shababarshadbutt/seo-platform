@@ -30,10 +30,12 @@ import { probeUrl } from "./verifyProbe.js";
 // BOUNDED, and this is the number that matters.
 //
 // Every sampled URL costs one probe for the original plus one per distinct
-// reading — two or three requests. Against the 5 requests/second a WAF typically
-// allows, 20 URLs is ~10 seconds of traffic; the whole pattern would be hours. The
-// rule is inferred from this sample and then widened, exactly as every other
-// redirect rule in this codebase is.
+// reading — so two or three PROBES, and MEASURED against a live run, two HTTP
+// requests each: a clean 2xx pays a HEAD plus the ranged body GET that detects a
+// soft 404, and a non-clean one pays a HEAD plus the escalation retry. So 20 URLs
+// is roughly 100 requests, or ~20 seconds at the 5 requests/second a WAF
+// typically allows. The whole pattern would be hours. The rule is inferred from
+// this sample and then widened, exactly as every other redirect rule here is.
 const PROBE_SAMPLE = 20;
 
 // How many rows to read before filtering for padding. The pool is already capped
@@ -126,7 +128,9 @@ export async function processNormalizationProbeJob(
     const sample = candidates.slice(0, PROBE_SAMPLE);
 
     const probed: ProbedUrl[] = [];
-    let requests = 0;
+    // Counts URL PROBES. Each costs two HTTP requests at the origin -- see
+    // probes_total in migration 058.
+    let probes = 0;
 
     for (const [index, sourceUrl] of sample.entries()) {
       const context = {
@@ -153,7 +157,7 @@ export async function processNormalizationProbeJob(
         options
       );
 
-      requests += 1;
+      probes += 1;
 
       const variants: ProbedVariant[] = [];
 
@@ -167,7 +171,7 @@ export async function processNormalizationProbeJob(
           options
         );
 
-        requests += 1;
+        probes += 1;
         variants.push({
           kind: variant.kind,
           url: variant.path,
@@ -196,7 +200,7 @@ export async function processNormalizationProbeJob(
        SET status = 'COMPLETE',
            candidates_total = $2,
            sampled_total = $3,
-           requests_total = $4,
+           probes_total = $4,
            result = $5::jsonb,
            completed_at = now()
        WHERE id = $1`,
@@ -204,7 +208,7 @@ export async function processNormalizationProbeJob(
         runId,
         candidates.length,
         probed.length,
-        requests,
+        probes,
         JSON.stringify({
           urls: probed,
           totals: summary.totals,
@@ -222,7 +226,8 @@ export async function processNormalizationProbeJob(
         run_id: runId,
         candidates: candidates.length,
         sampled: probed.length,
-        requests,
+        probes,
+        requests_estimated: probes * 2,
         ...summary.totals,
         recommended: summary.recommended
       },

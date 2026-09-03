@@ -995,7 +995,7 @@ export async function verificationRoutes(app: FastifyInstance) {
     async (request) => {
       const result = await pool.query(
         `
-          SELECT id, status, candidates_total, sampled_total, requests_total,
+          SELECT id, status, candidates_total, sampled_total, probes_total,
                  checked_on_staging, result, error, started_at, completed_at
           FROM normalization_probe_runs
           WHERE pattern_id = $1 AND session_id = $2

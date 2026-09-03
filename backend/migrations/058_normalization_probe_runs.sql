@@ -33,11 +33,20 @@ CREATE TABLE IF NOT EXISTS normalization_probe_runs (
   -- one costs two or three live requests against a host that is frequently
   -- capped at 5 requests/second.
   sampled_total integer NOT NULL DEFAULT 0,
-  -- Requests actually spent. Recorded because "how much did this cost the
-  -- client's server?" is a question the rate limiter's design makes answerable,
-  -- and guessing it from sampled_total would be wrong: a URL whose two readings
-  -- agree costs one variant probe, not two.
-  requests_total integer NOT NULL DEFAULT 0,
+  -- URL PROBES performed -- NOT HTTP requests, and the distinction is the whole
+  -- reason this is not called requests_total.
+  --
+  -- One probe is one URL checked, and it costs TWO HTTP requests in practice:
+  -- a clean 2xx pays a HEAD plus the ranged body GET that detects a soft 404,
+  -- and a non-clean result pays a HEAD plus the escalation retry on the browser
+  -- fallback profile. MEASURED against a live run: 7 probes produced 14 requests
+  -- at the origin.
+  --
+  -- Recorded because guessing it from sampled_total would be wrong -- a URL whose
+  -- two readings agree costs one variant probe, not two -- and because a number an
+  -- operator reads as "what this cost the client's server" has to mean what it
+  -- says. Multiply by two for the request count.
+  probes_total integer NOT NULL DEFAULT 0,
   -- WHICH ENVIRONMENT answered. Exactly the argument migration 057 makes for
   -- sampled_urls.checked_on_staging, and it bites harder here: the normalized
   -- URLs are expected to exist ONLY on the new site, so nearly every useful run
@@ -54,7 +63,7 @@ CREATE TABLE IF NOT EXISTS normalization_probe_runs (
   started_at timestamptz NOT NULL DEFAULT now(),
   completed_at timestamptz,
   CONSTRAINT normalization_probe_runs_counts_nonnegative
-    CHECK (candidates_total >= 0 AND sampled_total >= 0 AND requests_total >= 0)
+    CHECK (candidates_total >= 0 AND sampled_total >= 0 AND probes_total >= 0)
 );
 
 -- AT MOST ONE in-flight run per pattern, enforced by the database rather than a

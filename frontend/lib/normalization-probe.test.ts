@@ -73,15 +73,18 @@ test("a running probe says what it is doing", () => {
   assert.equal(summary.tone, "neutral");
 });
 
-// A pattern with no zero padding is not a failure and not a finding. Inventing a
-// reassuring message for it would be noise on a screen that is already dense.
-test("a pattern with no padded URLs shows nothing", () => {
+// This panel only renders after someone PRESSED a button, so an empty result has
+// to say so. Hiding it would be indistinguishable from the button not working.
+test("a pattern with no padded URLs says so rather than going blank", () => {
   const summary = normalizationProbeSummary(
     run({ candidates_total: 0, sampled_total: 0 }),
     false
   );
 
-  assert.equal(summary.show, false);
+  assert.equal(summary.show, true);
+  assert.equal(summary.tone, "neutral");
+  assert.match(summary.headline, /No zero-padded URLs/);
+  assert.equal(summary.ambiguous.length, 0);
 });
 
 test("a failed run surfaces the reason rather than a blank", () => {

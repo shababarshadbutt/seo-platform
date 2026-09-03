@@ -77,10 +77,24 @@ export function normalizationProbeSummary(
     return EMPTY;
   }
 
-  // A pattern with no zero-padded URLs is not a failure and not a finding. Saying
-  // nothing is the honest outcome.
+  // A pattern with no zero-padded URLs is not a failure and not a finding — but
+  // this only renders after someone PRESSED a button, and silence there is
+  // indistinguishable from the button not working. So it reports the empty
+  // result rather than hiding.
+  //
+  // Worded as "sampled URLs" because two different situations reach here — a
+  // pattern whose URLs carry no padding, and one whose sample pool was never
+  // built — and the run does not record which. Naming the thing that was actually
+  // looked at is true of both.
   if (run.candidates_total === 0) {
-    return EMPTY;
+    return {
+      show: true,
+      headline: "No zero-padded URLs in this pattern",
+      detail:
+        "None of this pattern's sampled URLs carry a padded number, so there is nothing to normalize.",
+      tone: "neutral",
+      ambiguous: []
+    };
   }
 
   const { totals } = run.result;

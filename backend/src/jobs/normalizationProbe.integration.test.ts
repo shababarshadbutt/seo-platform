@@ -104,7 +104,7 @@ async function seed(baseUrl: string, stagingBaseUrl: string | null, locs: string
 
 async function readRun(runId: string) {
   const result = await pool.query(
-    `SELECT status, candidates_total, sampled_total, requests_total,
+    `SELECT status, candidates_total, sampled_total, probes_total,
             checked_on_staging, result, error
      FROM normalization_probe_runs WHERE id = $1`,
     [runId]
