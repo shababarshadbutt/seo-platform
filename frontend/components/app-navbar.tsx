@@ -12,6 +12,7 @@ import {
   getSession,
   type SessionStatus
 } from "@/lib/api";
+import { CheckModeToggle } from "@/components/check-mode-toggle";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -210,6 +211,12 @@ export function AppNavbar() {
                 </a>
               ) : null}
             </div>
+            <span className="h-5 w-px bg-slate-700" aria-hidden="true" />
+            {/* WHICH ENVIRONMENT health checks are sent to. Here rather than beside
+                the version pill: the pill is the deployed IMAGE version, and a
+                flippable control reading "1.90" next to a pill reading "v1.90"
+                would be unreadable in a screenshot. */}
+            <CheckModeToggle />
             <span className="h-5 w-px bg-slate-700" aria-hidden="true" />
             <Link
               href="/sessions"

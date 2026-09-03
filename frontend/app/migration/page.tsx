@@ -50,6 +50,7 @@ import {
   type UploadRejectedFile,
   uploadSitemap
 } from "@/lib/api";
+import { deriveStagingBaseUrl } from "@/lib/staging-origin";
 import {
   baseUrlFromSftpDomain,
   resolvesToSamePrefix
@@ -303,6 +304,13 @@ export default function Home() {
   const uploadedBatchIndexesRef = useRef<Set<number>>(new Set());
   const [sessionName, setSessionName] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
+  // Blank means "derive dev.<domain> at check time" -- the placeholder shows
+  // exactly what that will be, so the guess is visible before the session exists.
+  const [stagingBaseUrl, setStagingBaseUrl] = useState("");
+  // A PREVIEW only. The backend re-derives this authoritatively at check time
+  // (and returns it as effective_staging_base_url), so this never decides where
+  // a probe goes -- it only shows the user the promise before they commit.
+  const derivedStagingBaseUrl = deriveStagingBaseUrl(baseUrl);
   const [sampleSize, setSampleSize] = useState(10);
   const [concurrency, setConcurrency] = useState("10");
   const [sourceMode, setSourceMode] = useState<SourceMode>("file");
@@ -1165,6 +1173,9 @@ export default function Home() {
       const created = await createSession({
         name: trimmedSessionName,
         baseUrl: trimmedBaseUrl,
+        // Blank is meaningful: it tells the backend to derive the staging origin
+        // rather than pin one, so an empty field must send nothing at all.
+        stagingBaseUrl: stagingBaseUrl.trim() || undefined,
         sampleSize,
         concurrency: concurrencyNumber
       });
@@ -1495,6 +1506,45 @@ export default function Home() {
                         </p>
                       )
                     ) : null}
+                  </div>
+
+                  {/* The 2.0 staging origin for this session. Shown ALWAYS, not
+                      gated on the current check mode: gating it would mean a
+                      session created while the toggle sat at 1.90 could never be
+                      checked against staging later, and the field is an override,
+                      not a mode. */}
+                  <div className="space-y-2">
+                    <label
+                      htmlFor="staging-base-url"
+                      className="text-sm font-semibold text-slate-700"
+                    >
+                      Staging Base URL{" "}
+                      <span className="font-normal text-slate-400">
+                        (optional)
+                      </span>
+                    </label>
+                    <Input
+                      id="staging-base-url"
+                      value={stagingBaseUrl}
+                      onChange={(event) =>
+                        setStagingBaseUrl(event.target.value)
+                      }
+                      placeholder={derivedStagingBaseUrl ?? "https://dev.yoursite.com"}
+                    />
+                    <p className="text-sm text-slate-500">
+                      {derivedStagingBaseUrl ? (
+                        <>
+                          Leave blank to use{" "}
+                          <span className="font-mono">
+                            {derivedStagingBaseUrl}
+                          </span>
+                          .{" "}
+                        </>
+                      ) : null}
+                      Only URL health checks use this, and only in 2.0 mode.
+                      Sitemap files, downloads and publishing always use the Base
+                      URL.
+                    </p>
                   </div>
                 </div>
 

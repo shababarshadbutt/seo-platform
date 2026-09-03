@@ -33,7 +33,8 @@ import {
   Undo2,
   Wrench,
   XCircle,
-  UploadCloud
+  UploadCloud,
+  AlertTriangle
 } from "lucide-react";
 import {
   Bar,
@@ -128,6 +129,7 @@ import {
   type TransformSampleResult,
   type PublishProgressEvent
 } from "@/lib/api";
+import { describeCheckedEnvironment } from "@/lib/checked-environment";
 import {
   convertParamToABC,
   countTemplateParams,
@@ -4523,6 +4525,16 @@ export default function ResultsDashboardPage({
     structureStarter !== transformCurrentStructure;
 
   const session = sessionData?.session;
+  // The environment label for this session's stored verdicts. Pure, and unit-tested
+  // in lib/checked-environment.test.ts -- nothing under app/ is ever exercised by
+  // `npm test`, so the wording has to live in lib/ to be testable at all.
+  const checkedEnvironment = describeCheckedEnvironment(
+    session?.checked_environments,
+    {
+      prod: session?.base_url ?? "",
+      staging: session?.effective_staging_base_url ?? null
+    }
+  );
   const zipReady = session?.zip_ready ?? false;
   // The pre-generated ZIP is still being built in the background (recently
   // completed). We show a spinner label for this but NEVER disable the button —
@@ -4946,6 +4958,28 @@ export default function ResultsDashboardPage({
             <p className="mt-2 break-all font-mono text-xs text-slate-500">
               {session?.base_url ?? "Base URL unavailable"}
             </p>
+            {/* WHICH ENVIRONMENT these numbers describe.
+                Driven by the ROWS, never by the current toggle: the toggle says
+                what the NEXT run will do, the rows say what this data already is,
+                and after a flip those disagree. A screenshot of this page must
+                never be ambiguous about which server it measured. */}
+            {checkedEnvironment.kind !== "none" ? (
+              <p
+                data-testid="checked-environment-banner"
+                className={`mt-2 inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium ${
+                  checkedEnvironment.tone === "warning"
+                    ? "bg-amber-50 text-amber-800 ring-1 ring-inset ring-amber-300"
+                    : checkedEnvironment.tone === "info"
+                      ? "bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-200"
+                      : "bg-slate-100 text-slate-600"
+                }`}
+              >
+                {checkedEnvironment.tone !== "neutral" ? (
+                  <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
+                ) : null}
+                {checkedEnvironment.text}
+              </p>
+            ) : null}
           </div>
           {!isPrintMode ? (
             <div className="flex flex-wrap items-center gap-2 lg:justify-end">

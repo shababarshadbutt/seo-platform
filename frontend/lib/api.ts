@@ -1,3 +1,5 @@
+import { parseUrlCheckMode, type UrlCheckMode } from "./staging-origin";
+
 export type SessionStatus =
   | "PENDING"
   | "PROCESSING"
@@ -17,6 +19,14 @@ export type Session = {
   id: string;
   name: string;
   base_url: string;
+  // The 2.0 staging origin. `staging_base_url` is the raw per-session override
+  // (null = derive); `effective_staging_base_url` is what the backend ACTUALLY
+  // resolved, so the UI never has to re-derive it for an existing session.
+  staging_base_url?: string | null;
+  effective_staging_base_url?: string | null;
+  // Which environment produced this session's stored verdicts. A BOUNDED sample,
+  // like connectivity_warning -- enough to label a banner, not an exact census.
+  checked_environments?: { prod: number; staging: number };
   sample_size: number;
   concurrency: number;
   user_agent?: string;
@@ -378,6 +388,10 @@ type CreateSessionInput = {
   baseUrl: string;
   sampleSize: number;
   concurrency: number;
+  // Optional per-session override for the 2.0 staging origin. Omitted means
+  // "derive dev.<domain>", so leaving the field blank is a real choice, not a
+  // missing value.
+  stagingBaseUrl?: string;
 };
 
 type CreateSessionResponse = {
@@ -491,6 +505,83 @@ export function getRuntimeConfig(): Promise<RuntimeConfig> {
   }
 
   return runtimeConfigPromise;
+}
+
+// ---- The global 1.90 / 2.0 URL-check mode --------------------------------
+//
+// DELIBERATELY NOT PART OF RuntimeConfig. That object is deploy-time and
+// read-once-per-page-load by design (see lib/runtime-config.ts, which spends 25
+// lines on why), and this value has the opposite lifecycle: any user can change it
+// from the navbar at any moment, and every other open tab needs to notice. Riding
+// on runtimeConfigPromise would either freeze this for the page's lifetime or
+// force the whole config to be re-fetched on a timer.
+
+export type UrlCheckModeState = {
+  mode: UrlCheckMode;
+  updated_at: string | null;
+  updated_by: string | null;
+  // Verification/triage runs in flight, which are PINNED to the outgoing mode.
+  // Reported rather than used to block the flip -- see routes/settings.ts.
+  running_checks: number;
+};
+
+// FAILS CLOSED to 1.90. An unreachable settings endpoint must never render as
+// "you are checking staging": the amber state is a claim about where live traffic
+// is going, and a wrong one is worse than no toggle at all.
+const UNKNOWN_CHECK_MODE: UrlCheckModeState = {
+  mode: "1.90",
+  updated_at: null,
+  updated_by: null,
+  running_checks: 0
+};
+
+let urlCheckModePromise: Promise<UrlCheckModeState> | null = null;
+
+export function getUrlCheckMode(): Promise<UrlCheckModeState> {
+  if (!urlCheckModePromise) {
+    urlCheckModePromise = fetchWithTimeout(
+      backendUrl("/api/settings/url-check-mode"),
+      { cache: "no-store" }
+    )
+      .then((response) =>
+        response.ok
+          ? (response.json() as Promise<UrlCheckModeState>)
+          : Promise.reject(new Error(`url-check-mode ${response.status}`))
+      )
+      .then((state) => ({ ...state, mode: parseUrlCheckMode(state.mode) }))
+      .catch(() => {
+        // Never wedge the cache -- the navbar poll retries on its next tick.
+        urlCheckModePromise = null;
+
+        return UNKNOWN_CHECK_MODE;
+      });
+  }
+
+  return urlCheckModePromise;
+}
+
+// Explicit invalidation, which is the whole reason this is separate from
+// getRuntimeConfig: the value changes at runtime and the cache has to be droppable.
+export function invalidateUrlCheckMode() {
+  urlCheckModePromise = null;
+}
+
+export async function setUrlCheckMode(
+  mode: UrlCheckMode
+): Promise<UrlCheckModeState> {
+  const response = await fetchWithTimeout(
+    backendUrl("/api/settings/url-check-mode"),
+    {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode })
+    }
+  );
+  const state = await readJsonResponse<UrlCheckModeState>(response);
+
+  invalidateUrlCheckMode();
+
+  return { ...state, mode: parseUrlCheckMode(state.mode) };
 }
 
 async function fetchWithTimeout(
@@ -888,6 +979,7 @@ export async function createSession(input: CreateSessionInput) {
     body: JSON.stringify({
       name: input.name,
       base_url: input.baseUrl,
+      staging_base_url: input.stagingBaseUrl,
       sample_size: input.sampleSize,
       concurrency: input.concurrency
     })
