@@ -428,6 +428,10 @@ type SamplesResponse = {
   sampled_urls: SampledUrl[];
 };
 
+type BulkSamplesResponse = {
+  samples_by_pattern: Record<string, SampledUrl[]>;
+};
+
 type MismatchedUrlsResponse = {
   mismatched_urls: MismatchedUrl[];
 };
@@ -1362,6 +1366,29 @@ export async function getPatternSamples(
   const data = await readJsonResponse<SamplesResponse>(response);
 
   return data.sampled_urls;
+}
+
+// Samples for every pattern in the session, in one request. Used by the
+// results-page initial load (and its post-Fix/Delete refresh) instead of
+// firing one getPatternSamples call per pattern — that fan-out (~120 requests
+// on a large session, each 2 sequential DB queries) is what saturated the
+// shared connection pool and produced "Request timed out" on big sessions
+// with a few concurrent users. The per-pattern drawer fetch above is
+// untouched; this is only for the "every pattern at once" case.
+export async function getPatternSamplesBulk(
+  sessionId: string,
+  timeoutMs = SESSION_API_TIMEOUT_MS
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/patterns/samples`),
+    {
+      cache: "no-store"
+    },
+    timeoutMs
+  );
+  const data = await readJsonResponse<BulkSamplesResponse>(response);
+
+  return data.samples_by_pattern;
 }
 
 // ---- Distinct URL structures inside one pattern (v1.49) --------------------

@@ -93,6 +93,11 @@ import {
   sanitizeUploadedFilename
 } from "../sitemaps/filenames.js";
 import { peekRootElement } from "../sitemaps/peek.js";
+import { deleteSessionExports } from "../sitemaps/exportCleanup.js";
+import {
+  allSessionExportUsage,
+  sessionExportUsage
+} from "../sitemaps/exportStorage.js";
 import { deleteSessionUploads } from "../sitemaps/uploadCleanup.js";
 import {
   allSessionUploadUsage,
@@ -1935,7 +1940,10 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
   // and cleaned_at set, so "already reclaimed" is visibly different from "not
   // listed".
   app.get("/api/storage/sessions", async () => {
-    const usage = await allSessionUploadUsage();
+    const [usage, exportUsage] = await Promise.all([
+      allSessionUploadUsage(),
+      allSessionExportUsage()
+    ]);
     const result = await pool.query<{
       id: string;
       name: string;
@@ -1970,7 +1978,12 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     );
 
     const sessions = result.rows.map((row) => {
-      const onDisk = usage.get(row.id.toLowerCase()) ?? {
+      const sessionId = row.id.toLowerCase();
+      const onDisk = usage.get(sessionId) ?? {
+        bytes: 0,
+        file_count: 0
+      };
+      const exportsOnDisk = exportUsage.get(sessionId) ?? {
         bytes: 0,
         file_count: 0
       };
@@ -1985,9 +1998,10 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         completed_at: row.completed_at,
         uploads_cleaned_at: row.uploads_cleaned_at,
         sitemap_file_count: Number(row.file_count),
-        // What is actually on disk right now, not what was ingested.
-        disk_bytes: onDisk.bytes,
-        disk_file_count: onDisk.file_count
+        // What is actually on disk right now, not what was ingested. Includes
+        // exports (ZIPs/reports) since the reclaim action below frees both.
+        disk_bytes: onDisk.bytes + exportsOnDisk.bytes,
+        disk_file_count: onDisk.file_count + exportsOnDisk.file_count
       };
     });
 
@@ -2022,24 +2036,31 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           .send({ error: "Not Found", message: "session not found" });
       }
 
-      const usage = await sessionUploadUsage(request.params.id);
+      // Uploads + exports (ZIPs, transform samples, CSV/XLSX/PDF reports) are
+      // reclaimed together by the same action below, so the figure shown here
+      // — "this will free X" — has to be the sum of both, not just uploads.
+      const [uploadUsage, exportUsage] = await Promise.all([
+        sessionUploadUsage(request.params.id),
+        sessionExportUsage(request.params.id)
+      ]);
 
       return {
         session_id: request.params.id,
-        disk_bytes: usage.bytes,
-        disk_file_count: usage.file_count,
+        disk_bytes: uploadUsage.bytes + exportUsage.bytes,
+        disk_file_count: uploadUsage.file_count + exportUsage.file_count,
         uploads_cleaned_at: sessionResult.rows[0].uploads_cleaned_at
       };
     }
   );
 
-  // Explicit, user-confirmed reclamation of one session's upload blobs.
+  // Explicit, user-confirmed reclamation of one session's upload + export
+  // blobs.
   //
   // Deliberately a separate endpoint from DELETE /api/sessions/:id, which removes
   // the session ROW. This one keeps the row, its sitemap_files, its patterns and
   // its reports, and removes only the bytes — so the session stays browsable and
-  // its history intact. Shares deleteSessionUploads() with the safety-net job so
-  // the two cannot disagree about scope.
+  // its history intact. Shares deleteSessionUploads()/deleteSessionExports() with
+  // the safety-net job so the two cannot disagree about scope.
   app.post<{ Params: SessionParams }>(
     "/api/sessions/:id/uploads/cleanup",
     async (request, reply) => {
@@ -2054,16 +2075,15 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           .send({ error: "Not Found", message: "session not found" });
       }
 
-      const freed = await deleteSessionUploads(
-        request.params.id,
-        request.log,
-        "user"
-      );
+      const [freedUploads, freedExports] = await Promise.all([
+        deleteSessionUploads(request.params.id, request.log, "user"),
+        deleteSessionExports(request.params.id, request.log, "user")
+      ]);
 
       return {
         session_id: request.params.id,
-        freed_bytes: freed.bytes,
-        freed_file_count: freed.file_count
+        freed_bytes: freedUploads.bytes + freedExports.bytes,
+        freed_file_count: freedUploads.file_count + freedExports.file_count
       };
     }
   );
@@ -3188,6 +3208,58 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
       return {
         sampled_urls: samplesResult.rows
+      };
+    }
+  );
+
+  // Bulk samples for EVERY pattern in the session, in one query. The results
+  // page used to fan out one /patterns/:patternId/samples request per pattern
+  // (Promise.all over the pattern list) on every load and after every
+  // Fix/Delete action — on a session with ~120 patterns that's ~120 requests x
+  // 2 sequential queries each, queued behind the shared 10-connection pool
+  // (DB_POOL_MAX, db/pool.ts). With a few concurrent users on a large session
+  // that saturates the pool and the whole page times out. One join replaces
+  // the entire fan-out; the per-pattern route above is untouched (still used
+  // by the on-demand drawer refresh).
+  app.get<{ Params: SessionParams }>(
+    "/api/sessions/:id/patterns/samples",
+    async (request) => {
+      const samplesResult = await pool.query(
+        `
+          SELECT
+            sampled_urls.id,
+            sampled_urls.pattern_id,
+            sampled_urls.url,
+            sampled_urls.original_url,
+            sampled_urls.http_status,
+            sampled_urls.response_ms,
+            sampled_urls.is_hit,
+            sampled_urls.is_soft_404,
+            sampled_urls.checked_at,
+            sampled_urls.final_url,
+            sampled_urls.redirect_count,
+            sampled_urls.http_status_category,
+            sampled_urls.source_file,
+            sampled_urls.error_reason,
+            sampled_urls.is_deleted_from_sitemap,
+            sampled_urls.deleted_from_files
+          FROM sampled_urls
+          JOIN patterns ON patterns.id = sampled_urls.pattern_id
+          WHERE patterns.session_id = $1::uuid
+          ORDER BY sampled_urls.pattern_id ASC, sampled_urls.checked_at ASC, sampled_urls.id ASC
+        `,
+        [request.params.id]
+      );
+
+      const samplesByPattern: Record<string, unknown[]> = {};
+
+      for (const row of samplesResult.rows) {
+        const patternId = (row as { pattern_id: string }).pattern_id;
+        (samplesByPattern[patternId] ??= []).push(row);
+      }
+
+      return {
+        samples_by_pattern: samplesByPattern
       };
     }
   );

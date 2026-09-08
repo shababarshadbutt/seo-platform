@@ -79,6 +79,7 @@ import {
   getBulkReplaceStatus,
   getMismatchedUrls,
   getPatternSamples,
+  getPatternSamplesBulk,
   getPatternSourceFiles,
   getPatternStructures,
   getPatterns,
@@ -1397,25 +1398,20 @@ export default function ResultsDashboardPage({
       }
 
       try {
-        const [nextSessionData, nextPatternsResponse, nextMismatches] =
+        const [nextSessionData, nextPatternsResponse, nextMismatches, nextSamplesByPattern] =
           await Promise.all([
             getSession(params.id),
             getPatternsResponse(params.id),
-            getMismatchedUrls(params.id)
+            getMismatchedUrls(params.id),
+            getPatternSamplesBulk(params.id)
           ]);
         const nextPatterns = nextPatternsResponse.patterns;
-        const sampleEntries = await Promise.all(
-          nextPatterns.map(async (pattern) => [
-            pattern.id,
-            await getPatternSamples(params.id, pattern.id)
-          ] as const)
-        );
 
         setSessionData(nextSessionData);
         setPatterns(nextPatterns);
         setRefusedHosts(nextPatternsResponse.refusedHosts);
         setMismatches(nextMismatches);
-        setSamplesByPattern(Object.fromEntries(sampleEntries));
+        setSamplesByPattern(nextSamplesByPattern);
         setError("");
       } catch (nextError) {
         setError(friendlyApiErrorMessage(nextError, "Unable to load dashboard."));

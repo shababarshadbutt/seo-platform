@@ -1,5 +1,6 @@
 import type { FastifyBaseLogger } from "fastify";
 
+import { deleteSessionExports } from "../sitemaps/exportCleanup.js";
 import { deleteSessionUploads } from "../sitemaps/uploadCleanup.js";
 
 // The SAFETY NET for forgotten sessions — no longer the primary cleanup path.
@@ -24,4 +25,5 @@ export async function processCleanupUploadsJob(
   logger: FastifyBaseLogger
 ) {
   await deleteSessionUploads(data.session_id, logger, "safety-net");
+  await deleteSessionExports(data.session_id, logger, "safety-net");
 }
