@@ -82,6 +82,45 @@ async function withS3<T>(
   }
 }
 
+// Thrown by withAbortTimeout below, so callers can tell "the socket stalled"
+// apart from any other S3 failure (AccessDenied, NoSuchKey, ...).
+export class S3OperationTimeoutError extends Error {
+  constructor(label: string, ms: number) {
+    super(`${label} timed out after ${ms}ms`);
+    this.name = "S3OperationTimeoutError";
+  }
+}
+
+// Bound one S3 call by `ms`, aborting it rather than merely giving up on
+// waiting for it. Unlike sftp/sftpClient.ts's withTimeout — which can't cancel
+// ssh2's underlying operation and only stops us awaiting it — the SDK v3
+// accepts an AbortSignal on send() and Node's pipeline() accepts one too, so a
+// stalled request or a stall mid-stream is actually torn down here, not left
+// running in the background.
+async function withAbortTimeout<T>(
+  ms: number,
+  label: string,
+  work: (signal: AbortSignal) => Promise<T>
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new S3OperationTimeoutError(label, ms));
+  }, ms);
+  timer.unref?.();
+
+  try {
+    return await work(controller.signal);
+  } catch (error) {
+    if (controller.signal.aborted && controller.signal.reason instanceof S3OperationTimeoutError) {
+      throw controller.signal.reason;
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Every page of one ListObjectsV2 query, walked to exhaustion.
 //
 // PAGINATION IS NOT OPTIONAL. S3 caps a list response at 1,000 entries and says
@@ -101,12 +140,18 @@ async function listAllPages(
   let continuationToken: string | undefined;
 
   do {
-    const response = await client.send(
-      new ListObjectsV2Command({
-        Bucket: config.s3.bucket,
-        ...input,
-        ContinuationToken: continuationToken
-      })
+    const response = await withAbortTimeout(
+      config.s3.operationTimeoutMs,
+      "S3 list",
+      (signal) =>
+        client.send(
+          new ListObjectsV2Command({
+            Bucket: config.s3.bucket,
+            ...input,
+            ContinuationToken: continuationToken
+          }),
+          { abortSignal: signal }
+        )
     );
 
     onPage(response);
@@ -218,18 +263,28 @@ export async function downloadS3Object(
   seam: S3ClientSeam = {}
 ): Promise<void> {
   await withS3(seam, async (client) => {
-    const response = await client.send(
-      new GetObjectCommand({ Bucket: config.s3.bucket, Key: key })
+    await withAbortTimeout(
+      config.s3.operationTimeoutMs,
+      `S3 download of ${key}`,
+      async (signal) => {
+        const response = await client.send(
+          new GetObjectCommand({ Bucket: config.s3.bucket, Key: key }),
+          { abortSignal: signal }
+        );
+
+        if (!response.Body) {
+          throw new Error(`S3 returned no body for ${key}`);
+        }
+
+        // pipeline, not .pipe(): it propagates a mid-transfer error instead of
+        // leaving a half-written file behind a resolved promise, and it closes
+        // the write stream on failure. The signal here catches a stall
+        // mid-stream too, not just before the first byte.
+        await pipeline(response.Body as Readable, createWriteStream(localPath), {
+          signal
+        });
+      }
     );
-
-    if (!response.Body) {
-      throw new Error(`S3 returned no body for ${key}`);
-    }
-
-    // pipeline, not .pipe(): it propagates a mid-transfer error instead of
-    // leaving a half-written file behind a resolved promise, and it closes the
-    // write stream on failure.
-    await pipeline(response.Body as Readable, createWriteStream(localPath));
   });
 }
 

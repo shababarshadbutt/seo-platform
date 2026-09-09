@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
+  AlertTriangle,
   CalendarClock,
   CheckCircle2,
   Cloud,
@@ -100,6 +101,7 @@ export default function LastmodUpdaterPage() {
     total: number;
   } | null>(null);
   const [fetchError, setFetchError] = useState("");
+  const [skippedFiles, setSkippedFiles] = useState<{ name: string; reason: string }[]>([]);
   const pullSourceRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
@@ -137,6 +139,7 @@ export default function LastmodUpdaterPage() {
 
     setFetchError("");
     setFetchProgress(null);
+    setSkippedFiles([]);
     setFetchPhase("pulling");
     setFetchMessage("Starting…");
 
@@ -167,6 +170,7 @@ export default function LastmodUpdaterPage() {
                 : null
             );
           } else if (event.type === "done") {
+            setSkippedFiles(event.result?.skippedFiles ?? []);
             source.close();
             resolve();
           } else if (event.type === "error") {
@@ -502,6 +506,19 @@ export default function LastmodUpdaterPage() {
                 <CheckCircle2 className="h-4 w-4" />
                 {formatNumber(files.length)} file{files.length === 1 ? "" : "s"} ready
               </p>
+            ) : null}
+
+            {fetchPhase === "ready" && skippedFiles.length > 0 ? (
+              <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>
+                  {skippedFiles.length} file{skippedFiles.length === 1 ? "" : "s"} couldn&apos;t be
+                  pulled and {skippedFiles.length === 1 ? "was" : "were"} skipped — the rest are
+                  ready to use.
+                  <br />
+                  {skippedFiles.map((file) => `${file.name} (${file.reason})`).join(", ")}
+                </span>
+              </div>
             ) : null}
 
             {fetchError ? (

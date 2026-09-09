@@ -8,7 +8,8 @@ import { config } from "../config.js";
 import { pool } from "../db/pool.js";
 import {
   downloadS3Objects,
-  listS3SitemapObjects
+  listS3SitemapObjects,
+  S3OperationTimeoutError
 } from "../s3source/s3SourceClient.js";
 import { buildStoredUploadFilename } from "../sitemaps/filenames.js";
 import type { S3PullJobData } from "../queue/publishQueue.js";
@@ -87,20 +88,38 @@ export async function processS3PullJob(
       // Awaited, not fire-and-forget: unordered progress writes let a late frame
       // land after the terminal one and clobber it — a defect already found and
       // fixed on the publish path, so it is not repeated here.
+      const timedOut = !outcome.ok && outcome.error instanceof S3OperationTimeoutError;
+
       await job?.updateProgress({
         stage: "pull",
         current: completed,
         total,
+        // A stalled file gets its own wording, distinct from a generic
+        // failure, so the live progress text already tells the user this file
+        // was skipped rather than the pull being broken outright.
         message: outcome.ok
           ? `Pulled ${outcome.name} (${completed} of ${total})`
-          : `Failed ${outcome.name} (${completed} of ${total})`
+          : timedOut
+            ? `Skipped ${outcome.name} — no response from S3 (${completed} of ${total})`
+            : `Failed ${outcome.name} (${completed} of ${total})`
       });
     }
   });
 
+  // Names (with a friendly reason) of every file that didn't make it, so the
+  // UI can tell the user exactly what to look at instead of just a count.
+  const skippedFiles: { name: string; reason: string }[] = [];
+
   for (const [index, outcome] of outcomes.entries()) {
     if (!outcome.ok) {
       failed += 1;
+      skippedFiles.push({
+        name: outcome.name,
+        reason:
+          outcome.error instanceof S3OperationTimeoutError
+            ? "took too long to respond"
+            : "couldn't be downloaded"
+      });
       // Don't leave a truncated download behind to be parsed as a real sitemap.
       await unlink(outcome.localPath).catch(() => undefined);
       logger.error(
@@ -144,11 +163,11 @@ export async function processS3PullJob(
       failed > 0
         ? `Pulled ${stored} of ${total} file(s), ${failed} failed`
         : `Pulled ${stored} file(s) from ${domain}`,
-    result: { stored, failed, total, domain }
+    result: { stored, failed, total, domain, skippedFiles }
   });
 
   // Returned as the job's RETURN VALUE too: BullMQ persists that atomically with
   // completion, whereas a progress write can still be in flight when a watcher
   // first sees "completed" (a defect found on the publish path).
-  return { stored, failed, total, domain };
+  return { stored, failed, total, domain, skippedFiles };
 }

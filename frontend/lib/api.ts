@@ -4155,6 +4155,9 @@ export type RemotePullProgressEvent = {
     failed?: number;
     total?: number;
     domain?: string;
+    // S3 only, for now: which files didn't make it and a friendly reason why
+    // (e.g. "took too long to respond" for a stalled download).
+    skippedFiles?: { name: string; reason: string }[];
   };
 };
 

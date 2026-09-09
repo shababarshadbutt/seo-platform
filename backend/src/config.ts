@@ -488,7 +488,19 @@ export const config = {
     // session simply stops being referenced by the regenerated index; the
     // orphaned object stays put, harmless. Read as a flag so the decision is
     // visible and auditable rather than implicit in the absence of code.
-    allowDelete: (process.env.S3_PUBLISH_ALLOW_DELETE ?? "false") === "true"
+    allowDelete: (process.env.S3_PUBLISH_ALLOW_DELETE ?? "false") === "true",
+    // Hard ceiling on a single S3 list/get call, mirroring sftp.operationTimeoutMs
+    // above for the identical reason: there was no timeout here, and a stalled
+    // socket wedges one downloadS3Objects concurrency slot forever, which stalls
+    // the whole pull with no error and no further progress (observed directly —
+    // a Lastmod Updater S3 pull sat at "2871 of 2986" indefinitely). Clamped to
+    // 10..1200.
+    operationTimeoutMs:
+      readNumber("S3_OPERATION_TIMEOUT_SECONDS", {
+        fallback: 120,
+        min: 10,
+        max: 1200
+      }) * 1000
   },
 
   // The PUBLIC url a search engine fetches a sitemap at. Deliberately a separate

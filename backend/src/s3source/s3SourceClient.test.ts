@@ -12,7 +12,8 @@ import {
   downloadS3Object,
   downloadS3Objects,
   listS3Domains,
-  listS3SitemapObjects
+  listS3SitemapObjects,
+  S3OperationTimeoutError
 } from "./s3SourceClient.js";
 
 // Reading sitemaps back out of S3, with an injected stub client — the same seam
@@ -305,6 +306,101 @@ test("downloadS3Objects reports completion counts in order", async () => {
     // of order and a progress bar driven by them jumps around and goes backwards.
     assert.deepEqual(counts, [1, 2, 3, 4, 5]);
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// A stub client whose send() never settles on its own — the same shape a
+// stalled socket takes in production — and only rejects once the caller's
+// AbortSignal fires, exactly what a real GetObjectCommand under the AWS SDK
+// v3 does when aborted.
+function stuckClient() {
+  const client = new S3Client({ region: "us-east-1" });
+
+  client.send = ((
+    _command: unknown,
+    options?: { abortSignal?: AbortSignal }
+  ) => {
+    return new Promise((_resolve, reject) => {
+      options?.abortSignal?.addEventListener("abort", () => {
+        reject(options.abortSignal!.reason);
+      });
+    });
+  }) as typeof client.send;
+
+  client.destroy = () => {};
+
+  return client;
+}
+
+test("downloadS3Object times out instead of hanging forever on a stalled request", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "s3-source-"));
+  const originalTimeout = config.s3.operationTimeoutMs;
+
+  config.s3.operationTimeoutMs = 30;
+
+  try {
+    await assert.rejects(
+      () =>
+        downloadS3Object(
+          "sites/e.com/sitemaps/stuck.xml",
+          path.join(dir, "stuck.xml"),
+          { client: stuckClient() }
+        ),
+      (error: unknown) => error instanceof S3OperationTimeoutError
+    );
+  } finally {
+    config.s3.operationTimeoutMs = originalTimeout;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("downloadS3Objects skips a stalled file and still finishes the batch", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "s3-source-"));
+  const originalTimeout = config.s3.operationTimeoutMs;
+
+  config.s3.operationTimeoutMs = 30;
+
+  try {
+    const { client } = stubS3({
+      objects: {
+        "sites/e.com/sitemaps/a.xml": "<a/>",
+        "sites/e.com/sitemaps/c.xml": "<c/>"
+      }
+    });
+
+    // Route "b" to the stuck client's send, everything else to the normal stub —
+    // mirrors a real pull where only one of several objects stalls.
+    const stuck = stuckClient();
+    const realSend = client.send.bind(client);
+
+    client.send = ((command: { input: Record<string, unknown> }, options?: unknown) => {
+      if (command.input.Key === "sites/e.com/sitemaps/b.xml") {
+        return stuck.send(command as never, options as never);
+      }
+
+      return realSend(command as never, options as never);
+    }) as typeof client.send;
+
+    const outcomes = await downloadS3Objects(
+      ["a", "b", "c"].map((name) => ({
+        name: `${name}.xml`,
+        key: `sites/e.com/sitemaps/${name}.xml`,
+        localPath: path.join(dir, `${name}.xml`)
+      })),
+      { seam: { client } }
+    );
+
+    assert.deepEqual(
+      outcomes.map((o) => o.name),
+      ["a.xml", "b.xml", "c.xml"]
+    );
+    assert.equal(outcomes[0].ok, true);
+    assert.equal(outcomes[1].ok, false);
+    assert.ok(outcomes[1].error instanceof S3OperationTimeoutError);
+    assert.equal(outcomes[2].ok, true);
+  } finally {
+    config.s3.operationTimeoutMs = originalTimeout;
     await rm(dir, { recursive: true, force: true });
   }
 });
