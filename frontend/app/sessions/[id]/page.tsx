@@ -161,6 +161,7 @@ export default function SessionProcessingPage({
   const [error, setError] = useState("");
   const [connectionWarning, setConnectionWarning] = useState("");
   const [pendingWarning, setPendingWarning] = useState(false);
+  const [stalledWarning, setStalledWarning] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isFailedFilesOpen, setIsFailedFilesOpen] = useState(false);
   const [phaseMessageIndex, setPhaseMessageIndex] = useState(0);
@@ -172,6 +173,16 @@ export default function SessionProcessingPage({
   const [resumeError, setResumeError] = useState("");
   const dataRef = useRef<SessionResponse | null>(null);
   const failedPollsRef = useRef(0);
+  // Tracks the last-seen terminal (parsed or failed) file count for the
+  // PROCESSING phase, and when it last changed. A large session can go a
+  // couple of minutes between visible progress even when healthy (the
+  // watchdog that re-queues a dead parse job only sweeps every 2 minutes),
+  // so this needs the same margin as the Lastmod Updater's stall detector —
+  // sitting still much longer than that means parsing has actually stalled.
+  const parsingProgressRef = useRef<{ terminalCount: number; since: number }>({
+    terminalCount: -1,
+    since: Date.now()
+  });
 
   useEffect(() => {
     let isCancelled = false;
@@ -199,6 +210,23 @@ export default function SessionProcessingPage({
           setPendingWarning(true);
         } else {
           setPendingWarning(false);
+        }
+
+        const terminalCount = nextData.sitemap_files.filter(
+          (file) => file.parsed_at !== null || !file.is_valid
+        ).length;
+        const pendingCount = nextData.sitemap_files.length - terminalCount;
+
+        if (nextData.session.status === "PROCESSING" && pendingCount > 0) {
+          if (terminalCount !== parsingProgressRef.current.terminalCount) {
+            parsingProgressRef.current = { terminalCount, since: Date.now() };
+            setStalledWarning(false);
+          } else if (Date.now() - parsingProgressRef.current.since > 150000) {
+            setStalledWarning(true);
+          }
+        } else {
+          parsingProgressRef.current = { terminalCount: -1, since: Date.now() };
+          setStalledWarning(false);
         }
 
         if (isCompleteStatus(nextData.session.status) && redirectTimer === undefined) {
@@ -766,6 +794,40 @@ export default function SessionProcessingPage({
                   <span>
                     This is taking longer than usual — the worker may be busy
                   </span>
+                </div>
+              ) : null}
+
+              {stalledWarning && !isFailedStatus(status) ? (
+                <div
+                  className="flex flex-col gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-3 text-sm text-amber-800"
+                  role="alert"
+                >
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>
+                      Parsing seems stuck — {fileProgress.completedFiles} of{" "}
+                      {fileProgress.totalFiles} files done, no progress for a while.
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="bg-indigo-600 text-white hover:bg-indigo-700"
+                      disabled={isResuming}
+                      onClick={() => void handleResume()}
+                    >
+                      {isResuming ? (
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      ) : (
+                        <RefreshCw className="mr-2 h-4 w-4" />
+                      )}
+                      {isResuming ? "Resuming…" : "Retry remaining files"}
+                    </Button>
+                  </div>
+                  {resumeError ? (
+                    <span className="text-xs text-red-600">{resumeError}</span>
+                  ) : null}
                 </div>
               ) : null}
 

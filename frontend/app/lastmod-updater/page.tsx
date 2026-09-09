@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   AlertCircle,
   AlertTriangle,
@@ -45,7 +47,7 @@ import {
 import { Progress } from "@/components/ui/progress";
 
 type SourceMode = "sftp" | "s3";
-type FetchPhase = "idle" | "pulling" | "parsing" | "ready" | "error";
+type FetchPhase = "idle" | "pulling" | "parsing" | "ready" | "stalled" | "error";
 type ScopeTab = "all" | "selected" | "patterns";
 type PushPhase = "idle" | "running" | "done" | "error";
 
@@ -59,7 +61,24 @@ function todayDateString() {
 
 const PUSH_TERMINAL_STATUSES = new Set(["COMPLETE", "FAILED"]);
 
+// A large domain (thousands of files) can legitimately take many minutes to
+// finish parsing, so this can't be a flat wall-clock cap — it has to be a
+// "no progress at all" stall detector. The 2-minute watchdog re-enqueues any
+// file whose parse job died, so a healthy-but-slow run can go a couple of
+// minutes between visible progress; anything longer than that with zero
+// files completing is a real stall, not just a big domain.
+const PARSE_STALL_THRESHOLD_MS = 150_000;
+
+class ParsingTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ParsingTimeoutError";
+  }
+}
+
 export default function LastmodUpdaterPage() {
+  const router = useRouter();
+
   // ---- Step 1: source + domain ---------------------------------------------
   const [sourceMode, setSourceMode] = useState<SourceMode>("sftp");
   const [domains, setDomains] = useState<string[]>([]);
@@ -110,9 +129,26 @@ export default function LastmodUpdaterPage() {
     };
   }, []);
 
+  // A refresh mid-fetch used to lose the only handle to the in-flight session
+  // (nothing was ever persisted to the URL), so there was nothing to click —
+  // just the Step 1 domain picker again. Restore it from ?session=<id> and
+  // pick up wherever the run actually is.
+  useEffect(() => {
+    const existingSessionId = new URLSearchParams(window.location.search).get("session");
+
+    if (!existingSessionId) {
+      return;
+    }
+
+    setSessionId(existingSessionId);
+    void resumeParsing(existingSessionId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function waitForParsing(id: string) {
     setFetchPhase("parsing");
-    setFetchMessage("Waiting for files to finish parsing…");
+    let lastParsedCount = -1;
+    let lastProgressAt = Date.now();
 
     for (;;) {
       const { session, sitemap_files: sitemapFiles } = await getSession(id);
@@ -121,14 +157,66 @@ export default function LastmodUpdaterPage() {
         throw new Error("Fetching this domain's files failed — check the source and try again.");
       }
 
-      if (
-        sitemapFiles.length > 0 &&
-        sitemapFiles.every((file) => file.parsed_at !== null)
-      ) {
+      const total = sitemapFiles.length;
+      const parsedCount = sitemapFiles.filter((file) => file.parsed_at !== null).length;
+      const failedCount = sitemapFiles.filter(
+        (file) => file.parsed_at !== null && !file.is_valid
+      ).length;
+
+      if (total > 0 && parsedCount === total) {
         return;
       }
 
+      if (parsedCount !== lastParsedCount) {
+        lastParsedCount = parsedCount;
+        lastProgressAt = Date.now();
+      }
+
+      setFetchMessage(
+        total > 0
+          ? `Parsing files… ${parsedCount} of ${total} done${
+              failedCount > 0 ? ` (${failedCount} failed)` : ""
+            }`
+          : "Waiting for files to finish parsing…"
+      );
+
+      if (Date.now() - lastProgressAt > PARSE_STALL_THRESHOLD_MS) {
+        throw new ParsingTimeoutError(
+          total > 0
+            ? `Parsing hasn't made progress in a couple of minutes — ${parsedCount} of ${total} files done${
+                failedCount > 0 ? `, ${failedCount} failed` : ""
+              }. It may still finish on its own, or a file may be stuck.`
+            : "Parsing hasn't started and there's been no progress for a couple of minutes."
+        );
+      }
+
       await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+  }
+
+  function handleParsingOutcomeError(error: unknown) {
+    if (error instanceof ParsingTimeoutError) {
+      setFetchMessage(error.message);
+      setFetchPhase("stalled");
+      return;
+    }
+
+    setFetchError(friendlyApiErrorMessage(error, "Could not fetch this domain's files."));
+    setFetchPhase("error");
+  }
+
+  // Shared by the initial fetch and the "Check again" / refresh-resume paths
+  // so a stall never has to restart the S3/SFTP pull — parsing is the only
+  // thing that was ever stuck.
+  async function resumeParsing(id: string) {
+    setFetchError("");
+
+    try {
+      await waitForParsing(id);
+      setFetchPhase("ready");
+      setFetchMessage("");
+    } catch (error) {
+      handleParsingOutcomeError(error);
     }
   }
 
@@ -153,6 +241,9 @@ export default function LastmodUpdaterPage() {
       const newSessionId = created.session_id;
 
       setSessionId(newSessionId);
+      // So a refresh at any point from here on has something to reattach to
+      // instead of stranding the user back at the domain picker.
+      router.replace(`/lastmod-updater?session=${newSessionId}`, { scroll: false });
 
       const startPull = sourceMode === "sftp" ? startSftpPull : startS3Pull;
       const followProgress =
@@ -187,8 +278,7 @@ export default function LastmodUpdaterPage() {
       setFetchPhase("ready");
       setFetchMessage("");
     } catch (error) {
-      setFetchError(friendlyApiErrorMessage(error, "Could not fetch this domain's files."));
-      setFetchPhase("error");
+      handleParsingOutcomeError(error);
     }
   }
 
@@ -498,6 +588,33 @@ export default function LastmodUpdaterPage() {
                     value={Math.round((fetchProgress.current / fetchProgress.total) * 100)}
                   />
                 ) : null}
+              </div>
+            ) : null}
+
+            {fetchPhase === "stalled" ? (
+              <div className="space-y-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>{fetchMessage}</span>
+                </div>
+                <div className="flex items-center gap-4 pl-6">
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 font-semibold text-amber-900 hover:text-amber-950"
+                    onClick={() => sessionId && void resumeParsing(sessionId)}
+                  >
+                    <RefreshCcw className="h-3.5 w-3.5" />
+                    Check again
+                  </button>
+                  {sessionId ? (
+                    <Link
+                      href={`/sessions/${sessionId}`}
+                      className="font-semibold text-amber-900 underline hover:text-amber-950"
+                    >
+                      View full status →
+                    </Link>
+                  ) : null}
+                </div>
               </div>
             ) : null}
 

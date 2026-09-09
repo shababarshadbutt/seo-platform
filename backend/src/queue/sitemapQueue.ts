@@ -125,6 +125,14 @@ export async function enqueueParseSitemapJobs(
   for (let index = 0; index < jobs.length; index += batchSize) {
     const batch = jobs.slice(index, index + batchSize);
 
+    // addBulk() with a jobId that already exists (in ANY state, including
+    // "failed") is a silent no-op — so a permanently-failed parse job would
+    // never actually retry. Evict a terminal same-id job first, same as
+    // reusableSingletonJob() does for extract-patterns/sample-patterns.
+    await Promise.all(
+      batch.map((data) => reusableSingletonJob(parseSitemapJobOptions(data).jobId as string))
+    );
+
     enqueuedJobs.push(
       ...(await sitemapQueue.addBulk(
         batch.map((data) => ({
