@@ -137,6 +137,16 @@ transient error. A role without the permission is not fatal — a Head that fail
 for any reason other than a clean 404 is treated as "exists", so the publish
 degrades to keeping every entry indexed rather than breaking.
 
+**The instance role also needs `s3:ListBucket` on the bucket, scoped by a prefix
+condition to the sitemaps location** (`sites/*` under the default
+`S3_SITEMAPS_PREFIX_TEMPLATE`). This one IS fatal for the feature that needs it:
+the "From S3" sitemap source lists the bucket twice — once for the domain folders
+that populate the picker, once for the objects under the chosen folder — and
+`ListBucket` is a bucket-level action that `GetObject` and `PutObject` do not
+imply. Without it `GET /api/s3/domains` returns 502 and the dropdown is
+permanently empty; the error body says so explicitly rather than leaving it to be
+guessed at. Publishing is unaffected either way.
+
 ---
 
 ## Design decisions worth knowing before changing anything

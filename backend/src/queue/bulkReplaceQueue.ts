@@ -30,6 +30,12 @@ export const PATTERN_TRANSFORM_UNDO_JOB = "pattern-transform-undo" as const;
 // job row and the one-per-pattern guard with the operations it measures, so a
 // dry run and an apply can never be in flight for the same pattern at once.
 export const PATTERN_TRANSFORM_DRY_RUN_JOB = "pattern-transform-dry-run" as const;
+// Lastmod Updater: rewrite <lastmod> for a session's chosen scope, then publish
+// (jobs/lastmodUpdateJob.ts). Shares this queue rather than getting its own:
+// like rename/transform it rewrites the SAME sitemap files copy-on-write, so
+// serialising it here is what keeps it from interleaving a filename swap with
+// a rename or transform running on the same session.
+export const LASTMOD_UPDATE_JOB = "lastmod-update" as const;
 
 export type BulkReplaceJobData = {
   session_id: string;
@@ -99,11 +105,21 @@ export type PatternStructureJobData = {
   job_row_id: string;
 };
 
+// Lastmod Updater job. Everything it needs is in the lastmod_update_jobs row
+// (params jsonb), so the payload stays a pointer to it — same reasoning as
+// PatternStructureJobData.
+export type LastmodUpdateJobData = {
+  session_id: string;
+  // lastmod_update_jobs.id — the progress/status row this job drives.
+  job_row_id: string;
+};
+
 export type BulkReplaceQueueData =
   | BulkReplaceJobData
   | BulkReplaceUndoJobData
   | ApplyRedirectsJobData
-  | PatternStructureJobData;
+  | PatternStructureJobData
+  | LastmodUpdateJobData;
 export type BulkReplaceJobName =
   | typeof BULK_REPLACE_JOB
   | typeof BULK_REPLACE_UNDO_JOB
@@ -111,7 +127,8 @@ export type BulkReplaceJobName =
   | typeof PATTERN_RENAME_JOB
   | typeof PATTERN_TRANSFORM_JOB
   | typeof PATTERN_TRANSFORM_UNDO_JOB
-  | typeof PATTERN_TRANSFORM_DRY_RUN_JOB;
+  | typeof PATTERN_TRANSFORM_DRY_RUN_JOB
+  | typeof LASTMOD_UPDATE_JOB;
 
 export const bulkReplaceQueue = new Queue<
   BulkReplaceQueueData,
@@ -229,6 +246,29 @@ export async function enqueuePatternStructureJob(
     // rules can compound when re-applied, and its undo bookkeeping is one level
     // deep. A half-finished transform must surface as FAILED for the user to
     // undo deliberately, not be silently re-run from the top.
+    attempts: 1
+  });
+}
+
+// One in-flight lastmod update per session: the jobId is session-scoped, so a
+// second enqueue while one is active reuses the running job. The authoritative
+// guard is still the partial unique index from migration 060 — this just
+// avoids a duplicate BullMQ job for the common case.
+export async function enqueueLastmodUpdateJob(data: LastmodUpdateJobData) {
+  const jobId = `${LASTMOD_UPDATE_JOB}-${data.session_id}`;
+  const existingJob = await reusableSingletonJob(jobId);
+
+  if (existingJob) {
+    return existingJob;
+  }
+
+  return bulkReplaceQueue.add(LASTMOD_UPDATE_JOB, data, {
+    jobId,
+    removeOnComplete: { count: 100 },
+    removeOnFail: { count: 100 },
+    // NO retries, same reasoning as pattern structure jobs: a half-finished
+    // run must surface as FAILED for the user to re-trigger deliberately, not
+    // be silently re-run (which would re-publish mid-failure).
     attempts: 1
   });
 }

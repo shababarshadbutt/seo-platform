@@ -636,3 +636,247 @@ export async function countSitemapLocMatches(options: {
 
   return matched;
 }
+
+// ---- <lastmod> rewriting (Lastmod Updater) ---------------------------------
+//
+// Byte-preserving like the <loc> rewriter above, and deliberately built as a
+// SEPARATE transform rather than folded into LocRewriteTransform: that one
+// rewrites the element it is scanning for, whereas here the element decided
+// (<lastmod>) is not the element that determines the decision (<loc>, the
+// element just before it in the same <url>/<sitemap> block). Tracking two
+// markers at once is a different enough state machine that sharing one class
+// would make both harder to follow.
+//
+// SCOPE (v1, confirmed): only an EXISTING <lastmod> element's value is
+// rewritten. A <url> block with no <lastmod> at all is left exactly as-is —
+// this transform never inserts a new element, since doing so byte-safely
+// (deciding indentation, placement relative to <changefreq>/<priority>) is a
+// separate piece of work from rewriting one that already exists.
+//
+// ATTRIBUTION WITHOUT PARSING <url>/<sitemap> BLOCKS. The sitemap protocol
+// always writes <loc> before <lastmod> within one block, and exactly one <loc>
+// per block. So rather than tracking <url> open/close tags at all, this keeps
+// only "the most recently closed <loc>'s URL", cleared the moment a <lastmod>
+// consumes it (or overwritten by the next <loc>) — cheap, and correct for any
+// spec-conformant sitemap. A file that puts <lastmod> before <loc> in the same
+// block (nonconformant) would misattribute it to the PREVIOUS block's URL; not
+// guarded against, matching how the rest of this module already assumes
+// ordinary sitemap structure.
+const LASTMOD_OPEN = "<lastmod>";
+const LASTMOD_CLOSE = "</lastmod>";
+// Longest opening marker this transform watches for, minus one — how many
+// trailing bytes must be held back across a chunk boundary when neither marker
+// has been found yet, so a split "<last" or "<loc" is never mistaken for plain
+// text. See LocRewriteTransform's identical holdback technique above.
+const MAX_OPEN_MARKER_TAIL = Math.max(LOC_OPEN.length, LASTMOD_OPEN.length) - 1;
+
+// A rewrite decision for one URL's <lastmod>: return the new value, or null to
+// leave it exactly as written (out of scope, or already reads the target
+// value).
+export type LastmodDecision = (url: string) => string | null;
+
+// Decode a <loc> or <lastmod> element's raw inner text (CDATA-wrapped or plain
+// XML-entity-encoded) into its plain string value. Shares decodeXmlText with
+// rewriteLocInner above so the two can never disagree about what a given inner
+// text decodes to.
+function decodeInnerText(rawInner: string): string {
+  const cdataMatch = rawInner.match(/^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/);
+
+  if (cdataMatch) {
+    return cdataMatch[1].trim();
+  }
+
+  return decodeXmlText(rawInner.trim());
+}
+
+// Replace a <loc>/<lastmod> element's raw inner text with a NEW plain value,
+// preserving whether the original was CDATA-wrapped and its surrounding
+// whitespace padding. Unlike rewriteLocInner this never returns null — by the
+// time it is called the caller has already decided a rewrite happens.
+function replaceInnerText(rawInner: string, newValue: string): string {
+  const cdataMatch = rawInner.match(/^(\s*)<!\[CDATA\[([\s\S]*?)\]\]>(\s*)$/);
+
+  if (cdataMatch) {
+    const [, leading, , trailing] = cdataMatch;
+
+    return `${leading}<![CDATA[${newValue}]]>${trailing}`;
+  }
+
+  const leading = rawInner.match(/^\s*/)?.[0] ?? "";
+  const trailing = rawInner.match(/\s*$/)?.[0] ?? "";
+
+  return `${leading}${encodeXmlText(newValue)}${trailing}`;
+}
+
+// Streaming transform that rewrites only the text inside <lastmod>...</lastmod>
+// elements whose enclosing block's <loc> the caller's decision function says to
+// change, passing every other byte through unchanged — including <loc> itself,
+// which this transform reads but never rewrites.
+class LastmodRewriteTransform extends Transform {
+  private pending = "";
+  private mode: "idle" | "inLoc" | "inLastmod" = "idle";
+  private captured = "";
+  private pendingLocUrl: string | null = null;
+  private readonly decoder = new StringDecoder("utf8");
+
+  constructor(private readonly decide: LastmodDecision) {
+    super({ decodeStrings: false, encoding: "utf8" });
+  }
+
+  rewrittenCount = 0;
+
+  override _transform(
+    chunk: string | Buffer,
+    _encoding: BufferEncoding,
+    callback: TransformCallback
+  ) {
+    const buffer = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+
+    this.pending += this.decoder.write(buffer);
+    this.drain(false);
+    callback();
+  }
+
+  override _flush(callback: TransformCallback) {
+    this.pending += this.decoder.end();
+    this.drain(true);
+
+    if (this.mode !== "idle") {
+      // Unterminated <loc>/<lastmod>: emit what was captured verbatim rather
+      // than lose it.
+      this.push(this.captured);
+      this.captured = "";
+      this.mode = "idle";
+    }
+
+    if (this.pending) {
+      this.push(this.pending);
+      this.pending = "";
+    }
+
+    callback();
+  }
+
+  private drain(isEnd: boolean) {
+    for (;;) {
+      if (this.mode === "idle") {
+        const locIndex = this.pending.indexOf(LOC_OPEN);
+        const lastmodIndex = this.pending.indexOf(LASTMOD_OPEN);
+        const candidates = [
+          locIndex === -1 ? null : { index: locIndex, marker: LOC_OPEN, next: "inLoc" as const },
+          lastmodIndex === -1
+            ? null
+            : { index: lastmodIndex, marker: LASTMOD_OPEN, next: "inLastmod" as const }
+        ].filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null);
+
+        if (candidates.length === 0) {
+          const keep = isEnd ? 0 : MAX_OPEN_MARKER_TAIL;
+          const safeLength = Math.max(0, this.pending.length - keep);
+
+          if (safeLength > 0) {
+            this.push(this.pending.slice(0, safeLength));
+            this.pending = this.pending.slice(safeLength);
+          }
+
+          return;
+        }
+
+        const earliest = candidates.reduce((min, candidate) =>
+          candidate.index < min.index ? candidate : min
+        );
+
+        this.push(this.pending.slice(0, earliest.index + earliest.marker.length));
+        this.pending = this.pending.slice(earliest.index + earliest.marker.length);
+        this.mode = earliest.next;
+        this.captured = "";
+      } else if (this.mode === "inLoc") {
+        const closeIndex = this.pending.indexOf(LOC_CLOSE);
+
+        if (closeIndex === -1) {
+          const keep = isEnd ? 0 : LOC_CLOSE.length - 1;
+          const safeLength = Math.max(0, this.pending.length - keep);
+
+          this.captured += this.pending.slice(0, safeLength);
+          this.pending = this.pending.slice(safeLength);
+
+          return;
+        }
+
+        this.captured += this.pending.slice(0, closeIndex);
+        this.pendingLocUrl = decodeInnerText(this.captured);
+        this.push(this.captured);
+        this.push(LOC_CLOSE);
+        this.pending = this.pending.slice(closeIndex + LOC_CLOSE.length);
+        this.mode = "idle";
+        this.captured = "";
+      } else {
+        const closeIndex = this.pending.indexOf(LASTMOD_CLOSE);
+
+        if (closeIndex === -1) {
+          const keep = isEnd ? 0 : LASTMOD_CLOSE.length - 1;
+          const safeLength = Math.max(0, this.pending.length - keep);
+
+          this.captured += this.pending.slice(0, safeLength);
+          this.pending = this.pending.slice(safeLength);
+
+          return;
+        }
+
+        this.captured += this.pending.slice(0, closeIndex);
+
+        const url = this.pendingLocUrl;
+        const currentValue = decodeInnerText(this.captured);
+        const decided = url !== null ? this.decide(url) : null;
+
+        if (decided !== null && decided !== currentValue) {
+          this.rewrittenCount += 1;
+          this.push(replaceInnerText(this.captured, decided));
+        } else {
+          this.push(this.captured);
+        }
+
+        this.push(LASTMOD_CLOSE);
+        this.pending = this.pending.slice(closeIndex + LASTMOD_CLOSE.length);
+        this.mode = "idle";
+        this.captured = "";
+        // Consumed: a second <lastmod> in the same block (nonconformant) would
+        // otherwise silently reuse this URL rather than reading as unattributed.
+        this.pendingLocUrl = null;
+      }
+    }
+  }
+}
+
+// Build a LastmodDecision that rewrites every in-scope URL's <lastmod> to
+// `targetDate`. `urlScope: null` means every URL in the file is in scope (used
+// by the "All Files"/"Selected Files" modes); a Set restricts the rewrite to
+// exactly those <loc> values (used by "Vertical wise", scoped via
+// enumeratePopulation — see jobs/lastmodUpdateJob.ts).
+export function buildLastmodDecision(
+  targetDate: string,
+  urlScope: Set<string> | null
+): LastmodDecision {
+  return (url) => (urlScope !== null && !urlScope.has(url) ? null : targetDate);
+}
+
+// Stream `inputPath` through the <lastmod> rewriter into `outputPath`,
+// gzip-aware like rewriteSitemapLocFile. Returns how many <lastmod> elements
+// were actually changed (a URL already reading the target date, or with no
+// <lastmod> element at all, does not count).
+export async function rewriteSitemapLastmodFile(options: {
+  inputPath: string;
+  outputPath: string;
+  isGzip: boolean;
+  decide: LastmodDecision;
+}): Promise<number> {
+  const transform = new LastmodRewriteTransform(options.decide);
+  const readable = createReadStream(options.inputPath);
+  const writable = createWriteStream(options.outputPath);
+  const stages = options.isGzip
+    ? [readable, createGunzip(), transform, createGzip(), writable]
+    : [readable, transform, writable];
+
+  await pipeline(stages);
+
+  return transform.rewrittenCount;
+}

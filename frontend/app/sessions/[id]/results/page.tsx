@@ -8461,7 +8461,7 @@ export default function ResultsDashboardPage({
                     </span>
                   </p>
                   {/* The prefix is resolved server-side and cannot be influenced
-                      from here: an SFTP-pulled session uses the folder it was
+                      from here: a remotely-pulled session uses the folder it was
                       pulled from, anything else uses base_url's host with the
                       same www/case normalization the domain-mismatch check uses.
                       Stated rather than warned about, because the two can no
@@ -8469,7 +8469,9 @@ export default function ResultsDashboardPage({
                   <p className="pt-1 text-xs text-slate-500">
                     {publishPreview.domain_source === "sftp"
                       ? "Prefix taken from the SFTP folder these sitemaps were pulled from."
-                      : "Prefix taken from this session's base URL host (normalized — www and non-www resolve to the same prefix)."}
+                      : publishPreview.domain_source === "s3"
+                        ? "Prefix taken from the S3 folder these sitemaps were pulled from — this publish writes back over the objects it read."
+                        : "Prefix taken from this session's base URL host (normalized — www and non-www resolve to the same prefix)."}
                   </p>
                   {/* Stated up front so "one wildcard for 2,650 files" is not a
                       surprise after the fact. CloudFront bills per invalidation

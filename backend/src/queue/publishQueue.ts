@@ -14,6 +14,10 @@ import { redisConnectionOptions } from "./redisConnection.js";
 // domain safety is enforced by the per-domain lock, not by queue serialisation.
 export const PUBLISH_QUEUE_NAME = "publish";
 export const SFTP_PULL_JOB = "sftp-pull" as const;
+// Pulling a domain's sitemaps back OUT of the bucket publish writes to. Same
+// operation as an SFTP pull against a different store, so it belongs on this
+// queue for the same reasons — and, like a pull, two users' must run at once.
+export const S3_PULL_JOB = "s3-pull" as const;
 export const S3_PUBLISH_JOB = "s3-publish" as const;
 // Cleaner -> Migration handoff ingest. Lives here rather than on its own queue
 // because it is the SAME operation as an SFTP pull from a different source —
@@ -26,6 +30,11 @@ export const CLEANER_INGEST_JOB = "cleaner-ingest" as const;
 export const PUBLISH_WORKER_CONCURRENCY = 4;
 
 export type SftpPullJobData = {
+  session_id: string;
+  domain: string;
+};
+
+export type S3PullJobData = {
   session_id: string;
   domain: string;
 };
@@ -49,10 +58,12 @@ export type CleanerIngestJobData = {
 
 export type PublishQueueData =
   | SftpPullJobData
+  | S3PullJobData
   | S3PublishJobData
   | CleanerIngestJobData;
 export type PublishJobName =
   | typeof SFTP_PULL_JOB
+  | typeof S3_PULL_JOB
   | typeof S3_PUBLISH_JOB
   | typeof CLEANER_INGEST_JOB;
 
@@ -97,6 +108,26 @@ export async function enqueueSftpPullJob(data: SftpPullJobData) {
     removeOnFail: { count: 100 },
     // No automatic retry: a half-finished pull should be re-triggered
     // deliberately, not silently repeated against the SFTP endpoint.
+    attempts: 1
+  });
+}
+
+// One in-flight S3 pull per session — a second click reuses the running job.
+export async function enqueueS3PullJob(data: S3PullJobData) {
+  const jobId = `${S3_PULL_JOB}-${data.session_id}`;
+  const existing = await reusableSingletonJob(jobId);
+
+  if (existing) {
+    return existing;
+  }
+
+  return publishQueue.add(S3_PULL_JOB, data, {
+    jobId,
+    removeOnComplete: { count: 100 },
+    removeOnFail: { count: 100 },
+    // No automatic retry, for the same reason the SFTP pull has none: a
+    // half-finished pull should be re-triggered deliberately rather than
+    // silently repeated.
     attempts: 1
   });
 }

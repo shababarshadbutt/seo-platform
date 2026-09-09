@@ -30,6 +30,11 @@ import { normalizeHost } from "../sitemaps/domain.js";
 
 export type SessionPublishSource = {
   sftp_domain: string | null;
+  // Which remote store sftp_domain names (migration 059). A LABEL ONLY: it never
+  // takes part in choosing the prefix, so a wrong or missing value cannot send a
+  // publish to the wrong folder. NULL means SFTP — the only remote source that
+  // existed before the column did.
+  remote_source_kind?: string | null;
   base_url: string | null;
 };
 
@@ -47,7 +52,9 @@ export type PublishTarget = {
   publicHost: string;
   // Which rule produced prefixDomain. Surfaced in the UI and recorded on the
   // audit row so "why this prefix?" is answerable without re-deriving it.
-  source: "sftp" | "base_url";
+  // "sftp" and "s3" are the same rule (the remote folder wins) reported against
+  // different stores; only "base_url" is a different rule.
+  source: "sftp" | "s3" | "base_url";
   // Set when the SFTP folder and base_url's host disagree. The SFTP folder still
   // wins — that is the point — but the disagreement is logged and shown rather
   // than resolved silently.
@@ -93,15 +100,19 @@ export function publishTargetFromSession(
   const sftpDomain = session.sftp_domain?.trim() || null;
   const baseUrlHost = hostFromBaseUrl(session.base_url);
 
-  // The SFTP folder wins outright when present. Not "wins unless base_url looks
+  // The remote folder wins outright when present. Not "wins unless base_url looks
   // more specific" — an unconditional rule is the only kind that cannot drift,
   // and the folder name is the one value that provably matches where this
   // domain's files came from.
+  //
+  // This is why an S3-sourced session needs no new logic here: it stores its
+  // folder in the same column, so it inherits the same rule, and publishing
+  // writes back over exactly the objects it pulled.
   const rawPrefixHost = sftpDomain ?? baseUrlHost;
 
   if (!rawPrefixHost) {
     throw new PublishTargetError(
-      "Cannot work out where to publish: this session has no SFTP source domain and no usable base URL host."
+      "Cannot work out where to publish: this session has no remote source folder and no usable base URL host."
     );
   }
 
@@ -123,7 +134,14 @@ export function publishTargetFromSession(
     // Falls back to the prefix host only when there is no base_url to read a
     // serving host from.
     publicHost: baseUrlHost ?? prefixDomain,
-    source: sftpDomain ? "sftp" : "base_url",
+    // NULL / anything unrecognised maps to "sftp" rather than throwing: every
+    // session that had a folder before migration 059 was an SFTP pull, and a
+    // publish must never fail over a label that has no say in where it writes.
+    source: sftpDomain
+      ? session.remote_source_kind === "s3"
+        ? "s3"
+        : "sftp"
+      : "base_url",
     baseUrlHostIgnored:
       sftpDomain && baseUrlHost && normalizeHost(baseUrlHost) !== prefixDomain
         ? baseUrlHost
@@ -139,7 +157,7 @@ export async function resolvePublishTarget(
   sessionId: string
 ): Promise<PublishTarget> {
   const result = await pool.query<SessionPublishSource>(
-    "SELECT sftp_domain, base_url FROM sessions WHERE id = $1::uuid",
+    "SELECT sftp_domain, remote_source_kind, base_url FROM sessions WHERE id = $1::uuid",
     [sessionId]
   );
 

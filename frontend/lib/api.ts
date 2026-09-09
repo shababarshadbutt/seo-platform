@@ -3975,7 +3975,7 @@ export type PublishPreview = {
   // Where the prefix host came from. "sftp" = the folder the files were pulled
   // from (authoritative); "base_url" = the session base URL's host, normalized.
   // The server resolves this itself — the `domain` argument below is ignored.
-  domain_source: "sftp" | "base_url";
+  domain_source: "sftp" | "s3" | "base_url";
   // The host used for the public <loc> urls. Legitimately differs from `domain`
   // for a www site: one storage prefix, but the real serving host in the index.
   public_host: string;
@@ -4142,7 +4142,9 @@ export function followPublishProgress(
   return source;
 }
 
-export type SftpPullProgressEvent = {
+// Progress frames from a remote pull. IDENTICAL for SFTP and S3 — the backend
+// registers both streams from one handler — so the UI consumes one shape.
+export type RemotePullProgressEvent = {
   type: "progress" | "done" | "error";
   stage?: string;
   current?: number;
@@ -4156,20 +4158,24 @@ export type SftpPullProgressEvent = {
   };
 };
 
-// Follow a running SFTP pull. Same frame shape and same consumer contract as
+/** @deprecated Use RemotePullProgressEvent — the shape is shared with the S3 pull. */
+export type SftpPullProgressEvent = RemotePullProgressEvent;
+
+// Follow a running remote pull. Same frame shape and same consumer contract as
 // followPublishProgress above — only the endpoint differs — so the UI can show
 // "N of TOTAL" instead of a bare count that means nothing on its own.
-export function followSftpPullProgress(
+function followRemotePullProgress(
   sessionId: string,
-  onEvent: (event: SftpPullProgressEvent) => void
+  sourcePath: "sftp" | "s3",
+  onEvent: (event: RemotePullProgressEvent) => void
 ): EventSource {
   const source = new EventSource(
-    backendUrl(`/api/sessions/${sessionId}/sources/sftp/progress`)
+    backendUrl(`/api/sessions/${sessionId}/sources/${sourcePath}/progress`)
   );
 
   source.onmessage = (message) => {
     try {
-      onEvent(JSON.parse(message.data) as SftpPullProgressEvent);
+      onEvent(JSON.parse(message.data) as RemotePullProgressEvent);
     } catch {
       // Ignore malformed frames rather than tearing the stream down.
     }
@@ -4179,6 +4185,132 @@ export function followSftpPullProgress(
   };
 
   return source;
+}
+
+export function followSftpPullProgress(
+  sessionId: string,
+  onEvent: (event: RemotePullProgressEvent) => void
+): EventSource {
+  return followRemotePullProgress(sessionId, "sftp", onEvent);
+}
+
+// ---- S3 source -------------------------------------------------------------
+//
+// The counterpart of the SFTP trio above, reading from the bucket the publish
+// path writes to, so an already-published sitemap set can be pulled back in,
+// edited and published over.
+
+export type S3DomainsResult = {
+  domains: string[];
+  // Where the listing came from. Shown in the picker because the folder chosen
+  // here is the one a later publish overwrites.
+  bucket?: string;
+  prefix_root?: string;
+};
+
+export async function getS3Domains() {
+  const response = await fetchWithTimeout(
+    backendUrl("/api/s3/domains"),
+    { method: "GET" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<S3DomainsResult>(response);
+}
+
+// Queue a pull of every sitemap object under `domain`'s prefix into this
+// session. The files land through the same ingestion path a manual upload uses.
+export async function startS3Pull(sessionId: string, domain: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/sources/s3`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ domain })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<{ queued?: boolean; job_id?: string; domain?: string }>(
+    response
+  );
+}
+
+export function followS3PullProgress(
+  sessionId: string,
+  onEvent: (event: RemotePullProgressEvent) => void
+): EventSource {
+  return followRemotePullProgress(sessionId, "s3", onEvent);
+}
+
+// ---- Lastmod Updater --------------------------------------------------------
+//
+// Rewrite <lastmod> for a chosen scope of a session's current files, then push
+// to S3 — no cleaning. One background job; the frontend polls its status
+// rather than following an SSE stream (same convention as the pattern
+// rename/transform structure-job endpoint it mirrors on the backend).
+
+export type LastmodUpdateScope =
+  | { type: "all" }
+  | { type: "files"; filenames: string[] }
+  | { type: "patterns"; pattern_ids: string[] };
+
+export type LastmodUpdatePublishSummary = {
+  uploaded?: number;
+  bytes?: number;
+  index_key?: string;
+  failed_files?: PublishFailedFile[];
+  invalidation?: PublishInvalidation;
+};
+
+export type LastmodUpdateJobResult = {
+  files_touched?: number;
+  urls_rewritten?: number;
+  target_date?: string;
+  published?: LastmodUpdateJobPublished;
+};
+
+// Distinct name to avoid clashing with LastmodUpdatePublishSummary above while
+// keeping the same shape (result.published on a completed job).
+export type LastmodUpdateJobPublished = LastmodUpdatePublishSummary;
+
+export type LastmodUpdateJobStatus = {
+  status: "NONE" | "PENDING" | "RUNNING" | "PUBLISHING" | "COMPLETE" | "FAILED";
+  job_id?: string;
+  files_total?: number;
+  files_done?: number;
+  urls_rewritten?: number;
+  result?: LastmodUpdateJobResult | null;
+  error?: string | null;
+  already_completed?: boolean;
+  already_running?: boolean;
+};
+
+export async function enqueueLastmodUpdate(
+  sessionId: string,
+  input: { scope: LastmodUpdateScope; targetDate: string }
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/lastmod-update`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ scope: input.scope, target_date: input.targetDate })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<LastmodUpdateJobStatus>(response);
+}
+
+export async function getLastmodUpdateJob(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/lastmod-update`),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<LastmodUpdateJobStatus>(response);
 }
 
 // --- by-example transform: sample file + full-population check ---------------

@@ -1,8 +1,10 @@
 import {
+  buildLastmodDecision,
   buildLocMapRewriter,
   buildPatternTemplateRewriter,
   buildRedirectApplyRewriter,
   buildTrailingSlashRewriter,
+  rewriteSitemapLastmodFile,
   rewriteSitemapLocFile,
   type LocUrlRewriter
 } from "../sitemaps/rewriteLocs.js";
@@ -121,7 +123,14 @@ export type FileRewriteSpec =
       newStructure: string;
       structureFilters?: ResolvedStructureFilter[] | null;
       shapeFilter?: string[] | null;
-    };
+    }
+  // Lastmod Updater (v1.93-ish). Rewrites <lastmod> only — never <loc> — for
+  // every URL in the file (urls: null/undefined, "All Files"/"Selected Files")
+  // or exactly the given <loc> values ("Vertical wise", pre-resolved by
+  // enumeratePopulation on the caller's thread). An ARRAY, not a Set, for the
+  // same structured-clone reason every other collection in this spec crosses
+  // as a plain array.
+  | { kind: "lastmodUpdate"; targetDate: string; urls?: string[] | null };
 
 export type FileRewriteInput = {
   inputPath: string;
@@ -191,6 +200,21 @@ function buildRewriter(spec: FileRewriteSpec): LocUrlRewriter {
 export default async function fileRewrite(
   input: FileRewriteInput
 ): Promise<FileRewriteResult> {
+  // Handled separately from buildRewriter: a lastmodUpdate spec decides a
+  // SIBLING element's value from a URL, which is not a LocUrlRewriter (a
+  // decision about the <loc> URL itself) at all.
+  if (input.spec.kind === "lastmodUpdate") {
+    const scope = input.spec.urls ? new Set(input.spec.urls) : null;
+    const rewrittenCount = await rewriteSitemapLastmodFile({
+      inputPath: input.inputPath,
+      outputPath: input.outputPath,
+      isGzip: input.isGzip,
+      decide: buildLastmodDecision(input.spec.targetDate, scope)
+    });
+
+    return { rewrittenCount, skipped: emptySkippedReport() };
+  }
+
   const rewriter = buildRewriter(input.spec);
   // Only apply-redirects measures its shortfall — it is the only path whose reach
   // is bounded by what was verified rather than by what the rule can express, and

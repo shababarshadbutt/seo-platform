@@ -187,3 +187,62 @@ test("a stored domain that could escape the prefix is refused", () => {
     );
   }
 });
+
+// ---- Remote source labelling (migration 059) --------------------------------
+//
+// An S3-sourced session records its folder in the SAME column an SFTP one does,
+// deliberately: the prefix rule stays single. remote_source_kind is a LABEL, so
+// these assert that it changes what the audit row and the UI say and nothing
+// about where the bytes go.
+
+test("an S3-sourced session is labelled s3 and keeps the remote-folder rule", () => {
+  const target = publishTargetFromSession({
+    sftp_domain: "fastenersprocurement.com",
+    remote_source_kind: "s3",
+    base_url: "https://www.fastenersprocurement.com"
+  });
+
+  assert.equal(target.source, "s3");
+  // Same prefix an SFTP-sourced session with the same folder resolves to — this
+  // is what makes publishing write back over the objects the pull read.
+  assert.equal(target.prefixDomain, "fastenersprocurement.com");
+});
+
+test("the source label does not move the files", () => {
+  const folder = "fastenersprocurement.com";
+  const base = "https://www.fastenersprocurement.com";
+
+  assert.equal(
+    resolvedKey({ sftp_domain: folder, remote_source_kind: "s3", base_url: base }),
+    resolvedKey({ sftp_domain: folder, remote_source_kind: "sftp", base_url: base }),
+    "an S3-sourced and an SFTP-sourced session on the same folder must write the same key"
+  );
+});
+
+// Every session that had a folder before migration 059 was an SFTP pull, and the
+// backfill does not reach rows written by an older container mid-deploy. A label
+// that has no say in the prefix must never fail a publish.
+test("a missing or unrecognised source kind falls back to sftp", () => {
+  for (const kind of [undefined, null, "", "something-new"]) {
+    assert.equal(
+      publishTargetFromSession({
+        sftp_domain: "example.com",
+        remote_source_kind: kind,
+        base_url: null
+      }).source,
+      "sftp",
+      `must fall back for remote_source_kind ${JSON.stringify(kind)}`
+    );
+  }
+});
+
+test("an uploaded session is still base_url whatever the kind column says", () => {
+  assert.equal(
+    publishTargetFromSession({
+      sftp_domain: null,
+      remote_source_kind: "s3",
+      base_url: "https://example.com"
+    }).source,
+    "base_url"
+  );
+});

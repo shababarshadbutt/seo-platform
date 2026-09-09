@@ -29,16 +29,19 @@ import {
   PUBLISH_QUEUE_NAME,
   PUBLISH_WORKER_CONCURRENCY,
   SFTP_PULL_JOB,
+  S3_PULL_JOB,
   S3_PUBLISH_JOB,
   CLEANER_INGEST_JOB,
   closePublishQueue,
   type PublishQueueData,
   type PublishJobName,
   type SftpPullJobData,
+  type S3PullJobData,
   type S3PublishJobData,
   type CleanerIngestJobData
 } from "./queue/publishQueue.js";
 import { processSftpPullJob } from "./jobs/sftpPullJob.js";
+import { processS3PullJob } from "./jobs/s3PullJob.js";
 import { processCleanerIngestJob } from "./jobs/cleanerIngestJob.js";
 import { processS3PublishJob } from "./jobs/s3PublishJob.js";
 import { closePublishLockClient } from "./publish/publishLock.js";
@@ -54,10 +57,12 @@ import {
   closeBulkReplaceQueue,
   type ApplyRedirectsJobData,
   type BulkReplaceJobData,
+  LASTMOD_UPDATE_JOB,
   type BulkReplaceUndoJobData,
   type BulkReplaceQueueData,
   type BulkReplaceJobName,
-  type PatternStructureJobData
+  type PatternStructureJobData,
+  type LastmodUpdateJobData
 } from "./queue/bulkReplaceQueue.js";
 import {
   DELETE_PROBLEM_URLS_JOB,
@@ -112,6 +117,7 @@ import {
   processPatternTransformUndoJob,
   processPatternTransformDryRunJob
 } from "./jobs/patternStructureJob.js";
+import { processLastmodUpdateJob } from "./jobs/lastmodUpdateJob.js";
 import {
   processCleanupZipsJob,
   processPreGenerateZipJob
@@ -374,6 +380,11 @@ async function start() {
           return;
         }
 
+        if (job.name === LASTMOD_UPDATE_JOB) {
+          await processLastmodUpdateJob(job.data as LastmodUpdateJobData, app.log);
+          return;
+        }
+
         throw new Error(`Unsupported job: ${job.name}`);
       },
       {
@@ -408,6 +419,16 @@ async function start() {
           // both for the same reasons as the publish job below.
           return await processSftpPullJob(
             job.data as SftpPullJobData,
+            app.log,
+            job
+          );
+        }
+
+        if (job.name === S3_PULL_JOB) {
+          // Same contract as the SFTP pull above — `job` for progress, result
+          // returned so the SSE terminal frame can read it off returnvalue.
+          return await processS3PullJob(
+            job.data as S3PullJobData,
             app.log,
             job
           );

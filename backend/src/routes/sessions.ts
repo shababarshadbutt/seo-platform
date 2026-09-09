@@ -55,6 +55,7 @@ import {
   enqueueBulkReplaceJob,
   enqueueBulkReplaceUndoJob,
   enqueuePatternStructureJob,
+  enqueueLastmodUpdateJob,
   PATTERN_RENAME_JOB,
   PATTERN_TRANSFORM_JOB,
   PATTERN_TRANSFORM_UNDO_JOB,
@@ -71,6 +72,13 @@ import {
   serialisePatternStructureJob,
   type PatternStructureKind
 } from "../sitemaps/patternStructureJobClaim.js";
+import {
+  claimLastmodUpdateJob,
+  lastmodUpdateFingerprint,
+  latestLastmodUpdateJob,
+  serialiseLastmodUpdateJob
+} from "../sitemaps/lastmodUpdateJobClaim.js";
+import { isValidLastmodDate, todayLastmodDate } from "../sitemaps/lastmodDate.js";
 import {
   cachedWithSingleFlight,
   type CachedResult
@@ -107,12 +115,18 @@ import {
   createStoredSitemapFile,
   type StoredSitemapFile
 } from "../sitemaps/ingest.js";
-import { publishConfigError, sftpConfigError } from "../config.js";
+import {
+  publishConfigError,
+  s3SourceConfigError,
+  s3SourceRootPrefix,
+  sftpConfigError
+} from "../config.js";
 import {
   assertSafeDomain,
   listSftpDomains,
   sftpPoolStats
 } from "../sftp/sftpClient.js";
+import { listS3Domains } from "../s3source/s3SourceClient.js";
 import {
   acquirePublishLock,
   isPublishLocked,
@@ -135,19 +149,22 @@ import {
   CLEANER_INGEST_JOB,
   enqueueCleanerIngestJob,
   enqueueS3PublishJob,
+  enqueueS3PullJob,
   enqueueSftpPullJob,
   publishQueue,
   S3_PUBLISH_JOB,
+  S3_PULL_JOB,
   SFTP_PULL_JOB
 } from "../queue/publishQueue.js";
-
-// SSE tuning for publish progress, mirroring the Cleaner's values.
-const PUBLISH_SSE_KEEPALIVE_MS = 15 * 1000;
-const PUBLISH_SSE_POLL_MS = 1000;
-const PUBLISH_SSE_TIMEOUT_MS = 30 * 60 * 1000;
-// How long to wait for a just-enqueued job to become visible before reporting
-// that nothing is running.
-const PUBLISH_SSE_JOB_GRACE_MS = 10 * 1000;
+// SSE tuning for the long-running streams. Defined alongside the extracted pull
+// route so the two pulls and the publish stream share one set of values.
+import {
+  registerPullProgressRoute,
+  PUBLISH_SSE_JOB_GRACE_MS,
+  PUBLISH_SSE_KEEPALIVE_MS,
+  PUBLISH_SSE_POLL_MS,
+  PUBLISH_SSE_TIMEOUT_MS
+} from "./pullProgress.js";
 import {
   parseSitemapSource,
   streamSitemapUrlLocs,
@@ -8278,6 +8295,323 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     }
   );
 
+  // ---- S3 input -----------------------------------------------------------
+  //
+  // The counterpart of the SFTP routes above, reading from the same bucket and
+  // prefix the publish path writes to. That is the point: a session pulled from
+  // sites/<domain>/sitemaps/ publishes back over the objects it read, so an
+  // already-live sitemap set can be revised rather than reconstructed.
+
+  // The domains available to pull from the sitemaps bucket. Powers the source
+  // picker; a config-less deployment gets a clear 503 rather than a stack trace.
+  app.get("/api/s3/domains", async (_request, reply) => {
+    const configError = s3SourceConfigError();
+
+    if (configError) {
+      return reply
+        .code(503)
+        .send({ error: "Service Unavailable", message: configError });
+    }
+
+    try {
+      return {
+        domains: await listS3Domains(),
+        // Returned so the picker can show WHERE it is listing from. The user is
+        // about to choose a folder that a later publish will overwrite, and the
+        // bucket is not otherwise visible anywhere in the UI.
+        bucket: config.s3.bucket,
+        prefix_root: s3SourceRootPrefix()
+      };
+    } catch (error) {
+      return reply.code(502).send({
+        error: "Bad Gateway",
+        message:
+          error instanceof Error
+            ? // AccessDenied here almost always means the instance role has
+              // PutObject/GetObject but not ListBucket, which is invisible from
+              // the message alone — so name it rather than let it read as an
+              // outage. See docs/aws-deployment.md.
+              `Could not list S3 domains: ${error.message}${
+                /accessdenied/i.test(error.name) ||
+                /access denied/i.test(error.message)
+                  ? " (the instance role needs s3:ListBucket on this bucket, not only GetObject/PutObject)"
+                  : ""
+              }`
+            : "Could not list S3 domains"
+      });
+    }
+  });
+
+  // Pull a domain's whole sitemap set out of S3 into this session. A fourth
+  // session "source" alongside manual upload, fetch-from-URL and SFTP: the files
+  // land via the SAME ingestion path (createStoredSitemapFile + parse job), so
+  // nothing downstream distinguishes them. Always queued — a 1,600-object domain
+  // would blow the request timeout.
+  app.post<{ Params: SessionParams; Body: { domain?: unknown } }>(
+    "/api/sessions/:id/sources/s3",
+    async (request, reply) => {
+      const configError = s3SourceConfigError();
+
+      if (configError) {
+        return reply
+          .code(503)
+          .send({ error: "Service Unavailable", message: configError });
+      }
+
+      const sessionResult = await pool.query<{ sftp_domain: string | null }>(
+        "SELECT sftp_domain FROM sessions WHERE id = $1::uuid",
+        [request.params.id]
+      );
+
+      if (sessionResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "session not found" });
+      }
+
+      const domain =
+        typeof request.body?.domain === "string" ? request.body.domain.trim() : "";
+
+      try {
+        assertSafeDomain(domain);
+      } catch {
+        return reply.code(400).send(badRequest("a valid domain is required"));
+      }
+
+      // Same one-session-one-domain rule the SFTP route enforces, and checked
+      // against the same column: a session's files must all come from ONE
+      // folder, because that folder decides the single S3 prefix everything in
+      // the session publishes to.
+      const existingDomain = sessionResult.rows[0].sftp_domain;
+
+      if (existingDomain && existingDomain !== domain) {
+        return reply.code(409).send({
+          error: "Conflict",
+          message: `This session already holds sitemaps pulled from "${existingDomain}". Start a new session to work on "${domain}" — one session publishes to one domain's prefix.`
+        });
+      }
+
+      // Recorded at enqueue, before the pull runs: this is the moment the user
+      // chose the folder, and from here on it — not base_url — is what decides
+      // the publish prefix (see publish/publishTarget.ts). remote_source_kind is
+      // a label only; the prefix comes from sftp_domain either way.
+      await pool.query(
+        "UPDATE sessions SET sftp_domain = $2, remote_source_kind = 's3' WHERE id = $1::uuid",
+        [request.params.id, domain]
+      );
+
+      const job = await enqueueS3PullJob({
+        session_id: request.params.id,
+        domain
+      });
+
+      return reply.send({ queued: true, job_id: job.id, domain });
+    }
+  );
+
+  // ---- Lastmod Updater -----------------------------------------------------
+  //
+  // Rewrite <lastmod> for a chosen scope of this session's current files, then
+  // publish — one background job (jobs/lastmodUpdateJob.ts), same
+  // claim/attach/busy shape as pattern_structure_jobs so a client retry after a
+  // timeout attaches to the same run instead of re-rewriting and re-publishing.
+
+  type LastmodUpdateScope =
+    | { type: "all" }
+    | { type: "files"; filenames: string[] }
+    | { type: "patterns"; pattern_ids: string[] };
+
+  type LastmodUpdateBody = {
+    scope?: { type?: unknown; filenames?: unknown; pattern_ids?: unknown };
+    target_date?: unknown;
+  };
+
+  function parseLastmodScope(
+    body: LastmodUpdateBody
+  ): { ok: true; scope: LastmodUpdateScope } | { ok: false; message: string } {
+    const rawScope = body.scope;
+
+    if (!rawScope || typeof rawScope !== "object") {
+      return { ok: false, message: "scope is required" };
+    }
+
+    if (rawScope.type === "all") {
+      return { ok: true, scope: { type: "all" } };
+    }
+
+    if (rawScope.type === "files") {
+      const filenames = Array.isArray(rawScope.filenames)
+        ? rawScope.filenames.filter((entry): entry is string => typeof entry === "string")
+        : [];
+
+      if (filenames.length === 0) {
+        return { ok: false, message: "scope.filenames must be a non-empty array" };
+      }
+
+      return { ok: true, scope: { type: "files", filenames } };
+    }
+
+    if (rawScope.type === "patterns") {
+      const patternIds = Array.isArray(rawScope.pattern_ids)
+        ? rawScope.pattern_ids.filter((entry): entry is string => typeof entry === "string")
+        : [];
+
+      if (patternIds.length === 0) {
+        return { ok: false, message: "scope.pattern_ids must be a non-empty array" };
+      }
+
+      return { ok: true, scope: { type: "patterns", pattern_ids: patternIds } };
+    }
+
+    return {
+      ok: false,
+      message: 'scope.type must be "all", "files" or "patterns"'
+    };
+  }
+
+  // A cheap, approximate file count for the claim response's initial
+  // files_total — refined by the job itself once it resolves the real
+  // targets. "patterns" only has pattern_file_occurrences to estimate from,
+  // which is a candidate index, not authoritative (see jobs/patternPopulation.ts);
+  // good enough for an initial progress-bar number, never used to decide scope.
+  async function estimateLastmodFilesTotal(
+    sessionId: string,
+    scope: LastmodUpdateScope
+  ): Promise<number> {
+    if (scope.type === "all") {
+      const result = await pool.query<{ count: string }>(
+        `
+          SELECT COUNT(*) AS count
+          FROM sitemap_files
+          WHERE session_id = $1 AND source_role = 'current'
+            AND is_deleted = false AND is_index = false
+        `,
+        [sessionId]
+      );
+
+      return Number(result.rows[0].count);
+    }
+
+    if (scope.type === "files") {
+      return scope.filenames.length;
+    }
+
+    const result = await pool.query<{ count: string }>(
+      `
+        SELECT COUNT(DISTINCT source_file) AS count
+        FROM pattern_file_occurrences
+        WHERE pattern_id = ANY($1::uuid[])
+      `,
+      [scope.pattern_ids]
+    );
+
+    return Number(result.rows[0].count);
+  }
+
+  app.post<{ Params: SessionParams; Body: LastmodUpdateBody }>(
+    "/api/sessions/:id/lastmod-update",
+    async (request, reply) => {
+      const sessionResult = await pool.query("SELECT 1 FROM sessions WHERE id = $1::uuid", [
+        request.params.id
+      ]);
+
+      if (sessionResult.rowCount === 0) {
+        return reply.code(404).send({ error: "Not Found", message: "session not found" });
+      }
+
+      const parsedScope = parseLastmodScope(request.body ?? {});
+
+      if (!parsedScope.ok) {
+        return reply.code(400).send(badRequest(parsedScope.message));
+      }
+
+      const rawTargetDate = request.body?.target_date;
+      const targetDate =
+        typeof rawTargetDate === "string" && rawTargetDate.trim()
+          ? rawTargetDate.trim()
+          : todayLastmodDate();
+
+      if (!isValidLastmodDate(targetDate)) {
+        return reply
+          .code(400)
+          .send(badRequest('target_date must be a valid "YYYY-MM-DD" date'));
+      }
+
+      const sessionId = request.params.id;
+      const scope = parsedScope.scope;
+      const filesTotal = await estimateLastmodFilesTotal(sessionId, scope);
+      const fingerprint = lastmodUpdateFingerprint({ scope, target_date: targetDate });
+
+      const claim = await claimLastmodUpdateJob({
+        sessionId,
+        fingerprint,
+        params: { scope, target_date: targetDate },
+        filesTotal
+      });
+
+      if (claim.outcome === "already_completed") {
+        return reply.send({
+          ...serialiseLastmodUpdateJob(claim.job),
+          already_completed: true
+        });
+      }
+
+      if (claim.outcome === "attached") {
+        return reply.code(202).send({
+          job_id: claim.jobId,
+          files_total: claim.job?.files_total ?? filesTotal,
+          files_done: claim.job?.files_done ?? 0,
+          status: claim.job?.status ?? "RUNNING",
+          already_running: true
+        });
+      }
+
+      if (claim.outcome === "busy") {
+        return reply.code(409).send({
+          error: "Conflict",
+          message:
+            "A lastmod update is already running for this session — wait for it to finish before starting another.",
+          job_id: claim.jobId
+        });
+      }
+
+      await enqueueLastmodUpdateJob({
+        session_id: sessionId,
+        job_row_id: claim.jobId
+      });
+
+      return reply.code(202).send({
+        job_id: claim.jobId,
+        files_total: claim.filesTotal,
+        files_done: 0,
+        status: "PENDING"
+      });
+    }
+  );
+
+  // The most recent lastmod update job for a session — the frontend polls this
+  // until status is COMPLETE/FAILED.
+  app.get<{ Params: SessionParams }>(
+    "/api/sessions/:id/lastmod-update",
+    async (request, reply) => {
+      const sessionResult = await pool.query("SELECT 1 FROM sessions WHERE id = $1::uuid", [
+        request.params.id
+      ]);
+
+      if (sessionResult.rowCount === 0) {
+        return reply.code(404).send({ error: "Not Found", message: "session not found" });
+      }
+
+      const job = await latestLastmodUpdateJob(request.params.id);
+
+      if (!job) {
+        return reply.send({ status: "NONE" });
+      }
+
+      return reply.send(serialiseLastmodUpdateJob(job));
+    }
+  );
+
   // ---- Phase 1: S3 publish ------------------------------------------------
 
   // What a publish WOULD write, without writing anything. Lets the user see the
@@ -8701,173 +9035,30 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     }
   );
 
-  // ---- Phase 1: SFTP pull progress (SSE) ----------------------------------
+  // ---- Remote pull progress (SSE) -----------------------------------------
   //
-  // Deliberately the SAME mechanism as the publish stream above — hijacked
-  // socket, `data: {type,stage,current,total,message}` frames, keepalive
-  // comments, terminal done/error frame read from the job's RETURN VALUE — because
-  // that shape is already proven in production. The pull's file total is known
-  // before its download loop starts, so every frame carries current AND total
-  // rather than a bare count with nothing to compare against.
-  app.get<{ Params: SessionParams }>(
-    "/api/sessions/:id/sources/sftp/progress",
-    {
-      onRequest: (request, reply, done) => {
-        request.raw.setTimeout(PUBLISH_SSE_TIMEOUT_MS);
-        reply.raw.setTimeout(PUBLISH_SSE_TIMEOUT_MS);
-        done();
-      }
-    },
-    async (request, reply) => {
-      // Gate before hijacking, same as the publish stream.
-      const configError = sftpConfigError();
+  // Both remote sources stream progress through the SAME mechanism as the
+  // publish stream above — hijacked socket, `data: {type,stage,current,total,
+  // message}` frames, keepalive comments, terminal done/error frame read from the
+  // job's RETURN VALUE — because that shape is already proven in production. A
+  // pull's file total is known before its download loop starts, so every frame
+  // carries current AND total rather than a bare count with nothing to compare
+  // against.
+  //
+  // Registered from one function rather than written twice: see the note in
+  // routes/pullProgress.ts for the three defects that would otherwise have been
+  // duplicated along with the code.
+  registerPullProgressRoute(app, {
+    path: "/api/sessions/:id/sources/sftp/progress",
+    jobIdPrefix: SFTP_PULL_JOB,
+    configError: sftpConfigError,
+    label: "SFTP"
+  });
 
-      if (configError) {
-        return reply
-          .code(503)
-          .send({ error: "Service Unavailable", message: configError });
-      }
-
-      reply.hijack();
-      const stream = reply.raw;
-      stream.writeHead(200, {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive",
-        "X-Accel-Buffering": "no",
-        "Access-Control-Allow-Origin":
-          (request.headers.origin as string | undefined) ?? "*"
-      });
-
-      const send = (payload: unknown) => {
-        if (!stream.writableEnded) {
-          stream.write(`data: ${JSON.stringify(payload)}\n\n`);
-        }
-      };
-
-      const keepalive = setInterval(() => {
-        if (!stream.writableEnded) {
-          stream.write(": keepalive\n\n");
-        }
-      }, PUBLISH_SSE_KEEPALIVE_MS);
-      keepalive.unref?.();
-
-      let closed = false;
-      const stop = () => {
-        closed = true;
-        clearInterval(keepalive);
-      };
-      request.raw.on("close", stop);
-
-      const jobId = `${SFTP_PULL_JOB}-${request.params.id}`;
-      let lastMessage = "";
-      const startedAt = Date.now();
-
-      try {
-        for (;;) {
-          if (closed) {
-            return;
-          }
-
-          const job = await publishQueue.getJob(jobId);
-
-          if (!job) {
-            // Same grace window as publish: the client opens this stream right
-            // after its POST returns, and enqueue is not atomic with that.
-            if (Date.now() - startedAt < PUBLISH_SSE_JOB_GRACE_MS) {
-              await new Promise((resolve) =>
-                setTimeout(resolve, PUBLISH_SSE_POLL_MS)
-              );
-              continue;
-            }
-
-            send({ type: "done", message: "No SFTP pull is running." });
-            break;
-          }
-
-          const state = await job.getState();
-          const progress = job.progress as
-            | {
-                stage?: string;
-                current?: number;
-                total?: number;
-                message?: string;
-              }
-            | number
-            | undefined;
-
-          if (progress && typeof progress === "object") {
-            if (progress.message && progress.message !== lastMessage) {
-              lastMessage = progress.message;
-              send({
-                type: "progress",
-                stage: progress.stage ?? "pull",
-                current: progress.current,
-                total: progress.total,
-                message: progress.message
-              });
-            }
-          }
-
-          if (state === "completed") {
-            const settled = (await publishQueue.getJob(jobId)) ?? job;
-            const returned = settled.returnvalue as
-              | {
-                  stored?: number;
-                  failed?: number;
-                  total?: number;
-                  domain?: string;
-                }
-              | undefined;
-
-            send({
-              type: "done",
-              message: returned?.total
-                ? `Pulled ${returned.stored ?? 0} of ${returned.total} file(s)${
-                    returned.failed ? `, ${returned.failed} failed` : ""
-                  }`
-                : lastMessage || "SFTP pull complete.",
-              result: returned
-            });
-            break;
-          }
-
-          if (state === "failed") {
-            send({
-              type: "error",
-              message: job.failedReason || "SFTP pull failed."
-            });
-            break;
-          }
-
-          if (Date.now() - startedAt > PUBLISH_SSE_TIMEOUT_MS) {
-            send({
-              type: "error",
-              message:
-                "Stopped following this SFTP pull — it is taking unusually long."
-            });
-            break;
-          }
-
-          await new Promise((resolve) =>
-            setTimeout(resolve, PUBLISH_SSE_POLL_MS)
-          );
-        }
-      } catch (error) {
-        send({
-          type: "error",
-          message:
-            error instanceof Error
-              ? error.message
-              : "Could not follow SFTP pull"
-        });
-      } finally {
-        stop();
-
-        if (!stream.writableEnded) {
-          stream.end();
-        }
-      }
-    }
-  );
+  registerPullProgressRoute(app, {
+    path: "/api/sessions/:id/sources/s3/progress",
+    jobIdPrefix: S3_PULL_JOB,
+    configError: s3SourceConfigError,
+    label: "S3"
+  });
 };

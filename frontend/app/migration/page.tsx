@@ -23,7 +23,8 @@ import {
   Sparkles,
   UploadCloud,
   X,
-  Server
+  Server,
+  Database
 } from "lucide-react";
 
 import {
@@ -31,9 +32,12 @@ import {
   completeSitemapUpload,
   createSession,
   getSftpDomains,
+  getS3Domains,
   startSftpPull,
+  startS3Pull,
   friendlyApiErrorMessage,
   followSftpPullProgress,
+  followS3PullProgress,
   getCleanerHandoff,
   getRuntimeConfig,
   ingestCleanerRun,
@@ -43,7 +47,7 @@ import {
   submitSitemapUrls,
   type CleanerHandoffFile,
   type CleanerRun,
-  type SftpPullProgressEvent,
+  type RemotePullProgressEvent,
   type SitemapUrlPreview,
   type CleanerIngestProgress,
   type UploadProgress,
@@ -144,9 +148,12 @@ function describeRetention(ms: number | null): string | null {
   }.`;
 }
 
-// Third source alongside manual upload and fetch-from-URL: pull a domain's
-// whole sitemap set from the AWS Transfer Family SFTP location.
-type SourceMode = "file" | "url" | "sftp";
+// Two remote sources alongside manual upload and fetch-from-URL, both pulling a
+// domain's whole sitemap set from a folder: "sftp" from the AWS Transfer Family
+// location, "s3" from the sitemaps bucket the publish path writes to. The S3 one
+// is what makes revising an already-published set possible — pull what is live,
+// edit it, publish back over the same objects.
+type SourceMode = "file" | "url" | "sftp" | "s3";
 type SitemapUrlField = {
   id: string;
   value: string;
@@ -340,11 +347,26 @@ export default function Home() {
   const [sftpDomain, setSftpDomain] = useState("");
   const [sftpLoading, setSftpLoading] = useState(false);
   const [sftpError, setSftpError] = useState("");
+  // S3 source state, mirroring the SFTP block above. Listed lazily on first
+  // open for the same reason, and kept separate rather than shared so switching
+  // tabs cannot carry one store's selection into the other.
+  const [s3Domains, setS3Domains] = useState<string[]>([]);
+  const [s3Domain, setS3Domain] = useState("");
+  const [s3Loading, setS3Loading] = useState(false);
+  const [s3Error, setS3Error] = useState("");
+  // Where the S3 listing came from, shown in the panel: the folder chosen here
+  // is the one a later publish overwrites, and the bucket is not otherwise
+  // visible anywhere in the UI.
+  const [s3Location, setS3Location] = useState<{
+    bucket?: string;
+    prefixRoot?: string;
+  } | null>(null);
   // Live pull progress, streamed over SSE in the same shape the publish dialog
   // consumes. Carries current AND total so the user can see how much is left —
-  // a bare incrementing count told them nothing.
-  const [sftpPullProgress, setSftpPullProgress] =
-    useState<SftpPullProgressEvent | null>(null);
+  // a bare incrementing count told them nothing. Shared by both remote sources:
+  // only one can be pulling, and the backend emits identical frames for each.
+  const [remotePullProgress, setRemotePullProgress] =
+    useState<RemotePullProgressEvent | null>(null);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [legacyFiles, setLegacyFiles] = useState<File[]>([]);
   const [folderXmlCount, setFolderXmlCount] = useState<number | null>(null);
@@ -437,11 +459,16 @@ export default function Home() {
     sitemapUrlFieldStates.length > 0 &&
       sitemapUrlFieldStates.every((fieldState) => fieldState.hasValidPreview)
   );
+  // The folder chosen on whichever remote tab is active, or "" on the local
+  // tabs. Derived once so the validation, the divergence warning and the submit
+  // branch all read the same value instead of each re-deriving it.
+  const remoteDomain =
+    sourceMode === "sftp" ? sftpDomain : sourceMode === "s3" ? s3Domain : "";
   const hasValidSource =
     sourceMode === "file"
       ? selectedFiles.length > 0 || Boolean(cleanerHandoff?.token)
-      : sourceMode === "sftp"
-        ? sftpDomain.length > 0
+      : sourceMode === "sftp" || sourceMode === "s3"
+        ? remoteDomain.length > 0
         : hasValidUrlPreview;
   const hasValidConcurrency =
     Number.isInteger(concurrencyNumber) &&
@@ -617,15 +644,17 @@ export default function Home() {
     canSubmit
   ]);
 
-  // True when an SFTP-sourced session's Base URL has been edited to a host that
-  // would NOT resolve to the same publish prefix as the SFTP folder. Not an error
-  // — the backend takes the SFTP domain as authoritative regardless — but the user
-  // should know the two now describe different sites.
+  // True when a remotely-sourced session's Base URL has been edited to a host
+  // that would NOT resolve to the same publish prefix as the folder it is being
+  // pulled from. Not an error — the backend takes the remote folder as
+  // authoritative regardless — but the user should know the two now describe
+  // different sites. It matters more on the S3 tab, where the folder chosen is
+  // literally the one production serves from.
   const sftpBaseUrlDiverged =
-    sourceMode === "sftp" &&
-    sftpDomain.trim().length > 0 &&
+    (sourceMode === "sftp" || sourceMode === "s3") &&
+    remoteDomain.trim().length > 0 &&
     trimmedBaseUrl.length > 0 &&
-    !resolvesToSamePrefix(trimmedBaseUrl, sftpDomain);
+    !resolvesToSamePrefix(trimmedBaseUrl, remoteDomain);
 
   const baseUrlError = useMemo(() => {
     if (!baseUrlTouched || trimmedBaseUrl.length === 0 || hasValidBaseUrl) {
@@ -1029,6 +1058,32 @@ export default function Home() {
     }
   }
 
+  async function loadS3Domains() {
+    setS3Loading(true);
+    setS3Error("");
+
+    try {
+      const result = await getS3Domains();
+      setS3Domains(result.domains);
+      setS3Location({ bucket: result.bucket, prefixRoot: result.prefix_root });
+
+      // Auto-select when there is only one, exactly as the SFTP tab does: a
+      // one-option dropdown that still needs opening is pure friction.
+      if (result.domains.length === 1) {
+        setS3Domain(result.domains[0]);
+        setBaseUrl(baseUrlFromSftpDomain(result.domains[0]));
+        setBaseUrlTouched(false);
+      }
+    } catch (error) {
+      // A deployment without S3 configured answers 503 with a plain reason, and
+      // a role missing s3:ListBucket answers 502 with a message naming that —
+      // show either rather than an empty dropdown with no explanation.
+      setS3Error(friendlyApiErrorMessage(error, "Could not list S3 domains."));
+    } finally {
+      setS3Loading(false);
+    }
+  }
+
   async function loadSftpDomains() {
     setSftpLoading(true);
     setSftpError("");
@@ -1135,6 +1190,8 @@ export default function Home() {
         setFormError("Preview every sitemap URL before starting analysis.");
       } else if (sourceMode === "sftp" && !sftpDomain) {
         setFormError("Choose a domain to pull from SFTP.");
+      } else if (sourceMode === "s3" && !s3Domain) {
+        setFormError("Choose a domain to pull from S3.");
       } else {
         setFormError("Complete the required fields before starting analysis.");
       }
@@ -1300,10 +1357,22 @@ export default function Home() {
             return;
           }
         }
-      } else if (sourceMode === "sftp" && sftpDomain) {
+      } else if (
+        (sourceMode === "sftp" || sourceMode === "s3") &&
+        remoteDomain
+      ) {
         // Queued server-side: a domain can hold thousands of child sitemaps, so
         // the pull runs as a job and the session page shows it arriving.
-        await startSftpPull(created.session_id, sftpDomain);
+        //
+        // One branch for both remote sources — they differ only in which pair of
+        // functions moves the bytes, and the progress contract is identical.
+        const isS3 = sourceMode === "s3";
+
+        if (isS3) {
+          await startS3Pull(created.session_id, remoteDomain);
+        } else {
+          await startSftpPull(created.session_id, remoteDomain);
+        }
 
         // Stay on this page while the pull runs and show current/total, the same
         // way a multi-file upload does, rather than navigating instantly to a
@@ -1311,17 +1380,15 @@ export default function Home() {
         // are coming. Resolves on the terminal frame OR on stream error, so a
         // dropped SSE can't leave the form stuck mid-submit.
         await new Promise<void>((resolve) => {
-          const source = followSftpPullProgress(
-            created.session_id,
-            (event) => {
-              setSftpPullProgress(event);
+          const follow = isS3 ? followS3PullProgress : followSftpPullProgress;
+          const source = follow(created.session_id, (event) => {
+            setRemotePullProgress(event);
 
-              if (event.type === "done" || event.type === "error") {
-                source.close();
-                resolve();
-              }
+            if (event.type === "done" || event.type === "error") {
+              source.close();
+              resolve();
             }
-          );
+          });
 
           source.addEventListener("error", () => {
             source.close();
@@ -1478,22 +1545,23 @@ export default function Home() {
                     {baseUrlError ? (
                       <p className="text-sm text-red-500">{baseUrlError}</p>
                     ) : null}
-                    {/* Filled from the SFTP selection, but still editable — so
+                    {/* Filled from the remote selection, but still editable — so
                         say where the value came from, and say something louder if
                         an edit has moved it off the folder the files come from.
                         A www or case difference is deliberately NOT flagged: the
                         backend normalizes both to one prefix, so warning about it
                         would just train people to dismiss the warning. */}
-                    {sourceMode === "sftp" && sftpDomain ? (
+                    {remoteDomain ? (
                       sftpBaseUrlDiverged ? (
                         <p
                           className="text-sm text-amber-700"
                           data-testid="base-url-divergence-warning"
                         >
-                          This is a different site from the SFTP folder{" "}
-                          <span className="font-mono">{sftpDomain}</span>. The
+                          This is a different site from the{" "}
+                          {sourceMode === "s3" ? "S3" : "SFTP"} folder{" "}
+                          <span className="font-mono">{remoteDomain}</span>. The
                           files will still publish under{" "}
-                          <span className="font-mono">{sftpDomain}</span> — only
+                          <span className="font-mono">{remoteDomain}</span> — only
                           crawling and the public sitemap urls use this Base URL.
                         </p>
                       ) : (
@@ -1501,8 +1569,8 @@ export default function Home() {
                           className="text-sm text-slate-500"
                           data-testid="base-url-from-sftp"
                         >
-                          Filled from the SFTP folder{" "}
-                          <span className="font-mono">{sftpDomain}</span>.
+                          Filled from the {sourceMode === "s3" ? "S3" : "SFTP"}{" "}
+                          folder <span className="font-mono">{remoteDomain}</span>.
                         </p>
                       )
                     ) : null}
@@ -1608,10 +1676,10 @@ export default function Home() {
                   <div
                     className={cn(
                       "grid gap-1 rounded-full border border-indigo-100 bg-indigo-50 p-1",
-                      // Collapses to two columns when the SFTP tab is gated off,
-                      // so the strip stays full-width instead of leaving a third
-                      // empty cell where the hidden tab used to sit.
-                      awsPublishEnabled ? "grid-cols-3" : "grid-cols-2"
+                      // Collapses to two columns when the remote tabs are gated
+                      // off, so the strip stays full-width instead of leaving
+                      // empty cells where the hidden tabs used to sit.
+                      awsPublishEnabled ? "grid-cols-4" : "grid-cols-2"
                     )}
                     role="tablist"
                     aria-label="Sitemap source"
@@ -1678,6 +1746,35 @@ export default function Home() {
                       >
                         <Server className="h-4 w-4" aria-hidden="true" />
                         From SFTP
+                      </button>
+                    ) : null}
+                    {/* From S3 — gated on the same AWS_PUBLISH_ENABLED flag as
+                        the SFTP tab: same bucket, same instance role, one
+                        switch for every AWS-backed path. A DIFFERENT icon from
+                        SFTP on purpose — two remote tabs sharing Server would be
+                        indistinguishable at a glance. */}
+                    {awsPublishEnabled ? (
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={sourceMode === "s3"}
+                        onClick={() => {
+                          setSourceMode("s3");
+                          setFormError("");
+
+                          if (s3Domains.length === 0 && !s3Loading) {
+                            void loadS3Domains();
+                          }
+                        }}
+                        className={cn(
+                          "flex h-10 items-center justify-center gap-2 rounded-full text-sm font-semibold transition-colors",
+                          sourceMode === "s3"
+                            ? "bg-indigo-500 text-white shadow-sm"
+                            : "text-slate-500 hover:text-indigo-600"
+                        )}
+                      >
+                        <Database className="h-4 w-4" aria-hidden="true" />
+                        From S3
                       </button>
                     ) : null}
                   </div>
@@ -1759,6 +1856,99 @@ export default function Home() {
                               Fetch & Preview button look like this tab's
                               action. */}
                           {sftpDomain ? (
+                            <p className="text-sm text-slate-500">
+                              Click <span className="font-semibold">Start Analysis</span>{" "}
+                              below to pull this domain&apos;s sitemaps and begin.
+                            </p>
+                          ) : null}
+                        </>
+                      )}
+                    </div>
+                  ) : null}
+
+                  {/* From S3. Its OWN branch, not folded into the SFTP one —
+                      see the note below about each mode needing its own. */}
+                  {awsPublishEnabled && sourceMode === "s3" ? (
+                    <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                      <div className="space-y-1">
+                        <label
+                          className="text-sm font-semibold text-slate-700"
+                          htmlFor="s3-domain"
+                        >
+                          Client domain
+                        </label>
+                        <p className="text-xs text-slate-500">
+                          Pulls every sitemap file for this domain out of the
+                          bucket, then processes them exactly like uploads.
+                          Publishing this session writes back to the same folder,
+                          so this is the way to revise sitemaps that are already
+                          live.
+                        </p>
+                        {s3Location?.bucket ? (
+                          <p
+                            className="text-xs text-slate-400"
+                            data-testid="s3-source-location"
+                          >
+                            Reading from{" "}
+                            <span className="font-mono">
+                              s3://{s3Location.bucket}/
+                              {s3Location.prefixRoot ?? ""}
+                            </span>
+                          </p>
+                        ) : null}
+                      </div>
+
+                      {s3Loading ? (
+                        <p className="flex items-center gap-2 text-sm text-slate-500">
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          Listing domains…
+                        </p>
+                      ) : s3Error ? (
+                        <div className="space-y-2">
+                          <p className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                            {s3Error}
+                          </p>
+                          <button
+                            type="button"
+                            className="text-sm font-semibold text-indigo-600 hover:text-indigo-700"
+                            onClick={() => void loadS3Domains()}
+                          >
+                            Try again
+                          </button>
+                        </div>
+                      ) : (
+                        <>
+                          <select
+                            id="s3-domain"
+                            value={s3Domain}
+                            onChange={(event) => {
+                              const nextDomain = event.target.value;
+
+                              setS3Domain(nextDomain);
+                              setFormError("");
+                              // Filled from the selection for the same reason the
+                              // SFTP tab does it: a hand-typed www variant is how
+                              // one domain's sitemaps ended up published under a
+                              // second, wrong S3 prefix. It matters more here —
+                              // the folder picked IS the production one.
+                              setBaseUrl(baseUrlFromSftpDomain(nextDomain));
+                              setBaseUrlTouched(false);
+                            }}
+                            className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
+                          >
+                            <option value="">Select a domain…</option>
+                            {s3Domains.map((domain) => (
+                              <option key={domain} value={domain}>
+                                {domain}
+                              </option>
+                            ))}
+                          </select>
+                          {s3Domains.length === 0 ? (
+                            <p className="text-sm text-slate-500">
+                              No domains found in the S3 sitemaps location.
+                            </p>
+                          ) : null}
+                          {s3Domain ? (
                             <p className="text-sm text-slate-500">
                               Click <span className="font-semibold">Start Analysis</span>{" "}
                               below to pull this domain&apos;s sitemaps and begin.
@@ -2355,35 +2545,39 @@ export default function Home() {
                   ) : null}
                 </div>
 
-                {/* SFTP pull progress — same current/total contract as the
-                    publish dialog, shown here because the pull starts from this
-                    form. */}
-                {sftpPullProgress ? (
+                {/* Remote pull progress (SFTP or S3) — same current/total
+                    contract as the publish dialog, shown here because the pull
+                    starts from this form. One block for both: only one remote
+                    source can be pulling, and the frames are identical. */}
+                {remotePullProgress ? (
                   <div
                     className="space-y-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-sm text-slate-700"
                     role="status"
                   >
                     <div className="flex items-center justify-between gap-3">
                       <span>
-                        {sftpPullProgress.message ?? "Pulling from SFTP…"}
+                        {remotePullProgress.message ??
+                          (sourceMode === "s3"
+                            ? "Pulling from S3…"
+                            : "Pulling from SFTP…")}
                       </span>
-                      {typeof sftpPullProgress.current === "number" &&
-                      typeof sftpPullProgress.total === "number" &&
-                      sftpPullProgress.total > 0 ? (
+                      {typeof remotePullProgress.current === "number" &&
+                      typeof remotePullProgress.total === "number" &&
+                      remotePullProgress.total > 0 ? (
                         <span className="font-medium text-slate-900">
-                          {sftpPullProgress.current} of {sftpPullProgress.total}
+                          {remotePullProgress.current} of {remotePullProgress.total}
                         </span>
                       ) : null}
                     </div>
-                    {typeof sftpPullProgress.current === "number" &&
-                    typeof sftpPullProgress.total === "number" &&
-                    sftpPullProgress.total > 0 ? (
+                    {typeof remotePullProgress.current === "number" &&
+                    typeof remotePullProgress.total === "number" &&
+                    remotePullProgress.total > 0 ? (
                       <Progress
                         value={Math.min(
                           100,
                           Math.round(
-                            (sftpPullProgress.current /
-                              sftpPullProgress.total) *
+                            (remotePullProgress.current /
+                              remotePullProgress.total) *
                               100
                           )
                         )}

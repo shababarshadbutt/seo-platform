@@ -700,6 +700,71 @@ export function publishConfigError(): string | null {
   return null;
 }
 
+// Why READING sitemaps back out of S3 can't run, or null when it is usable.
+//
+// Separate from publishConfigError() despite overlapping: this path only ever
+// lists and gets objects, so it has no stake in PUBLIC_SITEMAP_URL_TEMPLATE (a
+// template missing {file} breaks a published index, not a pull). It does need
+// something publishing never has to check — that prefixTemplate actually
+// contains {domain}, because the source derives the "list the domain folders"
+// prefix by splitting the template on that placeholder. Publishing only ever
+// substitutes it for one known domain and would not notice its absence.
+export function s3SourceConfigError(): string | null {
+  const disabled = awsFeatureDisabledError();
+
+  if (disabled) {
+    return disabled;
+  }
+
+  // Leading sentences follow the same convention as the gates above: the first
+  // sentence is what the frontend renders and tests match on, configDiagnostics
+  // only appends.
+  if (!config.s3.region) {
+    return (
+      "Reading sitemaps from S3 is not configured on this deployment (AWS_REGION is unset)" +
+      configDiagnostics("AWS_REGION")
+    );
+  }
+
+  if (!config.s3.bucket) {
+    return (
+      "Reading sitemaps from S3 is not configured on this deployment (S3_BUCKET is unset)" +
+      configDiagnostics("S3_BUCKET")
+    );
+  }
+
+  if (!config.s3.prefixTemplate.includes("{domain}")) {
+    return "S3_SITEMAPS_PREFIX_TEMPLATE must contain {domain} (there would be no way to tell one client's sitemap folder from another's)";
+  }
+
+  return null;
+}
+
+// The prefix the per-domain folders sit under — everything in the template
+// BEFORE {domain}. With the default "sites/{domain}/sitemaps/" that is "sites/",
+// which listed with Delimiter:"/" yields one CommonPrefix per client domain.
+//
+// Derived from the same template s3PrefixForDomain() substitutes rather than
+// being its own env var, so the browse location and the publish location cannot
+// drift apart: they are two reads of one string.
+export function s3SourceRootPrefix(): string {
+  const [root] = config.s3.prefixTemplate.split("{domain}");
+
+  // Callers reach here past s3SourceConfigError(), which rejects a template with
+  // no {domain}. Guarded anyway: split() would return the WHOLE template as
+  // [root], and listing under "sites/{domain}/sitemaps/" literally would quietly
+  // return zero domains rather than fail.
+  if (!config.s3.prefixTemplate.includes("{domain}")) {
+    throw new Error(
+      "S3_SITEMAPS_PREFIX_TEMPLATE must contain {domain} to list the available domains"
+    );
+  }
+
+  // A leading "/" is not part of an S3 key. An empty root is legitimate — it
+  // means the domain folders sit at the bucket root.
+  return root.replace(/^\/+/, "");
+}
+
 // Resolve the S3 key prefix for one domain from the template — where the object
 // is STORED. Not related to publicSitemapUrl below; see the note on
 // config.publicSitemapUrlTemplate for why these two are separate.
