@@ -488,7 +488,8 @@ function replaceOffsets(value: string, maximalPrefix: number): number[] {
 // "more general" is never the tie-breaker.
 export function candidateTransforms(
   value: string,
-  segment: string
+  segment: string,
+  allowLiteralReplace = false
 ): ParamTransform[] {
   if (value === segment) {
     return [{ kind: "none" }];
@@ -531,7 +532,17 @@ export function candidateTransforms(
   // where a param used to sit. That is a STATIC segment, not a transform of the
   // param: reading it as {A|part-720|nsnpart|} would produce a rule matching
   // exactly the one URL it was derived from.
+  //
+  // UNLESS the caller has already established that this exact value is pinned
+  // — e.g. by a "LIMIT THIS EDIT TO" structure scope whose anchor equals the
+  // captured value exactly. In that case a literal replace is not specific to
+  // this one example at all: every URL the edit will ever touch carries this
+  // same value in this position, so {A|value|segment|} generalizes correctly.
   if (prefix === 0 && suffix === 0) {
+    if (allowLiteralReplace && value !== "") {
+      candidates.push({ kind: "replace", find: value, replace: segment });
+    }
+
     return candidates;
   }
 
@@ -586,7 +597,8 @@ export function candidateTransforms(
 function alignSegments(
   segments: string[],
   names: string[],
-  values: Map<string, string>
+  values: Map<string, string>,
+  pinnedParams?: Map<string, string>
 ): Array<{ rule: SegmentRule; options: ParamTransform[] }> | null {
   const segmentCount = segments.length;
   const nameCount = names.length;
@@ -598,7 +610,15 @@ function alignSegments(
     for (let j = 0; j < nameCount; j += 1) {
       const value = values.get(names[j]);
 
-      row.push(value === undefined ? [] : candidateTransforms(value, segments[i]));
+      row.push(
+        value === undefined
+          ? []
+          : candidateTransforms(
+              value,
+              segments[i],
+              pinnedParams?.get(names[j]) === value
+            )
+      );
     }
 
     optionsFor.push(row);
@@ -704,7 +724,8 @@ const PARAM_PERMUTATION_LIMIT = 12;
 function alignSegmentsAnyOrder(
   segments: string[],
   names: string[],
-  values: Map<string, string>
+  values: Map<string, string>,
+  pinnedParams?: Map<string, string>
 ): Array<{ rule: SegmentRule; options: ParamTransform[] }> | "ambiguous" | null {
   const segmentCount = segments.length;
   const nameCount = names.length;
@@ -721,7 +742,15 @@ function alignSegmentsAnyOrder(
     for (let j = 0; j < nameCount; j += 1) {
       const value = values.get(names[j]);
 
-      row.push(value === undefined ? [] : candidateTransforms(value, segments[i]));
+      row.push(
+        value === undefined
+          ? []
+          : candidateTransforms(
+              value,
+              segments[i],
+              pinnedParams?.get(names[j]) === value
+            )
+      );
     }
 
     optionsFor.push(row);
@@ -833,7 +862,8 @@ function alignSegmentsAnyOrder(
 export function inferNewStructure(
   oldUrl: string,
   newUrl: string,
-  current: ParsedStructure
+  current: ParsedStructure,
+  pinnedParams?: Map<string, string>
 ): StructureInference {
   const values = captureStructureValues(oldUrl, current);
 
@@ -887,13 +917,13 @@ export function inferNewStructure(
     };
   }
 
-  let aligned = alignSegments(segments, names, values);
+  let aligned = alignSegments(segments, names, values, pinnedParams);
 
   // A MOVE, not a mismatch (v1.78). The ordered pass cannot read a reorder, so a
   // refusal is retried allowing any order before it is reported as one. See
   // alignSegmentsAnyOrder — it can only turn a refusal into an answer.
   if (!aligned) {
-    const anyOrder = alignSegmentsAnyOrder(segments, names, values);
+    const anyOrder = alignSegmentsAnyOrder(segments, names, values, pinnedParams);
 
     if (anyOrder === "ambiguous") {
       return {

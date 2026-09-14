@@ -552,6 +552,58 @@ test("infers a reorder of the params", () => {
   assert.equal(result.ok && result.structure, "/a/{B}/{A}/");
 });
 
+test("infers an unrelated literal replace when the param is pinned to the captured value", () => {
+  // Same shape as the production report this guards: "quote" -> "rfq" shares
+  // no letters, so an unscoped example still refuses. Pinned to the "LIMIT
+  // THIS EDIT TO" value it was actually edited under, it succeeds — because
+  // that scope guarantees every URL the rule will touch carries this exact
+  // value in this position.
+  const current = parseStructure("/aviation/{A}/{B}/{C}");
+  const oldUrl =
+    "https://www.purchasingefficiency.com/aviation/quote/airbus-industries/a3817410103600/";
+  const newUrl =
+    "https://www.purchasingefficiency.com/rfq/airbus-industries/a3817410103600/";
+
+  const unpinned = inferNewStructure(oldUrl, newUrl, current);
+
+  assert.equal(unpinned.ok, false);
+  assert.match(
+    unpinned.ok ? "" : unpinned.error,
+    /does not keep every varying part/
+  );
+
+  const pinned = inferNewStructure(
+    oldUrl,
+    newUrl,
+    current,
+    new Map([["A", "quote"]])
+  );
+
+  assert.equal(pinned.ok, true);
+  assert.equal(pinned.ok && pinned.structure, "/{A|quote|rfq|}/{B}/{C}/");
+});
+
+test("a pin that does not match the captured value changes nothing", () => {
+  const current = parseStructure("/aviation/{A}/{B}/{C}");
+  const oldUrl =
+    "https://www.purchasingefficiency.com/aviation/quote/airbus-industries/a3817410103600/";
+  const newUrl =
+    "https://www.purchasingefficiency.com/rfq/airbus-industries/a3817410103600/";
+
+  const result = inferNewStructure(
+    oldUrl,
+    newUrl,
+    current,
+    new Map([["A", "quote-2024"]])
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(
+    result.ok ? "" : result.error,
+    /does not keep every varying part/
+  );
+});
+
 test("infers the reported production reorder, trailing slash intact", () => {
   // The modal is where this pair gets pasted, so the frontend copy asserts it
   // too: the user must not be told one thing here and another by the API.
@@ -686,6 +738,15 @@ test("candidateTransforms offers nothing for an unrelated literal", () => {
   // No shared material at either end: the user typed a static segment, not a
   // transform of the value.
   assert.deepEqual(candidateTransforms("part-720", "nsnpart"), []);
+});
+
+test("candidateTransforms offers a literal replace only when explicitly allowed", () => {
+  // Same unrelated pair, but now permitted — this is what a "LIMIT THIS EDIT
+  // TO" scope pinned to the captured value unlocks.
+  assert.deepEqual(candidateTransforms("quote", "rfq"), []);
+  assert.deepEqual(candidateTransforms("quote", "rfq", true), [
+    { kind: "replace", find: "quote", replace: "rfq" }
+  ]);
 });
 
 test("candidateTransforms puts the positional reading first", () => {

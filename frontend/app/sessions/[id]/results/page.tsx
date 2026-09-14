@@ -4062,6 +4062,37 @@ export default function ResultsDashboardPage({
   // Empty "current structure" => label-only rename (backward compatible).
   const wantsTransform = transformCurrentStructure.trim().length > 0;
 
+  // A param that "LIMIT THIS EDIT TO" has pinned to one exact anchor value —
+  // e.g. Segment A: quote — mapped from the position-keyed dropdown state to
+  // the {A}/{B}/{C} names inferNewStructure works with. Only a pin whose value
+  // exactly equals what the example captures for that param unlocks the
+  // literal-replace fallback in candidateTransforms; every other case behaves
+  // exactly as it did before this existed.
+  const pinnedStructureParams = useMemo(() => {
+    const entries = Object.entries(renameStructureSelections);
+
+    if (entries.length === 0) {
+      return undefined;
+    }
+
+    try {
+      const names = structureParamNames(parseStructure(transformCurrentStructure));
+      const map = new Map<string, string>();
+
+      for (const [paramIndex, selection] of entries) {
+        const name = names[Number(paramIndex)];
+
+        if (name) {
+          map.set(name, selection.value);
+        }
+      }
+
+      return map.size > 0 ? map : undefined;
+    } catch {
+      return undefined;
+    }
+  }, [renameStructureSelections, transformCurrentStructure]);
+
   // The rule derived from the before/after example pair. Recomputed as the user
   // types, entirely client-side — inferNewStructure is byte-mirrored from the
   // backend copy (see the sync-guard test), so what is shown here is what the
@@ -4080,7 +4111,8 @@ export default function ResultsDashboardPage({
       return inferNewStructure(
         transformOldExample,
         transformNewExample,
-        parseStructure(transformCurrentStructure)
+        parseStructure(transformCurrentStructure),
+        pinnedStructureParams
       );
     } catch (error) {
       return {
@@ -4095,7 +4127,8 @@ export default function ResultsDashboardPage({
     transformMode,
     transformOldExample,
     transformNewExample,
-    transformCurrentStructure
+    transformCurrentStructure,
+    pinnedStructureParams
   ]);
 
   // ONE source of truth for everything downstream — validation, preview, the
