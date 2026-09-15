@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   candidateTransforms,
   captureStructureValues,
+  diagnoseUnresolvedSegments,
   formatStructure,
   inferNewStructure,
   convertParamToABC,
@@ -602,6 +603,71 @@ test("a pin that does not match the captured value changes nothing", () => {
     result.ok ? "" : result.error,
     /does not keep every varying part/
   );
+});
+
+// --- diagnoseUnresolvedSegments ---------------------------------------------
+// HITL fallback: when inferNewStructure refuses because one segment shares no
+// characters with its replacement, name that segment instead of a flat error.
+
+test("diagnoseUnresolvedSegments returns null when nothing needs pinning", () => {
+  const current = parseStructure("/nspart/{A}/");
+  const result = diagnoseUnresolvedSegments(
+    "https://nsnstocks.com/nspart/part-720/",
+    "https://nsnstocks.com/nsnpart/part-7-20/",
+    current
+  );
+
+  assert.equal(result, null);
+});
+
+test("diagnoseUnresolvedSegments names the one unrelated-literal segment", () => {
+  // Same fixture as "infers an unrelated literal replace when the param is
+  // pinned to the captured value" above, unpinned.
+  const current = parseStructure("/aviation/{A}/{B}/{C}");
+  const oldUrl =
+    "https://www.purchasingefficiency.com/aviation/quote/airbus-industries/a3817410103600/";
+  const newUrl =
+    "https://www.purchasingefficiency.com/rfq/airbus-industries/a3817410103600/";
+
+  const result = diagnoseUnresolvedSegments(oldUrl, newUrl, current);
+
+  assert.deepEqual(result, [{ name: "A", from: "quote", to: "rfq" }]);
+});
+
+test("diagnoseUnresolvedSegments is progressive: confirming one reveals the next", () => {
+  const current = parseStructure("/p/{A}/{B}/");
+  const oldUrl = "https://x.com/p/quote/foo/";
+  const newUrl = "https://x.com/p/rfq/bar/";
+
+  const both = diagnoseUnresolvedSegments(oldUrl, newUrl, current);
+
+  assert.deepEqual(both, [
+    { name: "A", from: "quote", to: "rfq" },
+    { name: "B", from: "foo", to: "bar" }
+  ]);
+
+  const afterConfirmingA = diagnoseUnresolvedSegments(
+    oldUrl,
+    newUrl,
+    current,
+    new Map([["A", "quote"]])
+  );
+
+  assert.deepEqual(afterConfirmingA, [{ name: "B", from: "foo", to: "bar" }]);
+});
+
+test("diagnoseUnresolvedSegments returns null when no pinning could ever fix it", () => {
+  // Three params, but the new URL has only one segment besides the static
+  // "p" — no assignment of {A}, {B} and {C} to path segments exists
+  // regardless of what is pinned, so there is nothing to confirm.
+  const current = parseStructure("/p/{A}/{B}/{C}/");
+  const result = diagnoseUnresolvedSegments(
+    "https://x.com/p/one/two/three/",
+    "https://x.com/p/x/",
+    current
+  );
+
+  assert.equal(result, null);
 });
 
 test("infers the reported production reorder, trailing slash intact", () => {

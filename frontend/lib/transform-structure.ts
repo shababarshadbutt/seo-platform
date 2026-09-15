@@ -1033,3 +1033,98 @@ export function inferNewStructure(
 
   return { ok: true, structure, alternatives, warnings };
 }
+
+// --- HITL fallback for a segment that can't be explained automatically -----
+//
+// FRONTEND-ONLY: unlike everything above, this is not mirrored to the backend
+// copy and is not in the sync-guard's MIRRORED list. It never changes what a
+// rule MEANS — it only calls inferNewStructure a second time to find out which
+// param, if any, is the sole reason the first call refused, so the modal can
+// ask a human to confirm exactly that one thing instead of dead-ending.
+
+export type UnresolvedSegment = {
+  // The param name (e.g. "A") whose old/new values share no characters at
+  // either end, so candidateTransforms has nothing to offer for it unless it
+  // is pinned to this exact value.
+  name: string;
+  from: string;
+  to: string;
+};
+
+// When inferNewStructure(oldUrl, newUrl, current, pinnedParams) fails because
+// one or more segments are "unrelated literals" (see candidateTransforms), work
+// out which ones — so the UI can name them and offer a one-click confirmation
+// instead of the flat refusal.
+//
+// HOW: pin every currently-unpinned param to its OWN captured value and retry.
+// That trial can only ever ADD candidates (the literal-replace branch in
+// candidateTransforms is reached only when nothing else matched), so it never
+// changes the outcome for a param that already resolves without it. If the
+// retry still fails, there is no safe forward path to offer — return null and
+// let the caller keep showing the plain error. If it succeeds, the params whose
+// assigned transform is a whole-value replace are exactly the ones that needed
+// the pin.
+//
+// ADVISORY ONLY. The real inferNewStructure call — with the user's real,
+// confirmed pins — still runs its own self-check (replaying the rule against
+// the example) before anything is treated as resolved, so an imprecise
+// diagnosis here can at worst fail to explain a case; it can never let a wrong
+// rule through.
+export function diagnoseUnresolvedSegments(
+  oldUrl: string,
+  newUrl: string,
+  current: ParsedStructure,
+  pinnedParams?: Map<string, string>
+): UnresolvedSegment[] | null {
+  const values = captureStructureValues(oldUrl, current);
+
+  if (!values) {
+    return null;
+  }
+
+  const trialPins = new Map(pinnedParams ?? []);
+
+  values.forEach((value, name) => {
+    if (!trialPins.has(name)) {
+      trialPins.set(name, value);
+    }
+  });
+
+  const trial = inferNewStructure(oldUrl, newUrl, current, trialPins);
+
+  if (!trial.ok) {
+    return null;
+  }
+
+  let nextParsed: ParsedStructure;
+
+  try {
+    nextParsed = parseStructure(trial.structure);
+  } catch {
+    return null;
+  }
+
+  const unresolved: UnresolvedSegment[] = [];
+
+  for (const rule of nextParsed.segments) {
+    if (rule.type !== "param") {
+      continue;
+    }
+
+    if (pinnedParams?.has(rule.name)) {
+      continue;
+    }
+
+    const value = values.get(rule.name);
+
+    if (
+      value !== undefined &&
+      rule.transform.kind === "replace" &&
+      rule.transform.find === value
+    ) {
+      unresolved.push({ name: rule.name, from: value, to: rule.transform.replace });
+    }
+  }
+
+  return unresolved.length > 0 ? unresolved : null;
+}

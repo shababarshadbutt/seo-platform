@@ -142,13 +142,15 @@ import { describeCheckedEnvironment } from "@/lib/checked-environment";
 import {
   convertParamToABC,
   countTemplateParams,
+  diagnoseUnresolvedSegments,
   inferNewStructure,
   parseStructure,
   StructureSyntaxError,
   structureParamNames,
   transformUrl,
   validateStructures,
-  type ParsedStructure
+  type ParsedStructure,
+  type UnresolvedSegment
 } from "@/lib/transform-structure";
 import {
   BulkReplaceDialog,
@@ -1022,6 +1024,16 @@ export default function ResultsDashboardPage({
   // openRenameModal resets this on every open.
   const [renameStructureSelections, setRenameStructureSelections] = useState<
     Record<number, { anchor: "prefix" | "suffix"; value: string; label: string }>
+  >({});
+  // HITL fallback for a by-example edit where one segment shares no
+  // characters with its replacement (e.g. "quote" -> "rfq") and so cannot be
+  // explained automatically — see diagnoseUnresolvedSegments. Keyed by the
+  // {A}/{B}/{C} param name the user explicitly confirmed as a one-off literal
+  // replacement, separate from renameStructureSelections because it is not
+  // one of the pattern's detected sub-structures, just the user's own say-so.
+  // openRenameModal resets this on every open, same as renameStructureSelections.
+  const [manualLiteralOverrides, setManualLiteralOverrides] = useState<
+    Record<string, string>
   >({});
   // The detected structures + real URL pool for the pattern the modal is open
   // on. Loaded once per open; the dropdowns, the sample URL and the scoped
@@ -2222,6 +2234,7 @@ export default function ResultsDashboardPage({
           }
         : {}
     );
+    setManualLiteralOverrides({});
     setRenameFixCompleted(false);
     setRenameStructures(structuresByPattern[rowData.id] ?? null);
 
@@ -4068,10 +4081,16 @@ export default function ResultsDashboardPage({
   // exactly equals what the example captures for that param unlocks the
   // literal-replace fallback in candidateTransforms; every other case behaves
   // exactly as it did before this existed.
+  //
+  // manualLiteralOverrides is folded in here too, so a segment the user
+  // explicitly confirmed (see the "needs your confirmation" block below) is
+  // pinned exactly like a dropdown selection would be, with no other code path
+  // needing to know the two came from different places.
   const pinnedStructureParams = useMemo(() => {
-    const entries = Object.entries(renameStructureSelections);
+    const dropdownEntries = Object.entries(renameStructureSelections);
+    const manualEntries = Object.entries(manualLiteralOverrides);
 
-    if (entries.length === 0) {
+    if (dropdownEntries.length === 0 && manualEntries.length === 0) {
       return undefined;
     }
 
@@ -4079,7 +4098,7 @@ export default function ResultsDashboardPage({
       const names = structureParamNames(parseStructure(transformCurrentStructure));
       const map = new Map<string, string>();
 
-      for (const [paramIndex, selection] of entries) {
+      for (const [paramIndex, selection] of dropdownEntries) {
         const name = names[Number(paramIndex)];
 
         if (name) {
@@ -4087,11 +4106,15 @@ export default function ResultsDashboardPage({
         }
       }
 
+      for (const [name, value] of manualEntries) {
+        map.set(name, value);
+      }
+
       return map.size > 0 ? map : undefined;
     } catch {
       return undefined;
     }
-  }, [renameStructureSelections, transformCurrentStructure]);
+  }, [renameStructureSelections, manualLiteralOverrides, transformCurrentStructure]);
 
   // The rule derived from the before/after example pair. Recomputed as the user
   // types, entirely client-side — inferNewStructure is byte-mirrored from the
@@ -4125,6 +4148,42 @@ export default function ResultsDashboardPage({
     }
   }, [
     transformMode,
+    transformOldExample,
+    transformNewExample,
+    transformCurrentStructure,
+    pinnedStructureParams
+  ]);
+
+  // HITL fallback for exampleInference's refusal. Only meaningful once it has
+  // actually refused: names the segment(s) whose old/new values share no
+  // characters at all, so the box below can offer a one-click "confirm this
+  // as a one-off literal replacement" instead of a dead-end error. Purely
+  // advisory — see diagnoseUnresolvedSegments — the real inference above is
+  // what actually accepts or rejects a rule.
+  const unresolvedSegments = useMemo((): UnresolvedSegment[] | null => {
+    if (
+      transformMode !== "example" ||
+      exampleInference === null ||
+      exampleInference.ok ||
+      transformOldExample.length === 0 ||
+      transformNewExample.trim().length === 0
+    ) {
+      return null;
+    }
+
+    try {
+      return diagnoseUnresolvedSegments(
+        transformOldExample,
+        transformNewExample,
+        parseStructure(transformCurrentStructure),
+        pinnedStructureParams
+      );
+    } catch {
+      return null;
+    }
+  }, [
+    transformMode,
+    exampleInference,
     transformOldExample,
     transformNewExample,
     transformCurrentStructure,
@@ -7976,6 +8035,88 @@ export default function ResultsDashboardPage({
                               . Use Advanced if that is the one you meant.
                             </p>
                           ) : null}
+                          {/* One or more segments the user confirmed by hand
+                              below rather than the app inferring them (v1.85).
+                              Undo puts the segment back in front of the user
+                              instead of silently keeping a stale confirmation. */}
+                          {Object.entries(manualLiteralOverrides).map(
+                            ([name, from]) => (
+                              <p
+                                key={name}
+                                className="text-xs text-emerald-900"
+                                data-testid={`manual-override-${name}`}
+                              >
+                                Segment {name} (&quot;{from}&quot;) was
+                                confirmed manually rather than inferred.{" "}
+                                <button
+                                  type="button"
+                                  className="underline hover:no-underline"
+                                  onClick={() =>
+                                    setManualLiteralOverrides((current) => {
+                                      const next = { ...current };
+
+                                      delete next[name];
+
+                                      return next;
+                                    })
+                                  }
+                                >
+                                  Undo
+                                </button>
+                              </p>
+                            )
+                          )}
+                        </div>
+                      ) : unresolvedSegments && unresolvedSegments.length > 0 ? (
+                        // HITL fallback (v1.85): inferNewStructure refused
+                        // because at least one segment's old and new text
+                        // share no characters at all — candidateTransforms
+                        // will not guess at that, but a human can confirm it
+                        // directly instead of hitting a dead end. Confirming
+                        // pins that exact value, same as picking it from
+                        // "Limit this edit to" would.
+                        <div
+                          className="space-y-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2"
+                          data-testid="unresolved-segments"
+                        >
+                          <p className="text-xs font-semibold text-amber-900">
+                            Needs your confirmation
+                          </p>
+                          {unresolvedSegments.map((segment) => (
+                            <div
+                              key={segment.name}
+                              className="space-y-1"
+                              data-testid={`unresolved-segment-${segment.name}`}
+                            >
+                              <p className="text-xs text-amber-900">
+                                Segment {segment.name} (
+                                <code className="break-all font-mono">
+                                  {segment.from}
+                                </code>
+                                ) has nothing in common with{" "}
+                                <code className="break-all font-mono">
+                                  {segment.to}
+                                </code>{" "}
+                                — a rule can&apos;t be worked out
+                                automatically.
+                              </p>
+                              <button
+                                type="button"
+                                className="rounded border border-amber-300 bg-white px-2 py-1 text-xs font-semibold text-amber-800 hover:bg-amber-100"
+                                onClick={() =>
+                                  setManualLiteralOverrides((current) => ({
+                                    ...current,
+                                    [segment.name]: segment.from
+                                  }))
+                                }
+                              >
+                                Confirm: replace &quot;{segment.from}&quot;
+                                with &quot;{segment.to}&quot; only where
+                                Segment {segment.name} is exactly &quot;
+                                {segment.from}&quot;
+                              </button>
+                            </div>
+                          ))}
                         </div>
                       ) : null}
                     </>
