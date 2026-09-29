@@ -34,7 +34,7 @@ export function isHttpUrl(value: string) {
 export function displaySourceFilename(sessionId: string, filename: string) {
   const sessionPrefix = `${sessionId}-`;
   const internalPrefix =
-    /^(?:(?:renamed|fixed|bulk|transformed|deleted|slashed|lastmod)-[0-9a-f]+-)?(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-)?(?:fetched-\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-)?/i;
+    /^(?:(?:renamed|fixed|bulk|transformed|deleted|slashed|lastmod|generated)-[0-9a-f]+-)?(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-)?(?:fetched-\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-)?/i;
   const withoutSession = filename.startsWith(sessionPrefix)
     ? filename.slice(sessionPrefix.length)
     : filename;
@@ -128,6 +128,26 @@ export function buildTrailingSlashStoredFilename(
   const hexToken = token.replace(/[^0-9a-f]/gi, "").slice(0, 8) || "0";
 
   return `${sessionId}-slashed-${hexToken}-${sanitizeUploadedFilename(displayName)}`;
+}
+
+// Build a unique stored filename for a sitemap-regenerate wizard chunk file —
+// unlike the other edited variants, there is no source file this is a copy of
+// (it's written from scratch), but the same "session + marker + token +
+// sanitized display name" shape still applies: the token is shared by every
+// chunk in one job run (so ALL of a run's outputs are distinguishable from a
+// prior, possibly-failed run's), while sanitizeUploadedFilename's basename()
+// step is what lets displayName carry a "niin/rfq-1.xml"-style folder prefix
+// without that slash reaching the flat uploadDir — the folder is preserved
+// separately, in sitemap_files.original_filename, for the S3 key at publish
+// time.
+export function buildGeneratedSitemapStoredFilename(
+  sessionId: string,
+  displayName: string,
+  token: string
+) {
+  const hexToken = token.replace(/[^0-9a-f]/gi, "").slice(0, 8) || "0";
+
+  return `${sessionId}-generated-${hexToken}-${sanitizeUploadedFilename(displayName)}`;
 }
 
 // The filename a sitemap must carry in PRODUCTION, derived from its internal

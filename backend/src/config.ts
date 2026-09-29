@@ -395,6 +395,23 @@ export const config = {
     60 *
     1000,
 
+  // Same safety-net mechanism as uploadCleanupDelayMs, but specifically for the
+  // CSV-driven sitemap regeneration wizard: it fully replaces a site's sitemap
+  // files, and rollback there means "the originally-pulled files are still on
+  // local disk" rather than an S3-side backup (this tool never keeps one — see
+  // s3Publish.ts). 24 hours by default rather than the general 48h backstop,
+  // since this flow's local copies are the actual recovery point, not a mere
+  // courtesy window.
+  sitemapRegenerateCleanupDelayMs:
+    readNumber("SITEMAP_REGENERATE_CLEANUP_DELAY_HOURS", {
+      fallback: 24,
+      min: 1,
+      max: 720
+    }) *
+    60 *
+    60 *
+    1000,
+
   // How long a Cleaner run with NOBODY WATCHING keeps going before it is treated
   // as abandoned, aborted, and its SFTP connection slots released.
   //

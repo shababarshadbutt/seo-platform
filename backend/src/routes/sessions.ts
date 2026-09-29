@@ -56,6 +56,7 @@ import {
   enqueueBulkReplaceUndoJob,
   enqueuePatternStructureJob,
   enqueueLastmodUpdateJob,
+  enqueueSitemapRegenerateJob,
   PATTERN_RENAME_JOB,
   PATTERN_TRANSFORM_JOB,
   PATTERN_TRANSFORM_UNDO_JOB,
@@ -79,6 +80,21 @@ import {
   serialiseLastmodUpdateJob
 } from "../sitemaps/lastmodUpdateJobClaim.js";
 import { isValidLastmodDate, todayLastmodDate } from "../sitemaps/lastmodDate.js";
+import {
+  claimSitemapRegenerateJob,
+  latestSitemapRegenerateJob,
+  serialiseSitemapRegenerateJob,
+  sitemapRegenerateFingerprint
+} from "../sitemaps/sitemapRegenerateJobClaim.js";
+import {
+  SITEMAP_REGENERATE_CHUNK_SIZE,
+  type PatternDecision,
+  type SitemapRegenerateLastmodPolicy
+} from "../jobs/sitemapRegenerateJob.js";
+import {
+  DEFAULT_FILENAME_TEMPLATE,
+  validateFilenameTemplate
+} from "../sitemaps/outputFilenamePattern.js";
 import {
   cachedWithSingleFlight,
   type CachedResult
@@ -115,6 +131,8 @@ import {
   createStoredSitemapFile,
   type StoredSitemapFile
 } from "../sitemaps/ingest.js";
+import { parseCsvUrlList } from "../sitemaps/csvUrlList.js";
+import { writeSyntheticSitemapXml } from "../sitemaps/csvToSitemapXml.js";
 import {
   publishConfigError,
   s3SourceConfigError,
@@ -8609,6 +8627,444 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       }
 
       return reply.send(serialiseLastmodUpdateJob(job));
+    }
+  );
+
+  // ---- Sitemap Regenerate: CSV source ---------------------------------------
+  //
+  // The CSV-driven sitemap regeneration wizard's URL source: a CSV with one
+  // URL per row. Synthesized into a plain <urlset> and ingested exactly like
+  // an ordinary upload (source_role "legacy"), so pattern extraction and
+  // sampling need zero changes — extractPatternsJob.ts scopes everything by
+  // source_role, which is what keeps this file's patterns completely separate
+  // from the S3-pulled "current" ones.
+
+  function isCsvFilename(filename: string) {
+    return filename.toLowerCase().endsWith(".csv");
+  }
+
+  const CSV_SYNTHETIC_DISPLAY_NAME = "csv-urls.xml";
+
+  app.post<{ Params: SessionParams }>(
+    "/api/sessions/:id/csv-upload",
+    {
+      bodyLimit: uploadRouteBodyLimitBytes,
+      onRequest: (request, reply, done) => {
+        request.raw.setTimeout(uploadRouteTimeoutMs);
+        reply.raw.setTimeout(uploadRouteTimeoutMs);
+        done();
+      }
+    },
+    async (request, reply) => {
+      const sessionId = request.params.id;
+      const sessionResult = await pool.query(
+        "SELECT 1 FROM sessions WHERE id = $1::uuid",
+        [sessionId]
+      );
+
+      if (sessionResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "session not found" });
+      }
+
+      // One CSV per session — this wizard's sessions are single-shot (a fresh
+      // S3 pull starts a new one), so a second upload almost always means the
+      // user meant to correct a mistake by starting a new session, not append.
+      const existingLegacy = await pool.query(
+        "SELECT 1 FROM sitemap_files WHERE session_id = $1::uuid AND source_role = 'legacy' LIMIT 1",
+        [sessionId]
+      );
+
+      if ((existingLegacy.rowCount ?? 0) > 0) {
+        return reply.code(409).send({
+          error: "Conflict",
+          message: "A CSV has already been uploaded for this session."
+        });
+      }
+
+      const uploadedFile = await request.file();
+
+      if (!uploadedFile || !isCsvFilename(uploadedFile.filename)) {
+        if (uploadedFile) {
+          await drainMultipartFile(uploadedFile);
+        }
+
+        return reply.code(400).send(badRequest("Only .csv files are supported"));
+      }
+
+      await mkdir(config.uploadDir, { recursive: true });
+
+      const csvTempPath = path.join(
+        config.uploadDir,
+        `${sessionId}-csv-upload-${randomUUID()}.csv`
+      );
+
+      await pipeline(uploadedFile.file, createWriteStream(csvTempPath));
+
+      const { urls, skippedCount, skippedSample } =
+        await parseCsvUrlList(csvTempPath);
+
+      await unlink(csvTempPath).catch(() => {});
+
+      if (urls.length === 0) {
+        return reply.code(400).send({
+          ...badRequest("No valid URLs were found in the CSV."),
+          skipped_count: skippedCount,
+          skipped_sample: skippedSample
+        });
+      }
+
+      const storedFilename = buildStoredUploadFilename(
+        sessionId,
+        CSV_SYNTHETIC_DISPLAY_NAME,
+        "legacy"
+      );
+      const outPath = path.join(config.uploadDir, storedFilename);
+
+      await writeSyntheticSitemapXml(urls, outPath);
+
+      const storedSitemapFile = await createStoredSitemapFile(
+        sessionId,
+        storedFilename,
+        "legacy",
+        CSV_SYNTHETIC_DISPLAY_NAME
+      );
+
+      await enqueueParseSitemapJob({
+        sitemap_file_id: storedSitemapFile.sitemap_file_id,
+        session_id: sessionId
+      });
+
+      return reply.code(202).send({
+        sitemap_file_id: storedSitemapFile.sitemap_file_id,
+        url_count: urls.length,
+        skipped_count: skippedCount,
+        skipped_sample: skippedSample
+      });
+    }
+  );
+
+  // Poll parse/extract/sample readiness for the CSV-derived file, nudging
+  // extraction forward exactly like the resume endpoint does (see the
+  // "unparsedCount > 0 ... enqueueExtractPatternsJob" branch above) — the
+  // session is already COMPLETE from the S3 pull, so the ordinary
+  // auto-finalize hook (tryFinalizeParsedSession) refuses to fire for it.
+  app.get<{ Params: SessionParams }>(
+    "/api/sessions/:id/csv-upload",
+    async (request, reply) => {
+      const sessionId = request.params.id;
+      const fileResult = await pool.query<{
+        id: string;
+        parsed_at: Date | null;
+        is_valid: boolean;
+        total_urls: number;
+      }>(
+        `
+          SELECT id, parsed_at, is_valid, total_urls
+          FROM sitemap_files
+          WHERE session_id = $1::uuid AND source_role = 'legacy'
+          ORDER BY id DESC
+          LIMIT 1
+        `,
+        [sessionId]
+      );
+
+      if (fileResult.rowCount === 0) {
+        return reply.send({ phase: "NOT_UPLOADED" });
+      }
+
+      const file = fileResult.rows[0];
+
+      if (!file.parsed_at) {
+        return reply.send({ phase: "PARSING" });
+      }
+
+      if (!file.is_valid) {
+        return reply.send({ phase: "FAILED" });
+      }
+
+      const patternResult = await pool.query<{ count: string }>(
+        "SELECT COUNT(*) AS count FROM patterns WHERE session_id = $1::uuid AND source_role = 'legacy'",
+        [sessionId]
+      );
+      const patternCount = Number(patternResult.rows[0]?.count ?? 0);
+
+      if (patternCount === 0) {
+        // Idempotent nudge: enqueueExtractPatternsJob is a session-scoped
+        // singleton job, safe to call again on every poll until patterns
+        // appear.
+        await enqueueExtractPatternsJob({
+          sitemap_file_id: file.id,
+          session_id: sessionId
+        });
+
+        return reply.send({ phase: "EXTRACTING" });
+      }
+
+      const sampledResult = await pool.query<{ count: string }>(
+        `
+          SELECT COUNT(*) AS count
+          FROM patterns
+          WHERE session_id = $1::uuid AND source_role = 'legacy' AND status != 'PENDING'
+        `,
+        [sessionId]
+      );
+      const sampledCount = Number(sampledResult.rows[0]?.count ?? 0);
+
+      return reply.send({
+        phase: sampledCount >= patternCount ? "READY" : "SAMPLING",
+        pattern_count: patternCount,
+        sampled_count: sampledCount,
+        total_urls: file.total_urls
+      });
+    }
+  );
+
+  // ---- Sitemap Regenerate: apply decisions + publish ------------------------
+  //
+  // Apply each pattern's as-is/rewrite decision to the CSV-derived URL
+  // population, chunk into <=50,000-URL files under the user's filename
+  // template, then publish — one background job
+  // (jobs/sitemapRegenerateJob.ts), same claim/attach/busy shape as
+  // lastmod_update_jobs so a client retry after a timeout attaches to the
+  // same run instead of re-generating and re-publishing.
+
+  type RegeneratePatternDecisionBody = {
+    pattern_id?: unknown;
+    mode?: unknown;
+    current_structure?: unknown;
+    new_structure?: unknown;
+  };
+
+  type RegenerateBody = {
+    pattern_decisions?: unknown;
+    filename_template?: unknown;
+    lastmod_policy?: unknown;
+  };
+
+  function parsePatternDecisions(
+    raw: unknown
+  ): { ok: true; decisions: PatternDecision[] } | { ok: false; message: string } {
+    if (!Array.isArray(raw) || raw.length === 0) {
+      return { ok: false, message: "pattern_decisions must be a non-empty array" };
+    }
+
+    const decisions: PatternDecision[] = [];
+
+    for (const entry of raw as RegeneratePatternDecisionBody[]) {
+      if (typeof entry?.pattern_id !== "string" || entry.pattern_id === "") {
+        return {
+          ok: false,
+          message: "each pattern_decisions entry needs a pattern_id"
+        };
+      }
+
+      if (entry.mode === "as_is") {
+        decisions.push({ pattern_id: entry.pattern_id, mode: "as_is" });
+        continue;
+      }
+
+      if (entry.mode === "rewrite") {
+        if (
+          typeof entry.current_structure !== "string" ||
+          typeof entry.new_structure !== "string" ||
+          !entry.current_structure.trim() ||
+          !entry.new_structure.trim()
+        ) {
+          return {
+            ok: false,
+            message: `pattern ${entry.pattern_id}: mode "rewrite" needs current_structure and new_structure`
+          };
+        }
+
+        decisions.push({
+          pattern_id: entry.pattern_id,
+          mode: "rewrite",
+          current_structure: entry.current_structure,
+          new_structure: entry.new_structure
+        });
+        continue;
+      }
+
+      return {
+        ok: false,
+        message: `pattern ${entry.pattern_id}: mode must be "as_is" or "rewrite"`
+      };
+    }
+
+    return { ok: true, decisions };
+  }
+
+  app.post<{ Params: SessionParams; Body: RegenerateBody }>(
+    "/api/sessions/:id/regenerate",
+    async (request, reply) => {
+      const sessionId = request.params.id;
+      const sessionResult = await pool.query(
+        "SELECT 1 FROM sessions WHERE id = $1::uuid",
+        [sessionId]
+      );
+
+      if (sessionResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "session not found" });
+      }
+
+      const parsedDecisions = parsePatternDecisions(
+        request.body?.pattern_decisions
+      );
+
+      if (!parsedDecisions.ok) {
+        return reply.code(400).send(badRequest(parsedDecisions.message));
+      }
+
+      const rawTemplate = request.body?.filename_template;
+      const filenameTemplate =
+        typeof rawTemplate === "string" && rawTemplate.trim()
+          ? rawTemplate.trim()
+          : DEFAULT_FILENAME_TEMPLATE;
+      const templateValidation = validateFilenameTemplate(filenameTemplate);
+
+      if (!templateValidation.ok) {
+        return reply.code(400).send(badRequest(templateValidation.error));
+      }
+
+      const rawPolicy = request.body?.lastmod_policy;
+      const lastmodPolicy: SitemapRegenerateLastmodPolicy =
+        rawPolicy === "rewritten_only" ? "rewritten_only" : "all";
+
+      const csvFileResult = await pool.query<{ id: string }>(
+        `
+          SELECT id FROM sitemap_files
+          WHERE session_id = $1::uuid AND source_role = 'legacy'
+          ORDER BY id DESC
+          LIMIT 1
+        `,
+        [sessionId]
+      );
+
+      if (csvFileResult.rowCount === 0) {
+        return reply
+          .code(400)
+          .send(badRequest("Upload a CSV before regenerating."));
+      }
+
+      const patternIds = parsedDecisions.decisions.map(
+        (decision) => decision.pattern_id
+      );
+      const patternsResult = await pool.query<{ id: string; total_urls: string }>(
+        `
+          SELECT id, total_urls FROM patterns
+          WHERE session_id = $1::uuid AND source_role = 'legacy'
+            AND id = ANY($2::uuid[])
+        `,
+        [sessionId, patternIds]
+      );
+
+      if (patternsResult.rowCount !== patternIds.length) {
+        return reply
+          .code(400)
+          .send(
+            badRequest(
+              "One or more pattern_decisions entries reference an unknown pattern."
+            )
+          );
+      }
+
+      const urlsTotal = patternsResult.rows.reduce(
+        (sum, row) => sum + Number(row.total_urls),
+        0
+      );
+
+      if (urlsTotal === 0) {
+        return reply
+          .code(400)
+          .send(badRequest("The selected patterns have no URLs to regenerate."));
+      }
+
+      const filesTotal = Math.ceil(urlsTotal / SITEMAP_REGENERATE_CHUNK_SIZE);
+      const params = {
+        csv_sitemap_file_id: csvFileResult.rows[0].id,
+        pattern_decisions: parsedDecisions.decisions,
+        filename_template: filenameTemplate,
+        lastmod_policy: lastmodPolicy
+      };
+      const fingerprint = sitemapRegenerateFingerprint(params);
+
+      const claim = await claimSitemapRegenerateJob({
+        sessionId,
+        fingerprint,
+        params,
+        urlsTotal,
+        filesTotal
+      });
+
+      if (claim.outcome === "already_completed") {
+        return reply.send({
+          ...serialiseSitemapRegenerateJob(claim.job),
+          already_completed: true
+        });
+      }
+
+      if (claim.outcome === "attached") {
+        return reply.code(202).send({
+          job_id: claim.jobId,
+          urls_total: claim.job?.urls_total ?? urlsTotal,
+          files_total: claim.job?.files_total ?? filesTotal,
+          files_done: claim.job?.files_done ?? 0,
+          status: claim.job?.status ?? "RUNNING",
+          already_running: true
+        });
+      }
+
+      if (claim.outcome === "busy") {
+        return reply.code(409).send({
+          error: "Conflict",
+          message:
+            "A regenerate is already running for this session — wait for it to finish before starting another.",
+          job_id: claim.jobId
+        });
+      }
+
+      await enqueueSitemapRegenerateJob({
+        session_id: sessionId,
+        job_row_id: claim.jobId
+      });
+
+      return reply.code(202).send({
+        job_id: claim.jobId,
+        urls_total: claim.urlsTotal,
+        files_total: claim.filesTotal,
+        files_done: 0,
+        status: "PENDING"
+      });
+    }
+  );
+
+  // The most recent regenerate job for a session — the frontend polls this
+  // until status is COMPLETE/FAILED.
+  app.get<{ Params: SessionParams }>(
+    "/api/sessions/:id/regenerate",
+    async (request, reply) => {
+      const sessionResult = await pool.query(
+        "SELECT 1 FROM sessions WHERE id = $1::uuid",
+        [request.params.id]
+      );
+
+      if (sessionResult.rowCount === 0) {
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "session not found" });
+      }
+
+      const job = await latestSitemapRegenerateJob(request.params.id);
+
+      if (!job) {
+        return reply.send({ status: "NONE" });
+      }
+
+      return reply.send(serialiseSitemapRegenerateJob(job));
     }
   );
 

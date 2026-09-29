@@ -213,8 +213,26 @@ export async function enqueueCleanupUploadsJob(
   data: CleanupUploadsJobData,
   delayMs = CLEANUP_UPLOADS_DELAY_MS
 ) {
+  const jobId = `${CLEANUP_UPLOADS_JOB}-${data.session_id}`;
+  const existingJob = await sitemapQueue.getJob(jobId);
+
+  if (existingJob) {
+    const state = await existingJob.getState();
+
+    // Still-pending (not yet running) means a LATER markSessionComplete call —
+    // e.g. the sitemap-regenerate wizard re-arming this with its own 24h
+    // override after the CSV's own extract/sample pass already armed the
+    // default 48h — should win, not silently no-op the way add() would with a
+    // reused jobId. A terminal or in-flight job is left alone.
+    if (state === "delayed" || state === "waiting") {
+      await existingJob.remove();
+    } else {
+      return existingJob;
+    }
+  }
+
   return sitemapQueue.add(CLEANUP_UPLOADS_JOB, data, {
-    jobId: `${CLEANUP_UPLOADS_JOB}-${data.session_id}`,
+    jobId,
     delay: delayMs,
     removeOnComplete: {
       count: 1000

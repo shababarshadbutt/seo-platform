@@ -36,6 +36,14 @@ export const PATTERN_TRANSFORM_DRY_RUN_JOB = "pattern-transform-dry-run" as cons
 // serialising it here is what keeps it from interleaving a filename swap with
 // a rename or transform running on the same session.
 export const LASTMOD_UPDATE_JOB = "lastmod-update" as const;
+// Sitemap-regenerate wizard: apply the pattern decisions to the CSV-derived
+// URL population, write the resulting chunk files, then publish
+// (jobs/sitemapRegenerateJob.ts). Shares this queue for the same reason
+// lastmod-update does: it replaces the SAME sitemap files copy-on-write (via
+// soft-delete + fresh insert) and ends with the same publish step, so it must
+// not interleave with a rename/transform/lastmod-update run on the same
+// session.
+export const SITEMAP_REGENERATE_JOB = "sitemap-regenerate" as const;
 
 export type BulkReplaceJobData = {
   session_id: string;
@@ -114,12 +122,22 @@ export type LastmodUpdateJobData = {
   job_row_id: string;
 };
 
+// Sitemap-regenerate job. Everything it needs is in the
+// sitemap_regenerate_jobs row (params jsonb), same reasoning as
+// LastmodUpdateJobData.
+export type SitemapRegenerateJobData = {
+  session_id: string;
+  // sitemap_regenerate_jobs.id — the progress/status row this job drives.
+  job_row_id: string;
+};
+
 export type BulkReplaceQueueData =
   | BulkReplaceJobData
   | BulkReplaceUndoJobData
   | ApplyRedirectsJobData
   | PatternStructureJobData
-  | LastmodUpdateJobData;
+  | LastmodUpdateJobData
+  | SitemapRegenerateJobData;
 export type BulkReplaceJobName =
   | typeof BULK_REPLACE_JOB
   | typeof BULK_REPLACE_UNDO_JOB
@@ -128,7 +146,8 @@ export type BulkReplaceJobName =
   | typeof PATTERN_TRANSFORM_JOB
   | typeof PATTERN_TRANSFORM_UNDO_JOB
   | typeof PATTERN_TRANSFORM_DRY_RUN_JOB
-  | typeof LASTMOD_UPDATE_JOB;
+  | typeof LASTMOD_UPDATE_JOB
+  | typeof SITEMAP_REGENERATE_JOB;
 
 export const bulkReplaceQueue = new Queue<
   BulkReplaceQueueData,
@@ -269,6 +288,29 @@ export async function enqueueLastmodUpdateJob(data: LastmodUpdateJobData) {
     // NO retries, same reasoning as pattern structure jobs: a half-finished
     // run must surface as FAILED for the user to re-trigger deliberately, not
     // be silently re-run (which would re-publish mid-failure).
+    attempts: 1
+  });
+}
+
+// One in-flight regenerate per session: the jobId is session-scoped, so a
+// second enqueue while one is active reuses the running job. The
+// authoritative guard is still the partial unique index from migration 061 —
+// this just avoids a duplicate BullMQ job for the common case.
+export async function enqueueSitemapRegenerateJob(data: SitemapRegenerateJobData) {
+  const jobId = `${SITEMAP_REGENERATE_JOB}-${data.session_id}`;
+  const existingJob = await reusableSingletonJob(jobId);
+
+  if (existingJob) {
+    return existingJob;
+  }
+
+  return bulkReplaceQueue.add(SITEMAP_REGENERATE_JOB, data, {
+    jobId,
+    removeOnComplete: { count: 100 },
+    removeOnFail: { count: 100 },
+    // NO retries, same reasoning as lastmod-update: a half-finished run must
+    // surface as FAILED for the user to re-trigger deliberately, not be
+    // silently re-run (which would re-publish mid-failure).
     attempts: 1
   });
 }

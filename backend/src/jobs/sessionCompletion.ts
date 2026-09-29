@@ -248,14 +248,18 @@ export async function tryFinalizeParsedSession(
   return true;
 }
 
-export async function markSessionComplete(sessionId: string) {
+export async function markSessionComplete(
+  sessionId: string,
+  options?: { cleanupDelayMs?: number }
+) {
   await pool.query(
     "UPDATE sessions SET status = 'COMPLETE', completed_at = now() WHERE id = $1::uuid",
     [sessionId]
   );
-  await enqueueCleanupUploadsJob({
-    session_id: sessionId
-  });
+  await enqueueCleanupUploadsJob(
+    { session_id: sessionId },
+    options?.cleanupDelayMs
+  );
   // Pre-generate both download ZIPs in the background so the first download is
   // instant instead of building a fresh archive on demand. Fire-and-forget: a
   // Redis/queue hiccup here must NEVER throw into (and fail-then-retry) the

@@ -58,11 +58,13 @@ import {
   type ApplyRedirectsJobData,
   type BulkReplaceJobData,
   LASTMOD_UPDATE_JOB,
+  SITEMAP_REGENERATE_JOB,
   type BulkReplaceUndoJobData,
   type BulkReplaceQueueData,
   type BulkReplaceJobName,
   type PatternStructureJobData,
-  type LastmodUpdateJobData
+  type LastmodUpdateJobData,
+  type SitemapRegenerateJobData
 } from "./queue/bulkReplaceQueue.js";
 import {
   DELETE_PROBLEM_URLS_JOB,
@@ -118,6 +120,7 @@ import {
   processPatternTransformDryRunJob
 } from "./jobs/patternStructureJob.js";
 import { processLastmodUpdateJob } from "./jobs/lastmodUpdateJob.js";
+import { processSitemapRegenerateJob } from "./jobs/sitemapRegenerateJob.js";
 import {
   processCleanupZipsJob,
   processPreGenerateZipJob
@@ -132,6 +135,7 @@ import { destroyZipPool } from "./jobs/zipPool.js";
 import { destroyFileRewritePool } from "./jobs/fileRewritePool.js";
 import { destroyDryRunScanPool } from "./jobs/dryRunScanPool.js";
 import { destroyPatternPopulationPool } from "./jobs/patternPopulationPool.js";
+import { destroySitemapGeneratePool } from "./jobs/sitemapGeneratePool.js";
 import { processVerifyUrlsJob } from "./jobs/verifyUrlsJob.js";
 import { processTriageSampleJob } from "./jobs/triageJob.js";
 import { processNormalizationProbeJob } from "./jobs/normalizationProbeJob.js";
@@ -382,6 +386,14 @@ async function start() {
 
         if (job.name === LASTMOD_UPDATE_JOB) {
           await processLastmodUpdateJob(job.data as LastmodUpdateJobData, app.log);
+          return;
+        }
+
+        if (job.name === SITEMAP_REGENERATE_JOB) {
+          await processSitemapRegenerateJob(
+            job.data as SitemapRegenerateJobData,
+            app.log
+          );
           return;
         }
 
@@ -685,6 +697,7 @@ async function close() {
   await destroyFileRewritePool();
   await destroyDryRunScanPool();
   await destroyPatternPopulationPool();
+  await destroySitemapGeneratePool();
   await closeSitemapQueue();
   await closeBulkReplaceQueue();
   await closePublishQueue();

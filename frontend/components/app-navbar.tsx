@@ -151,6 +151,8 @@ export function AppNavbar() {
     (pathname?.startsWith("/migration") ?? false) ||
     (pathname?.startsWith("/sessions") ?? false);
   const isLastmodUpdaterActive = pathname?.startsWith("/lastmod-updater") ?? false;
+  const isSitemapRegenerateActive =
+    pathname?.startsWith("/sitemap-regenerate") ?? false;
 
   const toolLinkClass = (active: boolean) =>
     `inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-xs font-medium transition-colors ${
@@ -207,6 +209,15 @@ export function AppNavbar() {
                 className={toolLinkClass(isLastmodUpdaterActive)}
               >
                 🗓️ Lastmod Updater
+                <ExternalLink className="h-3 w-3" aria-hidden="true" />
+              </a>
+              <a
+                href="/sitemap-regenerate"
+                target="_blank"
+                rel="noopener noreferrer"
+                className={toolLinkClass(isSitemapRegenerateActive)}
+              >
+                🔁 Regenerate
                 <ExternalLink className="h-3 w-3" aria-hidden="true" />
               </a>
               {seoDeskUrl ? (

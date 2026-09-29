@@ -4316,6 +4316,129 @@ export async function getLastmodUpdateJob(sessionId: string) {
   return readJsonResponse<LastmodUpdateJobStatus>(response);
 }
 
+// ---- Sitemap Regenerate (CSV) ----------------------------------------------
+//
+// The CSV-driven sitemap regeneration wizard: upload a CSV of URLs (ingested
+// as a source_role "legacy" file so it gets patterns/samples exactly like an
+// ordinary upload — see backend/src/routes/sessions.ts's "Sitemap Regenerate:
+// CSV source" section), decide per pattern whether to keep URLs as-is or
+// rewrite them, then generate <=50,000-URL chunk files and publish. One
+// background job; the frontend polls its status the same way the Lastmod
+// Updater does above.
+
+export type CsvUploadResult = {
+  sitemap_file_id: string;
+  url_count: number;
+  skipped_count: number;
+  skipped_sample: { line: number; value: string; reason: string }[];
+};
+
+export async function uploadCsvUrlList(sessionId: string, file: File) {
+  const formData = new FormData();
+
+  formData.append("file", file, file.name);
+
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/csv-upload`),
+    { method: "POST", body: formData },
+    UPLOAD_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CsvUploadResult>(response);
+}
+
+export type CsvUploadPhase =
+  | "NOT_UPLOADED"
+  | "PARSING"
+  | "FAILED"
+  | "EXTRACTING"
+  | "SAMPLING"
+  | "READY";
+
+export type CsvUploadStatus = {
+  phase: CsvUploadPhase;
+  pattern_count?: number;
+  sampled_count?: number;
+  total_urls?: number;
+};
+
+export async function getCsvUploadStatus(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/csv-upload`),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CsvUploadStatus>(response);
+}
+
+export type SitemapRegeneratePatternDecision =
+  | { pattern_id: string; mode: "as_is" }
+  | {
+      pattern_id: string;
+      mode: "rewrite";
+      current_structure: string;
+      new_structure: string;
+    };
+
+export type SitemapRegenerateLastmodPolicy = "all" | "rewritten_only";
+
+export type SitemapRegenerateJobResult = {
+  files_written?: number;
+  urls_written?: number;
+  unclassified_count?: number;
+  unresolved_rewrite_count?: number;
+  filenames?: string[];
+  published?: LastmodUpdatePublishSummary;
+};
+
+export type SitemapRegenerateJobStatus = {
+  status: "NONE" | "PENDING" | "RUNNING" | "PUBLISHING" | "COMPLETE" | "FAILED";
+  job_id?: string;
+  urls_total?: number;
+  files_total?: number;
+  files_done?: number;
+  result?: SitemapRegenerateJobResult | null;
+  error?: string | null;
+  already_completed?: boolean;
+  already_running?: boolean;
+};
+
+export async function enqueueSitemapRegenerate(
+  sessionId: string,
+  input: {
+    patternDecisions: SitemapRegeneratePatternDecision[];
+    filenameTemplate: string;
+    lastmodPolicy: SitemapRegenerateLastmodPolicy;
+  }
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/regenerate`),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        pattern_decisions: input.patternDecisions,
+        filename_template: input.filenameTemplate,
+        lastmod_policy: input.lastmodPolicy
+      })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<SitemapRegenerateJobStatus>(response);
+}
+
+export async function getSitemapRegenerateJob(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sessions/${sessionId}/regenerate`),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<SitemapRegenerateJobStatus>(response);
+}
+
 // --- by-example transform: sample file + full-population check ---------------
 
 export type TransformSamplePair = { before: string; after: string };
