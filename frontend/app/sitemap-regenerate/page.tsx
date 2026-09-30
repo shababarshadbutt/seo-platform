@@ -64,7 +64,10 @@ type CsvPhase =
   | "error";
 type PushPhase = "idle" | "running" | "done" | "error";
 
-const CHUNK_SIZE = 50_000;
+const MIN_URLS_PER_FILE = 10_000;
+const MAX_URLS_PER_FILE = 50_000;
+const URLS_PER_FILE_STEP = 5_000;
+const DEFAULT_URLS_PER_FILE = 50_000;
 const DEFAULT_FILENAME_TEMPLATE = "sitemap-{n}.xml";
 const PROBLEM_STATUSES = new Set([301, 302, 307, 308, 404]);
 const PUSH_TERMINAL_STATUSES = new Set(["COMPLETE", "FAILED"]);
@@ -677,13 +680,22 @@ export default function SitemapRegeneratePage() {
 
   // ---- Step 4: file count + filename template -------------------------------
   const [filenameTemplate, setFilenameTemplate] = useState(DEFAULT_FILENAME_TEMPLATE);
+  const [maxUrlsPerFile, setMaxUrlsPerFile] = useState(DEFAULT_URLS_PER_FILE);
 
   const decidedUrlTotal = patterns.reduce(
     (sum, pattern) => sum + (Number(pattern.total_urls) || 0),
     0
   );
   const estimatedFilesTotal =
-    decidedUrlTotal > 0 ? Math.ceil(decidedUrlTotal / CHUNK_SIZE) : 0;
+    decidedUrlTotal > 0 ? Math.ceil(decidedUrlTotal / maxUrlsPerFile) : 0;
+
+  function adjustMaxUrlsPerFile(delta: number) {
+    setMaxUrlsPerFile((current) => {
+      const next = current + delta;
+
+      return Math.min(MAX_URLS_PER_FILE, Math.max(MIN_URLS_PER_FILE, next));
+    });
+  }
 
   // ---- Step 5: lastmod policy ------------------------------------------------
   const [lastmodPolicy, setLastmodPolicy] =
@@ -741,7 +753,8 @@ export default function SitemapRegeneratePage() {
       const started = await enqueueSitemapRegenerate(sessionId, {
         patternDecisions: finalDecisions,
         filenameTemplate,
-        lastmodPolicy
+        lastmodPolicy,
+        maxUrlsPerFile
       });
 
       setPushJob(started);
@@ -1057,10 +1070,51 @@ export default function SitemapRegeneratePage() {
           <CardHeader>
             <CardTitle className="text-base">4. Output files</CardTitle>
             <CardDescription>
-              Sitemap files hold up to 50,000 URLs each.
+              Sitemap files hold up to {formatNumber(maxUrlsPerFile)} URLs each.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            <div className="space-y-1.5">
+              <label
+                htmlFor="max-urls-per-file"
+                className="text-sm font-medium text-slate-700"
+              >
+                Max URLs per file
+              </label>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => adjustMaxUrlsPerFile(-URLS_PER_FILE_STEP)}
+                  disabled={maxUrlsPerFile <= MIN_URLS_PER_FILE}
+                  className="h-10 w-10 rounded-lg border border-slate-200 text-lg font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                  aria-label="Decrease max URLs per file"
+                >
+                  −
+                </button>
+                <input
+                  id="max-urls-per-file"
+                  type="text"
+                  readOnly
+                  value={formatNumber(maxUrlsPerFile)}
+                  className="h-10 w-32 rounded-lg border border-slate-200 px-3 text-center text-sm text-slate-700"
+                />
+                <button
+                  type="button"
+                  onClick={() => adjustMaxUrlsPerFile(URLS_PER_FILE_STEP)}
+                  disabled={maxUrlsPerFile >= MAX_URLS_PER_FILE}
+                  className="h-10 w-10 rounded-lg border border-slate-200 text-lg font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                  aria-label="Increase max URLs per file"
+                >
+                  +
+                </button>
+              </div>
+              <p className="text-xs text-slate-500">
+                Between {formatNumber(MIN_URLS_PER_FILE)} and{" "}
+                {formatNumber(MAX_URLS_PER_FILE)}, in steps of{" "}
+                {formatNumber(URLS_PER_FILE_STEP)}.
+              </p>
+            </div>
+
             {estimatedFilesTotal > 0 ? (
               <p className="text-sm text-slate-700">
                 {formatNumber(decidedUrlTotal)} URLs will produce{" "}

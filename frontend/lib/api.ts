@@ -4410,6 +4410,7 @@ export async function enqueueSitemapRegenerate(
     patternDecisions: SitemapRegeneratePatternDecision[];
     filenameTemplate: string;
     lastmodPolicy: SitemapRegenerateLastmodPolicy;
+    maxUrlsPerFile: number;
   }
 ) {
   const response = await fetchWithTimeout(
@@ -4420,7 +4421,8 @@ export async function enqueueSitemapRegenerate(
       body: JSON.stringify({
         pattern_decisions: input.patternDecisions,
         filename_template: input.filenameTemplate,
-        lastmod_policy: input.lastmodPolicy
+        lastmod_policy: input.lastmodPolicy,
+        max_urls_per_file: input.maxUrlsPerFile
       })
     },
     EXPORT_API_TIMEOUT_MS

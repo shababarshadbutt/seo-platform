@@ -87,7 +87,6 @@ import {
   sitemapRegenerateFingerprint
 } from "../sitemaps/sitemapRegenerateJobClaim.js";
 import {
-  SITEMAP_REGENERATE_CHUNK_SIZE,
   type PatternDecision,
   type SitemapRegenerateLastmodPolicy
 } from "../jobs/sitemapRegenerateJob.js";
@@ -95,6 +94,10 @@ import {
   DEFAULT_FILENAME_TEMPLATE,
   validateFilenameTemplate
 } from "../sitemaps/outputFilenamePattern.js";
+import {
+  DEFAULT_URLS_PER_FILE,
+  validateMaxUrlsPerFile
+} from "../sitemaps/maxUrlsPerFile.js";
 import {
   cachedWithSingleFlight,
   type CachedResult
@@ -8824,8 +8827,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
   // ---- Sitemap Regenerate: apply decisions + publish ------------------------
   //
   // Apply each pattern's as-is/rewrite decision to the CSV-derived URL
-  // population, chunk into <=50,000-URL files under the user's filename
-  // template, then publish — one background job
+  // population, chunk into files under the user's filename template and
+  // per-file URL cap, then publish — one background job
   // (jobs/sitemapRegenerateJob.ts), same claim/attach/busy shape as
   // lastmod_update_jobs so a client retry after a timeout attaches to the
   // same run instead of re-generating and re-publishing.
@@ -8841,6 +8844,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     pattern_decisions?: unknown;
     filename_template?: unknown;
     lastmod_policy?: unknown;
+    max_urls_per_file?: unknown;
   };
 
   function parsePatternDecisions(
@@ -8934,6 +8938,17 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       const lastmodPolicy: SitemapRegenerateLastmodPolicy =
         rawPolicy === "rewritten_only" ? "rewritten_only" : "all";
 
+      const rawMaxUrlsPerFile = request.body?.max_urls_per_file;
+      const maxUrlsPerFileValidation = validateMaxUrlsPerFile(
+        rawMaxUrlsPerFile === undefined ? DEFAULT_URLS_PER_FILE : rawMaxUrlsPerFile
+      );
+
+      if (!maxUrlsPerFileValidation.ok) {
+        return reply.code(400).send(badRequest(maxUrlsPerFileValidation.error));
+      }
+
+      const maxUrlsPerFile = maxUrlsPerFileValidation.value;
+
       const csvFileResult = await pool.query<{ id: string }>(
         `
           SELECT id FROM sitemap_files
@@ -8983,12 +8998,13 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           .send(badRequest("The selected patterns have no URLs to regenerate."));
       }
 
-      const filesTotal = Math.ceil(urlsTotal / SITEMAP_REGENERATE_CHUNK_SIZE);
+      const filesTotal = Math.ceil(urlsTotal / maxUrlsPerFile);
       const params = {
         csv_sitemap_file_id: csvFileResult.rows[0].id,
         pattern_decisions: parsedDecisions.decisions,
         filename_template: filenameTemplate,
-        lastmod_policy: lastmodPolicy
+        lastmod_policy: lastmodPolicy,
+        max_urls_per_file: maxUrlsPerFile
       };
       const fingerprint = sitemapRegenerateFingerprint(params);
 

@@ -14,6 +14,7 @@ import {
   type ParsedStructure
 } from "../sitemaps/transformStructure.js";
 import { pickCollisionFreeTemplate } from "../sitemaps/outputFilenamePattern.js";
+import { DEFAULT_URLS_PER_FILE } from "../sitemaps/maxUrlsPerFile.js";
 import {
   writeSitemapChunks,
   type SitemapChunkPlan
@@ -24,9 +25,10 @@ import { resolvePublishTarget } from "../publish/publishTarget.js";
 import { buildPublishPlan, executePublish } from "../publish/s3Publish.js";
 
 // The sitemap-regenerate wizard's job: apply each pattern's as-is/rewrite
-// decision to the CSV-derived URL population, chunk the result into
-// <=50,000-URL files under the user's filename template, replace the site's
-// current sitemap content with them, then publish — one traceable unit, one
+// decision to the CSV-derived URL population, chunk the result into files
+// under the user's filename template and per-file URL cap (params.
+// max_urls_per_file), replace the site's current sitemap content with them,
+// then publish — one traceable unit, one
 // job row, modeled on jobs/lastmodUpdateJob.ts (status moves PENDING ->
 // RUNNING -> PUBLISHING -> COMPLETE/FAILED, rewrite in one transaction,
 // publish reuses the exact plan/execute path an ordinary publish uses).
@@ -38,8 +40,6 @@ import { buildPublishPlan, executePublish } from "../publish/s3Publish.js";
 // below with a 24h override instead of the global 48h default, because for
 // THIS wizard those local copies are the actual rollback point, not a mere
 // courtesy window — see config.sitemapRegenerateCleanupDelayMs.
-
-const CHUNK_SIZE = 50_000;
 
 export const SITEMAP_REGENERATE_LASTMOD_POLICIES = ["all", "rewritten_only"] as const;
 export type SitemapRegenerateLastmodPolicy =
@@ -59,6 +59,7 @@ type JobParams = {
   pattern_decisions: PatternDecision[];
   filename_template: string;
   lastmod_policy: SitemapRegenerateLastmodPolicy;
+  max_urls_per_file: number;
 };
 
 type JobRow = {
@@ -234,15 +235,15 @@ async function resolveFinalUrls(
   return { urls, unclassifiedCount, unresolvedRewriteCount };
 }
 
-function chunkUrls(urls: ResolvedUrl[]): ResolvedUrl[][] {
+function chunkUrls(urls: ResolvedUrl[], chunkSize: number): ResolvedUrl[][] {
   if (urls.length === 0) {
     return [];
   }
 
   const chunks: ResolvedUrl[][] = [];
 
-  for (let start = 0; start < urls.length; start += CHUNK_SIZE) {
-    chunks.push(urls.slice(start, start + CHUNK_SIZE));
+  for (let start = 0; start < urls.length; start += chunkSize) {
+    chunks.push(urls.slice(start, start + chunkSize));
   }
 
   return chunks;
@@ -313,8 +314,13 @@ export async function processSitemapRegenerateJob(
   }
 
   const sessionId = job.session_id;
-  const { csv_sitemap_file_id, pattern_decisions, filename_template, lastmod_policy } =
-    job.params;
+  const {
+    csv_sitemap_file_id,
+    pattern_decisions,
+    filename_template,
+    lastmod_policy,
+    max_urls_per_file
+  } = job.params;
 
   logger.info(
     { session_id: sessionId, job_row_id: jobRowId },
@@ -351,7 +357,7 @@ export async function processSitemapRegenerateJob(
       logger
     );
 
-    const chunkedUrls = chunkUrls(urls);
+    const chunkedUrls = chunkUrls(urls, max_urls_per_file ?? DEFAULT_URLS_PER_FILE);
 
     if (chunkedUrls.length === 0) {
       throw new Error("The CSV's URLs resolved to nothing to regenerate.");
@@ -503,7 +509,3 @@ export async function processSitemapRegenerateJob(
     await markFailed(jobRowId, message);
   }
 }
-
-// Exposed so the enqueue route's pre-flight estimate (patterns.total_urls ->
-// files_total) uses the exact same chunk size this job actually chunks by.
-export const SITEMAP_REGENERATE_CHUNK_SIZE = CHUNK_SIZE;
