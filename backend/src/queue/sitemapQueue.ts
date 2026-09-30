@@ -48,6 +48,11 @@ export type SamplePatternsJobData = {
   // `resume` is IGNORED when this is set — re-checking a pattern that already has
   // rows is the entire point, so the already-sampled skip must not apply.
   pattern_id?: string;
+  // Restrict a session-wide (unscoped) run to these source_role values.
+  // Defaults to ["current"] when omitted, so every pre-existing caller keeps
+  // its old behavior. Ignored when pattern_id is set — a specific pattern id
+  // already disambiguates the row, so no role filter is applied there.
+  source_roles?: Array<"current" | "legacy">;
 };
 
 export type CleanupUploadsJobData = {

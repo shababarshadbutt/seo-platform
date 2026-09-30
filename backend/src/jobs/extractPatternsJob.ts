@@ -1251,9 +1251,17 @@ export async function processExtractPatternsJob(
     const hasPendingFiles = await hasPendingSitemapFiles(data.session_id);
 
     if (!hasPendingFiles) {
+      // Both roles: a CSV-wizard upload extracts 'legacy' patterns that would
+      // otherwise never get sampled (source_role defaulted to 'current' only).
+      // resume: true is safe on a session's very first sampling pass too (no
+      // pattern has sampled_urls yet, so nothing is skipped) and is what stops
+      // a CSV upload on an already-sampled session from re-verifying every
+      // 'current' pattern from scratch.
       await enqueueSamplePatternsJob({
         session_id: data.session_id,
-        sitemap_file_id: data.sitemap_file_id
+        sitemap_file_id: data.sitemap_file_id,
+        source_roles: ["current", "legacy"],
+        resume: true
       });
     }
 

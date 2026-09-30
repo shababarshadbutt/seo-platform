@@ -54,7 +54,14 @@ import {
 import { Progress } from "@/components/ui/progress";
 
 type FetchPhase = "idle" | "pulling" | "parsing" | "ready" | "stalled" | "error";
-type CsvPhase = "idle" | "uploading" | "processing" | "ready" | "error";
+type CsvPhase =
+  | "idle"
+  | "uploading"
+  | "extracting"
+  | "sampling"
+  | "ready"
+  | "stalled"
+  | "error";
 type PushPhase = "idle" | "running" | "done" | "error";
 
 const CHUNK_SIZE = 50_000;
@@ -533,6 +540,49 @@ export default function SitemapRegeneratePage() {
   const [csvError, setCsvError] = useState("");
   const [csvUploadResult, setCsvUploadResult] = useState<CsvUploadResult | null>(null);
   const [csvTotalUrls, setCsvTotalUrls] = useState(0);
+  const [csvPatternCount, setCsvPatternCount] = useState(0);
+  const [csvSampledCount, setCsvSampledCount] = useState(0);
+
+  // Polls pattern-detection/sampling progress for the CSV-derived file. Shared
+  // by the initial upload and the "Check again" retry after a stall, so both
+  // paths report the same "N of M patterns checked" progress instead of a
+  // bare spinner. Mirrors waitForParsing's stall detection above.
+  async function waitForCsvProcessing(id: string, fallbackUrlCount: number) {
+    let lastProgressKey = "";
+    let lastProgressAt = Date.now();
+
+    for (;;) {
+      const status = await getCsvUploadStatus(id);
+
+      if (status.phase === "FAILED") {
+        throw new Error("The uploaded CSV could not be parsed as sitemap URLs.");
+      }
+
+      setCsvPatternCount(status.pattern_count ?? 0);
+      setCsvSampledCount(status.sampled_count ?? 0);
+
+      if (status.phase === "READY") {
+        setCsvTotalUrls(status.total_urls ?? fallbackUrlCount);
+        setCsvPhase("ready");
+        return;
+      }
+
+      setCsvPhase(status.phase === "SAMPLING" ? "sampling" : "extracting");
+
+      const progressKey = `${status.phase}:${status.pattern_count ?? 0}:${status.sampled_count ?? 0}`;
+
+      if (progressKey !== lastProgressKey) {
+        lastProgressKey = progressKey;
+        lastProgressAt = Date.now();
+      } else if (Date.now() - lastProgressAt > PARSE_STALL_THRESHOLD_MS) {
+        throw new ParsingTimeoutError(
+          "This hasn't made progress in a couple of minutes. It may still finish on its own."
+        );
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
 
   async function handleCsvSelected(file: File) {
     if (!sessionId) {
@@ -541,29 +591,44 @@ export default function SitemapRegeneratePage() {
 
     setCsvError("");
     setCsvPhase("uploading");
+    setCsvPatternCount(0);
+    setCsvSampledCount(0);
 
     try {
       const uploaded = await uploadCsvUrlList(sessionId, file);
 
       setCsvUploadResult(uploaded);
-      setCsvPhase("processing");
-
-      for (;;) {
-        const status = await getCsvUploadStatus(sessionId);
-
-        if (status.phase === "FAILED") {
-          throw new Error("The uploaded CSV could not be parsed as sitemap URLs.");
-        }
-
-        if (status.phase === "READY") {
-          setCsvTotalUrls(status.total_urls ?? uploaded.url_count);
-          setCsvPhase("ready");
-          return;
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-      }
+      setCsvPhase("extracting");
+      await waitForCsvProcessing(sessionId, uploaded.url_count);
     } catch (error) {
+      if (error instanceof ParsingTimeoutError) {
+        setCsvError(error.message);
+        setCsvPhase("stalled");
+        return;
+      }
+
+      setCsvError(friendlyApiErrorMessage(error, "Could not process the CSV."));
+      setCsvPhase("error");
+    }
+  }
+
+  async function retryCsvProcessing() {
+    if (!sessionId || !csvUploadResult) {
+      return;
+    }
+
+    setCsvError("");
+    setCsvPhase("extracting");
+
+    try {
+      await waitForCsvProcessing(sessionId, csvUploadResult.url_count);
+    } catch (error) {
+      if (error instanceof ParsingTimeoutError) {
+        setCsvError(error.message);
+        setCsvPhase("stalled");
+        return;
+      }
+
       setCsvError(friendlyApiErrorMessage(error, "Could not process the CSV."));
       setCsvPhase("error");
     }
@@ -855,7 +920,9 @@ export default function SitemapRegeneratePage() {
                 <label
                   className={cn(
                     "flex h-24 cursor-pointer flex-col items-center justify-center gap-1.5 rounded-lg border-2 border-dashed border-slate-200 text-sm text-slate-500 hover:border-indigo-300 hover:text-indigo-600",
-                    (csvPhase === "uploading" || csvPhase === "processing") &&
+                    (csvPhase === "uploading" ||
+                      csvPhase === "extracting" ||
+                      csvPhase === "sampling") &&
                       "pointer-events-none opacity-60"
                   )}
                 >
@@ -877,13 +944,54 @@ export default function SitemapRegeneratePage() {
                   />
                 </label>
 
-                {csvPhase === "uploading" || csvPhase === "processing" ? (
+                {csvPhase === "uploading" ? (
                   <p className="flex items-center gap-2 text-sm text-slate-700">
                     <Loader2 className="h-4 w-4 animate-spin" />
-                    {csvPhase === "uploading"
-                      ? "Uploading…"
-                      : "Detecting patterns and checking sample URLs…"}
+                    Uploading…
                   </p>
+                ) : null}
+
+                {csvPhase === "extracting" ? (
+                  <p className="flex items-center gap-2 text-sm text-slate-700">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    {csvPatternCount > 0
+                      ? `Detecting patterns… ${formatNumber(csvPatternCount)} found`
+                      : "Detecting patterns…"}
+                  </p>
+                ) : null}
+
+                {csvPhase === "sampling" ? (
+                  <div className="space-y-2">
+                    <p className="flex items-center gap-2 text-sm text-slate-700">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Checking sample URLs… {formatNumber(csvSampledCount)} of{" "}
+                      {formatNumber(csvPatternCount)} patterns checked
+                    </p>
+                    {csvPatternCount > 0 ? (
+                      <Progress
+                        value={Math.round((csvSampledCount / csvPatternCount) * 100)}
+                      />
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {csvPhase === "stalled" ? (
+                  <div className="space-y-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                    <div className="flex items-start gap-2">
+                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                      <span>{csvError}</span>
+                    </div>
+                    <div className="pl-6">
+                      <button
+                        type="button"
+                        className="inline-flex items-center gap-1 font-semibold text-amber-900 hover:text-amber-950"
+                        onClick={() => void retryCsvProcessing()}
+                      >
+                        <RefreshCcw className="h-3.5 w-3.5" />
+                        Check again
+                      </button>
+                    </div>
+                  </div>
                 ) : null}
 
                 {csvPhase === "ready" && csvUploadResult ? (
@@ -902,7 +1010,7 @@ export default function SitemapRegeneratePage() {
                   </div>
                 ) : null}
 
-                {csvError ? (
+                {csvPhase === "error" && csvError ? (
                   <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
                     <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
                     <span>{csvError}</span>

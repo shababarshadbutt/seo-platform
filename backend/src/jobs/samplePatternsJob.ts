@@ -296,6 +296,10 @@ export async function processSamplePatternsJob(
     // do not mark it FAILED. A completed session must not appear to reopen — and
     // must not sprout a Resume banner — because one row was re-measured.
     pattern_id?: string;
+    // Restrict a session-wide (unscoped) run to these source_role values.
+    // Defaults to ["current"] when omitted. Ignored when pattern_id is set,
+    // see the source_role filter below.
+    source_roles?: Array<"current" | "legacy">;
   },
   logger: FastifyBaseLogger
 ) {
@@ -349,16 +353,22 @@ export async function processSamplePatternsJob(
   }
 
   try {
+    // Unscoped (session-wide) runs default to 'current' only, matching every
+    // caller that predates the "legacy" (CSV wizard) role. A scoped re-check
+    // (pattern_id set) skips the role filter entirely — the id already
+    // uniquely identifies the row, and a stale role assumption there is what
+    // silently no-oped re-checks of CSV-derived patterns.
+    const roleFilter = scopedPatternId ? null : (data.source_roles ?? ["current"]);
     const patternsResult = await pool.query<PatternRow>(
       `
         SELECT id, template, total_urls, source_file
         FROM patterns
         WHERE session_id = $1
-          AND source_role = 'current'
+          AND ($3::text[] IS NULL OR source_role = ANY($3::text[]))
           AND ($2::uuid IS NULL OR id = $2::uuid)
         ORDER BY total_urls DESC, template ASC
       `,
-      [data.session_id, scopedPatternId]
+      [data.session_id, scopedPatternId, roleFilter]
     );
     let sampledUrlCount = 0;
     // Counted from the RESULTS, not from the config flag: what matters is how many URLs
