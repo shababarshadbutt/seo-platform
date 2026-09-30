@@ -105,7 +105,7 @@ export function CheckModeToggle() {
   return (
     <>
       <div
-        className={`inline-flex items-center gap-1 rounded-md p-0.5 ring-1 ring-inset ${
+        className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md p-1 ring-1 ring-inset ${
           isStaging
             ? "bg-amber-500/20 ring-amber-400/60"
             : "bg-slate-800 ring-slate-700"
@@ -117,7 +117,7 @@ export function CheckModeToggle() {
         }
       >
         <span
-          className={`hidden pl-1.5 text-[11px] font-medium sm:inline ${
+          className={`hidden whitespace-nowrap pl-1.5 text-[11px] font-medium sm:inline ${
             isStaging ? "text-amber-200" : "text-slate-400"
           }`}
         >
@@ -127,7 +127,7 @@ export function CheckModeToggle() {
           type="button"
           onClick={() => void apply("1.90")}
           disabled={isSaving}
-          className={`h-6 rounded px-2 text-[11px] font-semibold transition-colors disabled:opacity-60 ${
+          className={`h-7 whitespace-nowrap rounded px-2 text-[11px] font-semibold transition-colors disabled:opacity-60 ${
             isStaging
               ? "text-amber-200/70 hover:text-amber-100"
               : "bg-slate-700 text-white"
@@ -142,7 +142,7 @@ export function CheckModeToggle() {
             setIsConfirmOpen(true);
           }}
           disabled={isSaving}
-          className={`h-6 rounded px-2 text-[11px] font-semibold transition-colors disabled:opacity-60 ${
+          className={`h-7 whitespace-nowrap rounded px-2 text-[11px] font-semibold transition-colors disabled:opacity-60 ${
             isStaging
               ? "bg-amber-400 text-amber-950"
               : "text-slate-400 hover:text-white"

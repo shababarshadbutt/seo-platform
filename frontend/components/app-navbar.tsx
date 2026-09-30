@@ -154,18 +154,21 @@ export function AppNavbar() {
   const isSitemapRegenerateActive =
     pathname?.startsWith("/sitemap-regenerate") ?? false;
 
+  // Active = solid and bright (matches the New Analysis button's weight, so
+  // "you are here" is unmistakable at a glance). Inactive = dimmed until
+  // hovered, so the active tab is the only one competing for attention.
   const toolLinkClass = (active: boolean) =>
-    `inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-xs font-medium transition-colors ${
+    `inline-flex h-9 shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-3 text-xs font-medium transition-colors ${
       active
-        ? "bg-indigo-500/20 text-indigo-200 ring-1 ring-inset ring-indigo-400/50"
-        : "text-slate-300 hover:bg-slate-800 hover:text-white"
+        ? "bg-indigo-500 text-white shadow-sm"
+        : "text-slate-400 hover:bg-slate-800 hover:text-white"
     }`;
 
   return (
     <>
-      <nav className="sticky top-0 z-50 h-14 border-b border-slate-800 bg-slate-900">
-        <div className="mx-auto flex h-full w-full max-w-7xl items-center justify-between px-4 sm:px-6 lg:px-8">
-          <Link href="/" className="flex items-center gap-3">
+      <nav className="sticky top-0 z-50 h-16 border-b border-slate-800 bg-slate-900">
+        <div className="mx-auto flex h-full w-full max-w-7xl items-center justify-between gap-4 overflow-x-auto px-4 sm:px-6 lg:px-8">
+          <Link href="/" className="flex shrink-0 items-center gap-3">
             <span className="relative flex h-3 w-3">
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
               <span className="relative inline-flex h-3 w-3 rounded-full bg-emerald-500" />
@@ -182,7 +185,7 @@ export function AppNavbar() {
               </span>
             ) : null}
           </Link>
-          <div className="flex items-center gap-3">
+          <div className="flex shrink-0 items-center gap-3">
             <div className="flex items-center gap-1.5">
               <a
                 href="/cleaner"
@@ -191,7 +194,7 @@ export function AppNavbar() {
                 className={toolLinkClass(isCleanerActive)}
               >
                 🧹 Cleaner
-                <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
               </a>
               <a
                 href="/migration"
@@ -200,7 +203,7 @@ export function AppNavbar() {
                 className={toolLinkClass(isMigrationActive)}
               >
                 🗺️ Migration
-                <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
               </a>
               <a
                 href="/lastmod-updater"
@@ -209,7 +212,7 @@ export function AppNavbar() {
                 className={toolLinkClass(isLastmodUpdaterActive)}
               >
                 🗓️ Lastmod Updater
-                <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
               </a>
               <a
                 href="/sitemap-regenerate"
@@ -218,7 +221,7 @@ export function AppNavbar() {
                 className={toolLinkClass(isSitemapRegenerateActive)}
               >
                 🔁 Regenerate
-                <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
               </a>
               {seoDeskUrl ? (
                 <a
@@ -228,20 +231,20 @@ export function AppNavbar() {
                   className={toolLinkClass(false)}
                 >
                   📋 SEO Desk
-                  <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                  <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
                 </a>
               ) : null}
             </div>
-            <span className="h-5 w-px bg-slate-700" aria-hidden="true" />
+            <span className="h-5 w-px shrink-0 bg-slate-700" aria-hidden="true" />
             {/* WHICH ENVIRONMENT health checks are sent to. Here rather than beside
                 the version pill: the pill is the deployed IMAGE version, and a
                 flippable control reading "1.90" next to a pill reading "v1.90"
                 would be unreadable in a screenshot. */}
             <CheckModeToggle />
-            <span className="h-5 w-px bg-slate-700" aria-hidden="true" />
+            <span className="h-5 w-px shrink-0 bg-slate-700" aria-hidden="true" />
             <Link
               href="/sessions"
-              className="text-sm font-medium text-slate-300 transition-colors hover:text-white"
+              className="whitespace-nowrap text-sm font-medium text-slate-400 transition-colors hover:text-white"
             >
               History
             </Link>
@@ -252,15 +255,15 @@ export function AppNavbar() {
                   setCancelError("");
                   setIsDialogOpen(true);
                 }}
-                className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-red-500/70 px-3 text-sm font-semibold text-red-300 transition-colors hover:bg-red-500/10 hover:text-red-200"
+                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-red-500/70 px-3 text-sm font-semibold text-red-300 transition-colors hover:bg-red-500/10 hover:text-red-200"
               >
-                <StopCircle className="h-4 w-4" aria-hidden="true" />
+                <StopCircle className="h-4 w-4 shrink-0" aria-hidden="true" />
                 Stop Analysis
               </button>
             ) : null}
             <Link
               href="/migration"
-              className="inline-flex h-9 items-center justify-center rounded-lg bg-indigo-500 px-4 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-indigo-600"
+              className="inline-flex h-9 shrink-0 items-center justify-center whitespace-nowrap rounded-lg bg-indigo-500 px-4 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-indigo-600"
             >
               New Analysis
             </Link>
