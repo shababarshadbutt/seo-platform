@@ -158,7 +158,7 @@ export function AppNavbar() {
   // "you are here" is unmistakable at a glance). Inactive = dimmed until
   // hovered, so the active tab is the only one competing for attention.
   const toolLinkClass = (active: boolean) =>
-    `inline-flex h-9 shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-3 text-xs font-medium transition-colors ${
+    `inline-flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-3.5 text-[11px] font-medium transition-colors ${
       active
         ? "bg-indigo-500 text-white shadow-sm"
         : "text-slate-400 hover:bg-slate-800 hover:text-white"
@@ -167,7 +167,7 @@ export function AppNavbar() {
   return (
     <>
       <nav className="sticky top-0 z-50 h-16 border-b border-slate-800 bg-slate-900">
-        <div className="mx-auto flex h-full w-full max-w-7xl items-center justify-between gap-4 overflow-x-auto px-4 sm:px-6 lg:px-8">
+        <div className="mx-auto flex h-full w-full items-center justify-between gap-4 overflow-x-auto px-4 sm:px-6 lg:px-8">
           <Link href="/" className="flex shrink-0 items-center gap-3">
             <span className="relative flex h-3 w-3">
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
