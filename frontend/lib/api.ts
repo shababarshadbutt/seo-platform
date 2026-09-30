@@ -3076,6 +3076,33 @@ export async function downloadCorrectedSitemap(
   };
 }
 
+// A minimal <urlset> zip of just the sampled 4xx URLs for one pattern — used
+// by the sitemap-regenerate wizard's Skip flow, so a pattern the user chose
+// not to fix can still be exported as a record before its URLs are dropped
+// from the regenerated sitemap.
+export async function downloadPatternFailedUrls(
+  sessionId: string,
+  patternId: string,
+  options: DownloadOptions = {}
+) {
+  const { blob, response } = await downloadToBlob(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/download-failed-urls`
+    ),
+    { cache: "no-store" },
+    options
+  );
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = objectUrl;
+  link.download = downloadFilename(response, "flagged-urls.zip");
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
 // One file whose <loc>s point at a domain other than the session's base URL;
 // the filtered download strips those URLs. `foreign_url_count` is a sampled
 // LOWER BOUND (see the backend preview endpoint) — `foreign_url_count_is_minimum`
@@ -4374,6 +4401,7 @@ export async function getCsvUploadStatus(sessionId: string) {
 
 export type SitemapRegeneratePatternDecision =
   | { pattern_id: string; mode: "as_is" }
+  | { pattern_id: string; mode: "exclude" }
   | {
       pattern_id: string;
       mode: "rewrite";

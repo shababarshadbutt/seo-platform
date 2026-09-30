@@ -27,17 +27,21 @@ function finishStream(stream: import("node:fs").WriteStream): Promise<void> {
   });
 }
 
+export function buildSyntheticSitemapXml(urls: string[]): string {
+  let xml = URLSET_HEADER;
+
+  for (const url of urls) {
+    xml += `  <url>\n    <loc>${escapeXml(url)}</loc>\n  </url>\n`;
+  }
+
+  return xml + URLSET_FOOTER;
+}
+
 export async function writeSyntheticSitemapXml(
   urls: string[],
   outPath: string
 ): Promise<void> {
   const stream = createWriteStream(outPath);
-  stream.write(URLSET_HEADER);
-
-  for (const url of urls) {
-    stream.write(`  <url>\n    <loc>${escapeXml(url)}</loc>\n  </url>\n`);
-  }
-
-  stream.write(URLSET_FOOTER);
+  stream.write(buildSyntheticSitemapXml(urls));
   await finishStream(stream);
 }

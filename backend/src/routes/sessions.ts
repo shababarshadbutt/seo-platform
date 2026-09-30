@@ -135,7 +135,10 @@ import {
   type StoredSitemapFile
 } from "../sitemaps/ingest.js";
 import { parseCsvUrlList } from "../sitemaps/csvUrlList.js";
-import { writeSyntheticSitemapXml } from "../sitemaps/csvToSitemapXml.js";
+import {
+  buildSyntheticSitemapXml,
+  writeSyntheticSitemapXml
+} from "../sitemaps/csvToSitemapXml.js";
 import {
   publishConfigError,
   s3SourceConfigError,
@@ -4430,6 +4433,67 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         reply.raw.destroy(error);
       });
 
+      void archive.finalize();
+
+      return reply.send(archive);
+    }
+  );
+
+  // Zip of just the sampled URLs that came back 4xx for this pattern — for
+  // the sitemap-regenerate wizard's Skip flow (a pattern skipped instead of
+  // fixed can still be downloaded as a record of what's being dropped). 3xx
+  // (redirect) samples are deliberately excluded: a redirect isn't broken,
+  // it still resolves. This is a snapshot of what pattern SAMPLING already
+  // checked, not a full re-verification of the pattern's whole population.
+  app.get<{ Params: PatternParams }>(
+    "/api/sessions/:id/patterns/:patternId/download-failed-urls",
+    async (request, reply) => {
+      const patternResult = await pool.query(
+        "SELECT 1 FROM patterns WHERE session_id = $1 AND id = $2",
+        [request.params.id, request.params.patternId]
+      );
+
+      if (patternResult.rowCount === 0) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "pattern not found"
+        });
+      }
+
+      const urlsResult = await pool.query<{ url: string }>(
+        `
+          SELECT url
+          FROM sampled_urls
+          WHERE pattern_id = $1
+            AND http_status_category = 'failure'
+            AND http_status >= 400 AND http_status < 500
+          ORDER BY url ASC
+        `,
+        [request.params.patternId]
+      );
+
+      if (urlsResult.rowCount === 0) {
+        return reply.code(404).send({
+          error: "Not Found",
+          message: "no broken URLs found for this pattern in the current sample"
+        });
+      }
+
+      const xml = buildSyntheticSitemapXml(urlsResult.rows.map((row) => row.url));
+      const archive = new ZipArchive({ zlib: { level: 0 } });
+
+      reply.header("content-type", "application/zip");
+      reply.header(
+        "content-disposition",
+        `attachment; filename="flagged-urls-pattern-${request.params.patternId}.zip"`
+      );
+
+      archive.on("error", (error) => {
+        request.log.error({ error }, "download-failed-urls archive error");
+        reply.raw.destroy(error);
+      });
+
+      archive.append(xml, { name: "flagged-urls.xml" });
       void archive.finalize();
 
       return reply.send(archive);
@@ -8869,6 +8933,11 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         continue;
       }
 
+      if (entry.mode === "exclude") {
+        decisions.push({ pattern_id: entry.pattern_id, mode: "exclude" });
+        continue;
+      }
+
       if (entry.mode === "rewrite") {
         if (
           typeof entry.current_structure !== "string" ||
@@ -8893,7 +8962,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
       return {
         ok: false,
-        message: `pattern ${entry.pattern_id}: mode must be "as_is" or "rewrite"`
+        message: `pattern ${entry.pattern_id}: mode must be "as_is", "rewrite", or "exclude"`
       };
     }
 

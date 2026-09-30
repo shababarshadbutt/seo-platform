@@ -47,6 +47,7 @@ export type SitemapRegenerateLastmodPolicy =
 
 export type PatternDecision =
   | { pattern_id: string; mode: "as_is" }
+  | { pattern_id: string; mode: "exclude" }
   | {
       pattern_id: string;
       mode: "rewrite";
@@ -151,12 +152,17 @@ type ResolvedUrl = {
 // extracted pattern anyway, since extraction partitions by segment count and
 // static-segment shape, but ties are broken deterministically rather than
 // left to iteration order.
-async function resolveFinalUrls(
+export async function resolveFinalUrls(
   csvStoredFilename: string,
   decisions: PatternDecision[],
   patternTemplates: Map<string, string>,
   logger: FastifyBaseLogger
-): Promise<{ urls: ResolvedUrl[]; unclassifiedCount: number; unresolvedRewriteCount: number }> {
+): Promise<{
+  urls: ResolvedUrl[];
+  unclassifiedCount: number;
+  unresolvedRewriteCount: number;
+  excludedCount: number;
+}> {
   const parsedByPatternId = new Map<
     string,
     { current: ParsedStructure; next: ParsedStructure }
@@ -185,6 +191,7 @@ async function resolveFinalUrls(
   const urls: ResolvedUrl[] = [];
   let unclassifiedCount = 0;
   let unresolvedRewriteCount = 0;
+  let excludedCount = 0;
 
   await streamSitemapUrlLocs(csvStoredFilename, (loc) => {
     let pathname: string;
@@ -210,6 +217,11 @@ async function resolveFinalUrls(
       return;
     }
 
+    if (matched.decision.mode === "exclude") {
+      excludedCount += 1;
+      return;
+    }
+
     const parsed = parsedByPatternId.get(matched.decision.pattern_id);
     const transformed = parsed ? transformUrl(loc, parsed.current, parsed.next) : null;
 
@@ -232,7 +244,14 @@ async function resolveFinalUrls(
     );
   }
 
-  return { urls, unclassifiedCount, unresolvedRewriteCount };
+  if (excludedCount > 0) {
+    logger.info(
+      { excluded_count: excludedCount },
+      "sitemap regenerate job: some CSV URLs were excluded by a skip decision"
+    );
+  }
+
+  return { urls, unclassifiedCount, unresolvedRewriteCount, excludedCount };
 }
 
 function chunkUrls(urls: ResolvedUrl[], chunkSize: number): ResolvedUrl[][] {
@@ -350,7 +369,7 @@ export async function processSitemapRegenerateJob(
       patternsResult.rows.map((row) => [row.id, row.template])
     );
 
-    const { urls, unclassifiedCount, unresolvedRewriteCount } = await resolveFinalUrls(
+    const { urls, unclassifiedCount, unresolvedRewriteCount, excludedCount } = await resolveFinalUrls(
       csvFileResult.rows[0].filename,
       pattern_decisions,
       patternTemplates,
@@ -437,7 +456,8 @@ export async function processSitemapRegenerateJob(
         files_written: writtenChunks.length,
         urls_written: urlsWritten,
         unclassified_count: unclassifiedCount,
-        unresolved_rewrite_count: unresolvedRewriteCount
+        unresolved_rewrite_count: unresolvedRewriteCount,
+        excluded_count: excludedCount
       },
       "sitemap regenerate job: files written"
     );
@@ -468,6 +488,7 @@ export async function processSitemapRegenerateJob(
           urls_written: urlsWritten,
           unclassified_count: unclassifiedCount,
           unresolved_rewrite_count: unresolvedRewriteCount,
+          excluded_count: excludedCount,
           filenames: writtenChunks.map((chunk) => chunk.displayFilename),
           published: {
             uploaded: publishResult.uploaded,

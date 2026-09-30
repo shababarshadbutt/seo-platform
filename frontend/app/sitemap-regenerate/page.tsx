@@ -17,6 +17,7 @@ import {
 
 import {
   createSession,
+  downloadPatternFailedUrls,
   enqueueSitemapRegenerate,
   friendlyApiErrorMessage,
   getCsvUploadStatus,
@@ -90,11 +91,20 @@ class ParsingTimeoutError extends Error {
 
 type PatternDecisionState =
   | { mode: "as_is" }
+  | { mode: "exclude" }
   | {
       mode: "rewrite";
       newUrl: string;
       pinnedOverrides: Map<string, string>;
     };
+
+function patternHasProblemSamples(samples: SampledUrl[] | null) {
+  return (samples ?? []).some(
+    (sample) =>
+      PROBLEM_STATUSES.has(Number(sample.http_status) || 0) ||
+      sample.http_status_category === "blocked"
+  );
+}
 
 function statusChipClass(sample: SampledUrl) {
   const status = Number(sample.http_status) || 0;
@@ -127,6 +137,10 @@ function PatternReviewCard({
 }) {
   const [samples, setSamples] = useState<SampledUrl[] | null>(null);
   const [samplesError, setSamplesError] = useState("");
+  const [awaitingFixConfirm, setAwaitingFixConfirm] = useState(false);
+  const [skipConfirmOpen, setSkipConfirmOpen] = useState(false);
+  const [downloadingFailedUrls, setDownloadingFailedUrls] = useState(false);
+  const [downloadError, setDownloadError] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -159,6 +173,10 @@ function PatternReviewCard({
     onRegisterResolver(() => {
       if (decision.mode === "as_is") {
         return { pattern_id: pattern.id, mode: "as_is" };
+      }
+
+      if (decision.mode === "exclude") {
+        return { pattern_id: pattern.id, mode: "exclude" };
       }
 
       const oldUrlExample = samples?.[0]?.url ?? "";
@@ -230,6 +248,45 @@ function PatternReviewCard({
     onChange({ mode: "rewrite", newUrl, pinnedOverrides: nextPinned });
   }
 
+  function handleFixClick() {
+    window.open(
+      `/sessions/${pattern.session_id}/results?fixPattern=${pattern.id}`,
+      "_blank",
+      "noopener,noreferrer"
+    );
+    setAwaitingFixConfirm(true);
+  }
+
+  function handleMarkFixed() {
+    setAwaitingFixConfirm(false);
+    onChange({ mode: "as_is" });
+  }
+
+  async function handleDownloadThenSkip() {
+    setDownloadingFailedUrls(true);
+    setDownloadError("");
+
+    try {
+      await downloadPatternFailedUrls(pattern.session_id, pattern.id);
+    } catch (error) {
+      setDownloadError(
+        friendlyApiErrorMessage(error, "No broken URLs found to download.")
+      );
+    } finally {
+      setDownloadingFailedUrls(false);
+    }
+
+    setSkipConfirmOpen(false);
+    onChange({ mode: "exclude" });
+  }
+
+  function handleSkipWithoutDownload() {
+    setSkipConfirmOpen(false);
+    onChange({ mode: "exclude" });
+  }
+
+  const hasProblem = patternHasProblemSamples(samples);
+
   return (
     <div className="rounded-lg border border-slate-200 p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -262,47 +319,136 @@ function PatternReviewCard({
         </div>
       )}
 
-      <div
-        className="mt-3 grid grid-cols-2 gap-1 rounded-full border border-indigo-100 bg-indigo-50 p-1 text-xs"
-        role="tablist"
-      >
-        <button
-          type="button"
-          role="tab"
-          aria-selected={decision.mode === "as_is"}
-          onClick={() => onChange({ mode: "as_is" })}
-          className={cn(
-            "flex h-8 items-center justify-center rounded-full font-semibold transition-colors",
-            decision.mode === "as_is"
-              ? "bg-indigo-500 text-white shadow-sm"
-              : "text-slate-500 hover:text-indigo-600"
-          )}
-        >
-          Keep as-is
-        </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={decision.mode === "rewrite"}
-          onClick={() =>
-            onChange(
-              decision.mode === "rewrite"
-                ? decision
-                : { mode: "rewrite", newUrl: "", pinnedOverrides: new Map() }
-            )
-          }
-          className={cn(
-            "flex h-8 items-center justify-center rounded-full font-semibold transition-colors",
-            decision.mode === "rewrite"
-              ? "bg-indigo-500 text-white shadow-sm"
-              : "text-slate-500 hover:text-indigo-600"
-          )}
-        >
-          Rewrite by example
-        </button>
-      </div>
+      {decision.mode === "exclude" ? (
+        <div className="mt-3 flex items-center justify-between gap-2 rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs text-slate-600">
+          <span>Excluded — these URLs will not be in the new sitemap.</span>
+          <button
+            type="button"
+            className="shrink-0 font-semibold text-indigo-600 underline hover:text-indigo-700"
+            onClick={() => onChange({ mode: "as_is" })}
+          >
+            Undo
+          </button>
+        </div>
+      ) : awaitingFixConfirm ? (
+        <div className="mt-3 space-y-1.5 rounded-md border border-indigo-200 bg-indigo-50 px-2.5 py-1.5 text-xs text-indigo-900">
+          <p>
+            Opened in Migration in a new tab. Once you&rsquo;ve applied a fix
+            there, confirm below.
+          </p>
+          <div className="flex gap-3">
+            <button
+              type="button"
+              className="font-semibold underline hover:text-indigo-950"
+              onClick={handleMarkFixed}
+            >
+              I&rsquo;ve fixed it — keep as-is
+            </button>
+            <button
+              type="button"
+              className="text-indigo-700 hover:text-indigo-900"
+              onClick={() => setAwaitingFixConfirm(false)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : skipConfirmOpen ? (
+        <div className="mt-3 space-y-1.5 rounded-md border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-xs text-amber-900">
+          <p>Exclude this pattern&rsquo;s URLs from the new sitemap?</p>
+          {downloadError ? <p className="text-red-700">{downloadError}</p> : null}
+          <div className="flex flex-wrap gap-3">
+            <button
+              type="button"
+              disabled={downloadingFailedUrls}
+              className="font-semibold underline hover:text-amber-950 disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={() => void handleDownloadThenSkip()}
+            >
+              {downloadingFailedUrls
+                ? "Downloading…"
+                : "Download broken URLs, then skip"}
+            </button>
+            <button
+              type="button"
+              className="font-semibold underline hover:text-amber-950"
+              onClick={handleSkipWithoutDownload}
+            >
+              Skip without downloading
+            </button>
+            <button
+              type="button"
+              className="text-amber-700 hover:text-amber-900"
+              onClick={() => setSkipConfirmOpen(false)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : hasProblem ? (
+        <div className="mt-3 flex items-center justify-between gap-2 rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-xs text-red-900">
+          <span>This pattern has broken or redirected URLs.</span>
+          <div className="flex shrink-0 gap-3">
+            <button
+              type="button"
+              className="font-semibold underline hover:text-red-950"
+              onClick={handleFixClick}
+            >
+              Fix
+            </button>
+            <button
+              type="button"
+              className="font-semibold underline hover:text-red-950"
+              onClick={() => setSkipConfirmOpen(true)}
+            >
+              Skip
+            </button>
+          </div>
+        </div>
+      ) : null}
 
-      {decision.mode === "rewrite" ? (
+      {decision.mode === "exclude" ? null : (
+        <>
+          <div
+            className="mt-3 grid grid-cols-2 gap-1 rounded-full border border-indigo-100 bg-indigo-50 p-1 text-xs"
+            role="tablist"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={decision.mode === "as_is"}
+              onClick={() => onChange({ mode: "as_is" })}
+              className={cn(
+                "flex h-8 items-center justify-center rounded-full font-semibold transition-colors",
+                decision.mode === "as_is"
+                  ? "bg-indigo-500 text-white shadow-sm"
+                  : "text-slate-500 hover:text-indigo-600"
+              )}
+            >
+              Keep as-is
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={decision.mode === "rewrite"}
+              onClick={() =>
+                onChange(
+                  decision.mode === "rewrite"
+                    ? decision
+                    : { mode: "rewrite", newUrl: "", pinnedOverrides: new Map() }
+                )
+              }
+              className={cn(
+                "flex h-8 items-center justify-center rounded-full font-semibold transition-colors",
+                decision.mode === "rewrite"
+                  ? "bg-indigo-500 text-white shadow-sm"
+                  : "text-slate-500 hover:text-indigo-600"
+              )}
+            >
+              Rewrite by example
+            </button>
+          </div>
+
+          {decision.mode === "rewrite" ? (
         <div className="mt-3 space-y-2">
           <div className="space-y-1">
             <span className="text-xs font-medium text-slate-600">
@@ -365,7 +511,9 @@ function PatternReviewCard({
             </p>
           ) : null}
         </div>
-      ) : null}
+          ) : null}
+        </>
+      )}
     </div>
   );
 }

@@ -9,7 +9,7 @@ import {
   useState
 } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   AlertCircle,
   ArrowUpDown,
@@ -924,6 +924,8 @@ export default function ResultsDashboardPage({
   params: { id: string };
 }) {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const autoOpenedFixPatternRef = useRef(false);
   const [sessionData, setSessionData] = useState<SessionResponse | null>(null);
   const [patterns, setPatterns] = useState<Pattern[]>([]);
   // Hosts whose edge refused every request profile, from the same payload as the
@@ -1585,6 +1587,38 @@ export default function ResultsDashboardPage({
         : rows.filter((row) => row.status === statusFilter),
     [rows, statusFilter]
   );
+  // Deep-link from the sitemap-regenerate wizard's Fix button
+  // (?fixPattern=<id>, opened in a new tab) straight into this pattern's
+  // Update Pattern modal, once the pattern rows have loaded. Fires once per
+  // page load — the param is then stripped so a refresh doesn't reopen it.
+  useEffect(() => {
+    const fixPatternId = searchParams.get("fixPattern");
+
+    if (!fixPatternId || autoOpenedFixPatternRef.current || rows.length === 0) {
+      return;
+    }
+
+    const target = rows.find((row) => row.id === fixPatternId);
+
+    if (!target) {
+      return;
+    }
+
+    autoOpenedFixPatternRef.current = true;
+    void openRenameModal(target);
+
+    const nextParams = new URLSearchParams(searchParams.toString());
+
+    nextParams.delete("fixPattern");
+    router.replace(
+      `${window.location.pathname}${
+        nextParams.toString() ? `?${nextParams.toString()}` : ""
+      }`,
+      { scroll: false }
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows, searchParams]);
+
   const selectedSamples = selectedRow
     ? samplesByPattern[selectedRow.id] ?? []
     : [];
