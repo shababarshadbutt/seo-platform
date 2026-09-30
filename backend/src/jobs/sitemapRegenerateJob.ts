@@ -270,9 +270,10 @@ async function existingCurrentDisplayFilenames(
     filename: string;
     original_filename: string | null;
     is_index: boolean;
+    is_regenerate_output: boolean;
   }>(
     `
-      SELECT id, filename, original_filename, is_index
+      SELECT id, filename, original_filename, is_index, is_regenerate_output
       FROM sitemap_files
       WHERE session_id = $1 AND source_role = 'current' AND is_deleted = false
     `,
@@ -287,7 +288,12 @@ async function existingCurrentDisplayFilenames(
       row.original_filename ?? productionFilename(sessionId, row.filename)
     );
 
-    if (!row.is_index) {
+    // Only THIS wizard's own previously-written chunk output is superseded on
+    // a re-run. A file this session pulled for real from S3/SFTP during Step 1
+    // is never a candidate here — soft-deleting it would drop it from the
+    // republished index even though the CSV never touched it. See migration
+    // 062.
+    if (!row.is_index && row.is_regenerate_output) {
       oldContentRows.push({ id: row.id, filename: row.filename });
     }
   }

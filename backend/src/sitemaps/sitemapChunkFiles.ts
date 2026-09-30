@@ -89,9 +89,9 @@ export async function writeSitemapChunks(
         `
           INSERT INTO sitemap_files (
             session_id, filename, total_urls, parsed_at, is_valid, is_empty,
-            is_index, source_role, original_filename
+            is_index, source_role, original_filename, is_regenerate_output
           )
-          VALUES ($1, $2, $3, now(), TRUE, $4, FALSE, 'current', $5)
+          VALUES ($1, $2, $3, now(), TRUE, $4, FALSE, 'current', $5, TRUE)
           RETURNING id
         `,
         [
