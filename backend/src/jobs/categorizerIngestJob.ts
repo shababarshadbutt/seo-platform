@@ -146,10 +146,8 @@ export async function processCategorizerIngestJob(
   const filesFailed = new Set<string>();
 
   for (const file of pending) {
-    const localPath = path.join(
-      config.uploadDir,
-      `categorizer-${sessionId}-${file.name}`
-    );
+    const storedFilename = `categorizer-${sessionId}-${file.name}`;
+    const localPath = path.join(config.uploadDir, storedFilename);
 
     try {
       if (session.source_kind === "s3") {
@@ -177,7 +175,11 @@ export async function processCategorizerIngestJob(
       // typically <=50,000) — never the whole domain's.
       const urls: string[] = [];
 
-      await streamSitemapUrlLocs(localPath, (loc) => {
+      // The bare stored filename, not localPath: openSitemapSource
+      // (sitemaps/parser.ts) prepends config.uploadDir itself, same as every
+      // other caller of this function. Passing the already-absolute
+      // localPath here double-prefixes it into a path that never exists.
+      await streamSitemapUrlLocs(storedFilename, (loc) => {
         urls.push(loc);
       });
 
