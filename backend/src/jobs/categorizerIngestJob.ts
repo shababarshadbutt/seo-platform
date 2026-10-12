@@ -11,6 +11,7 @@ import {
   listS3SitemapObjects
 } from "../s3source/s3SourceClient.js";
 import { downloadSftpFiles, listSftpSitemapFiles } from "../sftp/sftpClient.js";
+import { runWithBoundedConcurrency } from "../sitemaps/boundedConcurrency.js";
 import { streamSitemapUrlLocs } from "../sitemaps/parser.js";
 import type { CategorizerIngestJobData } from "../queue/categorizerQueue.js";
 import {
@@ -28,9 +29,22 @@ import {
 // DELIBERATELY NOT enumeratePopulation (patternPopulation.ts): that holds the
 // WHOLE population in one in-memory Map, which is exactly the ceiling this
 // tool exists to avoid at tens-of-millions-of-URLs scale. streamSitemapUrlLocs
-// is per-URL-callback with zero accumulation across files; only ONE file's
-// URL list is ever held in memory at a time (bounded by the sitemap
-// protocol's own per-file cap, typically <=50,000), never the whole domain's.
+// is per-URL-callback with zero accumulation across files; at most
+// FILE_CONCURRENCY files' URL lists are held in memory at a time (each
+// bounded by the sitemap protocol's own per-file cap, typically <=50,000),
+// never the whole domain's.
+//
+// Files download+parse+insert CONCURRENTLY (bounded by FILE_CONCURRENCY),
+// not one at a time: this loop was sequential end-to-end — one S3/SFTP round
+// trip, one parse, one batch of inserts, THEN the next file — which meant a
+// ~1,900-file domain spent its entire runtime waiting on network latency it
+// never needed to serialize. runWithBoundedConcurrency is the same scheduler
+// downloadS3Objects/downloadSftpFiles already use internally, just applied
+// one level up so whole per-file pipelines overlap instead of only the
+// in-flight byte transfer. Safe to parallelize: each file's checkpoint/DB
+// work is independent and idempotent (ON CONFLICT DO NOTHING on URLs,
+// Set.add on filesDone/filesFailed), and downloadSftpFiles already caps real
+// concurrent SSH connections itself regardless of how many callers overlap.
 //
 // Resumable per FILE, not per URL: checkpoint.files_done is the set of
 // filenames already fully ingested. A crash mid-file just re-downloads and
@@ -53,6 +67,16 @@ type IngestCheckpoint = {
 // enough that one failed INSERT (a deadlock, a transient disconnect) loses at
 // most this many pending rows, not a whole large file's worth.
 const URL_BATCH_SIZE = 2000;
+
+// How many sitemap files download+parse+insert at once. Matches
+// DOWNLOAD_CONCURRENCY in s3SourceClient.ts for the same reason: enough to
+// keep the network busy without this process (or an SFTP endpoint with a
+// hard connection ceiling) being swamped. Deliberately modest, not
+// categorizerCrawl.maxConcurrency's 16 — that knob bounds HTTP status-check
+// sockets, a much lighter unit of work than a full file download+parse, and
+// some sitemap files here have run large enough (hundreds of thousands of
+// URLs) that holding too many in memory at once is the real ceiling.
+const FILE_CONCURRENCY = 4;
 
 async function flushUrlBatch(
   sessionId: string,
@@ -145,7 +169,7 @@ export async function processCategorizerIngestJob(
   // `pending` above and gets a fresh chance — no stale carry-forward needed.
   const filesFailed = new Set<string>();
 
-  for (const file of pending) {
+  await runWithBoundedConcurrency(pending, FILE_CONCURRENCY, async (file) => {
     const storedFilename = `categorizer-${sessionId}-${file.name}`;
     const localPath = path.join(config.uploadDir, storedFilename);
 
@@ -230,7 +254,7 @@ export async function processCategorizerIngestJob(
     } finally {
       await unlink(localPath).catch(() => undefined);
     }
-  }
+  });
 
   await markCategorizerJobComplete(jobRow.id);
   await updateCategorizerSessionStatus(sessionId, "INGESTED");
