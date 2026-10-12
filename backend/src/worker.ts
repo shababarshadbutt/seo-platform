@@ -107,6 +107,21 @@ import {
   type PreGenerateZipJobName,
   type PreGenerateZipQueueData
 } from "./queue/preGenerateZipQueue.js";
+import {
+  CATEGORIZER_CATEGORIZE_JOB,
+  CATEGORIZER_GENERATE_JOB,
+  CATEGORIZER_INGEST_JOB,
+  CATEGORIZER_QUEUE_NAME,
+  CATEGORIZER_STATUS_CHECK_JOB,
+  CATEGORIZER_WORKER_CONCURRENCY,
+  closeCategorizerQueue,
+  type CategorizerCategorizeJobData,
+  type CategorizerGenerateJobData,
+  type CategorizerIngestJobData,
+  type CategorizerJobName,
+  type CategorizerQueueData,
+  type CategorizerStatusCheckJobData
+} from "./queue/categorizerQueue.js";
 import { redisConnectionOptions } from "./queue/redisConnection.js";
 import {
   processBulkReplaceJob,
@@ -144,6 +159,10 @@ import { processExtractPatternsJob } from "./jobs/extractPatternsJob.js";
 import { processParseSitemapJob } from "./jobs/parseSitemapJob.js";
 import { processSamplePatternsJob } from "./jobs/samplePatternsJob.js";
 import { processWatchdogStuckSessionsJob } from "./jobs/watchdogStuckSessionsJob.js";
+import { processCategorizerIngestJob } from "./jobs/categorizerIngestJob.js";
+import { processCategorizerStatusCheckJob } from "./jobs/categorizerStatusCheckJob.js";
+import { processCategorizerCategorizeJob } from "./jobs/categorizerCategorizeJob.js";
+import { processCategorizerGenerateJob } from "./jobs/categorizerGenerateJob.js";
 
 // Parse/extract/sample jobs run here. Raised 5 → 10 so large sessions (hundreds
 // of independent per-file parse jobs) drain the queue about twice as fast
@@ -226,6 +245,18 @@ let preGenerateZipWorker: Worker<
   PreGenerateZipQueueData,
   void,
   PreGenerateZipJobName
+> | null = null;
+// Sitemap Categorizer: ingest / status-check / categorize / generate, each a
+// per-session singleton job (see queue/categorizerQueue.ts). Its own queue at
+// low concurrency — a status-check or generate phase can occupy a slot for a
+// long time (status-check deliberately re-enqueues its own continuation
+// rather than holding one BullMQ job open across a multi-day run — see
+// categorizerStatusCheckJob.ts), and this must not starve the SFTP/S3
+// pulls other sessions are waiting on.
+let categorizerWorker: Worker<
+  CategorizerQueueData,
+  unknown,
+  CategorizerJobName
 > | null = null;
 
 function jobDataContext(data: SitemapJobData | undefined) {
@@ -673,6 +704,66 @@ async function start() {
         "pre-generate-zip worker job failed"
       );
     });
+    categorizerWorker = new Worker<CategorizerQueueData, unknown, CategorizerJobName>(
+      CATEGORIZER_QUEUE_NAME,
+      async (job) => {
+        if (job.name === CATEGORIZER_INGEST_JOB) {
+          return await processCategorizerIngestJob(
+            job.data as CategorizerIngestJobData,
+            app.log,
+            job
+          );
+        }
+
+        if (job.name === CATEGORIZER_STATUS_CHECK_JOB) {
+          return await processCategorizerStatusCheckJob(
+            job.data as CategorizerStatusCheckJobData,
+            app.log,
+            job
+          );
+        }
+
+        if (job.name === CATEGORIZER_CATEGORIZE_JOB) {
+          return await processCategorizerCategorizeJob(
+            job.data as CategorizerCategorizeJobData,
+            app.log,
+            job
+          );
+        }
+
+        if (job.name === CATEGORIZER_GENERATE_JOB) {
+          return await processCategorizerGenerateJob(
+            job.data as CategorizerGenerateJobData,
+            app.log,
+            job
+          );
+        }
+
+        throw new Error(`Unsupported job: ${job.name}`);
+      },
+      {
+        connection: redisConnectionOptions(),
+        concurrency: CATEGORIZER_WORKER_CONCURRENCY,
+        // Same reasoning as the other long-running queues: a status-check or
+        // generate phase on a large session runs far past BullMQ's default
+        // 30s lock. The status-check job additionally re-enqueues its own
+        // continuation every categorizerCrawl.chunkMinutes, so this lock only
+        // needs to cover one chunk, not the whole multi-day run.
+        lockDuration: 60 * 60 * 1000
+      }
+    );
+    categorizerWorker.on("failed", (job, error) => {
+      app.log.error(
+        {
+          job_id: job?.id,
+          job_name: job?.name,
+          session_id: (job?.data as { session_id?: string } | undefined)
+            ?.session_id,
+          error
+        },
+        "categorizer worker job failed"
+      );
+    });
     await enqueueWatchdogStuckSessionsJob();
     await enqueueCleanupZipsJob();
     await app.listen({
@@ -693,6 +784,7 @@ async function close() {
   await verificationWorker?.close();
   await triageWorker?.close();
   await preGenerateZipWorker?.close();
+  await categorizerWorker?.close();
   await destroyZipPool();
   await destroyFileRewritePool();
   await destroyDryRunScanPool();
@@ -706,6 +798,7 @@ async function close() {
   await closeVerificationQueue();
   await closeTriageQueue();
   await closePreGenerateZipQueue();
+  await closeCategorizerQueue();
   await app.close();
   await closePool();
 }

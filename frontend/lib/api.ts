@@ -4614,3 +4614,206 @@ export async function downloadTransformSample(
   link.remove();
   URL.revokeObjectURL(objectUrl);
 }
+
+// ---- Sitemap Categorizer ----------------------------------------------------
+//
+// A standalone tool, its own session model (not Migration's `sessions` table):
+// pull every URL from a site's sitemaps on S3 or SFTP, status-check every one,
+// categorize the survivors by path structure (see backend's
+// sitemaps/categorizer.ts for the rules), and generate a fresh sitemap set.
+//
+// Four phases (ingest, status-check, categorize, generate) run as background
+// jobs with their own durable progress row — polled, like the Lastmod Updater
+// and sitemap-regenerate jobs above, rather than followed over SSE. A
+// status-check run can span hours to days on a large site, which is a poor
+// fit for a live stream the browser tab may not stay open for.
+
+export type CategorizerSourceKind = "s3" | "sftp";
+
+export type CategorizerSessionStatus =
+  | "CREATED"
+  | "INGESTING"
+  | "INGESTED"
+  | "CHECKING_STATUS"
+  | "STATUS_CHECKED"
+  | "CATEGORIZING"
+  | "CATEGORIZED"
+  | "GENERATING"
+  | "COMPLETE"
+  | "FAILED"
+  | "CANCELLED";
+
+export type CategorizerSession = {
+  id: string;
+  name: string;
+  base_url: string;
+  source_kind: CategorizerSourceKind;
+  source_domain: string;
+  user_agent: string;
+  status: CategorizerSessionStatus;
+  max_urls_per_file: number;
+  created_at: string;
+  updated_at: string;
+  error: string | null;
+};
+
+export type CategorizerPhase = "ingest" | "status-check" | "categorize" | "generate";
+
+export type CategorizerJobStatus = {
+  id: string;
+  session_id: string;
+  phase: CategorizerPhase;
+  status: "PENDING" | "RUNNING" | "PAUSED" | "COMPLETE" | "FAILED";
+  checkpoint: Record<string, unknown>;
+  items_total: NumberLike;
+  items_done: NumberLike;
+  error: string | null;
+};
+
+export type CategorizerCategorySummary = {
+  category: string;
+  urlCount: number;
+};
+
+export type CategorizerOutputFile = {
+  category: string;
+  chunk_index: number;
+  filename: string;
+  url_count: number;
+};
+
+export async function createCategorizerSession(input: {
+  name: string;
+  baseUrl: string;
+  sourceKind: CategorizerSourceKind;
+  sourceDomain: string;
+  userAgent?: string;
+  maxUrlsPerFile?: number;
+}) {
+  const response = await fetchWithTimeout(
+    backendUrl("/api/sitemap-categorizer/sessions"),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: input.name,
+        base_url: input.baseUrl,
+        source_kind: input.sourceKind,
+        source_domain: input.sourceDomain,
+        user_agent: input.userAgent,
+        max_urls_per_file: input.maxUrlsPerFile
+      })
+    },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CategorizerSession>(response);
+}
+
+export async function getCategorizerSessions() {
+  const response = await fetchWithTimeout(
+    backendUrl("/api/sitemap-categorizer/sessions"),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CategorizerSession[]>(response);
+}
+
+export async function getCategorizerSession(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sitemap-categorizer/sessions/${sessionId}`),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CategorizerSession>(response);
+}
+
+// Start (or attach to an already-running) one phase. Calling this again while
+// the phase is still RUNNING is safe — the backend enqueues onto a per-session
+// singleton job, so a second click just attaches instead of double-running it.
+export async function startCategorizerPhase(
+  sessionId: string,
+  phase: CategorizerPhase
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sitemap-categorizer/sessions/${sessionId}/${phase}`),
+    { method: "POST" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<{ job_id?: string }>(response);
+}
+
+export async function getCategorizerPhaseStatus(
+  sessionId: string,
+  phase: CategorizerPhase
+) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sitemap-categorizer/sessions/${sessionId}/jobs/${phase}`),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  if (response.status === 404) {
+    return null;
+  }
+
+  return readJsonResponse<CategorizerJobStatus>(response);
+}
+
+export async function getCategorizerCategories(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sitemap-categorizer/sessions/${sessionId}/categories`),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CategorizerCategorySummary[]>(response);
+}
+
+export async function getCategorizerOutputFiles(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sitemap-categorizer/sessions/${sessionId}/output-files`),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CategorizerOutputFile[]>(response);
+}
+
+// Streamed, like every other ZIP download in this file — see downloadToBlob's
+// own notes on why a plain blob() fetch is the wrong tool for a multi-file
+// archive.
+export async function downloadCategorizerZip(sessionId: string, domain: string) {
+  const { blob, response } = await downloadToBlob(
+    backendUrl(`/api/sitemap-categorizer/sessions/${sessionId}/download`),
+    { cache: "no-store" }
+  );
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = objectUrl;
+  link.download = downloadFilename(response, `${domain}-sitemaps.zip`);
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+export async function downloadCategorizer404s(sessionId: string, domain: string) {
+  const { blob, response } = await downloadToBlob(
+    backendUrl(`/api/sitemap-categorizer/sessions/${sessionId}/download-404s`),
+    { cache: "no-store" }
+  );
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = objectUrl;
+  link.download = downloadFilename(response, `${domain}-404-urls.zip`);
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}

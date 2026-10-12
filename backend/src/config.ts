@@ -292,6 +292,51 @@ export const config = {
     })
   },
 
+  // ---- Sitemap Categorizer: exhaustive status-check crawler ---------------
+  //
+  // DELIBERATELY NO SEPARATE RATE LIMIT HERE. hostRateLimiter.ts's budget is
+  // PER HOST and PROCESS-GLOBAL precisely so that two different callers
+  // hitting the same origin share one ceiling instead of each getting their
+  // own and quietly summing past it ("25 requests/second quietly becomes
+  // 50" — see that file's header comment). The categorizer crawler calls
+  // probeUrl exactly as verifyUrlsJob.ts does, so it draws from
+  // `verification.maxRequestsPerSecond` — the SAME WAF-safe 5 req/s budget —
+  // rather than a competing one. A multi-million-URL site at that rate takes
+  // a long time (days, for a 90M-URL site); raising the SHARED number is an
+  // operational decision for whoever owns the target site, not something to
+  // default around with a tool-specific knob.
+  //
+  // Concurrency IS its own knob, independent of verification's: it bounds
+  // THIS process's socket usage, not what the target host experiences (the
+  // shared rate limiter enforces that regardless of concurrency) — see
+  // verifyProbe.ts's note on why concurrency and rate are tuned separately.
+  categorizerCrawl: {
+    maxConcurrency: readNumber("CATEGORIZER_CRAWL_MAX_CONCURRENCY", {
+      fallback: 16,
+      min: 1,
+      max: 64
+    }),
+    // Rows read per keyset-pagination batch in the status-check / categorize /
+    // generate phases. Large enough to amortize the per-batch DB round trip
+    // over a 90M-row table, small enough that one batch's HTTP checks finish
+    // (and its checkpoint commits) well within one BullMQ job attempt's chunk
+    // of work — see processCategorizerStatusCheckJob.
+    batchSize: readNumber("CATEGORIZER_CRAWL_BATCH_SIZE", {
+      fallback: 5000,
+      min: 100,
+      max: 50000
+    }),
+    // How long one BullMQ job attempt spends on the crawl before checkpointing
+    // and re-enqueuing a continuation, in minutes. A single long-lived BullMQ
+    // job is the wrong shape for a run that can span days — see the note on
+    // continuation re-enqueue in categorizerStatusCheckJob.ts.
+    chunkMinutes: readNumber("CATEGORIZER_CRAWL_CHUNK_MINUTES", {
+      fallback: 30,
+      min: 1,
+      max: 180
+    })
+  },
+
   // ---- Private-VPC routing for URL health checks --------------------------
   //
   // The ~650 sites this checker measures run on 7 EC2 boxes inside the SAME VPC

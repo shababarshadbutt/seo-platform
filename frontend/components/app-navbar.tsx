@@ -153,6 +153,8 @@ export function AppNavbar() {
   const isLastmodUpdaterActive = pathname?.startsWith("/lastmod-updater") ?? false;
   const isSitemapRegenerateActive =
     pathname?.startsWith("/sitemap-regenerate") ?? false;
+  const isSitemapCategorizerActive =
+    pathname?.startsWith("/sitemap-categorizer") ?? false;
 
   // Active = solid and bright (matches the New Analysis button's weight, so
   // "you are here" is unmistakable at a glance). Inactive = dimmed until
@@ -221,6 +223,15 @@ export function AppNavbar() {
                 className={toolLinkClass(isSitemapRegenerateActive)}
               >
                 🔁 Regenerate
+                <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
+              </a>
+              <a
+                href="/sitemap-categorizer"
+                target="_blank"
+                rel="noopener noreferrer"
+                className={toolLinkClass(isSitemapCategorizerActive)}
+              >
+                🗂️ Categorizer
                 <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
               </a>
               {seoDeskUrl ? (
