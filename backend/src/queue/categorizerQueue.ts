@@ -17,6 +17,15 @@ export const CATEGORIZER_QUEUE_NAME = "sitemap-categorizer";
 
 export const CATEGORIZER_INGEST_JOB = "categorizer-ingest" as const;
 export const CATEGORIZER_STATUS_CHECK_JOB = "categorizer-status-check" as const;
+// The default status-check engine: a per-category SAMPLED check
+// (categorizerStatusSampleJob.ts), not a full per-URL sweep. A separate job
+// name rather than a `mode` field on the existing job data, matching how
+// every other phase variant here is dispatched (by job.name in worker.ts) —
+// both still write to the SAME categorizer_jobs phase ("status-check"), so
+// categorizer_jobs_one_active_per_phase (migration 064) is still the one
+// authoritative lock preventing both from running for the same session at
+// once, same as the continuation-enqueue design already relies on.
+export const CATEGORIZER_STATUS_SAMPLE_JOB = "categorizer-status-sample" as const;
 export const CATEGORIZER_CATEGORIZE_JOB = "categorizer-categorize" as const;
 export const CATEGORIZER_GENERATE_JOB = "categorizer-generate" as const;
 
@@ -28,26 +37,31 @@ export const CATEGORIZER_WORKER_CONCURRENCY = 2;
 
 export type CategorizerIngestJobData = { session_id: string };
 export type CategorizerStatusCheckJobData = { session_id: string };
+export type CategorizerStatusSampleJobData = { session_id: string };
 export type CategorizerCategorizeJobData = { session_id: string };
 export type CategorizerGenerateJobData = { session_id: string };
 
 export type CategorizerQueueData =
   | CategorizerIngestJobData
   | CategorizerStatusCheckJobData
+  | CategorizerStatusSampleJobData
   | CategorizerCategorizeJobData
   | CategorizerGenerateJobData;
 export type CategorizerJobName =
   | typeof CATEGORIZER_INGEST_JOB
   | typeof CATEGORIZER_STATUS_CHECK_JOB
+  | typeof CATEGORIZER_STATUS_SAMPLE_JOB
   | typeof CATEGORIZER_CATEGORIZE_JOB
   | typeof CATEGORIZER_GENERATE_JOB;
 
 // worker.ts's queue-level "failed" handler only gets a BullMQ job (name +
 // data.session_id), not a CategorizerPhase string — this is how it recovers
-// one from the other to call markActiveCategorizerJobFailed.
+// one from the other to call markActiveCategorizerJobFailed. Both status-check
+// job names map to the same phase (see CATEGORIZER_STATUS_SAMPLE_JOB above).
 export const JOB_NAME_TO_PHASE: Record<CategorizerJobName, CategorizerPhase> = {
   [CATEGORIZER_INGEST_JOB]: "ingest",
   [CATEGORIZER_STATUS_CHECK_JOB]: "status-check",
+  [CATEGORIZER_STATUS_SAMPLE_JOB]: "status-check",
   [CATEGORIZER_CATEGORIZE_JOB]: "categorize",
   [CATEGORIZER_GENERATE_JOB]: "generate"
 };
@@ -122,6 +136,12 @@ export async function enqueueCategorizerStatusCheckJob(
   return enqueueSingleton(CATEGORIZER_STATUS_CHECK_JOB, data);
 }
 
+export async function enqueueCategorizerStatusSampleJob(
+  data: CategorizerStatusSampleJobData
+) {
+  return enqueueSingleton(CATEGORIZER_STATUS_SAMPLE_JOB, data);
+}
+
 export async function enqueueCategorizerCategorizeJob(
   data: CategorizerCategorizeJobData
 ) {
@@ -164,6 +184,12 @@ export async function enqueueCategorizerStatusCheckContinuation(
   data: CategorizerStatusCheckJobData
 ) {
   return enqueueContinuation(CATEGORIZER_STATUS_CHECK_JOB, data);
+}
+
+export async function enqueueCategorizerStatusSampleContinuation(
+  data: CategorizerStatusSampleJobData
+) {
+  return enqueueContinuation(CATEGORIZER_STATUS_SAMPLE_JOB, data);
 }
 
 export async function enqueueCategorizerCategorizeContinuation(

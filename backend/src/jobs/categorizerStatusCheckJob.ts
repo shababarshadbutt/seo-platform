@@ -17,11 +17,17 @@ import {
   updateCategorizerSessionStatus
 } from "./categorizerJobState.js";
 
-// Status-check phase: HTTP-probe EVERY ingested URL (not a sample) and record
-// its status, so categorization (the next phase) can exclude 404s from every
-// output file. The new scalable crawler this tool was built around — see the
-// architecture notes this module replaces: verifyUrlsJob.ts enumerates its
-// whole population into one in-memory Map, which this deliberately does not.
+// Status-check phase, "full" mode: HTTP-probe EVERY ingested URL (not a
+// sample) and record its status. This is the opt-in "advanced" path — the
+// default is categorizerStatusSampleJob.ts's per-category sampled check,
+// which is viable at tens-of-millions-of-URLs scale where a full sweep is
+// not. Runs AFTER categorize now (not before): categorization only needs
+// path shape, not status, so it moved ahead of this phase — see
+// categorizerCategorizeJob.ts.
+//
+// The new scalable crawler this tool was built around — see the architecture
+// notes this module replaces: verifyUrlsJob.ts enumerates its whole
+// population into one in-memory Map, which this deliberately does not.
 //
 // STREAMING, KEYSET-PAGINATED POPULATION. Never holds more than one batch
 // (config.categorizerCrawl.batchSize rows) in memory at a time, however many
@@ -80,7 +86,7 @@ export async function processCategorizerStatusCheckJob(
     throw new Error(`Categorizer session not found: ${sessionId}`);
   }
 
-  const jobRow = await startOrResumeCategorizerJob(sessionId, "status-check");
+  const jobRow = await startOrResumeCategorizerJob(sessionId, "status-check", "full");
   const checkpoint = jobRow.checkpoint as Partial<StatusCheckCheckpoint>;
   let lastId = checkpoint.last_id ?? 0;
 

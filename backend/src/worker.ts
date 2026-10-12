@@ -113,6 +113,7 @@ import {
   CATEGORIZER_INGEST_JOB,
   CATEGORIZER_QUEUE_NAME,
   CATEGORIZER_STATUS_CHECK_JOB,
+  CATEGORIZER_STATUS_SAMPLE_JOB,
   CATEGORIZER_WORKER_CONCURRENCY,
   closeCategorizerQueue,
   JOB_NAME_TO_PHASE,
@@ -121,7 +122,8 @@ import {
   type CategorizerIngestJobData,
   type CategorizerJobName,
   type CategorizerQueueData,
-  type CategorizerStatusCheckJobData
+  type CategorizerStatusCheckJobData,
+  type CategorizerStatusSampleJobData
 } from "./queue/categorizerQueue.js";
 import { markActiveCategorizerJobFailed } from "./jobs/categorizerJobState.js";
 import { redisConnectionOptions } from "./queue/redisConnection.js";
@@ -163,6 +165,7 @@ import { processSamplePatternsJob } from "./jobs/samplePatternsJob.js";
 import { processWatchdogStuckSessionsJob } from "./jobs/watchdogStuckSessionsJob.js";
 import { processCategorizerIngestJob } from "./jobs/categorizerIngestJob.js";
 import { processCategorizerStatusCheckJob } from "./jobs/categorizerStatusCheckJob.js";
+import { processCategorizerStatusSampleJob } from "./jobs/categorizerStatusSampleJob.js";
 import { processCategorizerCategorizeJob } from "./jobs/categorizerCategorizeJob.js";
 import { processCategorizerGenerateJob } from "./jobs/categorizerGenerateJob.js";
 
@@ -720,6 +723,14 @@ async function start() {
         if (job.name === CATEGORIZER_STATUS_CHECK_JOB) {
           return await processCategorizerStatusCheckJob(
             job.data as CategorizerStatusCheckJobData,
+            app.log,
+            job
+          );
+        }
+
+        if (job.name === CATEGORIZER_STATUS_SAMPLE_JOB) {
+          return await processCategorizerStatusSampleJob(
+            job.data as CategorizerStatusSampleJobData,
             app.log,
             job
           );

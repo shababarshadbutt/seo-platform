@@ -4659,20 +4659,29 @@ export type CategorizerSession = {
 
 export type CategorizerPhase = "ingest" | "status-check" | "categorize" | "generate";
 
+// SKIPPED is status-check only: the user explicitly chose to skip checking
+// status for this session (TimedPhaseChoice) rather than the phase having
+// actually run — kept distinct from COMPLETE so the UI can show an honest
+// "status wasn't checked" note instead of a result that looks clean.
 export type CategorizerJobStatus = {
   id: string;
   session_id: string;
   phase: CategorizerPhase;
-  status: "PENDING" | "RUNNING" | "PAUSED" | "COMPLETE" | "FAILED";
+  status: "PENDING" | "RUNNING" | "PAUSED" | "COMPLETE" | "FAILED" | "SKIPPED";
+  mode: "full" | "sampled" | null;
   checkpoint: Record<string, unknown>;
   items_total: NumberLike;
   items_done: NumberLike;
   error: string | null;
 };
 
+export type CategorizerCategoryStatus = "PENDING" | "GOOD" | "WARNING" | "BAD";
+
 export type CategorizerCategorySummary = {
   category: string;
   urlCount: number;
+  status: CategorizerCategoryStatus;
+  confidencePct: number | null;
 };
 
 export type CategorizerOutputFile = {
@@ -4709,6 +4718,10 @@ export type CategorizerStatusBucket =
 export type CategorizerStatusBreakdown = {
   pending_count: number;
   checked_count: number;
+  // Trusted via a category-level sample, never individually probed — see
+  // categorizerStatusSampleJob.ts. Its own count, not merged into pending or
+  // checked, since it's neither "not looked at" nor "individually verified".
+  skipped_count: number;
   buckets: Record<CategorizerStatusBucket, number>;
 };
 
@@ -4784,13 +4797,23 @@ export async function getCategorizerSession(sessionId: string) {
 // Start (or attach to an already-running) one phase. Calling this again while
 // the phase is still RUNNING is safe — the backend enqueues onto a per-session
 // singleton job, so a second click just attaches instead of double-running it.
+//
+// `mode` only means something for "status-check": 'sampled' (default — a
+// per-category confidence pass), 'full' (the original per-URL sweep), or
+// 'skip' (no HTTP work at all, every categorized URL flows straight to
+// generate). Ignored by every other phase.
 export async function startCategorizerPhase(
   sessionId: string,
-  phase: CategorizerPhase
+  phase: CategorizerPhase,
+  mode?: "full" | "sampled" | "skip"
 ) {
   const response = await fetchWithTimeout(
     backendUrl(`/api/sitemap-categorizer/sessions/${sessionId}/${phase}`),
-    { method: "POST" },
+    {
+      method: "POST",
+      headers: mode ? { "content-type": "application/json" } : undefined,
+      body: mode ? JSON.stringify({ mode }) : undefined
+    },
     EXPORT_API_TIMEOUT_MS
   );
 

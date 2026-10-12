@@ -23,31 +23,37 @@ import {
   updateCategorizerSessionStatus
 } from "./categorizerJobState.js";
 
-// Categorize phase: classify every status-checked, non-404 URL (doc sections
-// 3 and 4 — see sitemaps/categorizer.ts for the rules themselves). Two
-// sub-passes over the SAME streamed, keyset-paginated population, because
-// depth detection needs a FINALIZED boundary map before any URL can be
-// assigned a filename — see DepthBoundaryDetector's own notes on why.
+// Categorize phase: classify every ingested URL by path structure (doc
+// sections 3 and 4 — see sitemaps/categorizer.ts for the rules themselves).
+// Runs right after ingest, BEFORE status-check: categorization only looks at
+// a URL's path shape, never its HTTP status, so it does not need to wait
+// behind a full per-URL crawl that is not viable at tens-of-millions-of-URLs
+// scale. Two sub-passes over the SAME streamed, keyset-paginated population,
+// because depth detection needs a FINALIZED boundary map before any URL can
+// be assigned a filename — see DepthBoundaryDetector's own notes on why.
 //
 //   1. "detect" — stream every eligible URL once, feeding non-RFQ ones into a
 //      DepthBoundaryDetector. RFQ-shaped URLs are excluded from this pass so
 //      literal RFQ path segments ("rfq", "nsn") never pollute the regular
 //      depth statistics. RESTARTS ON RESUME rather than resuming mid-pass: it
 //      is pure DB-read + in-memory compute (no HTTP), so a full rescan is
-//      cheap relative to the status-check phase, and the detector's tracker
-//      state is not worth serializing across a worker restart for that
-//      saving. Finishes by persisting the resolved boundaries into the job's
-//      checkpoint, once, as plain data (bounded by distinct static prefixes).
+//      cheap, and the detector's tracker state is not worth serializing
+//      across a worker restart for that saving. Finishes by persisting the
+//      resolved boundaries into the job's checkpoint, once, as plain data
+//      (bounded by distinct static prefixes).
 //   2. "assign" — stream every eligible URL again (category_state='pending'),
 //      classify it against the now-finalized boundaries, and write
 //      rule_matched + category_state='categorized'. THIS sub-pass is fully
 //      resumable by its own keyset cursor, same as the status-check phase.
 //
-// 404 EXCLUSION HAPPENS IN THE QUERY, not as a later filter: both sub-passes
-// select "http_status IS DISTINCT FROM 404" (not just "<> 404", which a NULL
-// http_status — an unchecked row — would also satisfy) AND
-// "check_state = 'checked'", so a URL that was never verified can never be
-// silently treated as non-404 and categorized.
+// 404 EXCLUSION NO LONGER HAPPENS HERE. It used to be a query filter
+// ("check_state='checked' AND http_status IS DISTINCT FROM 404"), back when
+// status-check ran first — that's gone now that status isn't known yet at
+// categorize time. Instead, the status-check phase (sampled or full, run
+// AFTER this one) flips a confirmed-404 URL's category_state to 'excluded'
+// directly, which categorizerGenerateJob.ts's existing
+// "category_state = 'categorized'" query already skips — see
+// categorizerStatusSampleJob.ts.
 
 type CategorizerSessionRow = {
   id: string;
@@ -80,11 +86,11 @@ export async function processCategorizerCategorizeJob(
     throw new Error(`Categorizer session not found: ${sessionId}`);
   }
 
-  const statusCheckJob = await latestCategorizerJob(sessionId, "status-check");
+  const ingestJob = await latestCategorizerJob(sessionId, "ingest");
 
-  if (!statusCheckJob || statusCheckJob.status !== "COMPLETE") {
+  if (!ingestJob || ingestJob.status !== "COMPLETE") {
     throw new Error(
-      "Cannot categorize before the status-check phase has completed for this session"
+      "Cannot categorize before the ingest phase has completed for this session"
     );
   }
 
@@ -94,8 +100,7 @@ export async function processCategorizerCategorizeJob(
   await updateCategorizerSessionStatus(sessionId, "CATEGORIZING");
 
   const totalResult = await pool.query<{ count: string }>(
-    `SELECT COUNT(*)::text AS count FROM categorizer_urls
-     WHERE session_id = $1 AND check_state = 'checked' AND http_status IS DISTINCT FROM 404`,
+    `SELECT COUNT(*)::text AS count FROM categorizer_urls WHERE session_id = $1`,
     [sessionId]
   );
   const total = Number(totalResult.rows[0]?.count ?? 0);
@@ -128,8 +133,7 @@ export async function processCategorizerCategorizeJob(
         `
           SELECT id::text AS id, url
           FROM categorizer_urls
-          WHERE session_id = $1 AND check_state = 'checked'
-            AND http_status IS DISTINCT FROM 404 AND id > $2
+          WHERE session_id = $1 AND id > $2
           ORDER BY id
           LIMIT $3
         `,
@@ -191,9 +195,7 @@ export async function processCategorizerCategorizeJob(
       `
         SELECT id::text AS id, url
         FROM categorizer_urls
-        WHERE session_id = $1 AND check_state = 'checked'
-          AND http_status IS DISTINCT FROM 404 AND category_state = 'pending'
-          AND id > $2
+        WHERE session_id = $1 AND category_state = 'pending' AND id > $2
         ORDER BY id
         LIMIT $3
       `,

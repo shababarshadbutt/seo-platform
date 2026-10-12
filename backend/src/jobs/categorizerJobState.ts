@@ -14,13 +14,25 @@ export type CategorizerJobStatus =
   | "RUNNING"
   | "PAUSED"
   | "COMPLETE"
-  | "FAILED";
+  | "FAILED"
+  // The status-check phase only: the user explicitly skipped checking
+  // status for this session (TimedPhaseChoice on the frontend) rather than
+  // the phase having run to completion — kept distinct from COMPLETE so the
+  // UI can show an honest "status wasn't checked" banner instead of a result
+  // that silently looks clean.
+  | "SKIPPED";
+// Which status-check engine produced a COMPLETE/RUNNING job row: the
+// original full per-URL crawl, or the new per-category sampled check. Only
+// meaningful for phase "status-check"; null for every other phase and for a
+// SKIPPED row (nothing ran).
+export type CategorizerJobMode = "full" | "sampled";
 
 export type CategorizerJobRow = {
   id: string;
   session_id: string;
   phase: CategorizerPhase;
   status: CategorizerJobStatus;
+  mode: CategorizerJobMode | null;
   checkpoint: Record<string, unknown>;
   items_total: number;
   items_done: number;
@@ -28,7 +40,7 @@ export type CategorizerJobRow = {
 };
 
 const JOB_COLUMNS =
-  "id, session_id, phase, status, checkpoint, items_total, items_done, error";
+  "id, session_id, phase, status, mode, checkpoint, items_total, items_done, error";
 
 // The most recent job row for (session, phase), or null if the phase has
 // never been started. Used to gate a later phase on an earlier one's
@@ -59,7 +71,12 @@ export async function latestCategorizerJob(
 // this past the table's one-active-row-per-phase unique index.
 export async function startOrResumeCategorizerJob(
   sessionId: string,
-  phase: CategorizerPhase
+  phase: CategorizerPhase,
+  // Which status-check engine is starting this phase (ignored for every
+  // other phase). Only applied on a FRESH row — a resumed PENDING/RUNNING
+  // row keeps whatever mode it was created with, since a resume continues
+  // the same run, not a different engine.
+  mode?: CategorizerJobMode
 ): Promise<CategorizerJobRow> {
   const active = await pool.query<CategorizerJobRow>(
     `SELECT ${JOB_COLUMNS}
@@ -74,10 +91,10 @@ export async function startOrResumeCategorizerJob(
   }
 
   const created = await pool.query<CategorizerJobRow>(
-    `INSERT INTO categorizer_jobs (session_id, phase, status)
-     VALUES ($1, $2, 'PENDING')
+    `INSERT INTO categorizer_jobs (session_id, phase, status, mode)
+     VALUES ($1, $2, 'PENDING', $3)
      RETURNING ${JOB_COLUMNS}`,
-    [sessionId, phase]
+    [sessionId, phase, mode ?? null]
   );
 
   return created.rows[0];
@@ -93,6 +110,25 @@ export async function markCategorizerJobRunning(
      WHERE id = $1`,
     [jobId, itemsTotal ?? null]
   );
+}
+
+// The route's direct "skip status-check" action: no BullMQ job ever runs, so
+// there is no PENDING row to transition — this inserts the terminal row
+// outright. Still subject to categorizer_jobs_one_active_per_phase (a
+// PENDING/RUNNING status-check must finish or be re-run before it can be
+// skipped), same as every other phase start.
+export async function insertSkippedCategorizerJob(
+  sessionId: string,
+  phase: CategorizerPhase
+): Promise<CategorizerJobRow> {
+  const created = await pool.query<CategorizerJobRow>(
+    `INSERT INTO categorizer_jobs (session_id, phase, status, completed_at)
+     VALUES ($1, $2, 'SKIPPED', now())
+     RETURNING ${JOB_COLUMNS}`,
+    [sessionId, phase]
+  );
+
+  return created.rows[0];
 }
 
 export async function updateCategorizerJobCheckpoint(

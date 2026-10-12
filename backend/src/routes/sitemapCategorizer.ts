@@ -15,6 +15,7 @@ import {
 } from "../sitemaps/categorizerMaxUrlsPerFile.js";
 import { buildSyntheticSitemapXml } from "../sitemaps/csvToSitemapXml.js";
 import {
+  insertSkippedCategorizerJob,
   latestCategorizerJob,
   type CategorizerPhase
 } from "../jobs/categorizerJobState.js";
@@ -22,7 +23,8 @@ import {
   enqueueCategorizerCategorizeJob,
   enqueueCategorizerGenerateJob,
   enqueueCategorizerIngestJob,
-  enqueueCategorizerStatusCheckJob
+  enqueueCategorizerStatusCheckJob,
+  enqueueCategorizerStatusSampleJob
 } from "../queue/categorizerQueue.js";
 
 // Routes for the Sitemap Categorizer tool — a standalone module (own session
@@ -145,11 +147,21 @@ async function fetchSession(sessionId: string): Promise<CategorizerSessionRow | 
 // instead of letting the job fail asynchronously hours into a run (the job
 // processors enforce the same gate themselves as a second line of defense —
 // see categorizerCategorizeJob.ts / categorizerGenerateJob.ts).
+//
+// Categorize now comes right after ingest (it only needs URL path shape, not
+// HTTP status — see categorizerCategorizeJob.ts), and status-check moved
+// after it: it's a per-CATEGORY confidence pass over categorize's output now,
+// not a per-URL gate in front of it (categorizerStatusSampleJob.ts).
 const PRECEDING_PHASE: Partial<Record<CategorizerPhase, CategorizerPhase>> = {
-  "status-check": "ingest",
-  categorize: "status-check",
-  generate: "categorize"
+  categorize: "ingest",
+  "status-check": "categorize",
+  generate: "status-check"
 };
+
+// A status-check job is "done enough" for generate to proceed whether it
+// actually ran (COMPLETE, full or sampled) or was explicitly skipped by the
+// user (SKIPPED) — see the status-check POST handler's `mode: 'skip'` branch.
+const DONE_STATUSES = new Set(["COMPLETE", "SKIPPED"]);
 
 export async function sitemapCategorizerRoutes(app: FastifyInstance) {
   app.post<{
@@ -254,7 +266,7 @@ export async function sitemapCategorizerRoutes(app: FastifyInstance) {
   // if it shows an active (PENDING/RUNNING) row, this just attaches to it
   // instead of enqueueing a second run.
   for (const phase of PHASES) {
-    app.post<{ Params: SessionParams }>(
+    app.post<{ Params: SessionParams; Body: { mode?: unknown } }>(
       `/api/sitemap-categorizer/sessions/:id/${phase}`,
       async (request, reply) => {
         const sessionId = request.params.id;
@@ -269,7 +281,7 @@ export async function sitemapCategorizerRoutes(app: FastifyInstance) {
         if (precedingPhase) {
           const precedingJob = await latestCategorizerJob(sessionId, precedingPhase);
 
-          if (!precedingJob || precedingJob.status !== "COMPLETE") {
+          if (!precedingJob || !DONE_STATUSES.has(precedingJob.status)) {
             return reply.code(409).send({
               error: "Conflict",
               message: `The "${precedingPhase}" phase must complete before "${phase}" can start`
@@ -283,14 +295,39 @@ export async function sitemapCategorizerRoutes(app: FastifyInstance) {
           return reply.code(202).send({ job_id: null, status: activeJob.status });
         }
 
+        // status-check alone offers a choice: 'sampled' (default — a
+        // per-category confidence pass, viable at tens-of-millions-of-URLs
+        // scale), 'full' (the original per-URL sweep, opt-in), or 'skip'
+        // (no HTTP work at all — every categorized URL flows straight to
+        // generate, see categorizerGenerateJob.ts which has no status
+        // dependency of its own).
+        if (phase === "status-check") {
+          const mode = request.body?.mode;
+
+          if (mode === "skip") {
+            const job = await insertSkippedCategorizerJob(sessionId, "status-check");
+
+            await pool.query(
+              "UPDATE categorizer_sessions SET status = 'STATUS_CHECKED', updated_at = now() WHERE id = $1",
+              [sessionId]
+            );
+
+            return reply.code(202).send({ job_id: job.id, status: job.status });
+          }
+
+          const enqueueStatusCheck =
+            mode === "full" ? enqueueCategorizerStatusCheckJob : enqueueCategorizerStatusSampleJob;
+          const job = await enqueueStatusCheck({ session_id: sessionId });
+
+          return reply.code(202).send({ job_id: job.id });
+        }
+
         const enqueue =
           phase === "ingest"
             ? enqueueCategorizerIngestJob
-            : phase === "status-check"
-              ? enqueueCategorizerStatusCheckJob
-              : phase === "categorize"
-                ? enqueueCategorizerCategorizeJob
-                : enqueueCategorizerGenerateJob;
+            : phase === "categorize"
+              ? enqueueCategorizerCategorizeJob
+              : enqueueCategorizerGenerateJob;
 
         const job = await enqueue({ session_id: sessionId });
 
@@ -394,17 +431,27 @@ export async function sitemapCategorizerRoutes(app: FastifyInstance) {
   // the others — categorizerCategorizeJob.ts's own "http_status IS DISTINCT
   // FROM 404" treats a NULL the same as a real non-404 response, which this
   // breakdown makes visible rather than silent.
+  //
+  // skipped_count is its OWN number, not merged into pending or checked: a
+  // 'skipped' row (categorizerStatusSampleJob.ts) was never individually
+  // probed, but it also isn't "not yet looked at" — it's trusted via its
+  // category's sample. Collapsing it into either existing bucket would make
+  // one of them lie about what actually happened to those URLs.
   app.get<{ Params: SessionParams }>(
     "/api/sitemap-categorizer/sessions/:id/status-breakdown",
     async (request) => {
       const sessionId = request.params.id;
 
       const pendingResult = await pool.query<{ count: string }>(
-        `SELECT COUNT(*)::text AS count FROM categorizer_urls WHERE session_id = $1 AND check_state <> 'checked'`,
+        `SELECT COUNT(*)::text AS count FROM categorizer_urls WHERE session_id = $1 AND check_state NOT IN ('checked', 'skipped')`,
         [sessionId]
       );
       const checkedResult = await pool.query<{ count: string }>(
         `SELECT COUNT(*)::text AS count FROM categorizer_urls WHERE session_id = $1 AND check_state = 'checked'`,
+        [sessionId]
+      );
+      const skippedResult = await pool.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM categorizer_urls WHERE session_id = $1 AND check_state = 'skipped'`,
         [sessionId]
       );
       const bucketsResult = await pool.query<{ bucket: string; count: string }>(
@@ -440,6 +487,7 @@ export async function sitemapCategorizerRoutes(app: FastifyInstance) {
       return {
         pending_count: Number(pendingResult.rows[0]?.count ?? 0),
         checked_count: Number(checkedResult.rows[0]?.count ?? 0),
+        skipped_count: Number(skippedResult.rows[0]?.count ?? 0),
         buckets
       };
     }
@@ -484,23 +532,44 @@ export async function sitemapCategorizerRoutes(app: FastifyInstance) {
   // Live preview of the categorize phase's output, grouped by category —
   // available as soon as categorize has written rows, even mid-run, and
   // independent of chunking (which only happens at generate time).
+  //
+  // Includes 'excluded' rows in url_count's source set (not just
+  // 'categorized') and left-joins categorizer_categories so a category the
+  // sampled status-check dropped entirely (status BAD — see
+  // categorizerStatusSampleJob.ts) still shows up here with its real
+  // confidence, instead of silently vanishing once every one of its rows is
+  // excluded. status/confidencePct are null until that category has been
+  // sampled at all.
   app.get<{ Params: SessionParams }>(
     "/api/sitemap-categorizer/sessions/:id/categories",
     async (request) => {
-      const result = await pool.query<{ category: string; url_count: string }>(
+      const result = await pool.query<{
+        category: string;
+        url_count: string;
+        status: string | null;
+        confidence_pct: string | null;
+      }>(
         `
-          SELECT category, COUNT(*)::text AS url_count
-          FROM categorizer_urls
-          WHERE session_id = $1 AND category_state = 'categorized'
-          GROUP BY category
-          ORDER BY category
+          SELECT
+            u.category,
+            COUNT(*) FILTER (WHERE u.category_state = 'categorized')::text AS url_count,
+            c.status,
+            c.confidence_pct::text AS confidence_pct
+          FROM categorizer_urls u
+          LEFT JOIN categorizer_categories c
+            ON c.session_id = u.session_id AND c.category = u.category
+          WHERE u.session_id = $1 AND u.category_state IN ('categorized', 'excluded')
+          GROUP BY u.category, c.status, c.confidence_pct
+          ORDER BY u.category
         `,
         [request.params.id]
       );
 
       return result.rows.map((row) => ({
         category: row.category,
-        urlCount: Number(row.url_count)
+        urlCount: Number(row.url_count),
+        status: row.status ?? "PENDING",
+        confidencePct: row.confidence_pct === null ? null : Number(row.confidence_pct)
       }));
     }
   );

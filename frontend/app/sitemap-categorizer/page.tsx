@@ -50,14 +50,7 @@ import {
   CardTitle
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle
-} from "@/components/ui/dialog";
+import { TimedPhaseChoice } from "@/components/categorizer/TimedPhaseChoice";
 
 // Per categorizerMaxUrlsPerFile.ts — kept in sync by hand since this is a
 // frontend-only bound check (the backend is authoritative and re-validates).
@@ -76,6 +69,15 @@ function isPhaseActive(job: CategorizerJobStatus | null) {
   return job?.status === "PENDING" || job?.status === "RUNNING";
 }
 
+// COMPLETE (the phase ran) and SKIPPED (status-check only — the user
+// explicitly chose not to run it, see TimedPhaseChoice below) are both
+// terminal, non-active states. Treated as one group for gating later phases;
+// PhaseCard's own render still tells them apart (a SKIPPED job gets its own
+// neutral banner, never the green "Done" one).
+function isPhaseDone(job: CategorizerJobStatus | null) {
+  return job?.status === "COMPLETE" || job?.status === "SKIPPED";
+}
+
 // A durable-job progress card: polls one phase's status row every few seconds
 // (not SSE — a status-check run can span hours to days, which is a poor fit
 // for a stream the browser tab may not stay open for) and renders a progress
@@ -86,7 +88,7 @@ function PhaseCard({
   description,
   sessionId,
   phase,
-  confirmBeforeStart,
+  renderIdle,
   disabled,
   onComplete,
   renderPreview,
@@ -100,7 +102,15 @@ function PhaseCard({
   description: string;
   sessionId: string;
   phase: CategorizerPhase;
-  confirmBeforeStart?: { title: string; description: string };
+  // Replaces the default plain "Start" button for the not-yet-started state.
+  // Only status-check uses this (TimedPhaseChoice, offering sampled/full/skip
+  // instead of a single Start action) — every other phase omits it and gets
+  // the default button. Receives THIS card's own start()/loading so the
+  // custom UI shares the same polling/loading state as the rest of the card.
+  renderIdle?: (
+    start: (mode?: "full" | "sampled" | "skip") => void,
+    loading: boolean
+  ) => React.ReactNode;
   disabled?: boolean;
   onComplete?: () => void;
   // Rendered in BOTH the active and complete states, not just after
@@ -126,7 +136,6 @@ function PhaseCard({
   const [job, setJob] = useState<CategorizerJobStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [confirmOpen, setConfirmOpen] = useState(false);
   const notifiedComplete = useRef(false);
 
   const poll = useCallback(async () => {
@@ -135,7 +144,7 @@ function PhaseCard({
 
       setJob(status);
 
-      if (status?.status === "COMPLETE" && !notifiedComplete.current) {
+      if (isPhaseDone(status) && !notifiedComplete.current) {
         notifiedComplete.current = true;
         onComplete?.();
       }
@@ -154,12 +163,12 @@ function PhaseCard({
     return () => window.clearInterval(interval);
   }, [poll]);
 
-  async function start() {
+  async function start(mode?: "full" | "sampled" | "skip") {
     setLoading(true);
     setError("");
 
     try {
-      await startCategorizerPhase(sessionId, phase);
+      await startCategorizerPhase(sessionId, phase, mode);
       await poll();
     } catch (err) {
       setError(friendlyApiErrorMessage(err, "Unable to start this phase."));
@@ -172,7 +181,8 @@ function PhaseCard({
   const done = Number(job?.items_done ?? 0);
   const percent = total > 0 ? Math.round((done / total) * 100) : 0;
   const active = isPhaseActive(job);
-  const complete = job?.status === "COMPLETE";
+  const complete = isPhaseDone(job);
+  const skipped = job?.status === "SKIPPED";
   const failed = job?.status === "FAILED";
   const empty = job ? (isEmpty ?? ((j: CategorizerJobStatus) => Number(j?.items_total ?? 0) === 0))(job) : false;
 
@@ -188,21 +198,19 @@ function PhaseCard({
         {job && renderNote ? renderNote(job) : null}
 
         {!job || (!active && !complete) ? (
-          <Button
-            type="button"
-            disabled={disabled || loading}
-            onClick={() => {
-              if (confirmBeforeStart) {
-                setConfirmOpen(true);
-              } else {
-                void start();
-              }
-            }}
-            className="gap-2"
-          >
-            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-            {failed ? "Retry" : "Start"}
-          </Button>
+          renderIdle ? (
+            renderIdle((mode) => void start(mode), disabled || loading)
+          ) : (
+            <Button
+              type="button"
+              disabled={disabled || loading}
+              onClick={() => void start()}
+              className="gap-2"
+            >
+              {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              {failed ? "Retry" : "Start"}
+            </Button>
+          )
         ) : null}
 
         {active ? (
@@ -222,7 +230,13 @@ function PhaseCard({
 
         {complete ? (
           <div className="space-y-3">
-            {empty ? (
+            {skipped ? (
+              <p className="flex items-center gap-2 text-sm font-medium text-amber-700">
+                <AlertTriangle className="h-4 w-4" />
+                Skipped — status wasn&rsquo;t checked, every categorized URL was
+                included as-is.
+              </p>
+            ) : empty ? (
               <p className="flex items-center gap-2 text-sm font-medium text-amber-700">
                 <AlertTriangle className="h-4 w-4" />
                 {`Completed — no ${emptyNoun} were found`}
@@ -253,31 +267,6 @@ function PhaseCard({
           </div>
         ) : null}
       </CardContent>
-
-      {confirmBeforeStart ? (
-        <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>{confirmBeforeStart.title}</DialogTitle>
-              <DialogDescription>{confirmBeforeStart.description}</DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setConfirmOpen(false)}>
-                Cancel
-              </Button>
-              <Button
-                type="button"
-                onClick={() => {
-                  setConfirmOpen(false);
-                  void start();
-                }}
-              >
-                Start
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-      ) : null}
     </Card>
   );
 }
@@ -371,6 +360,7 @@ function CategoriesPreview({ sessionId }: { sessionId: string }) {
         <thead className="bg-slate-50 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
           <tr>
             <th className="px-3 py-2">Category</th>
+            <th className="px-3 py-2">Status</th>
             <th className="px-3 py-2 text-right">URLs</th>
             <th className="px-3 py-2 text-right">Sample</th>
           </tr>
@@ -381,6 +371,12 @@ function CategoriesPreview({ sessionId }: { sessionId: string }) {
               <tr>
                 <td className="px-3 py-2 font-mono text-xs text-slate-700">
                   {category.category}.xml
+                </td>
+                <td className="px-3 py-2">
+                  <CategoryStatusBadge
+                    status={category.status}
+                    confidencePct={category.confidencePct}
+                  />
                 </td>
                 <td className="px-3 py-2 text-right text-slate-700">
                   {formatNumber(category.urlCount)}
@@ -401,7 +397,7 @@ function CategoriesPreview({ sessionId }: { sessionId: string }) {
               </tr>
               {expanded === category.category ? (
                 <tr>
-                  <td colSpan={3} className="p-0">
+                  <td colSpan={4} className="p-0">
                     <CategorySampleRows sessionId={sessionId} category={category.category} />
                   </td>
                 </tr>
@@ -411,6 +407,39 @@ function CategoriesPreview({ sessionId }: { sessionId: string }) {
         </tbody>
       </table>
     </div>
+  );
+}
+
+// PENDING means "not sampled yet" (see migration 065's categorizer_categories
+// — the same PENDING-is-not-BAD distinction patternScore.ts documents for
+// patterns.status), rendered as neutral, not a verdict.
+function CategoryStatusBadge({
+  status,
+  confidencePct
+}: {
+  status: CategorizerCategorySummary["status"];
+  confidencePct: number | null;
+}) {
+  const styles: Record<CategorizerCategorySummary["status"], string> = {
+    PENDING: "bg-slate-100 text-slate-600",
+    GOOD: "bg-emerald-100 text-emerald-700",
+    WARNING: "bg-amber-100 text-amber-700",
+    BAD: "bg-red-100 text-red-700"
+  };
+  const labels: Record<CategorizerCategorySummary["status"], string> = {
+    PENDING: "Not sampled",
+    GOOD: "Good",
+    WARNING: "Warning",
+    BAD: "Excluded (bad)"
+  };
+
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${styles[status]}`}
+    >
+      {labels[status]}
+      {confidencePct !== null ? ` — ${confidencePct}%` : ""}
+    </span>
   );
 }
 
@@ -953,10 +982,10 @@ export default function SitemapCategorizerPage() {
             Sitemap Categorizer
           </h1>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            Pull every URL from a site&rsquo;s existing sitemaps, check the status
-            of every one, automatically categorize the survivors by path
-            structure, and generate a clean, capped-size sitemap set with an
-            index — ready for Google Search Console.
+            Pull every URL from a site&rsquo;s existing sitemaps, automatically
+            categorize them by path structure, sample-check each
+            category&rsquo;s status, and generate a clean, capped-size sitemap
+            set with an index — ready for Google Search Console.
           </p>
         </div>
 
@@ -1105,29 +1134,43 @@ export default function SitemapCategorizerPage() {
 
             <PhaseCard
               step={3}
-              title="Check status"
-              description="Check the HTTP status of every ingested URL. 404s are excluded from every output file."
+              title="Categorize"
+              description="Classify every ingested URL by path structure (regular pages, static listings, and RFQ shapes)."
               sessionId={session.id}
-              phase="status-check"
+              phase="categorize"
               disabled={!ingestDone}
-              confirmBeforeStart={{
-                title: "Start checking every URL?",
-                description:
-                  "This checks the status of every URL, not a sample, and can take a long time on a large site. It runs in the background and can be revisited later — this tab does not need to stay open."
-              }}
-              onComplete={() => setStatusCheckDone(true)}
-              renderPreview={<StatusCheckBreakdown sessionId={session.id} />}
+              onComplete={() => setCategorizeDone(true)}
+              renderPreview={<CategoriesPreview sessionId={session.id} />}
             />
 
             <PhaseCard
               step={4}
-              title="Categorize"
-              description="Classify every non-404 URL by path structure (regular pages, static listings, and RFQ shapes)."
+              title="Check status"
+              description="Sample-check each category's URLs and score its confidence. 404s found in a sample (and any category that scores too low) are excluded from the output."
               sessionId={session.id}
-              phase="categorize"
-              disabled={!statusCheckDone}
-              onComplete={() => setCategorizeDone(true)}
-              renderPreview={<CategoriesPreview sessionId={session.id} />}
+              phase="status-check"
+              disabled={!categorizeDone}
+              onComplete={() => setStatusCheckDone(true)}
+              renderIdle={(start, loading) => (
+                <TimedPhaseChoice
+                  seconds={5}
+                  disabled={loading}
+                  title="Check status before generating?"
+                  description="By default this checks a sample of URLs per category and scores each category's confidence — fast, even on huge sites. You can skip status checking entirely, or opt into the slower full per-URL check instead."
+                  onTimeout={() => start("sampled")}
+                  actions={[
+                    {
+                      label: "Skip to Generate & Download",
+                      onClick: () => start("skip")
+                    },
+                    {
+                      label: "Check every URL instead",
+                      onClick: () => start("full")
+                    }
+                  ]}
+                />
+              )}
+              renderPreview={<StatusCheckBreakdown sessionId={session.id} />}
             />
 
             <PhaseCard
@@ -1136,7 +1179,7 @@ export default function SitemapCategorizerPage() {
               description="Write the final capped-size sitemap files and a sitemap-index.xml."
               sessionId={session.id}
               phase="generate"
-              disabled={!categorizeDone}
+              disabled={!statusCheckDone}
               renderPreview={
                 <OutputFilesAndDownload
                   sessionId={session.id}

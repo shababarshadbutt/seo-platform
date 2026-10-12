@@ -334,6 +334,18 @@ export const config = {
       fallback: 30,
       min: 1,
       max: 180
+    }),
+    // How many URLs the sampled status-check job probes per CATEGORY, instead
+    // of every URL in it — the fix for a full sweep not being viable at
+    // tens-of-millions-of-URLs scale (see categorizerStatusSampleJob.ts).
+    // Mirrors the per-pattern sample used by samplePatternsJob.ts, just a
+    // fixed size here rather than a per-session sessions.sample_size column —
+    // a categorizer session is a one-shot run, not a pattern watched over
+    // time, so there is no reuse-window/resample concern to tune per session.
+    sampleSizePerCategory: readNumber("CATEGORIZER_SAMPLE_SIZE_PER_CATEGORY", {
+      fallback: 30,
+      min: 1,
+      max: 500
     })
   },
 
