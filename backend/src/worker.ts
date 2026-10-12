@@ -115,6 +115,7 @@ import {
   CATEGORIZER_STATUS_CHECK_JOB,
   CATEGORIZER_WORKER_CONCURRENCY,
   closeCategorizerQueue,
+  JOB_NAME_TO_PHASE,
   type CategorizerCategorizeJobData,
   type CategorizerGenerateJobData,
   type CategorizerIngestJobData,
@@ -122,6 +123,7 @@ import {
   type CategorizerQueueData,
   type CategorizerStatusCheckJobData
 } from "./queue/categorizerQueue.js";
+import { markActiveCategorizerJobFailed } from "./jobs/categorizerJobState.js";
 import { redisConnectionOptions } from "./queue/redisConnection.js";
 import {
   processBulkReplaceJob,
@@ -763,6 +765,23 @@ async function start() {
         },
         "categorizer worker job failed"
       );
+
+      const sessionId = (job?.data as { session_id?: string } | undefined)
+        ?.session_id;
+      const phase = job?.name ? JOB_NAME_TO_PHASE[job.name] : undefined;
+
+      if (sessionId && phase) {
+        void markActiveCategorizerJobFailed(
+          sessionId,
+          phase,
+          error?.message ?? String(error)
+        ).catch((dbError) => {
+          app.log.error(
+            { dbError, session_id: sessionId, phase },
+            "failed to persist categorizer job failure"
+          );
+        });
+      }
     });
     await enqueueWatchdogStuckSessionsJob();
     await enqueueCleanupZipsJob();

@@ -46,6 +46,7 @@ type CategorizerSessionRow = {
 
 type IngestCheckpoint = {
   files_done: string[];
+  files_failed?: string[];
 };
 
 // Batches flushed well under Postgres's parameter-count ceiling and small
@@ -139,7 +140,10 @@ export async function processCategorizerIngestJob(
     message: `Ingesting ${pending.length} of ${remoteFiles.length} file(s) from ${session.source_domain}`
   });
 
-  let failed = 0;
+  // Tracked for THIS run only, not loaded from a prior checkpoint: a file
+  // that failed last run is never in files_done, so it's already back in
+  // `pending` above and gets a fresh chance — no stale carry-forward needed.
+  const filesFailed = new Set<string>();
 
   for (const file of pending) {
     const localPath = path.join(
@@ -187,13 +191,12 @@ export async function processCategorizerIngestJob(
 
       filesDone.add(file.name);
 
-      const nextCheckpoint: IngestCheckpoint = {
-        files_done: Array.from(filesDone)
-      };
-
       await updateCategorizerJobCheckpoint(
         jobRow.id,
-        nextCheckpoint,
+        {
+          files_done: Array.from(filesDone),
+          files_failed: Array.from(filesFailed)
+        } satisfies IngestCheckpoint,
         filesDone.size
       );
       await job?.updateProgress({
@@ -205,11 +208,22 @@ export async function processCategorizerIngestJob(
     } catch (error) {
       // A failed file is reported and skipped, not fatal to the whole ingest
       // — the same choice s3PullJob.ts/sftpPullJob.ts make. It stays OUT of
-      // files_done, so the next run retries it.
-      failed += 1;
+      // files_done, so the next run retries it. Persisted into the
+      // checkpoint (previously only counted locally and logged) so the API
+      // and UI can surface "N file(s) failed to download" instead of this
+      // being invisible outside the worker's own logs.
+      filesFailed.add(file.name);
       logger.error(
         { session_id: sessionId, file: file.name, error },
         "categorizer ingest: file failed"
+      );
+      await updateCategorizerJobCheckpoint(
+        jobRow.id,
+        {
+          files_done: Array.from(filesDone),
+          files_failed: Array.from(filesFailed)
+        } satisfies IngestCheckpoint,
+        filesDone.size
       );
     } finally {
       await unlink(localPath).catch(() => undefined);
@@ -224,7 +238,7 @@ export async function processCategorizerIngestJob(
       session_id: sessionId,
       files_total: remoteFiles.length,
       files_ingested: filesDone.size,
-      files_failed: failed
+      files_failed: filesFailed.size
     },
     "categorizer ingest complete"
   );
@@ -234,10 +248,14 @@ export async function processCategorizerIngestJob(
     current: filesDone.size,
     total: remoteFiles.length,
     message:
-      failed > 0
-        ? `Ingested ${filesDone.size} of ${remoteFiles.length} file(s), ${failed} failed`
+      filesFailed.size > 0
+        ? `Ingested ${filesDone.size} of ${remoteFiles.length} file(s), ${filesFailed.size} failed`
         : `Ingested ${filesDone.size} file(s) from ${session.source_domain}`
   });
 
-  return { filesTotal: remoteFiles.length, filesIngested: filesDone.size, failed };
+  return {
+    filesTotal: remoteFiles.length,
+    filesIngested: filesDone.size,
+    failed: filesFailed.size
+  };
 }

@@ -126,6 +126,24 @@ export async function markCategorizerJobFailed(jobId: string, message: string) {
   );
 }
 
+// Used by worker.ts's queue-level "failed" handler, which only has a BullMQ
+// job (session_id + job name, mapped to a phase via JOB_NAME_TO_PHASE) — not
+// the categorizer_jobs.id markCategorizerJobFailed needs. Scoped to the
+// active (PENDING/RUNNING) row so a failure reported for an already-resumed
+// or already-retried phase can't clobber a newer attempt's row.
+export async function markActiveCategorizerJobFailed(
+  sessionId: string,
+  phase: CategorizerPhase,
+  message: string
+) {
+  await pool.query(
+    `UPDATE categorizer_jobs
+     SET status = 'FAILED', error = $3, updated_at = now()
+     WHERE session_id = $1 AND phase = $2 AND status IN ('PENDING', 'RUNNING')`,
+    [sessionId, phase, message]
+  );
+}
+
 export async function updateCategorizerSessionStatus(
   sessionId: string,
   status: string

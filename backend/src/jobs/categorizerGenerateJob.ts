@@ -10,7 +10,7 @@ import { runSitemapGenerateJob } from "./sitemapGeneratePool.js";
 import { renderCategoryChunkFilename } from "../sitemaps/categoryOutputFilename.js";
 import { buildCategorizerSitemapIndexXml } from "../sitemaps/categorizerIndex.js";
 import {
-  enqueueCategorizerGenerateJob,
+  enqueueCategorizerGenerateContinuation,
   type CategorizerGenerateJobData
 } from "../queue/categorizerQueue.js";
 import {
@@ -107,7 +107,7 @@ export async function processCategorizerGenerateJob(
   for (const category of categories) {
     for (;;) {
       if (Date.now() > chunkDeadlineMs) {
-        await enqueueCategorizerGenerateJob({ session_id: sessionId });
+        await enqueueCategorizerGenerateContinuation({ session_id: sessionId });
         logger.info(
           { session_id: sessionId, category, done: doneCount, total },
           "categorizer generate: chunk time box reached, continuation enqueued"

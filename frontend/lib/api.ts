@@ -4682,6 +4682,57 @@ export type CategorizerOutputFile = {
   url_count: number;
 };
 
+export type CategorizerIngestSummary = {
+  total_urls: number;
+  files: { source_file: string | null; url_count: number }[];
+};
+
+export type CategorizerUrlRow = {
+  id: string;
+  url: string;
+  source_file: string | null;
+};
+
+export type CategorizerUrlPage = {
+  urls: CategorizerUrlRow[];
+  next_cursor: string | null;
+};
+
+export type CategorizerStatusBucket =
+  | "2xx"
+  | "3xx"
+  | "404"
+  | "4xx"
+  | "5xx"
+  | "probe_failed";
+
+export type CategorizerStatusBreakdown = {
+  pending_count: number;
+  checked_count: number;
+  buckets: Record<CategorizerStatusBucket, number>;
+};
+
+export type CategorizerStatusSampleRow = {
+  id: string;
+  url: string;
+  http_status: number | null;
+};
+
+export type CategorizerStatusSamplePage = {
+  urls: CategorizerStatusSampleRow[];
+  next_cursor: string | null;
+};
+
+export type CategorizerCategorySampleRow = {
+  id: string;
+  url: string;
+};
+
+export type CategorizerCategorySamplePage = {
+  urls: CategorizerCategorySampleRow[];
+  next_cursor: string | null;
+};
+
 export async function createCategorizerSession(input: {
   name: string;
   baseUrl: string;
@@ -4781,6 +4832,94 @@ export async function getCategorizerOutputFiles(sessionId: string) {
   );
 
   return readJsonResponse<CategorizerOutputFile[]>(response);
+}
+
+export async function getCategorizerIngestSummary(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sitemap-categorizer/sessions/${sessionId}/ingest-summary`),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CategorizerIngestSummary>(response);
+}
+
+export async function getCategorizerIngestUrls(
+  sessionId: string,
+  cursor?: string | null,
+  limit = 50
+) {
+  const params = new URLSearchParams({ limit: String(limit) });
+
+  if (cursor) {
+    params.set("cursor", cursor);
+  }
+
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sitemap-categorizer/sessions/${sessionId}/ingest-urls?${params.toString()}`
+    ),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CategorizerUrlPage>(response);
+}
+
+export async function getCategorizerStatusBreakdown(sessionId: string) {
+  const response = await fetchWithTimeout(
+    backendUrl(`/api/sitemap-categorizer/sessions/${sessionId}/status-breakdown`),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CategorizerStatusBreakdown>(response);
+}
+
+export async function getCategorizerStatusSample(
+  sessionId: string,
+  bucket: CategorizerStatusBucket,
+  cursor?: string | null,
+  limit = 50
+) {
+  const params = new URLSearchParams({ bucket, limit: String(limit) });
+
+  if (cursor) {
+    params.set("cursor", cursor);
+  }
+
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sitemap-categorizer/sessions/${sessionId}/status-breakdown/sample?${params.toString()}`
+    ),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CategorizerStatusSamplePage>(response);
+}
+
+export async function getCategorizerCategorySample(
+  sessionId: string,
+  category: string,
+  cursor?: string | null,
+  limit = 50
+) {
+  const params = new URLSearchParams({ limit: String(limit) });
+
+  if (cursor) {
+    params.set("cursor", cursor);
+  }
+
+  const response = await fetchWithTimeout(
+    backendUrl(
+      `/api/sitemap-categorizer/sessions/${sessionId}/categories/${encodeURIComponent(category)}/sample?${params.toString()}`
+    ),
+    { cache: "no-store" },
+    EXPORT_API_TIMEOUT_MS
+  );
+
+  return readJsonResponse<CategorizerCategorySamplePage>(response);
 }
 
 // Streamed, like every other ZIP download in this file — see downloadToBlob's

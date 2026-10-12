@@ -1,6 +1,9 @@
+import { randomUUID } from "node:crypto";
+
 import { Queue } from "bullmq";
 
 import { redisConnectionOptions } from "./redisConnection.js";
+import type { CategorizerPhase } from "../jobs/categorizerJobState.js";
 
 // The Sitemap Categorizer tool's background work: ingest (pull + parse every
 // sitemap file for a domain), status-check (HTTP-probe every ingested URL),
@@ -38,6 +41,16 @@ export type CategorizerJobName =
   | typeof CATEGORIZER_STATUS_CHECK_JOB
   | typeof CATEGORIZER_CATEGORIZE_JOB
   | typeof CATEGORIZER_GENERATE_JOB;
+
+// worker.ts's queue-level "failed" handler only gets a BullMQ job (name +
+// data.session_id), not a CategorizerPhase string — this is how it recovers
+// one from the other to call markActiveCategorizerJobFailed.
+export const JOB_NAME_TO_PHASE: Record<CategorizerJobName, CategorizerPhase> = {
+  [CATEGORIZER_INGEST_JOB]: "ingest",
+  [CATEGORIZER_STATUS_CHECK_JOB]: "status-check",
+  [CATEGORIZER_CATEGORIZE_JOB]: "categorize",
+  [CATEGORIZER_GENERATE_JOB]: "generate"
+};
 
 export const categorizerQueue = new Queue<
   CategorizerQueueData,
@@ -119,6 +132,50 @@ export async function enqueueCategorizerGenerateJob(
   data: CategorizerGenerateJobData
 ) {
   return enqueueSingleton(CATEGORIZER_GENERATE_JOB, data);
+}
+
+// A chunked phase's own time-box continuation, called from WITHIN the
+// currently-executing job for that exact phase+session. Deliberately bypasses
+// enqueueSingleton/reusableSingletonJob: that helper only adds a new job when
+// the existing singleton-id job is "completed" or "failed", but here the
+// existing job is the CALLER ITSELF, still "active" — so reusableSingletonJob
+// would just hand back that same job and add nothing, silently dropping the
+// continuation (the bug this function exists to fix). A fresh, random job id
+// guarantees BullMQ always adds real, runnable work.
+//
+// Safe without a BullMQ-level lock because categorizer_jobs already has one:
+// categorizer_jobs_one_active_per_phase (migration 064) plus
+// startOrResumeCategorizerJob's "pick up the active PENDING/RUNNING row"
+// logic means whichever BullMQ job/attempt picks this up resumes the same
+// durable checkpoint, regardless of job id.
+async function enqueueContinuation(
+  jobName: CategorizerJobName,
+  data: CategorizerQueueData
+) {
+  return categorizerQueue.add(jobName, data, {
+    jobId: `${jobName}-${data.session_id}-${randomUUID()}`,
+    removeOnComplete: { count: 100 },
+    removeOnFail: { count: 100 },
+    attempts: 1
+  });
+}
+
+export async function enqueueCategorizerStatusCheckContinuation(
+  data: CategorizerStatusCheckJobData
+) {
+  return enqueueContinuation(CATEGORIZER_STATUS_CHECK_JOB, data);
+}
+
+export async function enqueueCategorizerCategorizeContinuation(
+  data: CategorizerCategorizeJobData
+) {
+  return enqueueContinuation(CATEGORIZER_CATEGORIZE_JOB, data);
+}
+
+export async function enqueueCategorizerGenerateContinuation(
+  data: CategorizerGenerateJobData
+) {
+  return enqueueContinuation(CATEGORIZER_GENERATE_JOB, data);
 }
 
 export async function closeCategorizerQueue() {

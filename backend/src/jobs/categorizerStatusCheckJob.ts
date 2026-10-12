@@ -6,7 +6,7 @@ import { pool } from "../db/pool.js";
 import { runWithBoundedConcurrency } from "../sitemaps/boundedConcurrency.js";
 import { probeUrl, verifyConcurrency } from "./verifyProbe.js";
 import {
-  enqueueCategorizerStatusCheckJob,
+  enqueueCategorizerStatusCheckContinuation,
   type CategorizerStatusCheckJobData
 } from "../queue/categorizerQueue.js";
 import {
@@ -125,7 +125,7 @@ export async function processCategorizerStatusCheckJob(
 
   for (;;) {
     if (Date.now() > chunkDeadlineMs) {
-      await enqueueCategorizerStatusCheckJob({ session_id: sessionId });
+      await enqueueCategorizerStatusCheckContinuation({ session_id: sessionId });
       logger.info(
         { session_id: sessionId, last_id: lastId, done: doneCount, total },
         "categorizer status-check: chunk time box reached, continuation enqueued"

@@ -34,6 +34,63 @@ const PHASES: CategorizerPhase[] = ["ingest", "status-check", "categorize", "gen
 
 type SessionParams = { id: string };
 type PhaseParams = { id: string; phase: string };
+type CategoryParams = { id: string; category: string };
+type CursorQuery = { cursor?: string; limit?: string };
+type BucketSampleQuery = CursorQuery & { bucket?: string };
+
+const DEFAULT_SAMPLE_LIMIT = 50;
+const MAX_SAMPLE_LIMIT = 200;
+
+// Shared cursor/limit parsing for every keyset-paginated preview endpoint
+// below — categorizer_urls is hash-partitioned for tens-of-millions-row
+// sessions, so these all page by "id > cursor ORDER BY id", never OFFSET.
+function parseCursor(raw: string | undefined): number {
+  const value = Number(raw ?? 0);
+
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function parseLimit(raw: string | undefined): number {
+  const value = Number(raw ?? DEFAULT_SAMPLE_LIMIT);
+
+  if (!Number.isFinite(value) || value <= 0) {
+    return DEFAULT_SAMPLE_LIMIT;
+  }
+
+  return Math.min(value, MAX_SAMPLE_LIMIT);
+}
+
+const STATUS_BUCKETS = [
+  "2xx",
+  "3xx",
+  "404",
+  "4xx",
+  "5xx",
+  "probe_failed"
+] as const;
+type StatusBucket = (typeof STATUS_BUCKETS)[number];
+
+// Mirrors the bucket CASE expression in the /status-breakdown route — kept in
+// one place so the breakdown counts and the per-bucket sample/download
+// queries can never drift apart.
+function statusBucketWhereClause(bucket: string): string | null {
+  switch (bucket as StatusBucket) {
+    case "2xx":
+      return "http_status BETWEEN 200 AND 299";
+    case "3xx":
+      return "http_status BETWEEN 300 AND 399";
+    case "404":
+      return "http_status = 404";
+    case "4xx":
+      return "http_status BETWEEN 400 AND 499 AND http_status <> 404";
+    case "5xx":
+      return "http_status BETWEEN 500 AND 599";
+    case "probe_failed":
+      return "http_status IS NULL";
+    default:
+      return null;
+  }
+}
 
 function badRequest(message: string) {
   return { error: "Bad Request", message };
@@ -41,6 +98,20 @@ function badRequest(message: string) {
 
 function notFound(message: string) {
   return { error: "Not Found", message };
+}
+
+// A 404 that distinguishes GOOD news (e.g. a site with genuinely zero real
+// 404s — nothing to exclude, not a bug) from something the user should
+// investigate (e.g. nothing was ever ingested/categorized/generated).
+// `reason` is a stable machine-readable tag the frontend branches on;
+// `severity` picks the styling — "info" renders as a neutral/positive note,
+// "warning" keeps the existing red-alert treatment.
+function emptyResult(
+  message: string,
+  reason: string,
+  severity: "info" | "warning"
+) {
+  return { error: "Not Found", message, reason, severity };
 }
 
 type CategorizerSessionRow = {
@@ -172,9 +243,16 @@ export async function sitemapCategorizerRoutes(app: FastifyInstance) {
   );
 
   // One route per phase start/resume: POST .../ingest | status-check |
-  // categorize | generate. Each enqueues onto the per-session singleton job
-  // (categorizerQueue.ts), so a repeat call while one is already running
-  // attaches to it rather than starting a second.
+  // categorize | generate.
+  //
+  // Guarded by the categorizer_jobs row, NOT by BullMQ job state: a chunked
+  // phase's own time-box continuation (see categorizerQueue.ts's
+  // enqueueContinuation) runs under a fresh BullMQ job id every chunk, so the
+  // ORIGINAL singleton job this route would check shows "completed" after
+  // the very first chunk even though the phase is still genuinely running.
+  // categorizer_jobs_one_active_per_phase (migration 064) is the real lock —
+  // if it shows an active (PENDING/RUNNING) row, this just attaches to it
+  // instead of enqueueing a second run.
   for (const phase of PHASES) {
     app.post<{ Params: SessionParams }>(
       `/api/sitemap-categorizer/sessions/:id/${phase}`,
@@ -197,6 +275,12 @@ export async function sitemapCategorizerRoutes(app: FastifyInstance) {
               message: `The "${precedingPhase}" phase must complete before "${phase}" can start`
             });
           }
+        }
+
+        const activeJob = await latestCategorizerJob(sessionId, phase);
+
+        if (activeJob && (activeJob.status === "PENDING" || activeJob.status === "RUNNING")) {
+          return reply.code(202).send({ job_id: null, status: activeJob.status });
         }
 
         const enqueue =
@@ -239,6 +323,164 @@ export async function sitemapCategorizerRoutes(app: FastifyInstance) {
     }
   );
 
+  // Ingest preview: per-file URL breakdown + a total, so the Ingest step can
+  // show real output instead of a bare file count. total_urls is the ground
+  // truth for "did ingest actually produce anything" — items_total on the
+  // job row is a FILE count, not a URL count (categorizerIngestJob.ts), so it
+  // can't tell "0 files found" apart from "files found, 0 URLs extracted".
+  app.get<{ Params: SessionParams }>(
+    "/api/sitemap-categorizer/sessions/:id/ingest-summary",
+    async (request) => {
+      const sessionId = request.params.id;
+
+      const totalResult = await pool.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM categorizer_urls WHERE session_id = $1`,
+        [sessionId]
+      );
+      const filesResult = await pool.query<{ source_file: string | null; url_count: string }>(
+        `
+          SELECT source_file, COUNT(*)::text AS url_count
+          FROM categorizer_urls
+          WHERE session_id = $1
+          GROUP BY source_file
+          ORDER BY COUNT(*) DESC
+          LIMIT 50
+        `,
+        [sessionId]
+      );
+
+      return {
+        total_urls: Number(totalResult.rows[0]?.count ?? 0),
+        files: filesResult.rows.map((row) => ({
+          source_file: row.source_file,
+          url_count: Number(row.url_count)
+        }))
+      };
+    }
+  );
+
+  // A sample page of ingested URLs, keyset-paginated on the table's own PK —
+  // this table can hold tens of millions of rows per session, so there is no
+  // "list them all" route, only "give me the next page after this cursor".
+  app.get<{ Params: SessionParams; Querystring: CursorQuery }>(
+    "/api/sitemap-categorizer/sessions/:id/ingest-urls",
+    async (request) => {
+      const sessionId = request.params.id;
+      const cursor = parseCursor(request.query.cursor);
+      const limit = parseLimit(request.query.limit);
+
+      const result = await pool.query<{ id: string; url: string; source_file: string | null }>(
+        `
+          SELECT id::text AS id, url, source_file
+          FROM categorizer_urls
+          WHERE session_id = $1 AND id > $2
+          ORDER BY id
+          LIMIT $3
+        `,
+        [sessionId, cursor, limit]
+      );
+
+      return {
+        urls: result.rows,
+        next_cursor:
+          result.rows.length === limit ? result.rows[result.rows.length - 1].id : null
+      };
+    }
+  );
+
+  // HTTP status-code breakdown for the Check-status step. Kept distinct from
+  // "checking" (truly unchecked) and "checked but http_status is NULL" (a
+  // probe that ran but got no status back) rather than folding either into
+  // the others — categorizerCategorizeJob.ts's own "http_status IS DISTINCT
+  // FROM 404" treats a NULL the same as a real non-404 response, which this
+  // breakdown makes visible rather than silent.
+  app.get<{ Params: SessionParams }>(
+    "/api/sitemap-categorizer/sessions/:id/status-breakdown",
+    async (request) => {
+      const sessionId = request.params.id;
+
+      const pendingResult = await pool.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM categorizer_urls WHERE session_id = $1 AND check_state <> 'checked'`,
+        [sessionId]
+      );
+      const checkedResult = await pool.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM categorizer_urls WHERE session_id = $1 AND check_state = 'checked'`,
+        [sessionId]
+      );
+      const bucketsResult = await pool.query<{ bucket: string; count: string }>(
+        `
+          SELECT
+            CASE
+              WHEN http_status IS NULL THEN 'probe_failed'
+              WHEN http_status = 404 THEN '404'
+              WHEN http_status BETWEEN 200 AND 299 THEN '2xx'
+              WHEN http_status BETWEEN 300 AND 399 THEN '3xx'
+              WHEN http_status BETWEEN 400 AND 499 THEN '4xx'
+              WHEN http_status BETWEEN 500 AND 599 THEN '5xx'
+              ELSE 'other'
+            END AS bucket,
+            COUNT(*)::text AS count
+          FROM categorizer_urls
+          WHERE session_id = $1 AND check_state = 'checked'
+          GROUP BY bucket
+        `,
+        [sessionId]
+      );
+
+      const buckets: Record<string, number> = {};
+
+      for (const bucket of STATUS_BUCKETS) {
+        buckets[bucket] = 0;
+      }
+
+      for (const row of bucketsResult.rows) {
+        buckets[row.bucket] = Number(row.count);
+      }
+
+      return {
+        pending_count: Number(pendingResult.rows[0]?.count ?? 0),
+        checked_count: Number(checkedResult.rows[0]?.count ?? 0),
+        buckets
+      };
+    }
+  );
+
+  // A sample of URLs in one status bucket (see statusBucketWhereClause),
+  // keyset-paginated the same way as every other preview route here.
+  app.get<{ Params: SessionParams; Querystring: BucketSampleQuery }>(
+    "/api/sitemap-categorizer/sessions/:id/status-breakdown/sample",
+    async (request, reply) => {
+      const sessionId = request.params.id;
+      const whereClause = statusBucketWhereClause(request.query.bucket ?? "");
+
+      if (!whereClause) {
+        return reply
+          .code(400)
+          .send(badRequest(`bucket must be one of: ${STATUS_BUCKETS.join(", ")}`));
+      }
+
+      const cursor = parseCursor(request.query.cursor);
+      const limit = parseLimit(request.query.limit);
+
+      const result = await pool.query<{ id: string; url: string; http_status: number | null }>(
+        `
+          SELECT id::text AS id, url, http_status
+          FROM categorizer_urls
+          WHERE session_id = $1 AND check_state = 'checked' AND id > $2 AND ${whereClause}
+          ORDER BY id
+          LIMIT $3
+        `,
+        [sessionId, cursor, limit]
+      );
+
+      return {
+        urls: result.rows,
+        next_cursor:
+          result.rows.length === limit ? result.rows[result.rows.length - 1].id : null
+      };
+    }
+  );
+
   // Live preview of the categorize phase's output, grouped by category —
   // available as soon as categorize has written rows, even mid-run, and
   // independent of chunking (which only happens at generate time).
@@ -260,6 +502,34 @@ export async function sitemapCategorizerRoutes(app: FastifyInstance) {
         category: row.category,
         urlCount: Number(row.url_count)
       }));
+    }
+  );
+
+  // Drill-down: a sample of URLs within one category, keyset-paginated via
+  // idx_categorizer_urls_session_category (session_id, category, id).
+  app.get<{ Params: CategoryParams; Querystring: CursorQuery }>(
+    "/api/sitemap-categorizer/sessions/:id/categories/:category/sample",
+    async (request) => {
+      const { id: sessionId, category } = request.params;
+      const cursor = parseCursor(request.query.cursor);
+      const limit = parseLimit(request.query.limit);
+
+      const result = await pool.query<{ id: string; url: string }>(
+        `
+          SELECT id::text AS id, url
+          FROM categorizer_urls
+          WHERE session_id = $1 AND category = $2 AND category_state = 'categorized' AND id > $3
+          ORDER BY id
+          LIMIT $4
+        `,
+        [sessionId, category, cursor, limit]
+      );
+
+      return {
+        urls: result.rows,
+        next_cursor:
+          result.rows.length === limit ? result.rows[result.rows.length - 1].id : null
+      };
     }
   );
 
@@ -303,7 +573,46 @@ export async function sitemapCategorizerRoutes(app: FastifyInstance) {
       );
 
       if (filesResult.rowCount === 0) {
-        return reply.code(404).send(notFound("No generated files yet for this session"));
+        // There's no "good news" version of zero output files — diagnose WHY
+        // so the message points at the actual upstream gap instead of a bare
+        // "not found".
+        const ingestedResult = await pool.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM categorizer_urls WHERE session_id = $1`,
+          [sessionId]
+        );
+
+        if (Number(ingestedResult.rows[0]?.count ?? 0) === 0) {
+          return reply.code(404).send(
+            emptyResult(
+              "No URLs were ever ingested for this session — check the source domain and that it has sitemap files.",
+              "no_urls_ingested",
+              "warning"
+            )
+          );
+        }
+
+        const categorizedResult = await pool.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM categorizer_urls WHERE session_id = $1 AND category_state = 'categorized'`,
+          [sessionId]
+        );
+
+        if (Number(categorizedResult.rows[0]?.count ?? 0) === 0) {
+          return reply.code(404).send(
+            emptyResult(
+              "No URLs were categorized for this session — every ingested URL may have been excluded as a 404, or the categorize phase hasn't completed.",
+              "no_categorized_urls",
+              "warning"
+            )
+          );
+        }
+
+        return reply.code(404).send(
+          emptyResult(
+            "No generated files yet for this session — run Generate to write the output sitemap set.",
+            "not_generated_yet",
+            "warning"
+          )
+        );
       }
 
       const archive = new ZipArchive({ zlib: { level: 0 } });
@@ -367,7 +676,32 @@ export async function sitemapCategorizerRoutes(app: FastifyInstance) {
       );
 
       if (urlsResult.rowCount === 0) {
-        return reply.code(404).send(notFound("No 404 URLs recorded for this session"));
+        // Zero real 404s is a legitimate, GOOD outcome when checking
+        // actually happened — not an error — so long as status-check ran at
+        // all. If it never ran (or produced nothing), that's the opposite:
+        // something upstream the user should look at.
+        const checkedResult = await pool.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM categorizer_urls WHERE session_id = $1 AND check_state = 'checked'`,
+          [sessionId]
+        );
+
+        if (Number(checkedResult.rows[0]?.count ?? 0) === 0) {
+          return reply.code(404).send(
+            emptyResult(
+              "No URLs have been status-checked for this session yet.",
+              "nothing_checked",
+              "warning"
+            )
+          );
+        }
+
+        return reply.code(404).send(
+          emptyResult(
+            "No 404 URLs were found for this session — every checked URL responded.",
+            "no_404s_found",
+            "info"
+          )
+        );
       }
 
       const xml = buildSyntheticSitemapXml(urlsResult.rows.map((row) => row.url));

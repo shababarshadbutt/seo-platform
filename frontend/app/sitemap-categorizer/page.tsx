@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
   AlertTriangle,
@@ -12,22 +12,34 @@ import {
 } from "lucide-react";
 
 import {
+  apiErrorPayload,
   createCategorizerSession,
   downloadCategorizer404s,
   downloadCategorizerZip,
   friendlyApiErrorMessage,
   getCategorizerCategories,
+  getCategorizerCategorySample,
+  getCategorizerIngestSummary,
+  getCategorizerIngestUrls,
   getCategorizerOutputFiles,
   getCategorizerPhaseStatus,
+  getCategorizerStatusBreakdown,
+  getCategorizerStatusSample,
   getS3Domains,
   getSftpDomains,
   startCategorizerPhase,
+  type CategorizerCategorySamplePage,
   type CategorizerCategorySummary,
+  type CategorizerIngestSummary,
   type CategorizerJobStatus,
   type CategorizerOutputFile,
   type CategorizerPhase,
   type CategorizerSession,
-  type CategorizerSourceKind
+  type CategorizerSourceKind,
+  type CategorizerStatusBreakdown,
+  type CategorizerStatusBucket,
+  type CategorizerStatusSamplePage,
+  type CategorizerUrlPage
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
@@ -77,7 +89,11 @@ function PhaseCard({
   confirmBeforeStart,
   disabled,
   onComplete,
-  renderAfterComplete
+  renderPreview,
+  completedUnitLabel = "URL(s)",
+  emptyNoun = "URLs",
+  isEmpty,
+  renderNote
 }: {
   step: number;
   title: string;
@@ -87,7 +103,25 @@ function PhaseCard({
   confirmBeforeStart?: { title: string; description: string };
   disabled?: boolean;
   onComplete?: () => void;
-  renderAfterComplete?: React.ReactNode;
+  // Rendered in BOTH the active and complete states, not just after
+  // completion — several previews (categorize's category breakdown,
+  // generate's output-file list) update incrementally while the phase is
+  // still RUNNING, and gating them on COMPLETE hid that from the user.
+  renderPreview?: React.ReactNode;
+  // Ingest's job.items_total is a FILE count, not a URL count
+  // (categorizerIngestJob.ts), so its card passes "file(s)"/"files" here
+  // instead of the default "URL(s)"/"URLs" the other three phases use.
+  completedUnitLabel?: string;
+  emptyNoun?: string;
+  // Overrides the default "items_total === 0" emptiness check. Ingest needs
+  // "items_done === 0" instead, since a run where every listed file failed
+  // to download (items_total > 0, items_done === 0) is just as empty as one
+  // that found zero files.
+  isEmpty?: (job: CategorizerJobStatus) => boolean;
+  // An optional live status line read off the job row directly (e.g.
+  // ingest's checkpoint.files_failed) — rendered whenever a job row exists,
+  // regardless of active/complete, so it updates mid-run too.
+  renderNote?: (job: CategorizerJobStatus) => React.ReactNode;
 }) {
   const [job, setJob] = useState<CategorizerJobStatus | null>(null);
   const [loading, setLoading] = useState(false);
@@ -140,6 +174,7 @@ function PhaseCard({
   const active = isPhaseActive(job);
   const complete = job?.status === "COMPLETE";
   const failed = job?.status === "FAILED";
+  const empty = job ? (isEmpty ?? ((j: CategorizerJobStatus) => Number(j?.items_total ?? 0) === 0))(job) : false;
 
   return (
     <Card className="mb-4">
@@ -150,6 +185,8 @@ function PhaseCard({
         <CardDescription>{description}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
+        {job && renderNote ? renderNote(job) : null}
+
         {!job || (!active && !complete) ? (
           <Button
             type="button"
@@ -169,26 +206,36 @@ function PhaseCard({
         ) : null}
 
         {active ? (
-          <div className="space-y-2">
-            <p className="flex items-center gap-2 text-sm text-slate-700">
-              <Loader2 className="h-4 w-4 animate-spin" />
-              {total > 0
-                ? `${formatNumber(done)} of ${formatNumber(total)}`
-                : "Working…"}
-            </p>
-            {total > 0 ? <Progress value={percent} /> : null}
+          <div className="space-y-3">
+            <div className="space-y-2">
+              <p className="flex items-center gap-2 text-sm text-slate-700">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {total > 0
+                  ? `${formatNumber(done)} of ${formatNumber(total)}`
+                  : "Working…"}
+              </p>
+              {total > 0 ? <Progress value={percent} /> : null}
+            </div>
+            {renderPreview}
           </div>
         ) : null}
 
         {complete ? (
           <div className="space-y-3">
-            <p className="flex items-center gap-2 text-sm font-medium text-emerald-700">
-              <CheckCircle2 className="h-4 w-4" />
-              {total > 0
-                ? `Done — ${formatNumber(total)} URL(s)`
-                : "Done"}
-            </p>
-            {renderAfterComplete}
+            {empty ? (
+              <p className="flex items-center gap-2 text-sm font-medium text-amber-700">
+                <AlertTriangle className="h-4 w-4" />
+                {`Completed — no ${emptyNoun} were found`}
+              </p>
+            ) : (
+              <p className="flex items-center gap-2 text-sm font-medium text-emerald-700">
+                <CheckCircle2 className="h-4 w-4" />
+                {total > 0
+                  ? `Done — ${formatNumber(total)} ${completedUnitLabel}`
+                  : "Done"}
+              </p>
+            )}
+            {renderPreview}
           </div>
         ) : null}
 
@@ -235,20 +282,82 @@ function PhaseCard({
   );
 }
 
-function CategoriesPreview({ sessionId }: { sessionId: string }) {
-  const [categories, setCategories] = useState<CategorizerCategorySummary[] | null>(null);
+function CategorySampleRows({
+  sessionId,
+  category
+}: {
+  sessionId: string;
+  category: string;
+}) {
+  const [page, setPage] = useState<CategorizerCategorySamplePage | null>(null);
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
 
-    void getCategorizerCategories(sessionId).then((result) => {
-      if (!cancelled) {
-        setCategories(result);
-      }
-    });
+    setLoading(true);
+    void getCategorizerCategorySample(sessionId, category)
+      .then((result) => {
+        if (!cancelled) {
+          setPage(result);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      });
 
     return () => {
       cancelled = true;
+    };
+  }, [sessionId, category]);
+
+  if (loading) {
+    return <p className="px-3 py-2 text-xs text-slate-500">Loading sample…</p>;
+  }
+
+  if (!page || page.urls.length === 0) {
+    return <p className="px-3 py-2 text-xs text-slate-500">No sample URLs found.</p>;
+  }
+
+  return (
+    <ul className="divide-y divide-slate-100 bg-slate-50/60">
+      {page.urls.map((row) => (
+        <li key={row.id} className="truncate px-3 py-1.5 font-mono text-xs text-slate-600">
+          {row.url}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// Polls (not a one-shot fetch) because category counts change continuously
+// while the categorize phase is still RUNNING — PhaseCard now renders this
+// during both the active and complete states (renderPreview), so it needs to
+// keep refreshing itself rather than freezing at whatever it saw on mount.
+function CategoriesPreview({ sessionId }: { sessionId: string }) {
+  const [categories, setCategories] = useState<CategorizerCategorySummary[] | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const poll = () => {
+      void getCategorizerCategories(sessionId).then((result) => {
+        if (!cancelled) {
+          setCategories(result);
+        }
+      });
+    };
+
+    poll();
+
+    const interval = window.setInterval(poll, POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
     };
   }, [sessionId]);
 
@@ -263,21 +372,334 @@ function CategoriesPreview({ sessionId }: { sessionId: string }) {
           <tr>
             <th className="px-3 py-2">Category</th>
             <th className="px-3 py-2 text-right">URLs</th>
+            <th className="px-3 py-2 text-right">Sample</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
           {categories.map((category) => (
-            <tr key={category.category}>
-              <td className="px-3 py-2 font-mono text-xs text-slate-700">
-                {category.category}.xml
-              </td>
-              <td className="px-3 py-2 text-right text-slate-700">
-                {formatNumber(category.urlCount)}
-              </td>
-            </tr>
+            <Fragment key={category.category}>
+              <tr>
+                <td className="px-3 py-2 font-mono text-xs text-slate-700">
+                  {category.category}.xml
+                </td>
+                <td className="px-3 py-2 text-right text-slate-700">
+                  {formatNumber(category.urlCount)}
+                </td>
+                <td className="px-3 py-2 text-right">
+                  <button
+                    type="button"
+                    className="text-xs font-medium text-indigo-600 hover:underline"
+                    onClick={() =>
+                      setExpanded((current) =>
+                        current === category.category ? null : category.category
+                      )
+                    }
+                  >
+                    {expanded === category.category ? "Hide" : "View"}
+                  </button>
+                </td>
+              </tr>
+              {expanded === category.category ? (
+                <tr>
+                  <td colSpan={3} className="p-0">
+                    <CategorySampleRows sessionId={sessionId} category={category.category} />
+                  </td>
+                </tr>
+              ) : null}
+            </Fragment>
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+// Ingest's own preview: a per-file breakdown plus a first page of the actual
+// ingested URLs. Exists so "1,871" on the card means something concrete
+// instead of being whatever job.items_total happens to hold (a FILE count,
+// not a URL count — see PhaseCard's completedUnitLabel note on the ingest
+// card below).
+function IngestPreview({ sessionId }: { sessionId: string }) {
+  const [summary, setSummary] = useState<CategorizerIngestSummary | null>(null);
+  const [urlPage, setUrlPage] = useState<CategorizerUrlPage | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const poll = () => {
+      void getCategorizerIngestSummary(sessionId).then((result) => {
+        if (!cancelled) {
+          setSummary(result);
+        }
+      });
+    };
+
+    poll();
+
+    const interval = window.setInterval(poll, POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [sessionId]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void getCategorizerIngestUrls(sessionId).then((result) => {
+      if (!cancelled) {
+        setUrlPage(result);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
+
+  async function loadMore() {
+    if (!urlPage?.next_cursor) {
+      return;
+    }
+
+    setLoadingMore(true);
+
+    try {
+      const next = await getCategorizerIngestUrls(sessionId, urlPage.next_cursor);
+
+      setUrlPage((current) => ({
+        urls: [...(current?.urls ?? []), ...next.urls],
+        next_cursor: next.next_cursor
+      }));
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  if (!summary || summary.total_urls === 0) {
+    return null;
+  }
+
+  return (
+    <div className="space-y-3">
+      <p className="text-sm text-slate-600">
+        {formatNumber(summary.total_urls)} URL(s) ingested across{" "}
+        {formatNumber(summary.files.length)} file(s).
+      </p>
+
+      <div className="max-h-48 overflow-y-auto rounded-lg border border-slate-200">
+        <ul className="divide-y divide-slate-100">
+          {(urlPage?.urls ?? []).map((row) => (
+            <li key={row.id} className="truncate px-3 py-1.5 font-mono text-xs text-slate-600">
+              {row.url}
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      {urlPage?.next_cursor ? (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={loadingMore}
+          onClick={() => void loadMore()}
+          className="gap-2"
+        >
+          {loadingMore ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+          Load more
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+function ingestNoteFromJob(job: CategorizerJobStatus) {
+  const failed = (job.checkpoint as { files_failed?: unknown })?.files_failed;
+  const failedCount = Array.isArray(failed) ? failed.length : 0;
+
+  if (failedCount === 0) {
+    return null;
+  }
+
+  return (
+    <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+      <span>
+        {formatNumber(failedCount)} file(s) failed to download and will be retried on the next
+        run of this phase.
+      </span>
+    </div>
+  );
+}
+
+const STATUS_BUCKET_LABELS: Record<CategorizerStatusBucket, string> = {
+  "2xx": "2xx (OK)",
+  "3xx": "3xx (Redirect)",
+  "404": "404 (Not found)",
+  "4xx": "4xx (Other client error)",
+  "5xx": "5xx (Server error)",
+  probe_failed: "Probe failed (no response)"
+};
+
+function StatusSampleRows({
+  sessionId,
+  bucket
+}: {
+  sessionId: string;
+  bucket: CategorizerStatusBucket;
+}) {
+  const [page, setPage] = useState<CategorizerStatusSamplePage | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    setLoading(true);
+    void getCategorizerStatusSample(sessionId, bucket)
+      .then((result) => {
+        if (!cancelled) {
+          setPage(result);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, bucket]);
+
+  if (loading) {
+    return <p className="px-3 py-2 text-xs text-slate-500">Loading sample…</p>;
+  }
+
+  if (!page || page.urls.length === 0) {
+    return <p className="px-3 py-2 text-xs text-slate-500">No sample URLs found.</p>;
+  }
+
+  return (
+    <ul className="divide-y divide-slate-100 bg-slate-50/60">
+      {page.urls.map((row) => (
+        <li key={row.id} className="truncate px-3 py-1.5 font-mono text-xs text-slate-600">
+          {row.url}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// Live HTTP status-code breakdown. Polls while the phase is still RUNNING
+// (same pattern as CategoriesPreview) since results accumulate continuously
+// during a status-check run that can span hours to days.
+function StatusCheckBreakdown({ sessionId }: { sessionId: string }) {
+  const [breakdown, setBreakdown] = useState<CategorizerStatusBreakdown | null>(null);
+  const [expanded, setExpanded] = useState<CategorizerStatusBucket | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const poll = () => {
+      void getCategorizerStatusBreakdown(sessionId).then((result) => {
+        if (!cancelled) {
+          setBreakdown(result);
+        }
+      });
+    };
+
+    poll();
+
+    const interval = window.setInterval(poll, POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [sessionId]);
+
+  if (!breakdown || breakdown.checked_count === 0) {
+    return null;
+  }
+
+  const buckets = Object.entries(breakdown.buckets) as [CategorizerStatusBucket, number][];
+
+  return (
+    <div className="overflow-hidden rounded-lg border border-slate-200">
+      <table className="w-full text-sm">
+        <thead className="bg-slate-50 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
+          <tr>
+            <th className="px-3 py-2">Status</th>
+            <th className="px-3 py-2 text-right">URLs</th>
+            <th className="px-3 py-2 text-right">Sample</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-100">
+          {buckets
+            .filter(([, count]) => count > 0)
+            .map(([bucket, count]) => (
+              <Fragment key={bucket}>
+                <tr>
+                  <td className="px-3 py-2 text-xs text-slate-700">
+                    {STATUS_BUCKET_LABELS[bucket]}
+                  </td>
+                  <td className="px-3 py-2 text-right text-slate-700">{formatNumber(count)}</td>
+                  <td className="px-3 py-2 text-right">
+                    <button
+                      type="button"
+                      className="text-xs font-medium text-indigo-600 hover:underline"
+                      onClick={() =>
+                        setExpanded((current) => (current === bucket ? null : bucket))
+                      }
+                    >
+                      {expanded === bucket ? "Hide" : "View"}
+                    </button>
+                  </td>
+                </tr>
+                {expanded === bucket ? (
+                  <tr>
+                    <td colSpan={3} className="p-0">
+                      <StatusSampleRows sessionId={sessionId} bucket={bucket} />
+                    </td>
+                  </tr>
+                ) : null}
+              </Fragment>
+            ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// A download-button failure carries the backend's structured { reason,
+// severity } payload (sitemapCategorizer.ts's emptyResult) when available —
+// "info" means the empty result is actually good news (e.g. zero real 404s),
+// so it renders as a neutral note rather than the red alert a genuine
+// problem gets.
+function DownloadOutcome({
+  message,
+  severity
+}: {
+  message: string;
+  severity: "info" | "warning";
+}) {
+  if (severity === "info") {
+    return (
+      <div className="flex items-start gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+        <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+        <span>{message}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+      <span>{message}</span>
     </div>
   );
 }
@@ -290,59 +712,136 @@ function OutputFilesAndDownload({
   domain: string;
 }) {
   const [files, setFiles] = useState<CategorizerOutputFile[] | null>(null);
-  const [downloading, setDownloading] = useState(false);
-  const [downloadError, setDownloadError] = useState("");
+  const [breakdown, setBreakdown] = useState<CategorizerStatusBreakdown | null>(null);
+  const [downloadingZip, setDownloadingZip] = useState(false);
+  const [downloading404s, setDownloading404s] = useState(false);
+  const [zipOutcome, setZipOutcome] = useState<{
+    message: string;
+    severity: "info" | "warning";
+  } | null>(null);
+  const [outcome404s, setOutcome404s] = useState<{
+    message: string;
+    severity: "info" | "warning";
+  } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
 
-    void getCategorizerOutputFiles(sessionId).then((result) => {
-      if (!cancelled) {
-        setFiles(result);
-      }
-    });
+    const poll = () => {
+      void getCategorizerOutputFiles(sessionId).then((result) => {
+        if (!cancelled) {
+          setFiles(result);
+        }
+      });
+      void getCategorizerStatusBreakdown(sessionId).then((result) => {
+        if (!cancelled) {
+          setBreakdown(result);
+        }
+      });
+    };
+
+    poll();
+
+    const interval = window.setInterval(poll, POLL_INTERVAL_MS);
 
     return () => {
       cancelled = true;
+      window.clearInterval(interval);
     };
   }, [sessionId]);
 
   async function handleDownloadZip() {
-    setDownloading(true);
-    setDownloadError("");
+    setDownloadingZip(true);
+    setZipOutcome(null);
 
     try {
       await downloadCategorizerZip(sessionId, domain);
     } catch (err) {
-      setDownloadError(friendlyApiErrorMessage(err, "Unable to download the sitemap files."));
+      const payload = apiErrorPayload(err) as { message?: string; severity?: string } | null;
+
+      setZipOutcome({
+        message: friendlyApiErrorMessage(err, "Unable to download the sitemap files."),
+        severity: payload?.severity === "info" ? "info" : "warning"
+      });
     } finally {
-      setDownloading(false);
+      setDownloadingZip(false);
     }
   }
 
   async function handleDownload404s() {
-    setDownloading(true);
-    setDownloadError("");
+    setDownloading404s(true);
+    setOutcome404s(null);
 
     try {
       await downloadCategorizer404s(sessionId, domain);
     } catch (err) {
-      setDownloadError(friendlyApiErrorMessage(err, "Unable to download the 404 list."));
+      const payload = apiErrorPayload(err) as { message?: string; severity?: string } | null;
+
+      setOutcome404s({
+        message: friendlyApiErrorMessage(err, "Unable to download the 404 list."),
+        severity: payload?.severity === "info" ? "info" : "warning"
+      });
     } finally {
-      setDownloading(false);
+      setDownloading404s(false);
     }
   }
+
+  // Proactive, not reactive: once the real counts are in, a genuinely empty
+  // 404 list is known BEFORE the user can click the button — so it's
+  // disabled with a neutral note instead of letting the click round-trip to
+  // a 404 response just to find out.
+  const no404sFound =
+    breakdown !== null && breakdown.checked_count > 0 && breakdown.buckets["404"] === 0;
+  const totalUrlCount = files?.reduce((sum, file) => sum + file.url_count, 0) ?? 0;
 
   return (
     <div className="space-y-3">
       {files && files.length > 0 ? (
-        <p className="text-sm text-slate-600">
-          {formatNumber(files.length)} file(s) generated, plus sitemap-index.xml.
+        <div className="overflow-hidden rounded-lg border border-slate-200">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
+              <tr>
+                <th className="px-3 py-2">File</th>
+                <th className="px-3 py-2">Category</th>
+                <th className="px-3 py-2 text-right">URLs</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {files.map((file) => (
+                <tr key={file.filename}>
+                  <td className="px-3 py-2 font-mono text-xs text-slate-700">{file.filename}</td>
+                  <td className="px-3 py-2 text-xs text-slate-500">{file.category}</td>
+                  <td className="px-3 py-2 text-right text-slate-700">
+                    {formatNumber(file.url_count)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="border-t border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
+            {formatNumber(files.length)} file(s), {formatNumber(totalUrlCount)} URL(s) total,
+            plus sitemap-index.xml.
+          </p>
+        </div>
+      ) : (
+        <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+          No output files were generated yet.
+        </p>
+      )}
+
+      {no404sFound ? (
+        <p className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+          No 404s were found — every checked URL responded, so there&rsquo;s nothing to exclude.
         </p>
       ) : null}
 
       <div className="flex flex-wrap gap-2">
-        <Button type="button" onClick={() => void handleDownloadZip()} disabled={downloading} className="gap-2">
+        <Button
+          type="button"
+          onClick={() => void handleDownloadZip()}
+          disabled={downloadingZip}
+          className="gap-2"
+        >
           <Download className="h-4 w-4" />
           Download sitemap ZIP
         </Button>
@@ -350,7 +849,7 @@ function OutputFilesAndDownload({
           type="button"
           variant="outline"
           onClick={() => void handleDownload404s()}
-          disabled={downloading}
+          disabled={downloading404s || no404sFound}
           className="gap-2"
         >
           <Download className="h-4 w-4" />
@@ -358,11 +857,11 @@ function OutputFilesAndDownload({
         </Button>
       </div>
 
-      {downloadError ? (
-        <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-          <span>{downloadError}</span>
-        </div>
+      {zipOutcome ? (
+        <DownloadOutcome message={zipOutcome.message} severity={zipOutcome.severity} />
+      ) : null}
+      {outcome404s ? (
+        <DownloadOutcome message={outcome404s.message} severity={outcome404s.severity} />
       ) : null}
     </div>
   );
@@ -597,6 +1096,11 @@ export default function SitemapCategorizerPage() {
               sessionId={session.id}
               phase="ingest"
               onComplete={() => setIngestDone(true)}
+              completedUnitLabel="file(s)"
+              emptyNoun="files"
+              isEmpty={(job) => Number(job?.items_done ?? 0) === 0}
+              renderNote={ingestNoteFromJob}
+              renderPreview={<IngestPreview sessionId={session.id} />}
             />
 
             <PhaseCard
@@ -612,6 +1116,7 @@ export default function SitemapCategorizerPage() {
                   "This checks the status of every URL, not a sample, and can take a long time on a large site. It runs in the background and can be revisited later — this tab does not need to stay open."
               }}
               onComplete={() => setStatusCheckDone(true)}
+              renderPreview={<StatusCheckBreakdown sessionId={session.id} />}
             />
 
             <PhaseCard
@@ -622,7 +1127,7 @@ export default function SitemapCategorizerPage() {
               phase="categorize"
               disabled={!statusCheckDone}
               onComplete={() => setCategorizeDone(true)}
-              renderAfterComplete={<CategoriesPreview sessionId={session.id} />}
+              renderPreview={<CategoriesPreview sessionId={session.id} />}
             />
 
             <PhaseCard
@@ -632,7 +1137,7 @@ export default function SitemapCategorizerPage() {
               sessionId={session.id}
               phase="generate"
               disabled={!categorizeDone}
-              renderAfterComplete={
+              renderPreview={
                 <OutputFilesAndDownload
                   sessionId={session.id}
                   domain={session.source_domain}

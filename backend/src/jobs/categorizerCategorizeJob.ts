@@ -11,7 +11,7 @@ import {
   pathSegmentsFromUrl
 } from "../sitemaps/categorizer.js";
 import {
-  enqueueCategorizerCategorizeJob,
+  enqueueCategorizerCategorizeContinuation,
   type CategorizerCategorizeJobData
 } from "../queue/categorizerQueue.js";
 import {
@@ -115,7 +115,7 @@ export async function processCategorizerCategorizeJob(
 
     for (;;) {
       if (Date.now() > chunkDeadlineMs) {
-        await enqueueCategorizerCategorizeJob({ session_id: sessionId });
+        await enqueueCategorizerCategorizeContinuation({ session_id: sessionId });
         logger.info(
           { session_id: sessionId, scanned, total },
           "categorizer categorize: detect pass time box reached, continuation enqueued (restarts the detect pass)"
@@ -178,7 +178,7 @@ export async function processCategorizerCategorizeJob(
 
   for (;;) {
     if (Date.now() > chunkDeadlineMs) {
-      await enqueueCategorizerCategorizeJob({ session_id: sessionId });
+      await enqueueCategorizerCategorizeContinuation({ session_id: sessionId });
       logger.info(
         { session_id: sessionId, last_id: lastId, done: doneCount, total },
         "categorizer categorize: assign pass time box reached, continuation enqueued"
