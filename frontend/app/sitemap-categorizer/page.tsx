@@ -51,6 +51,7 @@ import {
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { TimedPhaseChoice } from "@/components/categorizer/TimedPhaseChoice";
+import { baseUrlFromSftpDomain } from "@/lib/host";
 
 // Per categorizerMaxUrlsPerFile.ts — kept in sync by hand since this is a
 // frontend-only bound check (the backend is authoritative and re-validates).
@@ -1047,7 +1048,17 @@ export default function SitemapCategorizerPage() {
               ) : (
                 <select
                   value={selectedDomain}
-                  onChange={(event) => setSelectedDomain(event.target.value)}
+                  onChange={(event) => {
+                    const nextDomain = event.target.value;
+
+                    setSelectedDomain(nextDomain);
+                    // Filled from the selection, same convention as the
+                    // Migration tool's SFTP domain picker (lib/host.ts) — a
+                    // hand-typed base URL that drifts from the domain actually
+                    // being crawled is how a session ends up ingesting one
+                    // site's sitemaps under another's base URL.
+                    setBaseUrl(baseUrlFromSftpDomain(nextDomain));
+                  }}
                   className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
                 >
                   <option value="">Select a domain…</option>
@@ -1117,6 +1128,24 @@ export default function SitemapCategorizerPage() {
                 </Button>
               </CardContent>
             </Card>
+
+            {/* The automatic "start ingest" call from handleCreateAndStart
+                fires right after the session is created, before this branch
+                even renders — a failure there (e.g. the categorizer worker
+                queue rejecting the request) used to be swallowed: createError
+                was only ever displayed in the !session branch above, which
+                this component had already left by the time the error landed.
+                That silent failure looked identical to a healthy idle "Start"
+                button, which is exactly what made the real bug (worker
+                starvation, fixed in categorizerQueue.ts) so hard to tell
+                apart from a frontend problem. Shown here too so a failed
+                auto-start is never invisible. */}
+            {createError ? (
+              <div className="mb-4 flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>{createError}</span>
+              </div>
+            ) : null}
 
             <PhaseCard
               step={2}

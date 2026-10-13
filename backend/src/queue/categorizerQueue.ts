@@ -29,11 +29,25 @@ export const CATEGORIZER_STATUS_SAMPLE_JOB = "categorizer-status-sample" as cons
 export const CATEGORIZER_CATEGORIZE_JOB = "categorizer-categorize" as const;
 export const CATEGORIZER_GENERATE_JOB = "categorizer-generate" as const;
 
-// How many categorizer phase-jobs run at once. Low: these are heavy,
-// long-running, per-session operations (one session's status-check or
-// generate phase can occupy a slot for a long time), not the bursty
-// short-lived jobs other queues run many of in parallel.
-export const CATEGORIZER_WORKER_CONCURRENCY = 2;
+// How many categorizer phase-jobs run at once, ACROSS EVERY SESSION — ingest,
+// status-check, categorize and generate all share this one number. Raised
+// 2 -> 6 after live sessions proved 2 is a starvation bug, not just a
+// conservative default: status-check/categorize/generate each hold a slot
+// for a whole chunkMinutes (30min by default) continuation before giving it
+// back (see the chunkDeadlineMs loops in those job files), so just TWO such
+// sessions running at once permanently occupy both slots. Every other
+// session's ingest job then sits in BullMQ's "waiting" state with no
+// categorizer_jobs row at all — startOrResumeCategorizerJob only inserts one
+// once a worker slot actually picks the job up — so GET .../jobs/ingest keeps
+// 404ing and the UI shows an idle "Start" button forever, with no error
+// anywhere to explain why (confirmed live: multiple sessions stuck at status
+// CREATED with created_at === updated_at while two other sessions sat in
+// CATEGORIZING/CHECKING_STATUS). 6 is still well short of
+// SITEMAP_WORKER_CONCURRENCY (10) — these phases are heavier per-slot than
+// that queue's bursty parse/extract jobs, so this isn't "bursty-high", just
+// enough headroom for a handful of users to each have a session mid-run
+// without a brand-new session's ingest click going silently nowhere.
+export const CATEGORIZER_WORKER_CONCURRENCY = 6;
 
 export type CategorizerIngestJobData = { session_id: string };
 export type CategorizerStatusCheckJobData = { session_id: string };
