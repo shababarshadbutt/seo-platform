@@ -1980,6 +1980,31 @@ export type RenamePatternResult = {
 // It also matters that this matches getRedirectCandidates exactly: the Fix
 // modal fires the two together for one scope and must not have one of them
 // give up at 10s while the other keeps going to 180s.
+//
+// RETRIES ON ITS OWN ABORT, rather than surfacing it immediately. The backend
+// scan is DESIGNED to outlive this request's timeout: backend/src/cache/
+// scanResultCache.ts's single-flight lock is held for up to 10 minutes and its
+// own comment says plainly that "the scan can outlive the request that asked
+// for it" (a client aborting at 30s while the work committed 130s later is the
+// case that sizing is based on). So the computation this request kicked off
+// keeps running server-side after the abort and will land in the cache under
+// the SAME key regardless of whether this request is still listening. A retry
+// is therefore nearly free: it either reads that cache hit directly, or waits
+// behind the still-running original (cachedWithSingleFlight's "loser" path)
+// instead of starting a second scan from zero. SOURCE_FILES_MAX_ATTEMPTS is
+// kept small and bounded well under the backend's 10-minute lock TTL so a
+// truly-stuck scan still surfaces sourceFileLoadErrorMessage's "took too long"
+// advice instead of retrying forever.
+const SOURCE_FILES_MAX_ATTEMPTS = 3;
+
+function isAbortError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { name?: unknown }).name === "AbortError"
+  );
+}
+
 export async function getPatternSourceFiles(
   sessionId: string,
   patternId: string,
@@ -1989,6 +2014,31 @@ export async function getPatternSourceFiles(
     structureFilters && structureFilters.length > 0
       ? `?structure_filter=${encodeURIComponent(JSON.stringify(structureFilters))}`
       : "";
+
+  for (let attempt = 1; attempt <= SOURCE_FILES_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await fetchPatternSourceFilesOnce(sessionId, patternId, query);
+    } catch (error) {
+      if (!isAbortError(error) || attempt === SOURCE_FILES_MAX_ATTEMPTS) {
+        throw error;
+      }
+      // Loop straight into the next attempt — no backoff delay. The first
+      // attempt already spent EXPORT_API_TIMEOUT_MS waiting, which is itself
+      // the pacing; adding a sleep here would only push a scan that is about
+      // to finish past this attempt's own abort.
+    }
+  }
+
+  // Unreachable: the loop above always returns or throws. Satisfies the
+  // compiler's control-flow analysis without an unused assertion.
+  throw new Error("getPatternSourceFiles: unreachable");
+}
+
+async function fetchPatternSourceFilesOnce(
+  sessionId: string,
+  patternId: string,
+  query: string
+): Promise<PatternSourceFilesResult> {
   const response = await fetchWithTimeout(
     backendUrl(
       `/api/sessions/${sessionId}/patterns/${patternId}/source-files${query}`

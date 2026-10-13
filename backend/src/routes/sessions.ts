@@ -217,6 +217,10 @@ import {
   rewriteSitemapLocFile
 } from "../sitemaps/rewriteLocs.js";
 import {
+  runSourceFileScanJob,
+  SOURCE_FILE_SCAN_PARALLEL_THRESHOLD
+} from "../jobs/sourceFileScanPool.js";
+import {
   applyRedirectRule,
   deriveRedirectRule,
   type RedirectRule
@@ -1187,12 +1191,142 @@ const SCOPED_BREAKDOWN_CONCURRENCY = 6;
 // as "not found" reads as a broken tool rather than as the read-only file it
 // is. The counts below are ONLY a diagnostic — which files are accepted, and
 // the occurrence numbers, are unchanged.
+type ResolvedScanFile = { displayName: string; storedFilename: string };
+
+// Scan a resolved file's occurrences via the ordinary async-I/O-concurrency
+// loop — no real CPU parallelism, so this is only used below
+// SOURCE_FILE_SCAN_PARALLEL_THRESHOLD, where thread startup would cost more
+// than it saves (same reasoning as transformDryRunScan.ts's scanInline).
+async function scanResolvedFilesInline(
+  files: ResolvedScanFile[],
+  template: string,
+  resolvedFilters: ResolvedStructureFilter[]
+): Promise<{
+  results: Array<{ source_file: string; occurrences: number }>;
+  noMatches: number;
+  unreadable: number;
+}> {
+  const matchesUrl = (url: string): boolean => {
+    let pathname: string;
+
+    try {
+      pathname = new URL(url).pathname;
+    } catch {
+      return false;
+    }
+
+    return (
+      pathMatchesTemplate(pathname, template) &&
+      urlMatchesStructureFilters(url, resolvedFilters)
+    );
+  };
+
+  const results: Array<{ source_file: string; occurrences: number }> = [];
+  let noMatches = 0;
+  let unreadable = 0;
+  let cursor = 0;
+
+  async function worker() {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+
+      if (index >= files.length) {
+        return;
+      }
+
+      const { displayName, storedFilename } = files[index];
+
+      try {
+        const occurrences = await countSitemapLocMatches({
+          inputPath: path.join(config.uploadDir, storedFilename),
+          isGzip: storedFilename.toLowerCase().endsWith(".gz"),
+          matchesUrl
+        });
+
+        if (occurrences > 0) {
+          results.push({ source_file: displayName, occurrences });
+        } else {
+          // Read fine, matched nothing. Usually a template that no longer
+          // describes what is on disk (see hasStaleCountsAfterFix) or a scope
+          // narrower than this file's contents.
+          noMatches += 1;
+        }
+      } catch {
+        // Missing/unreadable on disk — excluded rather than failing the whole
+        // preview.
+        unreadable += 1;
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(SCOPED_BREAKDOWN_CONCURRENCY, files.length) },
+      worker
+    )
+  );
+
+  return { results, noMatches, unreadable };
+}
+
+// Scan a resolved file's occurrences across the Piscina pool
+// (jobs/sourceFileScanPool.ts) — real CPU parallelism, used once the pattern's
+// total_urls crosses SOURCE_FILE_SCAN_PARALLEL_THRESHOLD. Mirrors
+// transformDryRunScan.ts's scanPooled: ONE task per file, not a fixed chunk
+// split, so Piscina's queue hands a free thread the next file regardless of
+// how unevenly sized the pattern's files are.
+async function scanResolvedFilesPooled(
+  files: ResolvedScanFile[],
+  template: string,
+  resolvedFilters: ResolvedStructureFilter[]
+): Promise<{
+  results: Array<{ source_file: string; occurrences: number }>;
+  noMatches: number;
+  unreadable: number;
+}> {
+  const results: Array<{ source_file: string; occurrences: number }> = [];
+  let noMatches = 0;
+  let unreadable = 0;
+
+  await Promise.all(
+    files.map(async ({ displayName, storedFilename }) => {
+      try {
+        const { occurrences, failed } = await runSourceFileScanJob({
+          inputPath: path.join(config.uploadDir, storedFilename),
+          isGzip: storedFilename.toLowerCase().endsWith(".gz"),
+          template,
+          resolvedFilters
+        });
+
+        if (failed) {
+          unreadable += 1;
+        } else if (occurrences > 0) {
+          results.push({ source_file: displayName, occurrences });
+        } else {
+          noMatches += 1;
+        }
+      } catch {
+        // A thread that died outright, rather than a file it could not read —
+        // counted the same way the inline path counts an unreadable file.
+        unreadable += 1;
+      }
+    })
+  );
+
+  return { results, noMatches, unreadable };
+}
+
 async function scopedPatternSourceFileBreakdown(
   patternId: string,
   sessionId: string,
   sourceRole: string,
   template: string,
-  resolvedFilters: ResolvedStructureFilter[]
+  resolvedFilters: ResolvedStructureFilter[],
+  // patterns.total_urls — what the inline-vs-pooled choice is made on, same
+  // reasoning as DRY_RUN_PARALLEL_THRESHOLD: per-file URL count predicts scan
+  // cost, file count does not.
+  totalUrls: number
 ): Promise<ScopedSourceFileBreakdown> {
   const candidates = await pool.query<{ source_file: string }>(
     "SELECT source_file FROM pattern_file_occurrences WHERE pattern_id = $1",
@@ -1233,85 +1367,43 @@ async function scopedPatternSourceFileBreakdown(
     );
   }
 
-  const matchesUrl = (url: string): boolean => {
-    let pathname: string;
-
-    try {
-      pathname = new URL(url).pathname;
-    } catch {
-      return false;
-    }
-
-    return (
-      pathMatchesTemplate(pathname, template) &&
-      urlMatchesStructureFilters(url, resolvedFilters)
-    );
-  };
-
   const displayNames = candidates.rows.map((row) => row.source_file);
-  const results: Array<{ source_file: string; occurrences: number }> = [];
-  // Plain closure-local counters, incremented from the concurrent workers
-  // below exactly as results.push already is: Node runs one worker at a time
-  // between await points, so ++ needs no synchronisation.
   const skipped = emptyScopedSkipCounts();
-  let cursor = 0;
+  const resolvedFiles: ResolvedScanFile[] = [];
 
-  async function worker() {
-    for (;;) {
-      const index = cursor;
-      cursor += 1;
+  for (const displayName of displayNames) {
+    const storedFilename = storedFilenameByDisplay.get(displayName);
 
-      if (index >= displayNames.length) {
-        return;
+    if (!storedFilename) {
+      // Two different situations behind one lookup miss, hence two counters:
+      // the file was fetched from a URL and has no local copy, or the row was
+      // deleted/renamed/role-mismatched since extraction recorded it. The
+      // unscoped breakdown tolerates the latter too (file_id resolves to
+      // null).
+      if (remoteDisplayNames.has(displayName)) {
+        skipped.remote += 1;
+      } else {
+        skipped.no_file_row += 1;
       }
 
-      const displayName = displayNames[index];
-      const storedFilename = storedFilenameByDisplay.get(displayName);
-
-      if (!storedFilename) {
-        // Two different situations behind one lookup miss, hence two counters:
-        // the file was fetched from a URL and has no local copy, or the row was
-        // deleted/renamed/role-mismatched since extraction recorded it. The
-        // unscoped breakdown tolerates the latter too (file_id resolves to
-        // null).
-        if (remoteDisplayNames.has(displayName)) {
-          skipped.remote += 1;
-        } else {
-          skipped.no_file_row += 1;
-        }
-
-        continue;
-      }
-
-      try {
-        const occurrences = await countSitemapLocMatches({
-          inputPath: path.join(config.uploadDir, storedFilename),
-          isGzip: storedFilename.toLowerCase().endsWith(".gz"),
-          matchesUrl
-        });
-
-        if (occurrences > 0) {
-          results.push({ source_file: displayName, occurrences });
-        } else {
-          // Read fine, matched nothing. Usually a template that no longer
-          // describes what is on disk (see hasStaleCountsAfterFix) or a scope
-          // narrower than this file's contents.
-          skipped.no_matches += 1;
-        }
-      } catch {
-        // Missing/unreadable on disk — excluded rather than failing the whole
-        // preview.
-        skipped.unreadable += 1;
-      }
+      continue;
     }
+
+    resolvedFiles.push({ displayName, storedFilename });
   }
 
-  await Promise.all(
-    Array.from(
-      { length: Math.min(SCOPED_BREAKDOWN_CONCURRENCY, displayNames.length) },
-      worker
-    )
-  );
+  // A single file cannot be split across threads, so it gains nothing from the
+  // pool however many URLs it holds — same guard as
+  // transformDryRunScan.ts:scanTransformDryRun.
+  const worthParallelising =
+    resolvedFiles.length > 1 && totalUrls >= SOURCE_FILE_SCAN_PARALLEL_THRESHOLD;
+
+  const { results, noMatches, unreadable } = worthParallelising
+    ? await scanResolvedFilesPooled(resolvedFiles, template, resolvedFilters)
+    : await scanResolvedFilesInline(resolvedFiles, template, resolvedFilters);
+
+  skipped.no_matches += noMatches;
+  skipped.unreadable += unreadable;
 
   return {
     files: results.sort(
@@ -1343,7 +1435,8 @@ async function cachedScopedPatternSourceFileBreakdown(
   sessionId: string,
   sourceRole: string,
   template: string,
-  resolvedFilters: ResolvedStructureFilter[]
+  resolvedFilters: ResolvedStructureFilter[],
+  totalUrls: number
 ): Promise<CachedResult<ScopedSourceFileBreakdown>> {
   const key = sourceFileScanCacheKey({
     patternId,
@@ -1360,7 +1453,8 @@ async function cachedScopedPatternSourceFileBreakdown(
       sessionId,
       sourceRole,
       template,
-      resolvedFilters
+      resolvedFilters,
+      totalUrls
     )
   );
 }
@@ -3382,7 +3476,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
               request.params.id,
               source_role,
               template,
-              resolvedFilters
+              resolvedFilters,
+              Number(total_urls)
             )
           : null;
       const sourceFiles =
@@ -3980,7 +4075,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
                   request.params.id,
                   resolved.value.sourceRole,
                   resolved.value.template,
-                  resolved.value.resolvedFilters
+                  resolved.value.resolvedFilters,
+                  resolved.value.totalUrls
                 )
               ).value.files
             : await patternSourceFileBreakdown(

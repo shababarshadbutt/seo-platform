@@ -11,6 +11,7 @@ import { logPrivateHostMapStatus } from "./http/privateHostMap.js";
 import { closeSitemapQueue } from "./queue/sitemapQueue.js";
 import { destroyCleanerPools } from "./jobs/cleanerPool.js";
 import { destroyPatternPopulationPool } from "./jobs/patternPopulationPool.js";
+import { destroySourceFileScanPool } from "./jobs/sourceFileScanPool.js";
 import { closePool, DB_POOL_MAX, pool } from "./db/pool.js";
 import { runMigrations } from "./db/migrate.js";
 import { fsErrorResponse } from "./errors/fsErrors.js";
@@ -230,6 +231,10 @@ async function close() {
   // — but the module is loaded by the verification routes, and a pool that is
   // never destroyed is a process that never exits if that ever changes.
   await destroyPatternPopulationPool();
+  // UNLIKE the other pools here, the scoped source-file scan actually runs in
+  // THIS process: it is a synchronous read fired from routes/sessions.ts, not a
+  // BullMQ job (see jobs/sourceFileScanPool.ts for why it isn't one).
+  await destroySourceFileScanPool();
   await closePool();
 }
 
