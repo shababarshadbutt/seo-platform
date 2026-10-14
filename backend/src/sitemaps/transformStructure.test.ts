@@ -7,8 +7,10 @@ import {
   formatStructure,
   inferNewStructure,
   StructureSyntaxError,
+  parseFallbackValues,
   parseStructure,
   structureParamNames,
+  transformingParamNames,
   transformUrl,
   validateStructures
 } from "./transformStructure.js";
@@ -167,6 +169,76 @@ test("transformUrl returns null when the result is unchanged", () => {
     transformUrl("https://e.com/manufacturer/square-d/page-1", CURRENT, identity),
     null
   );
+});
+
+// --- fallbackValues (HITL override) ----------------------------------------
+// The reported bug: {A|nsn-parts-1000|page-1-|} only strips the needle when
+// a URL's value actually contains it, so the rest get moved to the new path
+// with their stale value baked in. fallbackValues is the human's answer for
+// those — see transformCoverage.ts.
+
+test("fallbackValues replaces the value only where the rule itself is a no-op", () => {
+  const current = parseStructure("/nsn/{A}");
+  const next = parseStructure("/nsn/nsn-parts/{A|nsn-parts-1000|page-1-|}/");
+  const fallback = new Map([["A", "other"]]);
+
+  // The needle IS present — the rule itself covers this one, fallback unused.
+  assert.equal(
+    transformUrl("https://e.com/nsn/nsn-parts-10004/", current, next, fallback),
+    "https://e.com/nsn/nsn-parts/page-1-4/"
+  );
+
+  // The needle is NOT present — this is the "untransformed" case the
+  // coverage gate warns about. Without a fallback it would silently move to
+  // the new path keeping "nsn-parts-10062" (the reported bug). With one, the
+  // fallback value is used instead.
+  assert.equal(
+    transformUrl("https://e.com/nsn/nsn-parts-10062/", current, next, fallback),
+    "https://e.com/nsn/nsn-parts/other/"
+  );
+});
+
+test("without fallbackValues, an untransformed param keeps its stale value (unchanged default behavior)", () => {
+  const current = parseStructure("/nsn/{A}");
+  const next = parseStructure("/nsn/nsn-parts/{A|nsn-parts-1000|page-1-|}/");
+
+  assert.equal(
+    transformUrl("https://e.com/nsn/nsn-parts-10062/", current, next),
+    "https://e.com/nsn/nsn-parts/nsn-parts-10062/"
+  );
+});
+
+test("fallbackValues is ignored for a param whose transform is 'none'", () => {
+  const current = parseStructure("/nsn/{A}/{B}");
+  const next = parseStructure("/nsn/{A}/{B|catalog|list|}");
+  // A fallback keyed to A (a plain carry) must not override the captured
+  // value — only transforming params ever consult it.
+  const fallback = new Map([["A", "SHOULD-NOT-APPEAR"]]);
+
+  assert.equal(
+    transformUrl("https://e.com/nsn/square-d/catalog/", current, next, fallback),
+    "https://e.com/nsn/square-d/list"
+  );
+});
+
+test("transformingParamNames lists only params whose transform changes the value", () => {
+  const next = parseStructure("/nsn/{A}/{B|catalog|list|}/{C|upper|}");
+  assert.deepEqual(transformingParamNames(next), ["B", "C"]);
+  assert.deepEqual(transformingParamNames(parseStructure("/nsn/{A}/{B}")), []);
+});
+
+test("parseFallbackValues accepts a well-formed object and absent input", () => {
+  assert.deepEqual(parseFallbackValues(undefined), {});
+  assert.deepEqual(parseFallbackValues(null), {});
+  assert.deepEqual(parseFallbackValues({ A: "other" }), { A: "other" });
+});
+
+test("parseFallbackValues rejects non-objects, empty strings and over-long values", () => {
+  assert.equal(parseFallbackValues("other"), null);
+  assert.equal(parseFallbackValues(["other"]), null);
+  assert.equal(parseFallbackValues({ A: "" }), null);
+  assert.equal(parseFallbackValues({ A: 5 }), null);
+  assert.equal(parseFallbackValues({ A: "x".repeat(201) }), null);
 });
 
 // --- validateStructures ---------------------------------------------------

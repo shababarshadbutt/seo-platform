@@ -1,6 +1,7 @@
 import {
   captureStructureValues,
   transformUrl,
+  transformingParamNames,
   type ParsedStructure
 } from "./transformStructure.js";
 
@@ -40,15 +41,19 @@ export type CoverageVerdict = {
 export const LOW_COVERAGE_RATIO = 0.5;
 
 function expectsValueChange(next: ParsedStructure): boolean {
-  return next.segments.some(
-    (rule) => rule.type === "param" && rule.transform.kind !== "none"
-  );
+  return transformingParamNames(next).length > 0;
 }
 
+// `fallbackValues` (HITL override, v1.?? — keyed by `next` param name) is
+// the human's answer to "apply this value where the rule itself doesn't
+// change anything". Passed straight through to transformUrl so a URL the
+// fallback actually fixes counts as `transformed` here too — the gate and
+// the write agree on the same rule.
 export function measureTransformCoverage(
   urls: string[],
   current: ParsedStructure,
-  next: ParsedStructure
+  next: ParsedStructure,
+  fallbackValues?: Map<string, string>
 ): CoverageVerdict {
   const verdict: CoverageVerdict = {
     matched: 0,
@@ -80,7 +85,7 @@ export function measureTransformCoverage(
 
     verdict.matched += 1;
 
-    const rewritten = transformUrl(rawUrl, current, next);
+    const rewritten = transformUrl(rawUrl, current, next, fallbackValues);
 
     if (rewritten === null) {
       verdict.untransformed += 1;

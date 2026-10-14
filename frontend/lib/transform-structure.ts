@@ -172,6 +172,19 @@ export function structureParamNames(parsed: ParsedStructure): string[] {
     .map((rule) => rule.name);
 }
 
+// The `next`-structure param names whose transform is expected to actually
+// change the value. Mirrors the backend copy in transformStructure.ts —
+// the single place that decides which param(s) a fallback value (HITL
+// override) can apply to.
+export function transformingParamNames(next: ParsedStructure): string[] {
+  return next.segments
+    .filter(
+      (rule): rule is Extract<SegmentRule, { type: "param" }> =>
+        rule.type === "param" && rule.transform.kind !== "none"
+    )
+    .map((rule) => rule.name);
+}
+
 export function validateStructures(
   current: ParsedStructure,
   next: ParsedStructure,
@@ -266,10 +279,15 @@ export function captureStructureValues(
   return values;
 }
 
+// `fallbackValues` (HITL override, keyed by `next` param name) is the
+// human's answer to "what should the URLs this rule doesn't cover become?"
+// — see lib/transform-coverage.ts. Mirrors transformStructure.ts's backend
+// copy.
 export function transformUrl(
   rawUrl: string,
   current: ParsedStructure,
-  next: ParsedStructure
+  next: ParsedStructure,
+  fallbackValues?: Map<string, string>
 ): string | null {
   let url: URL;
 
@@ -305,7 +323,19 @@ export function transformUrl(
       return rule.value;
     }
 
-    return applyTransform(values.get(rule.name) ?? "", rule.transform);
+    const value = values.get(rule.name) ?? "";
+    const transformed = applyTransform(value, rule.transform);
+    const fallback = fallbackValues?.get(rule.name);
+
+    if (
+      rule.transform.kind !== "none" &&
+      transformed === value &&
+      fallback !== undefined
+    ) {
+      return fallback;
+    }
+
+    return transformed;
   });
 
   let nextPath = `/${rebuilt.join("/")}`;

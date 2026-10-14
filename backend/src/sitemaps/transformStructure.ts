@@ -202,6 +202,49 @@ export function structureParamNames(parsed: ParsedStructure): string[] {
     .map((rule) => rule.name);
 }
 
+// The `next`-structure param names whose transform is expected to actually
+// change the value (excludes plain {A} carries, which are not evidence of
+// anything when they come out unchanged). The single place that decides
+// which param(s) a fallback value (v1.?? HITL override) can apply to —
+// reused by transformCoverage.ts's expectsValueChange, the apply route's
+// validation of fallback_values, and the modal's fallback inputs.
+export function transformingParamNames(next: ParsedStructure): string[] {
+  return next.segments
+    .filter(
+      (rule): rule is Extract<SegmentRule, { type: "param" }> =>
+        rule.type === "param" && rule.transform.kind !== "none"
+    )
+    .map((rule) => rule.name);
+}
+
+// Parse the wire form of a fallback_values override. SHAPE only — whether
+// each key actually names one of `next`'s transforming params is a separate
+// check the caller makes once `next` is parsed (transformingParamNames),
+// the same two-step validation parseStructureFilters/resolveStructureFilters
+// already use. Returns null for anything malformed so the route 400s rather
+// than silently dropping a value the user typed.
+export function parseFallbackValues(raw: unknown): Record<string, string> | null {
+  if (raw === null || raw === undefined) {
+    return {};
+  }
+
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+
+  const values: Record<string, string> = {};
+
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value !== "string" || value.length === 0 || value.length > 200) {
+      return null;
+    }
+
+    values[name] = value;
+  }
+
+  return values;
+}
+
 // Validate a current/new structure pair against the pattern's {param} count.
 // Returns an error message, or null when the pair is valid. (Syntax errors are
 // raised earlier by parseStructure.)
@@ -306,10 +349,20 @@ export function captureStructureValues(
 // Returns the rewritten URL, or null when the URL does not match `current`
 // (segment count or a static segment differs) so callers leave it byte-for-byte.
 // Host, scheme, query string and hash are preserved; only the path changes.
+//
+// `fallbackValues` (HITL override, keyed by `next` param name) is the
+// human's answer to "what should the URLs this rule doesn't cover become?"
+// — see transformCoverage.ts. When a param's own transform would leave the
+// value unchanged (the exact condition that trips the low-coverage gate)
+// and a fallback is supplied for that param, the fallback value is used in
+// its place. Omitted everywhere outside the transform-apply path, so every
+// other caller (coverage preview without a fallback typed in yet, the
+// by-example inference self-check, etc.) is unaffected.
 export function transformUrl(
   rawUrl: string,
   current: ParsedStructure,
-  next: ParsedStructure
+  next: ParsedStructure,
+  fallbackValues?: Map<string, string>
 ): string | null {
   let url: URL;
 
@@ -346,7 +399,19 @@ export function transformUrl(
       return rule.value;
     }
 
-    return applyTransform(values.get(rule.name) ?? "", rule.transform);
+    const value = values.get(rule.name) ?? "";
+    const transformed = applyTransform(value, rule.transform);
+    const fallback = fallbackValues?.get(rule.name);
+
+    if (
+      rule.transform.kind !== "none" &&
+      transformed === value &&
+      fallback !== undefined
+    ) {
+      return fallback;
+    }
+
+    return transformed;
   });
 
   let nextPath = `/${rebuilt.join("/")}`;

@@ -46,6 +46,29 @@ test("the reported bug: a needle carrying the example's own digits", () => {
   );
 });
 
+// --- fallbackValues (HITL override) ----------------------------------------
+// The human's answer to the reported bug above.
+
+test("a fallback value clears the gate for the reported rule", () => {
+  const next = parseStructure("/nsn/nsn-parts/{A|nsn-parts-1000|page-1-|}/");
+  const fallback = new Map([["A", "other"]]);
+  const coverage = measureTransformCoverage(POOL, CURRENT, next, fallback);
+
+  assert.equal(coverage.matched, 7);
+  assert.equal(coverage.transformed, 7);
+  assert.equal(coverage.untransformed, 0);
+  assert.equal(isLowCoverage(coverage), false);
+});
+
+test("a fallback equal to one URL's own value leaves just that one flagged", () => {
+  const next = parseStructure("/nsn/nsn-parts/{A|nsn-parts-1000|page-1-|}/");
+  const fallback = new Map([["A", "nsn-parts-10062"]]);
+  const coverage = measureTransformCoverage(POOL, CURRENT, next, fallback);
+
+  assert.equal(coverage.transformed, 6);
+  assert.equal(coverage.untransformed, 1);
+});
+
 test("a rule that generalises is not flagged", () => {
   // Strip the shared prefix instead of an example-specific one: every value in
   // the pool starts "nsn-parts-", so every one transforms.

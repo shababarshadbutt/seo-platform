@@ -2250,6 +2250,10 @@ export async function transformPatternStructure(
     // Ticked source shapes (v1.69). Empty/omitted = every shape, so a caller
     // that never touches the checkboxes behaves exactly as before.
     shapeFilter?: string[] | null;
+    // HITL fallback override: a literal value, per `next` param name, for
+    // URLs whose own transform would otherwise leave the value unchanged.
+    // Can clear the coverage gate on its own, without forceLowCoverage.
+    fallbackValues?: Record<string, string> | null;
   },
   onProgress?: (progress: PatternStructureProgress) => void
 ) {
@@ -2267,6 +2271,9 @@ export async function transformPatternStructure(
         ...(input.forceLowCoverage ? { force_low_coverage: true } : {}),
         ...(input.shapeFilter && input.shapeFilter.length > 0
           ? { shape_filter: input.shapeFilter }
+          : {}),
+        ...(input.fallbackValues && Object.keys(input.fallbackValues).length > 0
+          ? { fallback_values: input.fallbackValues }
           : {})
       })
     }

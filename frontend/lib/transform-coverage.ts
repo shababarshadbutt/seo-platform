@@ -105,10 +105,15 @@ function paramPositions(next: ParsedStructure): Array<{
 //   "transformed"    → the rule did what it says.
 export type TransformOutcome = "no-match" | "kept-value" | "transformed";
 
+// `fallbackValues` (HITL override, keyed by `next` param name) is the
+// human's answer to "apply this value where the rule itself doesn't change
+// anything". Threaded through to transformUrl so a URL the fallback fixes
+// classifies as "transformed" here too.
 export function classifyTransform(
   rawUrl: string,
   current: ParsedStructure,
-  next: ParsedStructure
+  next: ParsedStructure,
+  fallbackValues?: Map<string, string>
 ): TransformOutcome {
   const expecting = paramPositions(next).filter(
     (position) => position.expectsChange
@@ -125,7 +130,7 @@ export function classifyTransform(
     return "no-match";
   }
 
-  const rewritten = transformUrl(rawUrl, current, next);
+  const rewritten = transformUrl(rawUrl, current, next, fallbackValues);
 
   // null means the result equalled the input — the strongest form of "did not
   // apply".
@@ -153,7 +158,8 @@ export function classifyTransform(
 export function measureTransformCoverage(
   urls: string[],
   current: ParsedStructure,
-  next: ParsedStructure
+  next: ParsedStructure,
+  fallbackValues?: Map<string, string>
 ): TransformCoverage {
   const positions = paramPositions(next);
   const expecting = positions.filter((position) => position.expectsChange);
@@ -170,7 +176,7 @@ export function measureTransformCoverage(
   }
 
   for (const rawUrl of urls) {
-    const outcome = classifyTransform(rawUrl, current, next);
+    const outcome = classifyTransform(rawUrl, current, next, fallbackValues);
 
     // A URL the rule was never going to match is not a failure of the rule, and
     // must not dilute the ratio in either direction.
@@ -192,7 +198,7 @@ export function measureTransformCoverage(
       // end up with (/nsn/nsn-parts/nsn-parts-10062/) is what makes this
       // alarming. Falls back to the input when the transform was a total no-op.
       coverage.examples.push(
-        transformUrl(rawUrl, current, next) ?? rawUrl
+        transformUrl(rawUrl, current, next, fallbackValues) ?? rawUrl
       );
     }
   }

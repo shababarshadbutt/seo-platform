@@ -147,6 +147,7 @@ import {
   parseStructure,
   StructureSyntaxError,
   structureParamNames,
+  transformingParamNames,
   transformUrl,
   validateStructures,
   type ParsedStructure,
@@ -2507,7 +2508,10 @@ export default function ResultsDashboardPage({
           // the full list: the two mean the same thing to the server, and an
           // empty filter keeps an unscoped apply on exactly the pre-v1.69 code
           // path instead of a shape guard that happens to admit everything.
-          shapeFilter: shapeFilterForApply
+          shapeFilter: shapeFilterForApply,
+          // HITL fallback override typed into the coverage warning — can
+          // clear the gate on its own, without needing forceLowCoverage too.
+          fallbackValues
         },
         setStructureProgress
       );
@@ -4525,6 +4529,22 @@ export default function ResultsDashboardPage({
   // still gaining the new static segment, yielding
   // /nsn/nsn-parts/nsn-parts-10062/. Measured against the same real URLs the
   // preview samples from, so the warning quotes what the user would really get.
+  // HITL fallback override: a literal value, per `next` param name, for the
+  // URLs the rule itself can't transform — the human's answer to the
+  // coverage warning below, instead of either leaving them broken or
+  // blanket-overriding the gate. Keyed by param name so a multi-param
+  // structure can get one field per param; in practice almost always one
+  // entry. Reset alongside forceLowCoverage, same reasoning. Declared ahead
+  // of transformCoverage because that measurement reads it.
+  const [fallbackValues, setFallbackValues] = useState<Record<string, string>>({});
+  // Which param(s) a fallback input should even be offered for — the names
+  // `next`'s own transform is expected to change, same set the coverage
+  // measurement and the server's validation use.
+  const fallbackParamNames = useMemo(
+    () => (transformParsed ? transformingParamNames(transformParsed.next) : []),
+    [transformParsed]
+  );
+
   const transformCoverage = useMemo(() => {
     if (!transformParsed) {
       return null;
@@ -4547,12 +4567,17 @@ export default function ResultsDashboardPage({
             return shape !== null && shapeFilterForApply.includes(shape);
           });
 
+    // fallbackValues (HITL override) feeds straight into the measurement so
+    // the warning's counts update live as the user types one in — the same
+    // function the apply route uses server-side to decide whether the gate
+    // still blocks.
     return measureTransformCoverage(
       scoped,
       transformParsed.current,
-      transformParsed.next
+      transformParsed.next,
+      new Map(Object.entries(fallbackValues))
     );
-  }, [transformPreviewSource, transformParsed, shapeFilterForApply]);
+  }, [transformPreviewSource, transformParsed, shapeFilterForApply, fallbackValues]);
   const transformLowCoverage =
     transformCoverage !== null && isLowCoverage(transformCoverage);
   // A gate, not a wall (v1.68). A deliberately narrow rule is unusual but not
@@ -4669,6 +4694,10 @@ export default function ResultsDashboardPage({
     // edit would silently re-arm the block's escape hatch for a rule nobody
     // looked at. (v1.68)
     setForceLowCoverage(false);
+    // Same reasoning for the fallback override: it was typed for the param(s)
+    // of ONE rule and must not silently apply to whatever the user edits it
+    // into next.
+    setFallbackValues({});
     // Same reasoning for the shape selection (v1.69): it describes the shapes of
     // ONE measurement, and the measurement is discarded above.
     setSelectedShapes(new Set());
@@ -8316,8 +8345,54 @@ export default function ResultsDashboardPage({
                       <p>
                         That usually means the rule was inferred from one example
                         and carries values specific to it. Adjust the new
-                        structure, or override if this narrow edit is intended.
+                        structure, fill in a value below for the URLs it
+                        doesn&apos;t cover, or override if this narrow edit is
+                        intended.
                       </p>
+                      {/* HITL fallback override. One text field per param the
+                          rule is supposed to change, so the human decides what
+                          the uncovered URLs become instead of either silently
+                          mangling them or blocking indefinitely. Updates
+                          transformCoverage live as the user types. */}
+                      {fallbackParamNames.length > 0 ? (
+                        <div
+                          className="space-y-1.5 rounded border border-red-200 bg-white px-2 py-2"
+                          data-testid="transform-fallback-values"
+                        >
+                          {fallbackParamNames.map((name) => (
+                            <label
+                              key={name}
+                              className="flex flex-col gap-0.5 text-[11px] text-red-900"
+                            >
+                              <span>
+                                Value to use for{" "}
+                                {fallbackParamNames.length > 1 ? (
+                                  <>
+                                    {"{"}
+                                    {name}
+                                    {"}"}
+                                  </>
+                                ) : (
+                                  "the URLs this rule can't change"
+                                )}
+                                :
+                              </span>
+                              <input
+                                type="text"
+                                className="rounded border border-slate-300 px-2 py-1 font-mono text-xs text-slate-900"
+                                value={fallbackValues[name] ?? ""}
+                                onChange={(event) =>
+                                  setFallbackValues((current) => ({
+                                    ...current,
+                                    [name]: event.target.value
+                                  }))
+                                }
+                                placeholder="e.g. other"
+                              />
+                            </label>
+                          ))}
+                        </div>
+                      ) : null}
                       {forceLowCoverage ? (
                         <p className="font-semibold">
                           Overridden — Apply is enabled.

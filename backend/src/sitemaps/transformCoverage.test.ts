@@ -48,6 +48,36 @@ test("the reported rule is refused", () => {
   assert.match(lowCoverageMessage(verdict), /force_low_coverage/);
 });
 
+// --- fallbackValues (HITL override) ----------------------------------------
+// The human's answer to the reported bug above: a literal value, per `next`
+// param name, for the URLs the rule's own transform leaves unchanged.
+
+test("a fallback value clears the gate for the reported rule", () => {
+  const next = parseStructure("/nsn/nsn-parts/{A|nsn-parts-1000|page-1-|}/");
+  const fallback = new Map([["A", "other"]]);
+  const verdict = measureTransformCoverage(POOL, CURRENT, next, fallback);
+
+  assert.equal(verdict.matched, 7);
+  // The 2 the rule's own replace already covers, PLUS the 5 the fallback
+  // now covers — all 7 count as transformed, none kept their stale value.
+  assert.equal(verdict.transformed, 7);
+  assert.equal(verdict.untransformed, 0);
+  assert.equal(isLowCoverage(verdict), false);
+});
+
+test("a fallback that only covers some of the untransformed URLs leaves the rest flagged", () => {
+  const next = parseStructure("/nsn/nsn-parts/{A|nsn-parts-1000|page-1-|}/");
+  // Equal to one of the untransformed values verbatim — so for THAT one URL
+  // the "fallback" is a no-op and it still reads as untransformed. The other
+  // four untransformed URLs are still fixed by it.
+  const fallback = new Map([["A", "nsn-parts-10062"]]);
+  const verdict = measureTransformCoverage(POOL, CURRENT, next, fallback);
+
+  assert.equal(verdict.matched, 7);
+  assert.equal(verdict.transformed, 6);
+  assert.equal(verdict.untransformed, 1);
+});
+
 test("a rule that generalises is allowed", () => {
   const next = parseStructure("/nsn/nsn-parts/{A|nsn-parts-|}/");
   const verdict = measureTransformCoverage(POOL, CURRENT, next);

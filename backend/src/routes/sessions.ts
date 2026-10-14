@@ -256,8 +256,10 @@ import { RedirectCollisionCounter } from "../sitemaps/redirectCollisions.js";
 import { RedirectRuleImpact } from "../sitemaps/redirectRuleImpact.js";
 import { looksLikeNotFoundUrl } from "../sitemaps/softNotFound.js";
 import {
+  parseFallbackValues,
   parseStructure,
   StructureSyntaxError,
+  transformingParamNames,
   transformUrl,
   validateStructures,
   type ParsedStructure
@@ -368,6 +370,10 @@ type TransformBody = {
   // One filter object (pre-v1.51) or an ARRAY of them, ANDed across {param}
   // positions. null / [] / absent = whole-pattern.
   structure_filter?: unknown;
+  // HITL override (v1.??) for the coverage gate: a literal value, per `next`
+  // param name, to use for URLs whose own transform would otherwise leave
+  // the value unchanged. See transformingParamNames in transformStructure.ts.
+  fallback_values?: unknown;
 };
 
 type SessionHistoryRow = {
@@ -3663,6 +3669,46 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
       const structureFilters = parsedFilters;
 
+      // HITL fallback override (v1.??). A literal value, per `next` param
+      // name, for URLs whose own transform leaves the value unchanged — the
+      // human's answer to the coverage gate below, rather than either
+      // silently writing the broken hybrid or blanket-overriding the gate.
+      const fallbackValuesRaw = parseFallbackValues(request.body?.fallback_values);
+
+      if (fallbackValuesRaw === null) {
+        return reply
+          .code(400)
+          .send(
+            badRequest(
+              "fallback_values must be an object of non-empty strings (≤200 chars)"
+            )
+          );
+      }
+
+      const transformingNames = new Set(transformingParamNames(next));
+      const unknownFallbackNames = Object.keys(fallbackValuesRaw).filter(
+        (name) => !transformingNames.has(name)
+      );
+
+      if (unknownFallbackNames.length > 0) {
+        return reply
+          .code(400)
+          .send(
+            badRequest(
+              `fallback_values references ${unknownFallbackNames
+                .map((name) => `"${name}"`)
+                .join(", ")}, which does not expect a transform here` +
+                (transformingNames.size > 0
+                  ? ` — only ${Array.from(transformingNames)
+                      .map((name) => `"${name}"`)
+                      .join(", ")} does`
+                  : "")
+            )
+          );
+      }
+
+      const fallbackValues = new Map(Object.entries(fallbackValuesRaw));
+
       // COVERAGE GATE (v1.68). Refuse a rule that fits almost nothing.
       //
       // The reported bug: one by-example pair inferred a `replace` needle
@@ -3677,7 +3723,13 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       // from, so the client's warning and this refusal quote the same numbers.
       // Only gates the APPLY: transform-dry-run and transform-sample-file stay
       // open, because measuring a bad rule is how the user finds out it is bad.
-      if (request.body?.force_low_coverage !== true) {
+      //
+      // fallback_values (HITL override, v1.??) is applied HERE too, always —
+      // not only when force_low_coverage is set — so a fallback that genuinely
+      // fixes coverage clears the gate on its own, and force_low_coverage stays
+      // the escape hatch for "apply it as-written anyway" when no fallback is
+      // given (or the fallback doesn't fully cover it).
+      {
         const poolResult = await pool.query<{ source_url: string }>(
           "SELECT source_url FROM pattern_urls WHERE pattern_id = $1",
           [request.params.patternId]
@@ -3685,10 +3737,11 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         const coverage = measureTransformCoverage(
           poolResult.rows.map((row) => row.source_url),
           current,
-          next
+          next,
+          fallbackValues
         );
 
-        if (isLowCoverage(coverage)) {
+        if (isLowCoverage(coverage) && request.body?.force_low_coverage !== true) {
           return reply.code(400).send(badRequest(lowCoverageMessage(coverage)));
         }
       }
@@ -3822,7 +3875,12 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           new_structure: newStructureRaw,
           new_template: newTemplateRaw ?? null,
           source_files: sourceFiles,
-          structure_filter: fingerprintFilters(structureFilters)
+          structure_filter: fingerprintFilters(structureFilters),
+          // Part of the fingerprint because it changes what gets WRITTEN —
+          // two applies differing only in fallback_values must not be treated
+          // as a retry of one another.
+          fallback_values:
+            Object.keys(fallbackValuesRaw).length === 0 ? null : fallbackValuesRaw
         }),
         params: {
           current_structure: currentStructureRaw,
@@ -3830,7 +3888,8 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           new_template: newTemplate,
           source_files: selectedFiles,
           structure_filter: structureFilters,
-          shape_filter: shapeFilter
+          shape_filter: shapeFilter,
+          fallback_values: fallbackValuesRaw
         },
         filesTotal: selectedFiles.length
       });

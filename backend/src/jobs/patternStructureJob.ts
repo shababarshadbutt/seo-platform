@@ -15,6 +15,7 @@ import {
   transformPatternSourceFilesOnDisk
 } from "../sitemaps/patternFileRewrites.js";
 import {
+  parseFallbackValues,
   parseStructure,
   transformUrl,
   type ParsedStructure
@@ -102,6 +103,8 @@ type JobRow = {
     structure_filter?: unknown;
     // Selected source shapes (v1.69) — see sitemaps/shapeFilter.ts.
     shape_filter?: unknown;
+    // HITL fallback override (v1.??) — see transformStructure.ts.
+    fallback_values?: unknown;
   };
 };
 
@@ -132,6 +135,21 @@ function jobStructureFilters(params: JobRow["params"]): StructureFilter[] {
   }
 
   return filters;
+}
+
+// HITL fallback override from the job params (v1.??) — see
+// transformingParamNames/parseFallbackValues in transformStructure.ts. The
+// route already validated the keys against the structure; re-checking that
+// here would need `next`, which callers already have parsed when they use
+// this, so it is left to them.
+function jobFallbackValues(params: JobRow["params"]): Map<string, string> {
+  const values = parseFallbackValues(params.fallback_values);
+
+  if (values === null) {
+    throw new Error("job params carry an invalid fallback_values");
+  }
+
+  return new Map(Object.entries(values));
 }
 
 async function markFailed(jobRowId: string, message: string) {
@@ -568,9 +586,10 @@ export async function processPatternTransformJob(
   // structure returns null before transformUrl sees it, in files and in the
   // DB-sample rewrites alike. Shape is outermost — it is the coarser question.
   const shapeFilter = jobShapeFilter(job.params);
+  const fallbackValues = jobFallbackValues(job.params);
   const rewriteUrl = applyShapeFilterToRewriter(
     applyStructureFilterToRewriter(
-      (url: string) => transformUrl(url, current, next),
+      (url: string) => transformUrl(url, current, next, fallbackValues),
       resolvedFilters
     ),
     shapeFilter

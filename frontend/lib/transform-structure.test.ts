@@ -14,6 +14,7 @@ import {
   countTemplateParams,
   parseStructure,
   structureParamNames,
+  transformingParamNames,
   transformUrl,
   validateStructures
 } from "./transform-structure";
@@ -24,6 +25,41 @@ import {
 // apply. A wording drift between them means the user is told one thing in the
 // modal and another by the API, so validateStructures itself is compared
 // byte-for-byte at the bottom of this file.
+
+// --- fallbackValues (HITL override) ----------------------------------------
+// Mirrors backend/src/sitemaps/transformStructure.test.ts's coverage of the
+// same behavior.
+
+test("fallbackValues replaces the value only where the rule itself is a no-op", () => {
+  const current = parseStructure("/nsn/{A}");
+  const next = parseStructure("/nsn/nsn-parts/{A|nsn-parts-1000|page-1-|}/");
+  const fallback = new Map([["A", "other"]]);
+
+  assert.equal(
+    transformUrl("https://e.com/nsn/nsn-parts-10004/", current, next, fallback),
+    "https://e.com/nsn/nsn-parts/page-1-4/"
+  );
+  assert.equal(
+    transformUrl("https://e.com/nsn/nsn-parts-10062/", current, next, fallback),
+    "https://e.com/nsn/nsn-parts/other/"
+  );
+});
+
+test("without fallbackValues, an untransformed param keeps its stale value", () => {
+  const current = parseStructure("/nsn/{A}");
+  const next = parseStructure("/nsn/nsn-parts/{A|nsn-parts-1000|page-1-|}/");
+
+  assert.equal(
+    transformUrl("https://e.com/nsn/nsn-parts-10062/", current, next),
+    "https://e.com/nsn/nsn-parts/nsn-parts-10062/"
+  );
+});
+
+test("transformingParamNames lists only params whose transform changes the value", () => {
+  const next = parseStructure("/nsn/{A}/{B|catalog|list|}/{C|upper|}");
+  assert.deepEqual(transformingParamNames(next), ["B", "C"]);
+  assert.deepEqual(transformingParamNames(parseStructure("/nsn/{A}/{B}")), []);
+});
 
 // --- the nsnstocks screenshot -----------------------------------------------
 // Pattern /nsn/{param}, scoped to niin-parts-{var}, user typed the literal
