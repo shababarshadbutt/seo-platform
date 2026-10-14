@@ -1106,6 +1106,28 @@ export default function ResultsDashboardPage({
   const [undoingTransformId, setUndoingTransformId] = useState<string | null>(
     null
   );
+  // Guards structureProgress/isTransforming/isRunningDryRun/findReplaceToast —
+  // shared, page-level state every rename/transform/dry-run/undo call writes
+  // into — from a STALE operation still writing after a NEWER one already
+  // owns that UI, whether the newer one is a second edit on the SAME pattern
+  // right after the first finished, or a switch to a DIFFERENT pattern while
+  // the first is still polling. Mirrors sourceFilesRequestIdRef's proven
+  // shape for the source-file list, applied to the operation-level state
+  // that list's own guard doesn't cover. Bumped at the top of every handler
+  // below and whenever the modal is pointed at a (possibly the same) pattern
+  // (openRenameModal), so each in-flight call can tell whether it still owns
+  // the UI once its await resolves.
+  const structureJobRequestIdRef = useRef(0);
+
+  function bumpStructureJobRequest(): number {
+    structureJobRequestIdRef.current += 1;
+
+    return structureJobRequestIdRef.current;
+  }
+
+  function isCurrentStructureJobRequest(requestId: number): boolean {
+    return structureJobRequestIdRef.current === requestId;
+  }
   const [downloadingSitemapId, setDownloadingSitemapId] = useState<
     string | null
   >(null);
@@ -2258,6 +2280,10 @@ export default function ResultsDashboardPage({
       } | null;
     } = {}
   ) {
+    // Invalidates any operation still in flight for whatever pattern was
+    // open before — this modal (re)opening for rowData is what makes that
+    // prior operation's eventual completion stale.
+    bumpStructureJobRequest();
     setFindReplaceToast(null);
     setRenameRow(rowData);
     // Reset on EVERY open: an unscoped Edit right after a scoped one must not
@@ -2398,6 +2424,8 @@ export default function ResultsDashboardPage({
       return;
     }
 
+    const requestId = bumpStructureJobRequest();
+
     setIsRenaming(true);
     setStructureProgress(null);
 
@@ -2410,8 +2438,20 @@ export default function ResultsDashboardPage({
           sourceFiles: Array.from(selectedRenameFiles),
           structureFilters: renameStructureFilters
         },
-        setStructureProgress
+        (progress) => {
+          if (isCurrentStructureJobRequest(requestId)) {
+            setStructureProgress(progress);
+          }
+        }
       );
+
+      if (!isCurrentStructureJobRequest(requestId)) {
+        // Superseded by a newer operation (a different pattern opened, or
+        // another edit on this one started) — that operation now owns
+        // loadResults/the toast/the structure cache; applying this result on
+        // top would overwrite what the user is currently looking at.
+        return;
+      }
 
       await loadResults({ silent: true });
       // A scoped edit changes the structure makeup — drop the cache so the
@@ -2444,13 +2484,26 @@ export default function ResultsDashboardPage({
               }`
       });
     } catch (nextError) {
-      setFindReplaceToast({
-        tone: "error",
-        message: friendlyApiErrorMessage(nextError, "Unable to rename pattern.")
-      });
+      if (isCurrentStructureJobRequest(requestId)) {
+        setFindReplaceToast({
+          tone: "error",
+          message: friendlyApiErrorMessage(
+            nextError,
+            "Unable to rename pattern."
+          )
+        });
+      }
     } finally {
+      // ALWAYS — this is THIS call's own reentry lock (canRename depends on
+      // !isRenaming); leaving it stuck true after a superseding operation
+      // would disable renaming entirely, not just for this pattern.
       setIsRenaming(false);
-      setStructureProgress(null);
+
+      if (isCurrentStructureJobRequest(requestId)) {
+        // Only if still current — a superseding operation's own progress
+        // display must not be clobbered by this stale call finishing late.
+        setStructureProgress(null);
+      }
     }
   }
 
@@ -2458,6 +2511,8 @@ export default function ResultsDashboardPage({
     if (!rowData.originalTemplate || undoingRenameId) {
       return;
     }
+
+    const requestId = bumpStructureJobRequest();
 
     setUndoingRenameId(rowData.id);
     setStructureProgress(null);
@@ -2470,8 +2525,16 @@ export default function ResultsDashboardPage({
           newTemplate: rowData.originalTemplate,
           sourceFiles: []
         },
-        setStructureProgress
+        (progress) => {
+          if (isCurrentStructureJobRequest(requestId)) {
+            setStructureProgress(progress);
+          }
+        }
       );
+
+      if (!isCurrentStructureJobRequest(requestId)) {
+        return;
+      }
 
       await loadResults({ silent: true });
       setFindReplaceToast({
@@ -2481,13 +2544,24 @@ export default function ResultsDashboardPage({
           : "Pattern name reverted"
       });
     } catch (nextError) {
-      setFindReplaceToast({
-        tone: "error",
-        message: friendlyApiErrorMessage(nextError, "Unable to undo rename.")
-      });
+      if (isCurrentStructureJobRequest(requestId)) {
+        setFindReplaceToast({
+          tone: "error",
+          message: friendlyApiErrorMessage(
+            nextError,
+            "Unable to undo rename."
+          )
+        });
+      }
     } finally {
+      // ALWAYS — the top-of-function reentry guard (`undoingRenameId`) must
+      // self-clear regardless of whether a newer operation superseded this
+      // one, or undo-rename would be permanently disabled.
       setUndoingRenameId(null);
-      setStructureProgress(null);
+
+      if (isCurrentStructureJobRequest(requestId)) {
+        setStructureProgress(null);
+      }
     }
   }
 
@@ -2495,6 +2569,8 @@ export default function ResultsDashboardPage({
     if (!renameRow) {
       return;
     }
+
+    const requestId = bumpStructureJobRequest();
 
     setIsTransforming(true);
     setStructureProgress(null);
@@ -2521,8 +2597,17 @@ export default function ResultsDashboardPage({
           // clear the gate on its own, without needing forceLowCoverage too.
           fallbackValues
         },
-        setStructureProgress
+        (progress) => {
+          if (isCurrentStructureJobRequest(requestId)) {
+            setStructureProgress(progress);
+          }
+        }
       );
+
+      if (!isCurrentStructureJobRequest(requestId)) {
+        // Superseded — see handleRenamePattern's own comment on this guard.
+        return;
+      }
 
       await loadResults({ silent: true });
       if (hasStructureScope) {
@@ -2547,16 +2632,24 @@ export default function ResultsDashboardPage({
             } file${result.files_rewritten === 1 ? "" : "s"}`
       });
     } catch (nextError) {
-      setFindReplaceToast({
-        tone: "error",
-        message: friendlyApiErrorMessage(
-          nextError,
-          "Unable to transform pattern."
-        )
-      });
+      if (isCurrentStructureJobRequest(requestId)) {
+        setFindReplaceToast({
+          tone: "error",
+          message: friendlyApiErrorMessage(
+            nextError,
+            "Unable to transform pattern."
+          )
+        });
+      }
     } finally {
+      // ALWAYS — the Apply button is disabled on isTransforming, so leaving
+      // it stuck true after a superseding operation would disable transforms
+      // entirely, not just for this pattern.
       setIsTransforming(false);
-      setStructureProgress(null);
+
+      if (isCurrentStructureJobRequest(requestId)) {
+        setStructureProgress(null);
+      }
     }
   }
 
@@ -2625,6 +2718,8 @@ export default function ResultsDashboardPage({
       return;
     }
 
+    const requestId = bumpStructureJobRequest();
+
     setIsRunningDryRun(true);
     setDryRunError(null);
     setStructureProgress(null);
@@ -2639,8 +2734,19 @@ export default function ResultsDashboardPage({
           sourceFiles: Array.from(selectedRenameFiles),
           structureFilters: renameStructureFilters
         },
-        setStructureProgress
+        (progress) => {
+          if (isCurrentStructureJobRequest(requestId)) {
+            setStructureProgress(progress);
+          }
+        }
       );
+
+      if (!isCurrentStructureJobRequest(requestId)) {
+        // Superseded — e.g. the pattern/structure/edit-reset effect already
+        // cleared transformDryRun for whatever is selected NOW; writing this
+        // stale result on top would silently undo that reset.
+        return;
+      }
 
       setTransformDryRun(result);
       // Every shape starts TICKED (v1.69): before this control existed a
@@ -2651,13 +2757,19 @@ export default function ResultsDashboardPage({
         new Set(result.shapes.map((entry) => entry.beforeShape))
       );
     } catch (error) {
-      setTransformDryRun(null);
-      setDryRunError(
-        friendlyApiErrorMessage(error, "Unable to check every URL.")
-      );
+      if (isCurrentStructureJobRequest(requestId)) {
+        setTransformDryRun(null);
+        setDryRunError(
+          friendlyApiErrorMessage(error, "Unable to check every URL.")
+        );
+      }
     } finally {
+      // ALWAYS — this is the top-of-function reentry guard (isRunningDryRun).
       setIsRunningDryRun(false);
-      setStructureProgress(null);
+
+      if (isCurrentStructureJobRequest(requestId)) {
+        setStructureProgress(null);
+      }
     }
   }
 
@@ -2666,6 +2778,8 @@ export default function ResultsDashboardPage({
       return;
     }
 
+    const requestId = bumpStructureJobRequest();
+
     setUndoingTransformId(rowData.id);
     setStructureProgress(null);
 
@@ -2673,8 +2787,16 @@ export default function ResultsDashboardPage({
       const result = await undoPatternTransform(
         params.id,
         rowData.id,
-        setStructureProgress
+        (progress) => {
+          if (isCurrentStructureJobRequest(requestId)) {
+            setStructureProgress(progress);
+          }
+        }
       );
+
+      if (!isCurrentStructureJobRequest(requestId)) {
+        return;
+      }
 
       await loadResults({ silent: true });
       setFindReplaceToast({
@@ -2684,16 +2806,22 @@ export default function ResultsDashboardPage({
           : "URL structure transformation reverted"
       });
     } catch (nextError) {
-      setFindReplaceToast({
-        tone: "error",
-        message: friendlyApiErrorMessage(
-          nextError,
-          "Unable to undo transformation."
-        )
-      });
+      if (isCurrentStructureJobRequest(requestId)) {
+        setFindReplaceToast({
+          tone: "error",
+          message: friendlyApiErrorMessage(
+            nextError,
+            "Unable to undo transformation."
+          )
+        });
+      }
     } finally {
+      // ALWAYS — the top-of-function reentry guard (undoingTransformId).
       setUndoingTransformId(null);
-      setStructureProgress(null);
+
+      if (isCurrentStructureJobRequest(requestId)) {
+        setStructureProgress(null);
+      }
     }
   }
 

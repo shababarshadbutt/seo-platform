@@ -67,6 +67,7 @@ import {
   claimPatternStructureJob,
   describeKind,
   latestPatternStructureJob,
+  patternStructureJobById,
   patternStructureFingerprint,
   recentlyCompletedJob,
   recentlyCompletedJobOfKind,
@@ -4418,10 +4419,19 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     }
   );
 
-  // Progress of the most recent structure operation (rename / transform /
-  // transform-undo) for a pattern. One endpoint for all three: they share the
+  // Progress of a structure operation (rename / transform / transform-undo)
+  // for a pattern. One endpoint for all three: they share the
   // pattern_structure_jobs row and only one can be in flight per pattern.
-  app.get<{ Params: PatternParams }>(
+  //
+  // job_id (optional): pins the lookup to ONE specific job instead of
+  // "whatever's newest for this pattern". A poller that kicked off job A and
+  // is still reading its status needs this once job A finishes and a job B
+  // for the same pattern can start — without it, a poll landing after B
+  // exists would read B's row back under A's identity (different kind, a
+  // differently-shaped `result`), which is exactly the job-identity
+  // confusion this param exists to close off. Omitted: unchanged "latest"
+  // behavior, so any other caller of this route is unaffected.
+  app.get<{ Params: PatternParams; Querystring: { job_id?: string } }>(
     "/api/sessions/:id/patterns/:patternId/structure-job",
     async (request, reply) => {
       const patternResult = await pool.query(
@@ -4435,9 +4445,16 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           .send({ error: "Not Found", message: "pattern not found" });
       }
 
-      const job = await latestPatternStructureJob(request.params.patternId);
+      const jobId = request.query?.job_id;
+      const job = jobId
+        ? await patternStructureJobById(request.params.patternId, jobId)
+        : await latestPatternStructureJob(request.params.patternId);
 
       if (!job) {
+        // Same shape whether nothing was ever recorded for this pattern OR
+        // the one specific job asked for is gone (pruned with its session) —
+        // the frontend already treats "no job_id in the body" as "this
+        // operation is no longer available" regardless of which case it was.
         return reply.send({ status: "NONE" });
       }
 

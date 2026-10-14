@@ -376,3 +376,29 @@ export async function latestPatternStructureJob(patternId: string) {
 
   return result.rowCount === 0 ? null : result.rows[0];
 }
+
+// A SPECIFIC job, not whatever is newest — for a poller that kicked off job A
+// and must keep reading job A's own status even after a job B is created for
+// the same pattern. "Latest for this pattern" alone can't make that
+// distinction once A is terminal and B has started; this can.
+//
+// jobId is scoped to patternId, not looked up bare: this is reachable from a
+// client-supplied query param, and a job id that belongs to a DIFFERENT
+// pattern (or session) must read as "not found" rather than handing back
+// another pattern's data.
+export async function patternStructureJobById(
+  patternId: string,
+  jobId: string
+) {
+  const result = await pool.query<PatternStructureJobRow>(
+    `
+      SELECT id, kind, status, files_total, files_done, urls_rewritten, result,
+             error, started_at, completed_at
+      FROM pattern_structure_jobs
+      WHERE pattern_id = $1 AND id = $2
+    `,
+    [patternId, jobId]
+  );
+
+  return result.rowCount === 0 ? null : result.rows[0];
+}

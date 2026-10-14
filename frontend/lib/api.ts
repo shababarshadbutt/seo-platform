@@ -2138,11 +2138,17 @@ export type PatternStructureJobStatus = {
 // the pattern has never had one.
 export async function getPatternStructureJob(
   sessionId: string,
-  patternId: string
+  patternId: string,
+  // Omitted: "latest job for this pattern" (unchanged default behavior).
+  // Passed (by awaitPatternStructureJob below): pin the poll to the EXACT
+  // job it kicked off, so a stale loop from an earlier operation on this
+  // same pattern can never pick up a newer job's row under its own identity.
+  jobId?: string
 ) {
+  const query = jobId ? `?job_id=${encodeURIComponent(jobId)}` : "";
   const response = await fetchWithTimeout(
     backendUrl(
-      `/api/sessions/${sessionId}/patterns/${patternId}/structure-job`
+      `/api/sessions/${sessionId}/patterns/${patternId}/structure-job${query}`
     ),
     { cache: "no-store" }
   );
@@ -2201,6 +2207,19 @@ async function awaitPatternStructureJob<T>(
   });
 
   const deadline = Date.now() + JOB_POLL_TIMEOUT_MS;
+  // Tolerance for a single slow/aborted poll — NOT a retry budget for the
+  // operation itself (JOB_POLL_TIMEOUT_MS already covers that). Re-reading a
+  // job's status is side-effect-free and idempotent, so a transient miss is
+  // strictly safer to retry than to treat as the operation having failed: the
+  // job keeps running in the worker process regardless of whether THIS read
+  // of its status succeeded. At the file counts this app now handles (a job
+  // can run minutes, meaning hundreds of poll round-trips instead of the
+  // ~46 a 70s transform used to take), a single bad round trip out of that
+  // many is expected, not exceptional — only a RUN of them means something is
+  // actually wrong. Consecutive, not cumulative, so one blip every so often
+  // never adds up to a false failure.
+  let consecutivePollFailures = 0;
+  const MAX_CONSECUTIVE_POLL_FAILURES = 5;
 
   for (;;) {
     if (Date.now() > deadline) {
@@ -2213,7 +2232,27 @@ async function awaitPatternStructureJob<T>(
 
     await sleep(JOB_POLL_INTERVAL_MS);
 
-    const job = await getPatternStructureJob(sessionId, patternId);
+    let job: PatternStructureJobStatus | { status: "NONE" };
+
+    try {
+      // Pinned to kickoff.job_id (not just "latest for this pattern") so a
+      // second operation started on the same pattern shortly after this one
+      // completes can never be picked up by THIS loop under the first
+      // operation's identity — see the job-identity investigation this
+      // guards against.
+      job = await getPatternStructureJob(sessionId, patternId, kickoff.job_id);
+      consecutivePollFailures = 0;
+    } catch (error) {
+      if (
+        !isAbortError(error) ||
+        consecutivePollFailures >= MAX_CONSECUTIVE_POLL_FAILURES - 1
+      ) {
+        throw error;
+      }
+
+      consecutivePollFailures += 1;
+      continue;
+    }
 
     if (!("job_id" in job)) {
       // No job row at all: the row was pruned with its session.
