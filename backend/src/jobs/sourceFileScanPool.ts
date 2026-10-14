@@ -37,6 +37,40 @@ export const SOURCE_FILE_SCAN_PARALLEL_THRESHOLD = readPositiveInt(
   50_000
 );
 
+// A pattern can be WIDE instead of DEEP: many files, each mostly OTHER url
+// shapes with only a sparse few matching this pattern, so total_urls (the
+// MATCHED count) never crosses the threshold above even though every
+// candidate file still has to be read and regex-matched in full — cost
+// tracks bytes-read-per-file x file count, not match count.
+//
+// MEASURED in bench/sourceFileScanRate.ts, realistic-size files (2,000
+// locs/file, 1-in-200 matching), warmup pass discarded:
+//
+//     100 files (1,000 matched)   inline  2.32s   pooled 0.53s   4.37x
+//     200 files (2,000 matched)   inline  4.19s   pooled 0.91s   4.59x
+//     500 files (5,000 matched)   inline 14.91s   pooled 3.06s   4.87x
+//
+// All three stay far under total_urls' 50,000-match threshold, and the inline
+// path's own rate (~34-48 files/s here) extrapolates to crossing the 180s
+// client timeout around 5,000-6,000 files on this box's local SSD — fewer on
+// whatever disk actually backs the deploy host's upload dir. 200 is chosen
+// to catch that well before it becomes a problem, while costing under a
+// second either way at this size.
+//
+// CAVEAT: at a pathologically tiny-file profile (1-10 locs/file — not a real
+// sitemap shape, but reproduced in the same bench at 4,000-12,000 files),
+// pooling's per-task dispatch overhead can make it slightly SLOWER than
+// inline (0.6-0.9x). That regime stays under a few seconds either way, far
+// from the 180s wall this threshold exists to avoid, so the trade is
+// accepted rather than worth a second signal (e.g. a stat() per candidate
+// file) to tell the two profiles apart upfront.
+//
+// Env-tunable for the same A/B reason as the threshold above.
+export const SOURCE_FILE_SCAN_FILE_COUNT_THRESHOLD = readPositiveInt(
+  "SOURCE_FILE_SCAN_FILE_COUNT_THRESHOLD",
+  200
+);
+
 // Parallel scanners, derived from core count exactly like DRY_RUN_MAX_WORKERS —
 // this work writes nothing and is bounded by CPU, so it scales with cores until
 // the main-thread merge (summing each file's count) becomes the limit. See
@@ -79,6 +113,20 @@ export function runSourceFileScanJob(
   input: SourceFileScanInput
 ): Promise<SourceFileScanOutput> {
   return getPool().run(input);
+}
+
+// A single file cannot be split across threads, so it gains nothing from the
+// pool however many URLs it holds — hence fileCount > 1 is required before
+// either threshold is consulted.
+export function shouldUseSourceFileScanPool(
+  fileCount: number,
+  totalUrls: number
+): boolean {
+  return (
+    fileCount > 1 &&
+    (totalUrls >= SOURCE_FILE_SCAN_PARALLEL_THRESHOLD ||
+      fileCount >= SOURCE_FILE_SCAN_FILE_COUNT_THRESHOLD)
+  );
 }
 
 export async function destroySourceFileScanPool(): Promise<void> {

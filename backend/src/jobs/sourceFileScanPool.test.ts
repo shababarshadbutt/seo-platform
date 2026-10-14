@@ -5,7 +5,13 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { resolveStructureFilters } from "../sitemaps/structureClusters.js";
-import { destroySourceFileScanPool, runSourceFileScanJob } from "./sourceFileScanPool.js";
+import {
+  destroySourceFileScanPool,
+  runSourceFileScanJob,
+  SOURCE_FILE_SCAN_FILE_COUNT_THRESHOLD,
+  SOURCE_FILE_SCAN_PARALLEL_THRESHOLD,
+  shouldUseSourceFileScanPool
+} from "./sourceFileScanPool.js";
 
 // sourceFileScanWorker.test.ts proves the TASK's logic agrees with
 // countSitemapLocMatches, calling it directly in-process. This test proves the
@@ -67,4 +73,38 @@ test("a file the pool cannot read comes back failed, not thrown", async () => {
 
   assert.equal(result.failed, true);
   assert.equal(result.occurrences, 0);
+});
+
+// shouldUseSourceFileScanPool routes on EITHER threshold: a pattern can be
+// DEEP (few files, many matching urls) or WIDE (many files, few matching urls
+// each) and either shape alone must be enough to justify the pool.
+test("a single file never pools, however many urls it holds", () => {
+  assert.equal(
+    shouldUseSourceFileScanPool(1, SOURCE_FILE_SCAN_PARALLEL_THRESHOLD * 10),
+    false
+  );
+});
+
+test("stays inline below both thresholds", () => {
+  assert.equal(
+    shouldUseSourceFileScanPool(
+      SOURCE_FILE_SCAN_FILE_COUNT_THRESHOLD - 1,
+      SOURCE_FILE_SCAN_PARALLEL_THRESHOLD - 1
+    ),
+    false
+  );
+});
+
+test("pools once total_urls crosses its threshold, even with few files", () => {
+  assert.equal(
+    shouldUseSourceFileScanPool(2, SOURCE_FILE_SCAN_PARALLEL_THRESHOLD),
+    true
+  );
+});
+
+test("pools once file count crosses its threshold, even with few matched urls", () => {
+  assert.equal(
+    shouldUseSourceFileScanPool(SOURCE_FILE_SCAN_FILE_COUNT_THRESHOLD, 1),
+    true
+  );
 });

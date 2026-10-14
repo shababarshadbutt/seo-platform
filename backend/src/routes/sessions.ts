@@ -211,15 +211,16 @@ import {
 } from "../queue/maintenanceQueue.js";
 import {
   buildPatternTemplateRewriter,
-  countSitemapLocMatches,
   countTemplateParams,
   pathMatchesTemplate,
   rewriteSitemapLocFile
 } from "../sitemaps/rewriteLocs.js";
+import { shouldUseSourceFileScanPool } from "../jobs/sourceFileScanPool.js";
 import {
-  runSourceFileScanJob,
-  SOURCE_FILE_SCAN_PARALLEL_THRESHOLD
-} from "../jobs/sourceFileScanPool.js";
+  scanResolvedFilesInline,
+  scanResolvedFilesPooled,
+  type ResolvedScanFile
+} from "../sitemaps/scopedSourceFileScan.js";
 import {
   applyRedirectRule,
   deriveRedirectRule,
@@ -1157,12 +1158,6 @@ function emptyScopedSkipCounts(): ScopedSkipCounts {
   return { remote: 0, no_file_row: 0, unreadable: 0, no_matches: 0 };
 }
 
-// How many files to stream-count in parallel. Read-only and lightweight next
-// to the actual rewrite (no output file, no worker-pool handoff), so this can
-// run inline on the request thread; capped so a pattern spanning hundreds of
-// files doesn't open them all at once.
-const SCOPED_BREAKDOWN_CONCURRENCY = 6;
-
 // Structure-scoped occurrence counts for the source-files list (v1.52), used
 // once the Update Pattern modal has a structure selected in "Limit this edit
 // to." patternSourceFileBreakdown's rollup is whole-pattern and, for a session
@@ -1191,132 +1186,6 @@ const SCOPED_BREAKDOWN_CONCURRENCY = 6;
 // as "not found" reads as a broken tool rather than as the read-only file it
 // is. The counts below are ONLY a diagnostic — which files are accepted, and
 // the occurrence numbers, are unchanged.
-type ResolvedScanFile = { displayName: string; storedFilename: string };
-
-// Scan a resolved file's occurrences via the ordinary async-I/O-concurrency
-// loop — no real CPU parallelism, so this is only used below
-// SOURCE_FILE_SCAN_PARALLEL_THRESHOLD, where thread startup would cost more
-// than it saves (same reasoning as transformDryRunScan.ts's scanInline).
-async function scanResolvedFilesInline(
-  files: ResolvedScanFile[],
-  template: string,
-  resolvedFilters: ResolvedStructureFilter[]
-): Promise<{
-  results: Array<{ source_file: string; occurrences: number }>;
-  noMatches: number;
-  unreadable: number;
-}> {
-  const matchesUrl = (url: string): boolean => {
-    let pathname: string;
-
-    try {
-      pathname = new URL(url).pathname;
-    } catch {
-      return false;
-    }
-
-    return (
-      pathMatchesTemplate(pathname, template) &&
-      urlMatchesStructureFilters(url, resolvedFilters)
-    );
-  };
-
-  const results: Array<{ source_file: string; occurrences: number }> = [];
-  let noMatches = 0;
-  let unreadable = 0;
-  let cursor = 0;
-
-  async function worker() {
-    for (;;) {
-      const index = cursor;
-      cursor += 1;
-
-      if (index >= files.length) {
-        return;
-      }
-
-      const { displayName, storedFilename } = files[index];
-
-      try {
-        const occurrences = await countSitemapLocMatches({
-          inputPath: path.join(config.uploadDir, storedFilename),
-          isGzip: storedFilename.toLowerCase().endsWith(".gz"),
-          matchesUrl
-        });
-
-        if (occurrences > 0) {
-          results.push({ source_file: displayName, occurrences });
-        } else {
-          // Read fine, matched nothing. Usually a template that no longer
-          // describes what is on disk (see hasStaleCountsAfterFix) or a scope
-          // narrower than this file's contents.
-          noMatches += 1;
-        }
-      } catch {
-        // Missing/unreadable on disk — excluded rather than failing the whole
-        // preview.
-        unreadable += 1;
-      }
-    }
-  }
-
-  await Promise.all(
-    Array.from(
-      { length: Math.min(SCOPED_BREAKDOWN_CONCURRENCY, files.length) },
-      worker
-    )
-  );
-
-  return { results, noMatches, unreadable };
-}
-
-// Scan a resolved file's occurrences across the Piscina pool
-// (jobs/sourceFileScanPool.ts) — real CPU parallelism, used once the pattern's
-// total_urls crosses SOURCE_FILE_SCAN_PARALLEL_THRESHOLD. Mirrors
-// transformDryRunScan.ts's scanPooled: ONE task per file, not a fixed chunk
-// split, so Piscina's queue hands a free thread the next file regardless of
-// how unevenly sized the pattern's files are.
-async function scanResolvedFilesPooled(
-  files: ResolvedScanFile[],
-  template: string,
-  resolvedFilters: ResolvedStructureFilter[]
-): Promise<{
-  results: Array<{ source_file: string; occurrences: number }>;
-  noMatches: number;
-  unreadable: number;
-}> {
-  const results: Array<{ source_file: string; occurrences: number }> = [];
-  let noMatches = 0;
-  let unreadable = 0;
-
-  await Promise.all(
-    files.map(async ({ displayName, storedFilename }) => {
-      try {
-        const { occurrences, failed } = await runSourceFileScanJob({
-          inputPath: path.join(config.uploadDir, storedFilename),
-          isGzip: storedFilename.toLowerCase().endsWith(".gz"),
-          template,
-          resolvedFilters
-        });
-
-        if (failed) {
-          unreadable += 1;
-        } else if (occurrences > 0) {
-          results.push({ source_file: displayName, occurrences });
-        } else {
-          noMatches += 1;
-        }
-      } catch {
-        // A thread that died outright, rather than a file it could not read —
-        // counted the same way the inline path counts an unreadable file.
-        unreadable += 1;
-      }
-    })
-  );
-
-  return { results, noMatches, unreadable };
-}
-
 async function scopedPatternSourceFileBreakdown(
   patternId: string,
   sessionId: string,
@@ -1392,11 +1261,15 @@ async function scopedPatternSourceFileBreakdown(
     resolvedFiles.push({ displayName, storedFilename });
   }
 
-  // A single file cannot be split across threads, so it gains nothing from the
-  // pool however many URLs it holds — same guard as
-  // transformDryRunScan.ts:scanTransformDryRun.
-  const worthParallelising =
-    resolvedFiles.length > 1 && totalUrls >= SOURCE_FILE_SCAN_PARALLEL_THRESHOLD;
+  // Pooled once EITHER threshold says so: total_urls predicts per-file CPU
+  // cost (same reasoning as transformDryRunScan.ts:scanTransformDryRun), but a
+  // pattern can also be wide instead of deep — many files, few matching URLs
+  // each — where file count, not URL volume, is what blows the inline path's
+  // time budget. See shouldUseSourceFileScanPool's own comment.
+  const worthParallelising = shouldUseSourceFileScanPool(
+    resolvedFiles.length,
+    totalUrls
+  );
 
   const { results, noMatches, unreadable } = worthParallelising
     ? await scanResolvedFilesPooled(resolvedFiles, template, resolvedFilters)
