@@ -43,12 +43,16 @@ test("scan result cache: hit, single-flight, and degradation", async (t) => {
     cachedWithSingleFlight,
     closeScanResultCache,
     computeCountForTests,
-    resetComputeCountForTests
+    resetComputeCountForTests,
+    setSingleFlightTimingForTests,
+    resetSingleFlightTimingForTests,
+    writeHeartbeat
   } = await import("./scanResultCache.js");
 
   const { closeRedisLockClient } = await import("../queue/redisLock.js");
 
   t.after(async () => {
+    resetSingleFlightTimingForTests();
     closeScanResultCache();
     // The expired-lock case below squats the key using redisLock's OWN
     // connection, which is separate from the cache's. Both have to go or the
@@ -132,4 +136,89 @@ test("scan result cache: hit, single-flight, and degradation", async (t) => {
     assert.deepEqual(result.value, payload);
     await squatter.release();
   });
+
+  await t.test(
+    "a loser outwaits the OLD budget while heartbeats keep arriving, and the scan runs once",
+    async () => {
+      // Proves the amplification bug this module exists to fix (see
+      // scanResultCache.ts's own history): shrink loserWaitBudgetMs far below
+      // a real compute() duration, so the OLD code (no heartbeat) would have
+      // given up and recomputed partway through — and assert it does not.
+      resetComputeCountForTests();
+      setSingleFlightTimingForTests({ loserWaitBudgetMs: 1_500 });
+
+      const key = `${KEY_PREFIX}:heartbeat-alive`;
+      const compute = async (report: (current: number, total: number) => void) => {
+        // Long enough to cross several heartbeat-write cycles AND several
+        // multiples of the shrunk 1.5s loser budget — if the heartbeat check
+        // were not in the loser loop, it would have taken over and
+        // recomputed well before this returns.
+        for (let step = 1; step <= 4; step += 1) {
+          report(step, 4);
+          await new Promise((resolve) => setTimeout(resolve, 900));
+        }
+
+        return payload;
+      };
+
+      const progressSeenByLoser: Array<{ current: number; total: number }> = [];
+
+      const [winner, loser] = await Promise.all([
+        cachedWithSingleFlight(key, compute),
+        // Started a tick later so it reliably loses the lock race, same as
+        // the "ten concurrent callers" case above.
+        new Promise((resolve) => setTimeout(resolve, 50)).then(() =>
+          cachedWithSingleFlight(key, compute, (current, total) => {
+            progressSeenByLoser.push({ current, total });
+          })
+        )
+      ]);
+
+      assert.equal(
+        computeCountForTests(),
+        1,
+        "a healthy, heartbeating winner must not be recomputed by its loser"
+      );
+      assert.deepEqual(winner.value, payload);
+      assert.deepEqual(loser.value, payload);
+      assert.ok(
+        progressSeenByLoser.length > 0,
+        "the loser must have relayed at least one heartbeat sighting"
+      );
+    }
+  );
+
+  await t.test(
+    "a winner that stops heartbeating is recovered from well under the old budget",
+    async () => {
+      // Simulates a winner that reported once, then crashed: write ONE
+      // heartbeat directly (no real compute() running), squat the real lock
+      // with a short TTL, and shrink the heartbeat TTL so staleness is
+      // detectable quickly. The loser must wait while the heartbeat still
+      // looks fresh, then recover once it goes stale — all in a few seconds,
+      // not the old budget's 170s.
+      resetComputeCountForTests();
+      setSingleFlightTimingForTests({ heartbeatTtlSeconds: 1 });
+
+      const { tryAcquireRedisLock } = await import("../queue/redisLock.js");
+      const key = `${KEY_PREFIX}:heartbeat-stale`;
+      const squatter = await tryAcquireRedisLock(key, 2);
+
+      assert.ok(squatter, "test needs to hold the lock first");
+      await writeHeartbeat(key, { current: 1, total: 10 });
+
+      const started = Date.now();
+      const result = await cachedWithSingleFlight(key, async () => payload);
+      const elapsedMs = Date.now() - started;
+
+      assert.deepEqual(result.value, payload);
+      assert.equal(computeCountForTests(), 1);
+      assert.ok(
+        elapsedMs < 10_000,
+        `recovery took ${elapsedMs}ms — expected well under the old 170s budget`
+      );
+
+      await squatter.release().catch(() => undefined);
+    }
+  );
 });

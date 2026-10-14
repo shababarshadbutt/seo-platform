@@ -81,6 +81,9 @@ import {
   getPatternSamples,
   getPatternSamplesBulk,
   getPatternSourceFiles,
+  followSourceFileScanProgress,
+  type SourceFileScanProgressEvent,
+  type ScopedSkipCounts,
   getPatternStructures,
   getPatterns,
   getPatternsResponse,
@@ -1017,6 +1020,11 @@ export default function ResultsDashboardPage({
     new Set()
   );
   const [isLoadingRenameFiles, setIsLoadingRenameFiles] = useState(false);
+  // Live "Scanning N of M files…" state for a SCOPED request, fed by the SSE
+  // stream below. null before the first progress frame lands (falls back to
+  // the plain "Loading source files…" copy) and reset on every new request.
+  const [renameSourceFileScanProgress, setRenameSourceFileScanProgress] =
+    useState<{ current: number; total: number } | null>(null);
   const [isRenaming, setIsRenaming] = useState(false);
   // Scope for the Update Pattern modal (v1.49; per-POSITION since v1.51).
   //
@@ -4327,6 +4335,10 @@ export default function ResultsDashboardPage({
   // dropdown values quickly must not let the FIRST response overwrite the
   // list after the SECOND has already landed.
   const sourceFilesRequestIdRef = useRef(0);
+  // The scoped (SSE) stream for whatever request is currently in flight, so a
+  // superseded request's stream gets closed rather than left running in the
+  // background after a newer dropdown change or an unmount.
+  const sourceFileScanStreamRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
     if (!renameRow) {
@@ -4341,51 +4353,150 @@ export default function ResultsDashboardPage({
     setRenameSourceFilesCached(false);
     setSelectedRenameFiles(new Set());
     setIsLoadingRenameFiles(true);
+    setRenameSourceFileScanProgress(null);
 
-    getPatternSourceFiles(params.id, renameRow.id, renameStructureFilters)
-      .then(({ files, skipped, cached }) => {
+    sourceFileScanStreamRef.current?.close();
+    sourceFileScanStreamRef.current = null;
+
+    const applyResult = (
+      files: PatternSourceFile[],
+      skipped: ScopedSkipCounts | null,
+      cached: boolean
+    ) => {
+      if (sourceFilesRequestIdRef.current !== requestId) {
+        return;
+      }
+
+      setRenameSourceFiles(files);
+      setRenameSourceFilesCached(cached);
+      setSelectedRenameFiles(new Set(files.map((file) => file.source_file)));
+      // Computed here, with the response that produced the list, rather than
+      // during render: the drop counters describe THIS response, and deriving
+      // the sentence later would let it outlive the numbers it explains.
+      setRenameSourceFilesNotice(
+        files.length === 0
+          ? sourceFileEmptinessMessage({
+              skipped,
+              staleAfterFix: hasStaleCountsAfterFix({
+                redirectsAppliedAt: renameRow.redirectsAppliedAt
+              })
+            })
+          : null
+      );
+      setIsLoadingRenameFiles(false);
+    };
+
+    const applyError = (error: unknown) => {
+      if (sourceFilesRequestIdRef.current !== requestId) {
+        return;
+      }
+
+      setRenameSourceFiles([]);
+      // A failed request is NOT evidence that the pattern has no files — the
+      // endpoint 400s on a structure_filter whose param_index no longer
+      // resolves against the template, and that used to read as a clean zero.
+      // Same reasoning as the Fix modal's scoped count above.
+      //
+      // The wording lives in the helper rather than here (v1.82) because the
+      // common failure is this request's own timeout, and interpolating
+      // error.message raw put a browser internal on screen: "signal is
+      // aborted without reason". See sourceFileLoadErrorMessage for why it
+      // matches on error.name and not on that text.
+      setRenameSourceFilesNotice(sourceFileLoadErrorMessage(error));
+      setIsLoadingRenameFiles(false);
+    };
+
+    if (renameStructureFilters.length === 0) {
+      // Unscoped: always the cheap DB rollup (patternSourceFileBreakdown on
+      // the backend never opens a file), so there is nothing here worth
+      // streaming — same plain fetch-with-retry as before.
+      getPatternSourceFiles(params.id, renameRow.id, renameStructureFilters)
+        .then(({ files, skipped, cached }) =>
+          applyResult(files, skipped, cached)
+        )
+        .catch(applyError);
+
+      return;
+    }
+
+    // Scoped: a structure filter can mean streaming every <loc> in thousands
+    // of real-size files, which can genuinely take minutes
+    // (bench/sourceFileScanRate.ts's filtered, large-file scenario) — far
+    // longer than a blind timeout can tell apart from a hang. Follow the SAME
+    // scan's live progress instead of guessing.
+    let receivedAnyFrame = false;
+    const stream = followSourceFileScanProgress(
+      params.id,
+      renameRow.id,
+      renameStructureFilters,
+      (event: SourceFileScanProgressEvent) => {
         if (sourceFilesRequestIdRef.current !== requestId) {
           return;
         }
 
-        setRenameSourceFiles(files);
-        setRenameSourceFilesCached(cached);
-        setSelectedRenameFiles(new Set(files.map((file) => file.source_file)));
-        // Computed here, with the response that produced the list, rather than
-        // during render: the drop counters describe THIS response, and deriving
-        // the sentence later would let it outlive the numbers it explains.
-        setRenameSourceFilesNotice(
-          files.length === 0
-            ? sourceFileEmptinessMessage({
-                skipped,
-                staleAfterFix: hasStaleCountsAfterFix({
-                  redirectsAppliedAt: renameRow.redirectsAppliedAt
-                })
-              })
-            : null
+        receivedAnyFrame = true;
+
+        if (event.type === "progress") {
+          if (
+            typeof event.current === "number" &&
+            typeof event.total === "number"
+          ) {
+            setRenameSourceFileScanProgress({
+              current: event.current,
+              total: event.total
+            });
+          }
+
+          return;
+        }
+
+        if (event.type === "done") {
+          applyResult(
+            event.result?.source_files ?? [],
+            event.result?.scope_skipped ?? null,
+            event.result?.cached === true
+          );
+          stream.close();
+
+          return;
+        }
+
+        applyError(
+          new Error(
+            event.message ?? "Could not scan this pattern's source files."
+          )
         );
-      })
-      .catch((error: unknown) => {
-        if (sourceFilesRequestIdRef.current === requestId) {
-          setRenameSourceFiles([]);
-          // A failed request is NOT evidence that the pattern has no files —
-          // the endpoint 400s on a structure_filter whose param_index no longer
-          // resolves against the template, and that used to read as a clean
-          // zero. Same reasoning as the Fix modal's scoped count above.
-          //
-          // The wording lives in the helper rather than here (v1.82) because the
-          // common failure is this request's own timeout, and interpolating
-          // error.message raw put a browser internal on screen: "signal is
-          // aborted without reason". See sourceFileLoadErrorMessage for why it
-          // matches on error.name and not on that text.
-          setRenameSourceFilesNotice(sourceFileLoadErrorMessage(error));
-        }
-      })
-      .finally(() => {
-        if (sourceFilesRequestIdRef.current === requestId) {
-          setIsLoadingRenameFiles(false);
-        }
-      });
+        stream.close();
+      }
+    );
+
+    sourceFileScanStreamRef.current = stream;
+
+    // EventSource itself failing before ANY frame arrived — e.g. a proxy that
+    // kills long-lived connections — falls back to the plain fetch-with-retry
+    // path rather than leaving the modal stuck. This is a SEPARATE listener
+    // from followSourceFileScanProgress's own onerror (both fire on the same
+    // underlying "error" event), so the fallback can live here with the
+    // request-id context instead of inside that shared helper.
+    stream.addEventListener("error", () => {
+      if (sourceFilesRequestIdRef.current !== requestId || receivedAnyFrame) {
+        return;
+      }
+
+      getPatternSourceFiles(params.id, renameRow.id, renameStructureFilters)
+        .then(({ files, skipped, cached }) =>
+          applyResult(files, skipped, cached)
+        )
+        .catch(applyError);
+    });
+
+    return () => {
+      stream.close();
+
+      if (sourceFileScanStreamRef.current === stream) {
+        sourceFileScanStreamRef.current = null;
+      }
+    };
   }, [renameRow, renameStructureFilters, params.id]);
 
   // Resolved against the pattern template so the client can apply the SAME
@@ -8470,7 +8581,13 @@ export default function ResultsDashboardPage({
                     {isLoadingRenameFiles ? (
                       <div className="flex items-center gap-2 px-3 py-3 text-sm text-slate-500">
                         <Loader2 className="h-4 w-4 animate-spin" />
-                        Loading source files…
+                        {renameSourceFileScanProgress
+                          ? `Scanning ${renameSourceFileScanProgress.current} of ${renameSourceFileScanProgress.total} file${
+                              renameSourceFileScanProgress.total === 1
+                                ? ""
+                                : "s"
+                            }…`
+                          : "Loading source files…"}
                       </div>
                     ) : renameSourceFiles.length === 0 ? (
                       <p className="px-3 py-3 text-sm text-slate-500">

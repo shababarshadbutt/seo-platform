@@ -2059,6 +2059,57 @@ async function fetchPatternSourceFilesOnce(
   };
 }
 
+// SSE sibling of getPatternSourceFiles, for the SCOPED case only (the backend
+// route ignores this path for an unscoped request — see its own comment).
+// getPatternSourceFiles/SOURCE_FILES_MAX_ATTEMPTS stay exactly as they are:
+// this is additive, not a replacement — unscoped requests, and the separate
+// Fix modal caller, keep using the plain fetch-with-retry path.
+//
+// A structure-scoped scan over thousands of real-size files can genuinely run
+// minutes (see jobs/sourceFileScanPool.ts's bench), which the blind
+// 180s-timeout-plus-3-retries loop above cannot tell apart from a hang. This
+// follows the SAME scan's live progress instead of guessing — same frame
+// shape and EventSource pattern as followPublishProgress/
+// followRemotePullProgress below, so the consumer code is the familiar one.
+export type SourceFileScanProgressEvent = {
+  type: "progress" | "done" | "error";
+  current?: number;
+  total?: number;
+  message?: string;
+  result?: {
+    source_files: PatternSourceFile[];
+    scope_skipped?: ScopedSkipCounts;
+    cached?: boolean;
+  };
+};
+
+export function followSourceFileScanProgress(
+  sessionId: string,
+  patternId: string,
+  structureFilters: StructureFilter[],
+  onEvent: (event: SourceFileScanProgressEvent) => void
+): EventSource {
+  const query = `?structure_filter=${encodeURIComponent(JSON.stringify(structureFilters))}`;
+  const source = new EventSource(
+    backendUrl(
+      `/api/sessions/${sessionId}/patterns/${patternId}/source-files/progress${query}`
+    )
+  );
+
+  source.onmessage = (message) => {
+    try {
+      onEvent(JSON.parse(message.data) as SourceFileScanProgressEvent);
+    } catch {
+      // Ignore malformed frames rather than tearing the stream down.
+    }
+  };
+  source.onerror = () => {
+    source.close();
+  };
+
+  return source;
+}
+
 // ---- Pattern structure operations run as background jobs -------------------
 //
 // Rename / transform / transform-undo each rewrite every sitemap file the pattern

@@ -34,7 +34,11 @@ const SCOPED_BREAKDOWN_CONCURRENCY = 6;
 export async function scanResolvedFilesInline(
   files: ResolvedScanFile[],
   template: string,
-  resolvedFilters: ResolvedStructureFilter[]
+  resolvedFilters: ResolvedStructureFilter[],
+  // Called once per file, after ANY outcome (matched, no-match, unreadable) —
+  // "current" means files attempted, not files matched. Optional: the bench
+  // and any caller that doesn't need progress just omits it.
+  onFileDone?: () => void
 ): Promise<{
   results: Array<{ source_file: string; occurrences: number }>;
   noMatches: number;
@@ -90,6 +94,8 @@ export async function scanResolvedFilesInline(
         // Missing/unreadable on disk — excluded rather than failing the whole
         // preview.
         unreadable += 1;
+      } finally {
+        onFileDone?.();
       }
     }
   }
@@ -114,7 +120,8 @@ export async function scanResolvedFilesInline(
 export async function scanResolvedFilesPooled(
   files: ResolvedScanFile[],
   template: string,
-  resolvedFilters: ResolvedStructureFilter[]
+  resolvedFilters: ResolvedStructureFilter[],
+  onFileDone?: () => void
 ): Promise<{
   results: Array<{ source_file: string; occurrences: number }>;
   noMatches: number;
@@ -145,6 +152,8 @@ export async function scanResolvedFilesPooled(
         // A thread that died outright, rather than a file it could not read —
         // counted the same way the inline path counts an unreadable file.
         unreadable += 1;
+      } finally {
+        onFileDone?.();
       }
     })
   );

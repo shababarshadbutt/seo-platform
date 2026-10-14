@@ -1201,7 +1201,12 @@ async function scopedPatternSourceFileBreakdown(
   // patterns.total_urls — what the inline-vs-pooled choice is made on, same
   // reasoning as DRY_RUN_PARALLEL_THRESHOLD: per-file URL count predicts scan
   // cost, file count does not.
-  totalUrls: number
+  totalUrls: number,
+  // Files attempted so far / total candidate files. Threaded down to
+  // cachedWithSingleFlight's `report`, which both relays it live to whichever
+  // caller is actually running this and throttle-writes it to the heartbeat
+  // key other watchers (a loser, an SSE stream) poll — see scanResultCache.ts.
+  onProgress?: (current: number, total: number) => void
 ): Promise<ScopedSourceFileBreakdown> {
   const candidates = await pool.query<{ source_file: string }>(
     "SELECT source_file FROM pattern_file_occurrences WHERE pattern_id = $1",
@@ -1277,9 +1282,33 @@ async function scopedPatternSourceFileBreakdown(
     totalUrls
   );
 
+  // Report the total immediately, before the first file is even opened, so a
+  // modal that just opened shows "Scanning 0 of N files" rather than nothing.
+  onProgress?.(0, resolvedFiles.length);
+
+  let filesDone = 0;
+  const onFileDone = () => onProgress?.(++filesDone, resolvedFiles.length);
+
   const { results, noMatches, unreadable } = worthParallelising
-    ? await scanResolvedFilesPooled(resolvedFiles, template, resolvedFilters)
-    : await scanResolvedFilesInline(resolvedFiles, template, resolvedFilters);
+    ? await scanResolvedFilesPooled(
+        resolvedFiles,
+        template,
+        resolvedFilters,
+        onFileDone
+      )
+    : await scanResolvedFilesInline(
+        resolvedFiles,
+        template,
+        resolvedFilters,
+        onFileDone
+      );
+
+  // Unconditional final report: the heartbeat a watcher last saw may be
+  // throttled (scanResultCache.ts's PROGRESS_WRITE_MIN_INTERVAL_MS) and so
+  // slightly behind — this makes sure the last number anyone sees is "done",
+  // not a stale in-progress count, even though the real completion signal is
+  // the cached RESULT, not this call.
+  onProgress?.(resolvedFiles.length, resolvedFiles.length);
 
   skipped.no_matches += noMatches;
   skipped.unreadable += unreadable;
@@ -1315,7 +1344,8 @@ async function cachedScopedPatternSourceFileBreakdown(
   sourceRole: string,
   template: string,
   resolvedFilters: ResolvedStructureFilter[],
-  totalUrls: number
+  totalUrls: number,
+  onProgress?: (current: number, total: number) => void
 ): Promise<CachedResult<ScopedSourceFileBreakdown>> {
   const key = sourceFileScanCacheKey({
     patternId,
@@ -1326,15 +1356,19 @@ async function cachedScopedPatternSourceFileBreakdown(
     resolvedFilters
   });
 
-  return cachedWithSingleFlight(key, () =>
-    scopedPatternSourceFileBreakdown(
-      patternId,
-      sessionId,
-      sourceRole,
-      template,
-      resolvedFilters,
-      totalUrls
-    )
+  return cachedWithSingleFlight(
+    key,
+    (report) =>
+      scopedPatternSourceFileBreakdown(
+        patternId,
+        sessionId,
+        sourceRole,
+        template,
+        resolvedFilters,
+        totalUrls,
+        report
+      ),
+    onProgress
   );
 }
 
@@ -3278,114 +3312,305 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     }
   );
 
+  // Shared by the JSON route below and its SSE progress sibling — pattern
+  // lookup + structure_filter parse/resolve, identical in both, so adding the
+  // SSE route didn't mean a second place to keep this validation in sync.
+  type SourceFilesScope =
+    | {
+        ok: true;
+        template: string;
+        sourceRole: string;
+        sourceFile: string | null;
+        totalUrls: number;
+        resolvedFilters: ResolvedStructureFilter[];
+      }
+    | { ok: false; status: number; body: unknown };
+
+  async function resolveSourceFilesScope(
+    sessionId: string,
+    patternId: string,
+    rawFilter: string | undefined
+  ): Promise<SourceFilesScope> {
+    const patternResult = await pool.query<{
+      total_urls: string;
+      source_file: string | null;
+      template: string;
+      source_role: string;
+    }>(
+      "SELECT total_urls, source_file, template, source_role FROM patterns WHERE session_id = $1 AND id = $2",
+      [sessionId, patternId]
+    );
+
+    if (patternResult.rowCount === 0) {
+      return {
+        ok: false,
+        status: 404,
+        body: { error: "Not Found", message: "pattern not found" }
+      };
+    }
+
+    const { total_urls, source_file, template, source_role } =
+      patternResult.rows[0];
+
+    // Optional scope (v1.52): once the modal's "Limit this edit to" picks a
+    // structure, the file list must match — see
+    // scopedPatternSourceFileBreakdown for why a rollup can't just be
+    // filtered after the fact. A query param, not a body, because this is a
+    // GET; encoded the same shape as the PATCH .../rename body's
+    // structure_filter (an array of {param_index, anchor, value}).
+    let requestedFilters: StructureFilter[] | null = [];
+
+    if (typeof rawFilter === "string" && rawFilter.length > 0) {
+      try {
+        requestedFilters = parseStructureFilters(JSON.parse(rawFilter));
+      } catch {
+        requestedFilters = null;
+      }
+    }
+
+    if (requestedFilters === null) {
+      return {
+        ok: false,
+        status: 400,
+        body: badRequest(STRUCTURE_FILTER_SHAPE_ERROR)
+      };
+    }
+
+    const resolvedFilters = resolveStructureFilters(
+      requestedFilters,
+      template
+    );
+
+    // ALL-OR-NOTHING, same reasoning as the rename/transform routes: a
+    // partially-resolved scope would silently widen the preview to include
+    // the position that failed to resolve.
+    if (resolvedFilters === null) {
+      return {
+        ok: false,
+        status: 400,
+        body: badRequest(
+          `structure_filter param_index ${requestedFilters
+            .map((filter) => filter.param_index)
+            .join(", ")} does not all exist in ${template}`
+        )
+      };
+    }
+
+    return {
+      ok: true,
+      template,
+      sourceRole: source_role,
+      sourceFile: source_file,
+      totalUrls: Number(total_urls),
+      resolvedFilters
+    };
+  }
+
+  // Shapes the final JSON payload both routes send: file_id enrichment plus
+  // the v1.80 drop counters/cache flag, ONLY present on the scoped path (see
+  // scoped ? {...} : {} below — leaving the key off keeps "nothing was
+  // dropped" distinct from "dropping isn't a thing here" for the unscoped
+  // rollup, which opens no files and has no drops to report).
+  async function buildSourceFilesResponse(
+    sessionId: string,
+    patternId: string,
+    sourceFile: string | null,
+    totalUrls: number,
+    scoped: CachedResult<ScopedSourceFileBreakdown> | null
+  ) {
+    const sourceFiles =
+      scoped?.value.files ??
+      (await patternSourceFileBreakdown(patternId, totalUrls, sourceFile));
+    // file_id lets the Update Pattern modal download exactly the files the
+    // user ticked (v1.51) — the download endpoint excludes by id, and the
+    // client must not be the thing that derives one from a display name.
+    // null when a recorded occurrence no longer has a live file row.
+    const fileIds = await sessionFileIdsByDisplayName(sessionId);
+
+    return {
+      source_files: sourceFiles.map((file) => ({
+        ...file,
+        file_id: fileIds.get(file.source_file) ?? null
+      })),
+      ...(scoped ? { scope_skipped: scoped.value.skipped } : {}),
+      // Only ever true on the scoped path, and only when nothing was computed
+      // for this request — so the modal can say an instant answer was a cache
+      // hit rather than leaving a suspiciously fast scan unexplained.
+      ...(scoped?.cached ? { cached: true } : {})
+    };
+  }
+
   app.get<{
     Params: PatternParams;
     Querystring: { structure_filter?: string };
   }>(
     "/api/sessions/:id/patterns/:patternId/source-files",
     async (request, reply) => {
-      const patternResult = await pool.query<{
-        total_urls: string;
-        source_file: string | null;
-        template: string;
-        source_role: string;
-      }>(
-        "SELECT total_urls, source_file, template, source_role FROM patterns WHERE session_id = $1 AND id = $2",
-        [request.params.id, request.params.patternId]
+      const scope = await resolveSourceFilesScope(
+        request.params.id,
+        request.params.patternId,
+        request.query?.structure_filter
       );
 
-      if (patternResult.rowCount === 0) {
-        return reply.code(404).send({
-          error: "Not Found",
-          message: "pattern not found"
-        });
+      if (!scope.ok) {
+        return reply.code(scope.status).send(scope.body);
       }
 
-      const { total_urls, source_file, template, source_role } =
-        patternResult.rows[0];
-
-      // Optional scope (v1.52): once the modal's "Limit this edit to" picks a
-      // structure, the file list must match — see
-      // scopedPatternSourceFileBreakdown for why a rollup can't just be
-      // filtered after the fact. A query param, not a body, because this is a
-      // GET; encoded the same shape as the PATCH .../rename body's
-      // structure_filter (an array of {param_index, anchor, value}).
-      const rawFilter = request.query?.structure_filter;
-      let requestedFilters: StructureFilter[] | null = [];
-
-      if (typeof rawFilter === "string" && rawFilter.length > 0) {
-        try {
-          requestedFilters = parseStructureFilters(JSON.parse(rawFilter));
-        } catch {
-          requestedFilters = null;
-        }
-      }
-
-      if (requestedFilters === null) {
-        return reply.code(400).send(badRequest(STRUCTURE_FILTER_SHAPE_ERROR));
-      }
-
-      const resolvedFilters = resolveStructureFilters(
-        requestedFilters,
-        template
-      );
-
-      // ALL-OR-NOTHING, same reasoning as the rename/transform routes: a
-      // partially-resolved scope would silently widen the preview to include
-      // the position that failed to resolve.
-      if (resolvedFilters === null) {
-        return reply.code(400).send(
-          badRequest(
-            `structure_filter param_index ${requestedFilters
-              .map((filter) => filter.param_index)
-              .join(", ")} does not all exist in ${template}`
-          )
-        );
-      }
-
-      // scope_skipped accompanies ONLY the scoped path. The unscoped rollup
-      // opens no files, so it has no drops to report — and leaving the key off
-      // rather than sending zeros keeps "nothing was dropped" distinct from
-      // "dropping isn't a thing here", which is what lets the client tell a
-      // genuinely empty pattern from an unexplained one.
       const scoped =
-        resolvedFilters.length > 0
+        scope.resolvedFilters.length > 0
           ? await cachedScopedPatternSourceFileBreakdown(
               request.params.patternId,
               request.params.id,
-              source_role,
-              template,
-              resolvedFilters,
-              Number(total_urls)
+              scope.sourceRole,
+              scope.template,
+              scope.resolvedFilters,
+              scope.totalUrls
             )
           : null;
-      const sourceFiles =
-        scoped?.value.files ??
-        (await patternSourceFileBreakdown(
-          request.params.patternId,
-          Number(total_urls),
-          source_file
-        ));
-      // file_id lets the Update Pattern modal download exactly the files the
-      // user ticked (v1.51) — the download endpoint excludes by id, and the
-      // client must not be the thing that derives one from a display name.
-      // null when a recorded occurrence no longer has a live file row.
-      const fileIds = await sessionFileIdsByDisplayName(request.params.id);
 
-      return {
-        source_files: sourceFiles.map((file) => ({
-          ...file,
-          file_id: fileIds.get(file.source_file) ?? null
-        })),
-        // The v1.80 drop counters are cached WITH the file list, not recomputed:
-        // a cached empty list that lost its explanation would be back to the
-        // bare "No source files found for this pattern." that v1.80 removed.
-        ...(scoped ? { scope_skipped: scoped.value.skipped } : {}),
-        // Only ever true on the scoped path, and only when nothing was computed
-        // for this request — so the modal can say an instant answer was a cache
-        // hit rather than leaving a suspiciously fast scan unexplained.
-        ...(scoped?.cached ? { cached: true } : {})
+      return buildSourceFilesResponse(
+        request.params.id,
+        request.params.patternId,
+        scope.sourceFile,
+        scope.totalUrls,
+        scoped
+      );
+    }
+  );
+
+  // SSE sibling of the route above (v2.1.9 — see the rename modal's "Loading
+  // source files…" state). The JSON route's own duration is bounded by the
+  // client's 180s fetch timeout and its own retry loop (EXPORT_API_TIMEOUT_MS,
+  // SOURCE_FILES_MAX_ATTEMPTS, frontend/lib/api.ts); a SCOPED scan spanning
+  // thousands of real-size files can genuinely run minutes
+  // (bench/sourceFileScanRate.ts's filtered, large-file scenario), which that
+  // retry loop cannot distinguish from a hang. This route lets the modal watch
+  // the SAME scan progress instead of guessing — same SSE shape as
+  // routes/pullProgress.ts / the publish-progress route further down this
+  // file, so the frontend consumer is the familiar EventSource pattern.
+  //
+  // Unscoped stays on the JSON route above — the DB rollup
+  // (patternSourceFileBreakdown) never opens a file and is always fast, so
+  // there is nothing here worth streaming.
+  app.get<{
+    Params: PatternParams;
+    Querystring: { structure_filter?: string };
+  }>(
+    "/api/sessions/:id/patterns/:patternId/source-files/progress",
+    {
+      onRequest: (request, reply, done) => {
+        request.raw.setTimeout(PUBLISH_SSE_TIMEOUT_MS);
+        reply.raw.setTimeout(PUBLISH_SSE_TIMEOUT_MS);
+        done();
+      }
+    },
+    async (request, reply) => {
+      // Gate BEFORE hijacking, same reasoning as the publish-progress route:
+      // once the socket is hijacked a normal JSON error reply is no longer
+      // possible.
+      const scope = await resolveSourceFilesScope(
+        request.params.id,
+        request.params.patternId,
+        request.query?.structure_filter
+      );
+
+      if (!scope.ok) {
+        return reply.code(scope.status).send(scope.body);
+      }
+
+      if (scope.resolvedFilters.length === 0) {
+        // Unscoped: build the cheap rollup directly and send one frame — no
+        // reason to hold a stream open for a call that was always fast.
+        const result = await buildSourceFilesResponse(
+          request.params.id,
+          request.params.patternId,
+          scope.sourceFile,
+          scope.totalUrls,
+          null
+        );
+
+        return reply.send({ type: "done", result });
+      }
+
+      reply.hijack();
+      const stream = reply.raw;
+      stream.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+        "Access-Control-Allow-Origin":
+          (request.headers.origin as string | undefined) ?? "*"
+      });
+
+      const send = (payload: unknown) => {
+        if (!stream.writableEnded) {
+          stream.write(`data: ${JSON.stringify(payload)}\n\n`);
+        }
       };
+
+      const keepalive = setInterval(() => {
+        if (!stream.writableEnded) {
+          stream.write(": keepalive\n\n");
+        }
+      }, PUBLISH_SSE_KEEPALIVE_MS);
+      keepalive.unref?.();
+
+      let closed = false;
+      const stop = () => {
+        closed = true;
+        clearInterval(keepalive);
+      };
+      request.raw.on("close", stop);
+
+      try {
+        const scoped = await cachedScopedPatternSourceFileBreakdown(
+          request.params.patternId,
+          request.params.id,
+          scope.sourceRole,
+          scope.template,
+          scope.resolvedFilters,
+          scope.totalUrls,
+          (current, total) => {
+            if (!closed) {
+              send({
+                type: "progress",
+                current,
+                total,
+                message: `Scanning ${current} of ${total} file(s)…`
+              });
+            }
+          }
+        );
+
+        if (closed) {
+          return;
+        }
+
+        const result = await buildSourceFilesResponse(
+          request.params.id,
+          request.params.patternId,
+          scope.sourceFile,
+          scope.totalUrls,
+          scoped
+        );
+
+        send({ type: "done", result });
+      } catch (error) {
+        send({
+          type: "error",
+          message:
+            error instanceof Error
+              ? error.message
+              : "Could not scan this pattern's source files."
+        });
+      } finally {
+        stop();
+
+        if (!stream.writableEnded) {
+          stream.end();
+        }
+      }
     }
   );
 
