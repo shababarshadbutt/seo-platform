@@ -181,6 +181,17 @@ function PhaseCard({
   const total = Number(job?.items_total ?? 0);
   const done = Number(job?.items_done ?? 0);
   const percent = total > 0 ? Math.round((done / total) * 100) : 0;
+  // Categorize alone runs two sub-passes (detect boundaries, then assign
+  // categories) over the SAME items_total, so its bar legitimately resets to
+  // 0 once mid-run at the detect -> assign handoff — labeling which sub-pass
+  // is live keeps that from reading as a fresh hang (categorizerCategorizeJob.ts).
+  const categorizePass = phase === "categorize" ? job?.checkpoint?.pass : undefined;
+  const categorizeStage =
+    typeof categorizePass === "string"
+      ? categorizePass === "detect"
+        ? "Detecting category structure"
+        : "Categorizing"
+      : null;
   const active = isPhaseActive(job);
   const complete = isPhaseDone(job);
   const skipped = job?.status === "SKIPPED";
@@ -220,7 +231,7 @@ function PhaseCard({
               <p className="flex items-center gap-2 text-sm text-slate-700">
                 <Loader2 className="h-4 w-4 animate-spin" />
                 {total > 0
-                  ? `${formatNumber(done)} of ${formatNumber(total)}`
+                  ? `${categorizeStage ? `${categorizeStage}: ` : ""}${formatNumber(done)} of ${formatNumber(total)}`
                   : "Working…"}
               </p>
               {total > 0 ? <Progress value={percent} /> : null}

@@ -188,6 +188,14 @@ function prefixKey(prefix: string[]): string {
   return JSON.stringify(prefix);
 }
 
+// JSON-safe snapshot of a detector's trackers, for checkpointing an in-progress
+// detect pass (see categorizerCategorizeJob.ts's resumable detect loop). Same
+// "cheap because bounded by distinct static prefixes" reasoning as `counts`
+// itself — this is never sized by URL count.
+export type SerializedDepthBoundaryDetector = Array<
+  [string, { counts: Array<[string, number]>; observedUrlCount: number; dynamic: boolean }]
+>;
+
 // Accumulates per-prefix position statistics across a streamed population.
 // Memory is bounded by the number of DISTINCT STATIC PREFIXES in the site
 // (tens to low thousands), never by URL count: a tracker's `counts` map stops
@@ -197,6 +205,33 @@ function prefixKey(prefix: string[]): string {
 // resolved-dynamic subtree.
 export class DepthBoundaryDetector {
   private trackers = new Map<string, DepthPositionTracker>();
+
+  // Rehydrates a detector from a prior serialize() snapshot, so a chunked
+  // detect pass can resume mid-scan instead of restarting at the root.
+  static fromSerialized(data: SerializedDepthBoundaryDetector): DepthBoundaryDetector {
+    const detector = new DepthBoundaryDetector();
+
+    for (const [key, tracker] of data) {
+      detector.trackers.set(key, {
+        counts: new Map(tracker.counts),
+        observedUrlCount: tracker.observedUrlCount,
+        dynamic: tracker.dynamic
+      });
+    }
+
+    return detector;
+  }
+
+  serialize(): SerializedDepthBoundaryDetector {
+    return Array.from(this.trackers, ([key, tracker]) => [
+      key,
+      {
+        counts: Array.from(tracker.counts),
+        observedUrlCount: tracker.observedUrlCount,
+        dynamic: tracker.dynamic
+      }
+    ]);
+  }
 
   observe(segments: string[]): void {
     let prefix: string[] = [];

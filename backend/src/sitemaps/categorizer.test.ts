@@ -256,3 +256,67 @@ test("categorizeUrl falls back to uncategorized for an unparseable URL", () => {
     filename: UNCATEGORIZED_FILENAME
   });
 });
+
+// --- DepthBoundaryDetector.serialize/fromSerialized: checkpoint round trip --
+
+test("a detector rehydrated from serialize() resolves the SAME boundaries as the original", () => {
+  const original = new DepthBoundaryDetector();
+
+  for (const product of ["g-10-sheet", "fr-4-sheet", "phenolic-rod", "nylon-block"]) {
+    original.observe(["aviation", "components", product]);
+  }
+  original.observe(["aviation"]);
+  original.observe(["aviation", "components"]);
+
+  const rehydrated = DepthBoundaryDetector.fromSerialized(original.serialize());
+
+  assert.deepEqual(
+    [...rehydrated.boundaries()].sort(),
+    [...original.boundaries()].sort()
+  );
+});
+
+test("a detector split mid-scan and rehydrated produces the SAME boundaries as one unbroken scan", () => {
+  const segmentsPerUrl = [
+    ["aviation", "components", "g-10-sheet"],
+    ["aviation", "components", "fr-4-sheet"],
+    ["aviation", "components", "phenolic-rod"],
+    ["aviation", "components", "nylon-block"],
+    ["aviation", "components", "peek-rod"],
+    ["aviation"],
+    ["aviation", "components"],
+    ["manufacturer", "08b"],
+    ["manufacturer", "12k"],
+    ["manufacturer", "55x"],
+    ["manufacturer", "7qr"],
+    ["manufacturer", "zz9"],
+    ["manufacturer"]
+  ];
+
+  const unbroken = new DepthBoundaryDetector();
+
+  for (const segments of segmentsPerUrl) {
+    unbroken.observe(segments);
+  }
+
+  // Simulate a chunk-deadline mid-scan: observe the first half, checkpoint
+  // (serialize -> fromSerialized, same as a worker restart would), then
+  // observe the remaining half against the rehydrated detector.
+  const splitAt = Math.floor(segmentsPerUrl.length / 2);
+  let resumed = new DepthBoundaryDetector();
+
+  for (const segments of segmentsPerUrl.slice(0, splitAt)) {
+    resumed.observe(segments);
+  }
+
+  resumed = DepthBoundaryDetector.fromSerialized(resumed.serialize());
+
+  for (const segments of segmentsPerUrl.slice(splitAt)) {
+    resumed.observe(segments);
+  }
+
+  assert.deepEqual(
+    [...resumed.boundaries()].sort(),
+    [...unbroken.boundaries()].sort()
+  );
+});

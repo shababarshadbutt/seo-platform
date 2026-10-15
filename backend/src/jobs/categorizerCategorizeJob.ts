@@ -8,7 +8,8 @@ import {
   categorizeRfq,
   categorizeUrl,
   DepthBoundaryDetector,
-  pathSegmentsFromUrl
+  pathSegmentsFromUrl,
+  type SerializedDepthBoundaryDetector
 } from "../sitemaps/categorizer.js";
 import {
   enqueueCategorizerCategorizeContinuation,
@@ -35,12 +36,14 @@ import {
 //   1. "detect" — stream every eligible URL once, feeding non-RFQ ones into a
 //      DepthBoundaryDetector. RFQ-shaped URLs are excluded from this pass so
 //      literal RFQ path segments ("rfq", "nsn") never pollute the regular
-//      depth statistics. RESTARTS ON RESUME rather than resuming mid-pass: it
-//      is pure DB-read + in-memory compute (no HTTP), so a full rescan is
-//      cheap, and the detector's tracker state is not worth serializing
-//      across a worker restart for that saving. Finishes by persisting the
-//      resolved boundaries into the job's checkpoint, once, as plain data
-//      (bounded by distinct static prefixes).
+//      depth statistics. RESUMABLE BY ITS OWN KEYSET CURSOR, same shape as
+//      "assign" below: a full rescan looked cheap (pure DB-read + in-memory
+//      compute, no HTTP) but at tens-of-millions-of-URLs scale one pass can
+//      outlast chunkMinutes, and restarting at id=0 every time then NEVER
+//      finishes — the detector's tracker state is bounded by distinct static
+//      prefixes (see DepthBoundaryDetector.serialize), so checkpointing it is
+//      cheap. Finishes by persisting the resolved boundaries into the job's
+//      checkpoint, once, as plain data.
 //   2. "assign" — stream every eligible URL again (category_state='pending'),
 //      classify it against the now-finalized boundaries, and write
 //      rule_matched + category_state='categorized'. THIS sub-pass is fully
@@ -63,6 +66,7 @@ type CategorizeCheckpoint = {
   pass?: "detect" | "assign";
   last_id?: number;
   boundaries?: string[][];
+  trackers?: SerializedDepthBoundaryDetector;
 };
 
 type EligibleUrlRow = {
@@ -113,17 +117,27 @@ export async function processCategorizerCategorizeJob(
   let pass: "detect" | "assign" = checkpoint.pass ?? "detect";
   let boundaries = checkpoint.boundaries ?? null;
 
+  const resumingDetect = checkpoint.pass === "detect";
+
   if (pass === "detect") {
-    const detector = new DepthBoundaryDetector();
-    let lastId = 0;
-    let scanned = 0;
+    const detector =
+      resumingDetect && checkpoint.trackers
+        ? DepthBoundaryDetector.fromSerialized(checkpoint.trackers)
+        : new DepthBoundaryDetector();
+    let lastId = resumingDetect ? checkpoint.last_id ?? 0 : 0;
+    let scanned = resumingDetect ? jobRow.items_done : 0;
 
     for (;;) {
       if (Date.now() > chunkDeadlineMs) {
+        await updateCategorizerJobCheckpoint(
+          jobRow.id,
+          { pass: "detect", last_id: lastId, trackers: detector.serialize() },
+          scanned
+        );
         await enqueueCategorizerCategorizeContinuation({ session_id: sessionId });
         logger.info(
           { session_id: sessionId, scanned, total },
-          "categorizer categorize: detect pass time box reached, continuation enqueued (restarts the detect pass)"
+          "categorizer categorize: detect pass time box reached, continuation enqueued (resumes from last_id)"
         );
 
         return { continued: true, pass: "detect", scanned, total };
@@ -154,6 +168,12 @@ export async function processCategorizerCategorizeJob(
 
       lastId = Number(batch.rows[batch.rows.length - 1].id);
       scanned += batch.rows.length;
+
+      await updateCategorizerJobCheckpoint(
+        jobRow.id,
+        { pass: "detect", last_id: lastId, trackers: detector.serialize() },
+        scanned
+      );
       await job?.updateProgress({
         stage: "detect-boundaries",
         current: scanned,
@@ -177,8 +197,15 @@ export async function processCategorizerCategorizeJob(
   }
 
   const boundaryLookup = buildDepthBoundaryLookup(boundaries ?? []);
-  let lastId = checkpoint.pass === "assign" ? checkpoint.last_id ?? 0 : 0;
-  let doneCount = jobRow.items_done;
+  const resumingAssign = checkpoint.pass === "assign";
+  let lastId = resumingAssign ? checkpoint.last_id ?? 0 : 0;
+  // jobRow.items_done reflects whatever state existed when this job row was
+  // fetched, BEFORE the detect pass above ran — for a resumed detect pass
+  // that's its (unrelated) scanned-URL count, not an assign count. Only trust
+  // it when this run is actually resuming an already-in-progress assign pass;
+  // every other path (fresh job, or just-finished detect falling through)
+  // starts assign at 0, matching the checkpoint reset above.
+  let doneCount = resumingAssign ? jobRow.items_done : 0;
 
   for (;;) {
     if (Date.now() > chunkDeadlineMs) {
