@@ -793,4 +793,105 @@ export async function sitemapCategorizerRoutes(app: FastifyInstance) {
       return reply.send(archive);
     }
   );
+
+  // Rows the categorize / status-check / status-sample phases couldn't write
+  // due to a per-row data error (e.g. a corrupted id) and isolated instead of
+  // letting the whole phase abort — see batchWriteFaultIsolation.ts. A plain
+  // CSV, not a sitemap ZIP like download-404s: these aren't a "resubmit to
+  // GSC" list, they're a short operator-review list (expected to be rare —
+  // a healthy run produces none).
+  app.get<{ Params: SessionParams }>(
+    "/api/sitemap-categorizer/sessions/:id/download-categorize-failures",
+    async (request, reply) => {
+      const sessionId = request.params.id;
+      const session = await fetchSession(sessionId);
+
+      if (!session) {
+        return reply.code(404).send(notFound("Categorizer session not found"));
+      }
+
+      const failedResult = await pool.query<{ url: string; error: string | null }>(
+        `
+          SELECT url, error
+          FROM categorizer_urls
+          WHERE session_id = $1 AND (category_state = 'failed' OR check_state = 'failed')
+          ORDER BY url ASC
+        `,
+        [sessionId]
+      );
+
+      if (failedResult.rowCount === 0) {
+        return reply.code(404).send(
+          emptyResult(
+            "No URLs failed to process for this session — nothing to review.",
+            "no_failures_found",
+            "info"
+          )
+        );
+      }
+
+      const csvField = (value: string) =>
+        /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+      const csv = [
+        "url,error",
+        ...failedResult.rows.map(
+          (row) => `${csvField(row.url)},${csvField(row.error ?? "")}`
+        )
+      ].join("\n");
+
+      reply.header("content-type", "text/csv; charset=utf-8");
+      reply.header(
+        "content-disposition",
+        `attachment; filename="${session.source_domain}-categorize-failures.csv"`
+      );
+
+      return reply.send(csv);
+    }
+  );
+
+  // The HITL "fix individually" action for a row download-categorize-failures
+  // surfaced: manually assign the category a human decided, rather than
+  // whatever caused the automatic write to fail. Scoped to rows ALREADY
+  // category_state='failed' for this session — this is a recovery action for
+  // that specific failure class, not a general-purpose category editor.
+  // Matched by url (not a row id) so fixing exactly the kind of row this
+  // mechanism exists for never itself requires casting that row's id.
+  app.patch<{ Params: SessionParams; Body: { url?: unknown; category?: unknown } }>(
+    "/api/sitemap-categorizer/sessions/:id/category-failures",
+    async (request, reply) => {
+      const sessionId = request.params.id;
+      const session = await fetchSession(sessionId);
+
+      if (!session) {
+        return reply.code(404).send(notFound("Categorizer session not found"));
+      }
+
+      const { url, category } = request.body ?? {};
+
+      if (typeof url !== "string" || url.trim() === "") {
+        return reply.code(400).send(badRequest("url is required"));
+      }
+
+      if (typeof category !== "string" || category.trim() === "") {
+        return reply.code(400).send(badRequest("category is required"));
+      }
+
+      const result = await pool.query(
+        `
+          UPDATE categorizer_urls
+          SET category = $3, category_state = 'categorized', rule_matched = 'manual-override', error = NULL
+          WHERE session_id = $1 AND url = $2 AND category_state = 'failed'
+        `,
+        [sessionId, url, category.trim()]
+      );
+
+      if (result.rowCount === 0) {
+        return reply.code(404).send(
+          notFound("No failed row matches that URL for this session — it may already be fixed.")
+        );
+      }
+
+      return reply.code(204).send();
+    }
+  );
 }

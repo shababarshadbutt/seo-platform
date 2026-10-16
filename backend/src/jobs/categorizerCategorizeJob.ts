@@ -3,6 +3,7 @@ import type { FastifyBaseLogger } from "fastify";
 
 import { config } from "../config.js";
 import { pool } from "../db/pool.js";
+import { writeBatchWithFaultIsolation } from "../sitemaps/batchWriteFaultIsolation.js";
 import {
   buildDepthBoundaryLookup,
   categorizeRfq,
@@ -49,6 +50,15 @@ import {
 //      rule_matched + category_state='categorized'. THIS sub-pass is fully
 //      resumable by its own keyset cursor, same as the status-check phase.
 //
+// ASSIGN WRITES ARE FAULT-ISOLATED (batchWriteFaultIsolation.ts). A batch is
+// written as one multi-row UPDATE for throughput, but if a row's bound value
+// can't be written (e.g. a corrupted id failing its ::bigint cast), that row
+// alone is bisected out, marked category_state='failed' with the error
+// captured, and the batch's other rows still write normally — one bad row no
+// longer aborts the whole phase. The recovery write matches by (session_id,
+// url), not id, specifically so marking a row 'failed' can't hit the exact
+// same cast failure that got it isolated in the first place.
+//
 // 404 EXCLUSION NO LONGER HAPPENS HERE. It used to be a query filter
 // ("check_state='checked' AND http_status IS DISTINCT FROM 404"), back when
 // status-check ran first — that's gone now that status isn't known yet at
@@ -73,6 +83,51 @@ type EligibleUrlRow = {
   id: string;
   url: string;
 };
+
+type AssignRow = {
+  id: string;
+  url: string;
+  ruleMatched: string;
+  category: string;
+};
+
+async function writeAssignBatch(sessionId: string, rows: AssignRow[]): Promise<void> {
+  const values: string[] = [];
+  const params: unknown[] = [sessionId];
+
+  for (const row of rows) {
+    const base = params.length;
+
+    params.push(row.id, row.ruleMatched, row.category);
+    values.push(`($${base + 1}::bigint, $${base + 2}, $${base + 3})`);
+  }
+
+  await pool.query(
+    `
+      UPDATE categorizer_urls AS u
+      SET rule_matched = v.rule_matched, category = v.category, category_state = 'categorized'
+      FROM (VALUES ${values.join(", ")}) AS v(id, rule_matched, category)
+      WHERE u.session_id = $1 AND u.id = v.id
+    `,
+    params
+  );
+}
+
+// Matches by (session_id, url) — NOT id — so recovering a row that failed its
+// own ::bigint cast doesn't immediately hit that same cast failure again.
+async function markAssignRowFailed(
+  sessionId: string,
+  row: AssignRow,
+  error: unknown
+): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+
+  await pool.query(
+    `UPDATE categorizer_urls SET category_state = 'failed', error = $3
+     WHERE session_id = $1 AND url = $2`,
+    [sessionId, row.url, message]
+  );
+}
 
 export async function processCategorizerCategorizeJob(
   data: CategorizerCategorizeJobData,
@@ -233,30 +288,31 @@ export async function processCategorizerCategorizeJob(
       break;
     }
 
-    const values: string[] = [];
-    const params: unknown[] = [sessionId];
-
-    for (const row of batch.rows) {
+    const assignRows: AssignRow[] = batch.rows.map((row) => {
       const result = categorizeUrl(row.url, boundaryLookup);
       // The un-chunked base name the generate phase groups by — strip the
       // ".xml" categorizeUrl's result carries for display, since chunking
       // (categoryOutputFilename.ts) re-derives the real per-chunk filename
       // from this base plus a 1-based index.
       const category = result.filename.replace(/\.xml$/, "");
-      const base = params.length;
 
-      params.push(row.id, result.ruleId, category);
-      values.push(`($${base + 1}::bigint, $${base + 2}, $${base + 3})`);
-    }
+      return { id: row.id, url: row.url, ruleMatched: result.ruleId, category };
+    });
 
-    await pool.query(
-      `
-        UPDATE categorizer_urls AS u
-        SET rule_matched = v.rule_matched, category = v.category, category_state = 'categorized'
-        FROM (VALUES ${values.join(", ")}) AS v(id, rule_matched, category)
-        WHERE u.session_id = $1 AND u.id = v.id
-      `,
-      params
+    await writeBatchWithFaultIsolation(
+      assignRows,
+      (rows) => writeAssignBatch(sessionId, rows),
+      async (row, error) => {
+        logger.warn(
+          {
+            session_id: sessionId,
+            url: row.url,
+            error: error instanceof Error ? error.message : String(error)
+          },
+          "categorizer categorize: row failed to write, marking category_state='failed' and continuing"
+        );
+        await markAssignRowFailed(sessionId, row, error);
+      }
     );
 
     lastId = Number(batch.rows[batch.rows.length - 1].id);
@@ -275,11 +331,20 @@ export async function processCategorizerCategorizeJob(
     });
   }
 
-  await markCategorizerJobComplete(jobRow.id);
+  // Recomputed from the table rather than accumulated in-memory: a chunked
+  // run can span several job attempts (time-boxed continuations), so an
+  // in-memory counter would reset to 0 on every continuation and undercount.
+  const failedResult = await pool.query<{ count: string }>(
+    `SELECT COUNT(*)::text AS count FROM categorizer_urls WHERE session_id = $1 AND category_state = 'failed'`,
+    [sessionId]
+  );
+  const failedCount = Number(failedResult.rows[0]?.count ?? 0);
+
+  await markCategorizerJobComplete(jobRow.id, failedCount);
   await updateCategorizerSessionStatus(sessionId, "CATEGORIZED");
 
   logger.info(
-    { session_id: sessionId, total, done: doneCount },
+    { session_id: sessionId, total, done: doneCount, failed: failedCount },
     "categorizer categorize complete"
   );
 

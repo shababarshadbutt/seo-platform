@@ -4820,6 +4820,10 @@ export type CategorizerJobStatus = {
   items_total: NumberLike;
   items_done: NumberLike;
   error: string | null;
+  // Rows this phase isolated-and-skipped rather than aborting the whole run
+  // over (see batchWriteFaultIsolation.ts on the backend) — 0 for a clean
+  // run.
+  failed_count: NumberLike;
 };
 
 export type CategorizerCategoryStatus = "PENDING" | "GOOD" | "WARNING" | "BAD";
@@ -5121,6 +5125,25 @@ export async function downloadCategorizer404s(sessionId: string, domain: string)
 
   link.href = objectUrl;
   link.download = downloadFilename(response, `${domain}-404-urls.zip`);
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+// Rows the categorize / status-check / status-sample phases isolated rather
+// than aborting the whole run over — see CategorizerJobStatus.failed_count
+// and batchWriteFaultIsolation.ts on the backend.
+export async function downloadCategorizerCategorizeFailures(sessionId: string, domain: string) {
+  const { blob, response } = await downloadToBlob(
+    backendUrl(`/api/sitemap-categorizer/sessions/${sessionId}/download-categorize-failures`),
+    { cache: "no-store" }
+  );
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = objectUrl;
+  link.download = downloadFilename(response, `${domain}-categorize-failures.csv`);
   document.body.appendChild(link);
   link.click();
   link.remove();

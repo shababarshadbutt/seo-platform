@@ -37,10 +37,14 @@ export type CategorizerJobRow = {
   items_total: number;
   items_done: number;
   error: string | null;
+  // How many rows this phase had to isolate-and-skip rather than abort over
+  // (see batchWriteFaultIsolation.ts) — 0 for every phase until categorize /
+  // status-check / status-sample set it on completion.
+  failed_count: number;
 };
 
 const JOB_COLUMNS =
-  "id, session_id, phase, status, mode, checkpoint, items_total, items_done, error";
+  "id, session_id, phase, status, mode, checkpoint, items_total, items_done, error, failed_count";
 
 // The most recent job row for (session, phase), or null if the phase has
 // never been started. Used to gate a later phase on an earlier one's
@@ -144,12 +148,15 @@ export async function updateCategorizerJobCheckpoint(
   );
 }
 
-export async function markCategorizerJobComplete(jobId: string) {
+// failedCount is the number of rows this phase isolated-and-skipped rather
+// than aborting over (see batchWriteFaultIsolation.ts) — 0 for a clean run,
+// the default for every caller that doesn't track it.
+export async function markCategorizerJobComplete(jobId: string, failedCount = 0) {
   await pool.query(
     `UPDATE categorizer_jobs
-     SET status = 'COMPLETE', completed_at = now(), updated_at = now()
+     SET status = 'COMPLETE', completed_at = now(), updated_at = now(), failed_count = $2
      WHERE id = $1`,
-    [jobId]
+    [jobId, failedCount]
   );
 }
 

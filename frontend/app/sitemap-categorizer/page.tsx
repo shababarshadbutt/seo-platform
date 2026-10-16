@@ -15,6 +15,7 @@ import {
   apiErrorPayload,
   createCategorizerSession,
   downloadCategorizer404s,
+  downloadCategorizerCategorizeFailures,
   downloadCategorizerZip,
   friendlyApiErrorMessage,
   getCategorizerCategories,
@@ -572,6 +573,75 @@ function ingestNoteFromJob(job: CategorizerJobStatus) {
         {formatNumber(failedCount)} file(s) failed to download and will be retried on the next
         run of this phase.
       </span>
+    </div>
+  );
+}
+
+// Rows categorize isolated rather than aborting the whole phase over (see
+// CategorizerJobStatus.failed_count and the backend's
+// batchWriteFaultIsolation.ts) — this is the "notify at the end, let a human
+// fix it" surface: a download of exactly those URLs and why they failed.
+// Expected to be empty for a healthy run.
+function CategorizeFailedNote({
+  sessionId,
+  domain,
+  job
+}: {
+  sessionId: string;
+  domain: string;
+  job: CategorizerJobStatus;
+}) {
+  const failedCount = Number(job.failed_count ?? 0);
+  const [downloading, setDownloading] = useState(false);
+  const [outcome, setOutcome] = useState<{
+    message: string;
+    severity: "info" | "warning";
+  } | null>(null);
+
+  if (failedCount === 0) {
+    return null;
+  }
+
+  async function handleDownload() {
+    setDownloading(true);
+    setOutcome(null);
+
+    try {
+      await downloadCategorizerCategorizeFailures(sessionId, domain);
+    } catch (err) {
+      const payload = apiErrorPayload(err) as { severity?: string } | null;
+
+      setOutcome({
+        message: friendlyApiErrorMessage(err, "Unable to download the failed-URL list."),
+        severity: payload?.severity === "info" ? "info" : "warning"
+      });
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+        <span>
+          {formatNumber(failedCount)} URL(s) hit a data error and couldn&rsquo;t be categorized —
+          every other URL was categorized normally. Download the list to review and fix them
+          individually.
+        </span>
+      </div>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={() => void handleDownload()}
+        disabled={downloading}
+        className="gap-2"
+      >
+        <Download className="h-4 w-4" />
+        Download failed URL(s)
+      </Button>
+      {outcome ? <DownloadOutcome message={outcome.message} severity={outcome.severity} /> : null}
     </div>
   );
 }
@@ -1180,6 +1250,13 @@ export default function SitemapCategorizerPage() {
               phase="categorize"
               disabled={!ingestDone}
               onComplete={() => setCategorizeDone(true)}
+              renderNote={(job) => (
+                <CategorizeFailedNote
+                  sessionId={session.id}
+                  domain={session.source_domain}
+                  job={job}
+                />
+              )}
               renderPreview={<CategoriesPreview sessionId={session.id} />}
             />
 

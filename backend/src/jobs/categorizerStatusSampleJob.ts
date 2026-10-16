@@ -1,8 +1,10 @@
 import type { Job } from "bullmq";
 import type { FastifyBaseLogger } from "fastify";
+import type { PoolClient } from "pg";
 
 import { config } from "../config.js";
 import { pool } from "../db/pool.js";
+import { writeBatchWithFaultIsolation } from "../sitemaps/batchWriteFaultIsolation.js";
 import { runWithBoundedConcurrency } from "../sitemaps/boundedConcurrency.js";
 import { calculatePatternScore } from "./patternScore.js";
 import type { SampleCheckResult } from "./sampleUrlCheck.js";
@@ -68,6 +70,59 @@ type SampleRow = {
   id: string;
   url: string;
 };
+
+type SampleWriteRow = {
+  id: string;
+  url: string;
+  httpStatus: number | null;
+  categoryState: "excluded" | "categorized";
+};
+
+async function writeSampleStatusBatch(
+  client: PoolClient,
+  sessionId: string,
+  rows: SampleWriteRow[]
+): Promise<void> {
+  const values: string[] = [];
+  const params: unknown[] = [sessionId];
+
+  for (const row of rows) {
+    const base = params.length;
+
+    params.push(row.id, row.httpStatus, row.categoryState);
+    values.push(`($${base + 1}::bigint, $${base + 2}::integer, $${base + 3})`);
+  }
+
+  await client.query(
+    `
+      UPDATE categorizer_urls AS u
+      SET http_status = v.http_status, check_state = 'checked', checked_at = now(),
+          category_state = v.category_state
+      FROM (VALUES ${values.join(", ")}) AS v(id, http_status, category_state)
+      WHERE u.session_id = $1 AND u.id = v.id
+    `,
+    params
+  );
+}
+
+// Matches by (session_id, url) — NOT id — so recovering a row that failed its
+// own ::bigint cast doesn't immediately hit that same cast failure again.
+// Drops the row out of 'categorized' (excluding it from output, the same as
+// a confirmed 404) rather than leaving its prior state ambiguous.
+async function markSampleRowFailed(
+  client: PoolClient,
+  sessionId: string,
+  url: string,
+  error: unknown
+): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+
+  await client.query(
+    `UPDATE categorizer_urls SET category_state = 'failed', check_state = 'failed', error = $3
+     WHERE session_id = $1 AND url = $2`,
+    [sessionId, url, message]
+  );
+}
 
 export async function processCategorizerStatusSampleJob(
   data: CategorizerStatusSampleJobData,
@@ -168,7 +223,7 @@ export async function processCategorizerStatusSampleJob(
     const results = await runWithBoundedConcurrency(
       sample.rows,
       concurrency,
-      async (row): Promise<SampleCheckResult & { id: string }> => {
+      async (row): Promise<SampleCheckResult & { id: string; url: string }> => {
         const result = await probeUrl(
           session.base_url,
           row.url,
@@ -182,7 +237,7 @@ export async function processCategorizerStatusSampleJob(
           }
         );
 
-        return { ...result, id: row.id };
+        return { ...result, id: row.id, url: row.url };
       }
     );
 
@@ -192,43 +247,52 @@ export async function processCategorizerStatusSampleJob(
       (result) => result.httpStatusCategory === "blocked"
     ).length;
 
-    const values: string[] = [];
-    const params: unknown[] = [sessionId];
-
-    for (const result of results) {
-      const base = params.length;
-      const categoryState = result.httpStatus === 404 ? "excluded" : "categorized";
-
-      params.push(result.id, result.httpStatus, categoryState);
-      values.push(`($${base + 1}::bigint, $${base + 2}::integer, $${base + 3})`);
-    }
+    const writeRows: SampleWriteRow[] = results.map((result) => ({
+      id: result.id,
+      url: result.url,
+      httpStatus: result.httpStatus,
+      categoryState: result.httpStatus === 404 ? "excluded" : "categorized"
+    }));
 
     const client = await pool.connect();
 
     try {
       await client.query("BEGIN");
 
-      await client.query(
-        `
-          UPDATE categorizer_urls AS u
-          SET http_status = v.http_status, check_state = 'checked', checked_at = now(),
-              category_state = v.category_state
-          FROM (VALUES ${values.join(", ")}) AS v(id, http_status, category_state)
-          WHERE u.session_id = $1 AND u.id = v.id
-        `,
-        params
+      // Fault-isolated: a row whose id can't be written (the same
+      // cast-failure class this mechanism exists for) is bisected out,
+      // marked category_state='failed' (dropping it from output, same as a
+      // confirmed 404), and every other sampled row still writes normally —
+      // one bad row no longer aborts this category's whole sample, and with
+      // it every category still queued behind it.
+      await writeBatchWithFaultIsolation(
+        writeRows,
+        (rows) => writeSampleStatusBatch(client, sessionId, rows),
+        async (row, error) => {
+          logger.warn(
+            {
+              session_id: sessionId,
+              url: row.url,
+              error: error instanceof Error ? error.message : String(error)
+            },
+            "categorizer status-sample: row failed to write, marking failed and continuing"
+          );
+          await markSampleRowFailed(client, sessionId, row.url, error);
+        }
       );
 
       // The rest of the category: trusted via this sample, never
-      // individually probed.
+      // individually probed. Matched by url, not id, for the same reason as
+      // above — this array can include a sampled row whose own id just
+      // failed to cast, and excluding by url sidesteps that entirely.
       await client.query(
         `
           UPDATE categorizer_urls
           SET check_state = 'skipped'
           WHERE session_id = $1 AND category = $2 AND category_state = 'categorized'
-            AND id <> ALL($3::bigint[])
+            AND url <> ALL($3::text[])
         `,
-        [sessionId, category, sample.rows.map((row) => row.id)]
+        [sessionId, category, sample.rows.map((row) => row.url)]
       );
 
       await client.query(
@@ -290,11 +354,21 @@ export async function processCategorizerStatusSampleJob(
     });
   }
 
-  await markCategorizerJobComplete(jobRow.id);
+  // Recomputed from the table rather than accumulated in-memory — same
+  // reasoning as the other categorizer phases: a chunked run can span
+  // several job attempts, and an in-memory counter would reset on each
+  // continuation.
+  const failedResult = await pool.query<{ count: string }>(
+    `SELECT COUNT(*)::text AS count FROM categorizer_urls WHERE session_id = $1 AND category_state = 'failed'`,
+    [sessionId]
+  );
+  const failedCount = Number(failedResult.rows[0]?.count ?? 0);
+
+  await markCategorizerJobComplete(jobRow.id, failedCount);
   await updateCategorizerSessionStatus(sessionId, "STATUS_CHECKED");
 
   logger.info(
-    { session_id: sessionId, total, done: doneCount },
+    { session_id: sessionId, total, done: doneCount, failed: failedCount },
     "categorizer status-sample complete"
   );
 
