@@ -15,17 +15,36 @@
 -- categorizerGenerateJob.ts already only reads category_state = 'categorized'
 -- (same mechanism migration 065 used for 'excluded'), so a 'failed' row is
 -- automatically dropped from output with no change needed there.
+-- NOT VALID, and never explicitly validated: a plain `ADD CONSTRAINT ... CHECK`
+-- forces Postgres to scan EVERY existing row (across all 16 partitions) to
+-- prove it holds, under an ACCESS EXCLUSIVE lock for the whole scan — on this
+-- table (tens of millions of rows at real scale) that is a multi-minute,
+-- deploy-blocking stall, not a formality. Live-caught: the first attempt to
+-- ship this migration hung an AWS deploy for 15+ minutes before anyone
+-- realized the "stuck" backend/worker containers were actually both waiting
+-- on this ALTER, not crashed.
+--
+-- Skipping validation is CORRECT here, not just faster: the old constraints
+-- only allowed a SUBSET of these values ('pending', 'categorized', 'excluded'
+-- / 'pending', 'checking', 'checked', 'skipped'). Every row already
+-- satisfies the OLD, stricter constraint, so it trivially satisfies this
+-- strictly-wider one too — there is no existing row a scan could ever find
+-- violating it. NOT VALID only affects retroactive verification of rows
+-- already in the table; it still fully enforces the check on every new
+-- INSERT/UPDATE from the moment this commits.
 ALTER TABLE categorizer_urls
   DROP CONSTRAINT categorizer_urls_category_state_known;
 ALTER TABLE categorizer_urls
   ADD CONSTRAINT categorizer_urls_category_state_known
-  CHECK (category_state IN ('pending', 'categorized', 'excluded', 'failed'));
+  CHECK (category_state IN ('pending', 'categorized', 'excluded', 'failed'))
+  NOT VALID;
 
 ALTER TABLE categorizer_urls
   DROP CONSTRAINT categorizer_urls_check_state_known;
 ALTER TABLE categorizer_urls
   ADD CONSTRAINT categorizer_urls_check_state_known
-  CHECK (check_state IN ('pending', 'checking', 'checked', 'skipped', 'failed'));
+  CHECK (check_state IN ('pending', 'checking', 'checked', 'skipped', 'failed'))
+  NOT VALID;
 
 -- One shared free-text column for whichever phase's isolated write failed on
 -- this row (categorize or status-check) — same convention as
