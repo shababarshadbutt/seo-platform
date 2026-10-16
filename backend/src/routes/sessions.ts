@@ -135,11 +135,7 @@ import {
   createStoredSitemapFile,
   type StoredSitemapFile
 } from "../sitemaps/ingest.js";
-import { parseCsvUrlList } from "../sitemaps/csvUrlList.js";
-import {
-  buildSyntheticSitemapXml,
-  writeSyntheticSitemapXml
-} from "../sitemaps/csvToSitemapXml.js";
+import { buildSyntheticSitemapXml } from "../sitemaps/csvToSitemapXml.js";
 import {
   publishConfigError,
   s3SourceConfigError,
@@ -205,6 +201,7 @@ import { collectProblemFileGroups } from "../sitemaps/problemFiles.js";
 import { previewTrailingSlash } from "../sitemaps/trailingSlashApply.js";
 import { checkTemplateConflict } from "../sitemaps/patternTemplateConflict.js";
 import {
+  enqueueCsvUploadIngestJob,
   enqueueDeleteProblemUrlsJob,
   enqueueFixTrailingSlashesJob,
   enqueueFixTrailingSlashesUndoJob,
@@ -8980,8 +8977,6 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     return filename.toLowerCase().endsWith(".csv");
   }
 
-  const CSV_SYNTHETIC_DISPLAY_NAME = "csv-urls.xml";
-
   app.post<{ Params: SessionParams }>(
     "/api/sessions/:id/csv-upload",
     {
@@ -9020,6 +9015,29 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         });
       }
 
+      // The ingest job (parse + chunked writes, below) can run for a while on
+      // a large CSV, well before any sitemap_files row exists for the
+      // existingLegacy check above to catch — guard separately against a
+      // double-submit during that window creating a second, never-updated
+      // maintenance_jobs row that the GET poll (which reads the MOST RECENT
+      // row) would then get stuck reading forever.
+      const inFlightIngest = await pool.query<{ id: string }>(
+        `
+          SELECT id FROM maintenance_jobs
+          WHERE session_id = $1::uuid AND kind = 'csv-upload-ingest'
+            AND status IN ('PENDING', 'RUNNING')
+          ORDER BY started_at DESC
+          LIMIT 1
+        `,
+        [sessionId]
+      );
+
+      if ((inFlightIngest.rowCount ?? 0) > 0) {
+        return reply
+          .code(202)
+          .send({ job_row_id: inFlightIngest.rows[0].id, status: "PENDING" });
+      }
+
       const uploadedFile = await request.file();
 
       if (!uploadedFile || !isCsvFilename(uploadedFile.filename)) {
@@ -9039,85 +9057,115 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
       await pipeline(uploadedFile.file, createWriteStream(csvTempPath));
 
-      const { urls, skippedCount, skippedSample } =
-        await parseCsvUrlList(csvTempPath);
-
-      await unlink(csvTempPath).catch(() => {});
-
-      if (urls.length === 0) {
-        return reply.code(400).send({
-          ...badRequest("No valid URLs were found in the CSV."),
-          skipped_count: skippedCount,
-          skipped_sample: skippedSample
-        });
-      }
-
-      const storedFilename = buildStoredUploadFilename(
-        sessionId,
-        CSV_SYNTHETIC_DISPLAY_NAME,
-        "legacy"
+      // Parsing + chunked writing happen in the background from here on —
+      // see jobs/csvUploadIngestJob.ts. Doing that work inline (as this route
+      // used to) blocked the whole API process's event loop for as long as a
+      // 1M+ row CSV took to turn into XML, with no worker thread involved at
+      // all.
+      const jobRow = await pool.query<{ id: string }>(
+        "INSERT INTO maintenance_jobs (session_id, kind) VALUES ($1, 'csv-upload-ingest') RETURNING id",
+        [sessionId]
       );
-      const outPath = path.join(config.uploadDir, storedFilename);
+      const jobRowId = jobRow.rows[0].id;
 
-      await writeSyntheticSitemapXml(urls, outPath);
-
-      const storedSitemapFile = await createStoredSitemapFile(
-        sessionId,
-        storedFilename,
-        "legacy",
-        CSV_SYNTHETIC_DISPLAY_NAME
-      );
-
-      await enqueueParseSitemapJob({
-        sitemap_file_id: storedSitemapFile.sitemap_file_id,
-        session_id: sessionId
+      await enqueueCsvUploadIngestJob({
+        session_id: sessionId,
+        job_row_id: jobRowId,
+        csv_temp_path: csvTempPath
       });
 
-      return reply.code(202).send({
-        sitemap_file_id: storedSitemapFile.sitemap_file_id,
-        url_count: urls.length,
-        skipped_count: skippedCount,
-        skipped_sample: skippedSample
-      });
+      return reply.code(202).send({ job_row_id: jobRowId, status: "PENDING" });
     }
   );
 
-  // Poll parse/extract/sample readiness for the CSV-derived file, nudging
-  // extraction forward exactly like the resume endpoint does (see the
-  // "unparsedCount > 0 ... enqueueExtractPatternsJob" branch above) — the
-  // session is already COMPLETE from the S3 pull, so the ordinary
+  // Poll upload-ingest / parse/extract/sample readiness for the CSV-derived
+  // files, nudging extraction forward exactly like the resume endpoint does
+  // (see the "unparsedCount > 0 ... enqueueExtractPatternsJob" branch above)
+  // — the session is already COMPLETE from the S3 pull, so the ordinary
   // auto-finalize hook (tryFinalizeParsedSession) refuses to fire for it.
   app.get<{ Params: SessionParams }>(
     "/api/sessions/:id/csv-upload",
     async (request, reply) => {
       const sessionId = request.params.id;
-      const fileResult = await pool.query<{
-        id: string;
-        parsed_at: Date | null;
-        is_valid: boolean;
-        total_urls: number;
+
+      const ingestJobResult = await pool.query<{
+        status: string;
+        files_total: number;
+        files_done: number;
+        items_changed: string;
+        error: string | null;
+        skipped: { count: number; sample: unknown[] } | null;
       }>(
         `
-          SELECT id, parsed_at, is_valid, total_urls
-          FROM sitemap_files
-          WHERE session_id = $1::uuid AND source_role = 'legacy'
-          ORDER BY id DESC
+          SELECT status, files_total, files_done, items_changed, error, skipped
+          FROM maintenance_jobs
+          WHERE session_id = $1::uuid AND kind = 'csv-upload-ingest'
+          ORDER BY started_at DESC
           LIMIT 1
         `,
         [sessionId]
       );
+      const ingestJob = ingestJobResult.rows[0] ?? null;
 
-      if (fileResult.rowCount === 0) {
+      if (
+        ingestJob &&
+        (ingestJob.status === "PENDING" || ingestJob.status === "RUNNING")
+      ) {
+        return reply.send({
+          phase: "INGESTING",
+          files_total: ingestJob.files_total,
+          files_done: ingestJob.files_done,
+          urls_processed: Number(ingestJob.items_changed)
+        });
+      }
+
+      if (ingestJob && ingestJob.status === "FAILED") {
+        return reply.send({
+          phase: "FAILED",
+          error: ingestJob.error,
+          skipped_count: ingestJob.skipped?.count ?? 0,
+          skipped_sample: ingestJob.skipped?.sample ?? []
+        });
+      }
+
+      // ingestJob is either COMPLETE (its chunks are now real sitemap_files
+      // rows, picked up below) or absent (nothing uploaded for this session
+      // yet).
+      const skippedFromIngest = ingestJob?.skipped ?? {
+        count: 0,
+        sample: [] as unknown[]
+      };
+
+      const filesResult = await pool.query<{
+        total_files: string;
+        unparsed_files: string;
+        invalid_files: string;
+        total_urls: string;
+        any_file_id: string | null;
+      }>(
+        `
+          SELECT
+            COUNT(*) AS total_files,
+            COUNT(*) FILTER (WHERE parsed_at IS NULL) AS unparsed_files,
+            COUNT(*) FILTER (WHERE parsed_at IS NOT NULL AND is_valid = FALSE) AS invalid_files,
+            COALESCE(SUM(total_urls), 0) AS total_urls,
+            MIN(id) AS any_file_id
+          FROM sitemap_files
+          WHERE session_id = $1::uuid AND source_role = 'legacy'
+        `,
+        [sessionId]
+      );
+      const files = filesResult.rows[0];
+
+      if (!files || Number(files.total_files) === 0) {
         return reply.send({ phase: "NOT_UPLOADED" });
       }
 
-      const file = fileResult.rows[0];
-
-      if (!file.parsed_at) {
+      if (Number(files.unparsed_files) > 0) {
         return reply.send({ phase: "PARSING" });
       }
 
-      if (!file.is_valid) {
+      if (Number(files.invalid_files) > 0) {
         return reply.send({ phase: "FAILED" });
       }
 
@@ -9130,13 +9178,19 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       if (patternCount === 0) {
         // Idempotent nudge: enqueueExtractPatternsJob is a session-scoped
         // singleton job, safe to call again on every poll until patterns
-        // appear.
+        // appear. Any one legacy file id works — extraction scopes by
+        // session_id + source_role across every matching file, not just the
+        // id passed in.
         await enqueueExtractPatternsJob({
-          sitemap_file_id: file.id,
+          sitemap_file_id: files.any_file_id as string,
           session_id: sessionId
         });
 
-        return reply.send({ phase: "EXTRACTING" });
+        return reply.send({
+          phase: "EXTRACTING",
+          skipped_count: skippedFromIngest.count,
+          skipped_sample: skippedFromIngest.sample
+        });
       }
 
       const sampledResult = await pool.query<{ count: string }>(
@@ -9153,7 +9207,9 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         phase: sampledCount >= patternCount ? "READY" : "SAMPLING",
         pattern_count: patternCount,
         sampled_count: sampledCount,
-        total_urls: file.total_urls
+        total_urls: Number(files.total_urls),
+        skipped_count: skippedFromIngest.count,
+        skipped_sample: skippedFromIngest.sample
       });
     }
   );
@@ -9288,11 +9344,13 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
       const maxUrlsPerFile = maxUrlsPerFileValidation.value;
 
-      const csvFileResult = await pool.query<{ id: string }>(
+      // A legacy CSV upload is now 1+ sitemap_files rows (chunked by
+      // jobs/csvUploadIngestJob.ts), so this is a plain existence check — the
+      // regenerate job below reads ALL of them, not one picked id.
+      const csvFileResult = await pool.query(
         `
-          SELECT id FROM sitemap_files
+          SELECT 1 FROM sitemap_files
           WHERE session_id = $1::uuid AND source_role = 'legacy'
-          ORDER BY id DESC
           LIMIT 1
         `,
         [sessionId]
@@ -9339,7 +9397,6 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
 
       const filesTotal = Math.ceil(urlsTotal / maxUrlsPerFile);
       const params = {
-        csv_sitemap_file_id: csvFileResult.rows[0].id,
         pattern_decisions: parsedDecisions.decisions,
         filename_template: filenameTemplate,
         lastmod_policy: lastmodPolicy,

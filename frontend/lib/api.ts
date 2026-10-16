@@ -4500,11 +4500,15 @@ export async function getLastmodUpdateJob(sessionId: string) {
 // background job; the frontend polls its status the same way the Lastmod
 // Updater does above.
 
-export type CsvUploadResult = {
-  sitemap_file_id: string;
-  url_count: number;
-  skipped_count: number;
-  skipped_sample: { line: number; value: string; reason: string }[];
+// The POST now only streams the file to disk and hands off to a background
+// job (parsing + chunked writes) rather than returning the final url_count —
+// a 1M+ row CSV used to make this request block the whole API process's
+// event loop for however long building the synthetic sitemap XML took. The
+// final counts (and the skipped-row sample) now arrive via getCsvUploadStatus
+// once ingest finishes — see CsvUploadStatus below.
+export type CsvUploadAck = {
+  job_row_id: string;
+  status: "PENDING";
 };
 
 export async function uploadCsvUrlList(sessionId: string, file: File) {
@@ -4518,11 +4522,12 @@ export async function uploadCsvUrlList(sessionId: string, file: File) {
     UPLOAD_API_TIMEOUT_MS
   );
 
-  return readJsonResponse<CsvUploadResult>(response);
+  return readJsonResponse<CsvUploadAck>(response);
 }
 
 export type CsvUploadPhase =
   | "NOT_UPLOADED"
+  | "INGESTING"
   | "PARSING"
   | "FAILED"
   | "EXTRACTING"
@@ -4534,6 +4539,15 @@ export type CsvUploadStatus = {
   pattern_count?: number;
   sampled_count?: number;
   total_urls?: number;
+  // Only present during/after INGESTING: chunk-write progress (see
+  // jobs/csvUploadIngestJob.ts) and, once known, how many CSV rows were
+  // skipped as not-a-valid-URL.
+  files_total?: number;
+  files_done?: number;
+  urls_processed?: number;
+  skipped_count?: number;
+  skipped_sample?: { line: number; value: string; reason: string }[];
+  error?: string | null;
 };
 
 export async function getCsvUploadStatus(sessionId: string) {

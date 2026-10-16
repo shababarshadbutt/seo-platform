@@ -56,7 +56,6 @@ export type PatternDecision =
     };
 
 type JobParams = {
-  csv_sitemap_file_id: string;
   pattern_decisions: PatternDecision[];
   filename_template: string;
   lastmod_policy: SitemapRegenerateLastmodPolicy;
@@ -153,7 +152,7 @@ type ResolvedUrl = {
 // static-segment shape, but ties are broken deterministically rather than
 // left to iteration order.
 export async function resolveFinalUrls(
-  csvStoredFilename: string,
+  csvStoredFilenames: string[],
   decisions: PatternDecision[],
   patternTemplates: Map<string, string>,
   logger: FastifyBaseLogger
@@ -193,7 +192,7 @@ export async function resolveFinalUrls(
   let unresolvedRewriteCount = 0;
   let excludedCount = 0;
 
-  await streamSitemapUrlLocs(csvStoredFilename, (loc) => {
+  function processLoc(loc: string) {
     let pathname: string;
 
     try {
@@ -235,7 +234,15 @@ export async function resolveFinalUrls(
     }
 
     urls.push({ loc: transformed, rewritten: true });
-  });
+  }
+
+  // One streaming pass per legacy chunk file (jobs/csvUploadIngestJob.ts
+  // splits the CSV upload across several, see csvLegacyChunkFiles.ts),
+  // sequentially so every call shares the same accumulating urls/counters
+  // above without needing to merge per-file results afterward.
+  for (const filename of csvStoredFilenames) {
+    await streamSitemapUrlLocs(filename, processLoc);
+  }
 
   if (unclassifiedCount > 0) {
     logger.info(
@@ -334,7 +341,6 @@ export async function processSitemapRegenerateJob(
 
   const sessionId = job.session_id;
   const {
-    csv_sitemap_file_id,
     pattern_decisions,
     filename_template,
     lastmod_policy,
@@ -347,13 +353,17 @@ export async function processSitemapRegenerateJob(
   );
 
   try {
+    // The CSV upload is 1+ 'legacy' sitemap_files rows (csvUploadIngestJob.ts
+    // chunks it), not necessarily one — read every chunk's filename so
+    // resolveFinalUrls streams the FULL uploaded URL population, not just
+    // whichever chunk happened to be picked.
     const csvFileResult = await pool.query<{ filename: string }>(
-      "SELECT filename FROM sitemap_files WHERE id = $1 AND session_id = $2",
-      [csv_sitemap_file_id, sessionId]
+      "SELECT filename FROM sitemap_files WHERE session_id = $1 AND source_role = 'legacy' ORDER BY id ASC",
+      [sessionId]
     );
 
     if (csvFileResult.rowCount === 0) {
-      throw new Error("The uploaded CSV's sitemap file could not be found.");
+      throw new Error("The uploaded CSV's sitemap files could not be found.");
     }
 
     const patternsResult = await pool.query<{ id: string; template: string }>(
@@ -370,7 +380,7 @@ export async function processSitemapRegenerateJob(
     );
 
     const { urls, unclassifiedCount, unresolvedRewriteCount, excludedCount } = await resolveFinalUrls(
-      csvFileResult.rows[0].filename,
+      csvFileResult.rows.map((row) => row.filename),
       pattern_decisions,
       patternTemplates,
       logger

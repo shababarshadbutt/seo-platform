@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -182,18 +182,16 @@ test("regenerating from a CSV keeps the site's other 'current' sitemap files ind
 `
   );
 
-  const csvFileResult = await pool.query<{ id: string }>(
+  await pool.query(
     `
       INSERT INTO sitemap_files (
         session_id, filename, total_urls, parsed_at, is_valid, is_empty,
         is_index, source_role
       )
       VALUES ($1, $2, 2, now(), TRUE, FALSE, FALSE, 'legacy')
-      RETURNING id
     `,
     [sessionId, csvStoredFilename]
   );
-  const csvSitemapFileId = csvFileResult.rows[0].id;
 
   async function enqueueRegenerateJob() {
     const jobRow = await pool.query<{ id: string }>(
@@ -206,7 +204,6 @@ test("regenerating from a CSV keeps the site's other 'current' sitemap files ind
         sessionId,
         randomUUID(),
         JSON.stringify({
-          csv_sitemap_file_id: csvSitemapFileId,
           pattern_decisions: [],
           filename_template: "sitemap-{n}.xml",
           lastmod_policy: "all"
@@ -335,4 +332,69 @@ test("regenerating from a CSV keeps the site's other 'current' sitemap files ind
     1,
     "still exactly one CSV-derived chunk file in the index — run 1's is gone, not duplicated"
   );
+
+  // --- Run 3: a SECOND legacy chunk file (csvUploadIngestJob.ts now splits a
+  // CSV upload across several 'legacy' rows, see csvLegacyChunkFiles.ts) must
+  // ALSO be read — this is the regression test for the bug that would have
+  // shipped if resolveFinalUrls/processSitemapRegenerateJob had kept reading
+  // only a single picked file id after that chunking landed.
+  const csvStoredFilename2 = `${randomUUID()}.xml`;
+
+  writeFileSync(
+    path.join(uploadDir, csvStoredFilename2),
+    `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.test/niin-parts/3</loc></url>
+</urlset>
+`
+  );
+
+  await pool.query(
+    `
+      INSERT INTO sitemap_files (
+        session_id, filename, total_urls, parsed_at, is_valid, is_empty,
+        is_index, source_role
+      )
+      VALUES ($1, $2, 1, now(), TRUE, FALSE, FALSE, 'legacy')
+    `,
+    [sessionId, csvStoredFilename2]
+  );
+
+  const thirdJobId = await enqueueRegenerateJob();
+
+  await processSitemapRegenerateJob(
+    { session_id: sessionId, job_row_id: thirdJobId },
+    silentLogger
+  );
+
+  const afterThirdRun = await pool.query<{ filename: string }>(
+    `
+      SELECT filename FROM sitemap_files
+      WHERE session_id = $1 AND source_role = 'current'
+        AND is_regenerate_output = TRUE AND is_deleted = FALSE
+    `,
+    [sessionId]
+  );
+
+  assert.equal(
+    afterThirdRun.rowCount,
+    1,
+    "run 3's own new chunk file is live"
+  );
+
+  const thirdChunkContents = readFileSync(
+    path.join(uploadDir, afterThirdRun.rows[0].filename),
+    "utf8"
+  );
+
+  for (const expectedUrl of [
+    "https://example.test/niin-parts/1",
+    "https://example.test/niin-parts/2",
+    "https://example.test/niin-parts/3"
+  ]) {
+    assert.ok(
+      thirdChunkContents.includes(`<loc>${expectedUrl}</loc>`),
+      `run 3's chunk file must contain ${expectedUrl} — proves BOTH legacy chunk files were read, not just one`
+    );
+  }
 });

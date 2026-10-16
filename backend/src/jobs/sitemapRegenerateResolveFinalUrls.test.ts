@@ -5,8 +5,8 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
-// resolveFinalUrls itself never touches postgres — it only reads a sitemap
-// file off disk (streamSitemapUrlLocs) and applies each pattern's decision in
+// resolveFinalUrls itself never touches postgres — it only reads sitemap
+// files off disk (streamSitemapUrlLocs) and applies each pattern's decision in
 // memory. Importing sitemapRegenerateJob.ts still opens a BullMQ queue at
 // module load transitively (via sessionCompletion.ts, see the
 // node-test-hang-not-redis / integration-test-must-close-queues lessons for
@@ -53,7 +53,12 @@ const silentLogger: any = {
   }
 };
 
-test("resolveFinalUrls drops every URL matching an 'exclude' decision, and keeps as_is/unmatched URLs", async (t) => {
+// Both scenarios share one test (rather than two top-level tests) so there is
+// only one setup/teardown of the shared uploadDir and the queue connections
+// resolveFinalUrls's module pulls in transitively — splitting them into
+// sibling tests means the first one's t.after (queue close + rmSync) runs
+// before the second starts, since they share module-level state.
+test("resolveFinalUrls", async (t) => {
   if (!(await redisReachable())) {
     rmSync(uploadDir, { recursive: true, force: true });
     t.skip(`redis not reachable at ${process.env.REDIS_URL} — skipping`);
@@ -74,43 +79,83 @@ test("resolveFinalUrls drops every URL matching an 'exclude' decision, and keeps
     rmSync(uploadDir, { recursive: true, force: true });
   });
 
-  const csvStoredFilename = "exclude-test-source.xml";
+  await t.test("drops every URL matching an 'exclude' decision, and keeps as_is/unmatched URLs", async () => {
+    const csvStoredFilename = "exclude-test-source.xml";
 
-  writeFileSync(
-    path.join(uploadDir, csvStoredFilename),
-    `<?xml version="1.0" encoding="UTF-8"?>
+    writeFileSync(
+      path.join(uploadDir, csvStoredFilename),
+      `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>https://example.test/niin-parts/1</loc></url>
   <url><loc>https://example.test/niin-parts/2</loc></url>
   <url><loc>https://example.test/other/1</loc></url>
 </urlset>
 `
-  );
+    );
 
-  const patternTemplates = new Map([
-    ["excluded-pattern", "/niin-parts/{id}"],
-    ["kept-pattern", "/other/{id}"]
-  ]);
+    const patternTemplates = new Map([
+      ["excluded-pattern", "/niin-parts/{id}"],
+      ["kept-pattern", "/other/{id}"]
+    ]);
 
-  const result = await resolveFinalUrls(
-    csvStoredFilename,
-    [
-      { pattern_id: "excluded-pattern", mode: "exclude" },
-      { pattern_id: "kept-pattern", mode: "as_is" }
-    ],
-    patternTemplates,
-    silentLogger
-  );
+    const result = await resolveFinalUrls(
+      [csvStoredFilename],
+      [
+        { pattern_id: "excluded-pattern", mode: "exclude" },
+        { pattern_id: "kept-pattern", mode: "as_is" }
+      ],
+      patternTemplates,
+      silentLogger
+    );
 
-  assert.equal(
-    result.excludedCount,
-    2,
-    "both niin-parts URLs were dropped by the exclude decision"
-  );
-  assert.equal(result.unclassifiedCount, 0);
-  assert.deepEqual(
-    result.urls.map((url) => url.loc),
-    ["https://example.test/other/1"],
-    "only the as_is-decided URL survives; excluded URLs are gone entirely"
-  );
+    assert.equal(
+      result.excludedCount,
+      2,
+      "both niin-parts URLs were dropped by the exclude decision"
+    );
+    assert.equal(result.unclassifiedCount, 0);
+    assert.deepEqual(
+      result.urls.map((url) => url.loc),
+      ["https://example.test/other/1"],
+      "only the as_is-decided URL survives; excluded URLs are gone entirely"
+    );
+  });
+
+  // jobs/csvUploadIngestJob.ts splits a CSV upload into several 'legacy'
+  // chunk files rather than one (see sitemaps/csvLegacyChunkFiles.ts); the
+  // regression test for a bug that would have otherwise shipped silently
+  // (publish dropping every URL but one chunk's) — resolveFinalUrls must read
+  // ALL of them, not just the first.
+  await t.test("reads URLs from every file in the list, not just the first", async () => {
+    const chunkFilenames = ["multi-chunk-1.xml", "multi-chunk-2.xml", "multi-chunk-3.xml"];
+    const urlsByChunk = [
+      ["https://example.test/other/1"],
+      ["https://example.test/other/2"],
+      ["https://example.test/other/3"]
+    ];
+
+    chunkFilenames.forEach((filename, index) => {
+      writeFileSync(
+        path.join(uploadDir, filename),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${urlsByChunk[index].map((loc) => `  <url><loc>${loc}</loc></url>`).join("\n")}
+</urlset>
+`
+      );
+    });
+
+    const result = await resolveFinalUrls(
+      chunkFilenames,
+      [{ pattern_id: "kept-pattern", mode: "as_is" }],
+      new Map([["kept-pattern", "/other/{id}"]]),
+      silentLogger
+    );
+
+    assert.deepEqual(
+      result.urls.map((url) => url.loc).sort(),
+      urlsByChunk.flat().sort(),
+      "every chunk file's URLs must be present, not just the first file's"
+    );
+  });
 });

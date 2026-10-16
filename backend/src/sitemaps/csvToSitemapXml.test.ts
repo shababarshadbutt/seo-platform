@@ -1,19 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { test } from "node:test";
 
-import { peekRootElement } from "./peek.js";
-import { writeSyntheticSitemapXml } from "./csvToSitemapXml.js";
-
-function withTempDir(run: (dir: string) => Promise<void>) {
-  const dir = mkdtempSync(path.join(os.tmpdir(), "csv-to-sitemap-xml-test-"));
-
-  return run(dir).finally(() => {
-    rmSync(dir, { recursive: true, force: true });
-  });
-}
+import { buildSyntheticSitemapXml } from "./csvToSitemapXml.js";
 
 function unescapeXml(value: string) {
   return value
@@ -23,41 +11,40 @@ function unescapeXml(value: string) {
     .replace(/&amp;/g, "&");
 }
 
-test("writes a valid <urlset> with one <loc> per URL, in order", async () => {
-  await withTempDir(async (dir) => {
-    const outPath = path.join(dir, "synthetic.xml");
-    const urls = [
-      "https://example.com/a",
-      "https://example.com/b?x=1&y=2",
-      "https://example.com/c"
-    ];
+test("builds a valid <urlset> with one <loc> per URL, in order", () => {
+  const urls = [
+    "https://example.com/a",
+    "https://example.com/b?x=1&y=2",
+    "https://example.com/c"
+  ];
 
-    await writeSyntheticSitemapXml(urls, outPath);
+  const xml = buildSyntheticSitemapXml(urls);
 
-    assert.equal(await peekRootElement(outPath), "urlset");
+  assert.match(xml, /^<\?xml version="1\.0" encoding="UTF-8"\?>\n<urlset /);
+  assert.match(xml, /<\/urlset>\n$/);
 
-    const contents = readFileSync(outPath, "utf8");
-    const seen = [...contents.matchAll(/<loc>(.*?)<\/loc>/g)].map((match) =>
-      unescapeXml(match[1])
-    );
+  const seen = [...xml.matchAll(/<loc>(.*?)<\/loc>/g)].map((match) =>
+    unescapeXml(match[1])
+  );
 
-    assert.deepEqual(seen, urls);
-  });
+  assert.deepEqual(seen, urls);
 });
 
-test("escapes XML-significant characters in the URL", async () => {
-  await withTempDir(async (dir) => {
-    const outPath = path.join(dir, "synthetic.xml");
+test("escapes XML-significant characters in the URL", () => {
+  const xml = buildSyntheticSitemapXml([
+    'https://example.com/a?x=1&y=2&q="quoted"'
+  ]);
 
-    await writeSyntheticSitemapXml(
-      ['https://example.com/a?x=1&y=2&q="quoted"'],
-      outPath
-    );
+  assert.match(xml, /&amp;/);
+  assert.match(xml, /&quot;/);
+  assert.doesNotMatch(
+    xml.replace(/<\?xml.*?\?>\n/, ""),
+    /&(?!amp;|quot;|lt;|gt;)/
+  );
+});
 
-    const contents = readFileSync(outPath, "utf8");
+test("returns an empty <urlset> for an empty list", () => {
+  const xml = buildSyntheticSitemapXml([]);
 
-    assert.match(contents, /&amp;/);
-    assert.match(contents, /&quot;/);
-    assert.doesNotMatch(contents.replace(/<\?xml.*?\?>\n/, ""), /&(?!amp;|quot;|lt;|gt;)/);
-  });
+  assert.match(xml, /<urlset[^>]*>\s*<\/urlset>\n?$/);
 });

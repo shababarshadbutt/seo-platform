@@ -29,7 +29,6 @@ import {
   startS3Pull,
   followS3PullProgress,
   uploadCsvUrlList,
-  type CsvUploadResult,
   type Pattern,
   type RemotePullProgressEvent,
   type SampledUrl,
@@ -58,6 +57,7 @@ type FetchPhase = "idle" | "pulling" | "parsing" | "ready" | "stalled" | "error"
 type CsvPhase =
   | "idle"
   | "uploading"
+  | "chunking"
   | "extracting"
   | "sampling"
   | "ready"
@@ -689,16 +689,29 @@ export default function SitemapRegeneratePage() {
   // ---- Step 2: CSV upload ---------------------------------------------------
   const [csvPhase, setCsvPhase] = useState<CsvPhase>("idle");
   const [csvError, setCsvError] = useState("");
-  const [csvUploadResult, setCsvUploadResult] = useState<CsvUploadResult | null>(null);
+  // Whether an upload has ever been accepted this session — just a guard for
+  // "Check again" after a stall; the final counts below come from polling,
+  // not from the (now near-instant) upload response itself.
+  const [csvUploaded, setCsvUploaded] = useState(false);
   const [csvTotalUrls, setCsvTotalUrls] = useState(0);
   const [csvPatternCount, setCsvPatternCount] = useState(0);
   const [csvSampledCount, setCsvSampledCount] = useState(0);
+  // Chunk-write progress while the background ingest job (see
+  // backend/src/jobs/csvUploadIngestJob.ts) is still parsing/writing —
+  // files_total stays 0 until parsing finishes and the chunk count is known.
+  const [csvFilesTotal, setCsvFilesTotal] = useState(0);
+  const [csvFilesDone, setCsvFilesDone] = useState(0);
+  const [csvUrlsProcessed, setCsvUrlsProcessed] = useState(0);
+  const [csvSkippedCount, setCsvSkippedCount] = useState(0);
 
-  // Polls pattern-detection/sampling progress for the CSV-derived file. Shared
-  // by the initial upload and the "Check again" retry after a stall, so both
-  // paths report the same "N of M patterns checked" progress instead of a
-  // bare spinner. Mirrors waitForParsing's stall detection above.
-  async function waitForCsvProcessing(id: string, fallbackUrlCount: number) {
+  // Polls ingest/pattern-detection/sampling progress for the CSV-derived
+  // files. Shared by the initial upload and the "Check again" retry after a
+  // stall, so both paths report the same progress instead of a bare spinner.
+  // Mirrors waitForParsing's stall detection above. No fallback URL count is
+  // needed any more — the upload response no longer carries one (see
+  // handleCsvSelected): the background ingest job parses the CSV itself, and
+  // this poll is the only place that count ever becomes known.
+  async function waitForCsvProcessing(id: string) {
     let lastProgressKey = "";
     let lastProgressAt = Date.now();
 
@@ -706,21 +719,33 @@ export default function SitemapRegeneratePage() {
       const status = await getCsvUploadStatus(id);
 
       if (status.phase === "FAILED") {
-        throw new Error("The uploaded CSV could not be parsed as sitemap URLs.");
+        throw new Error(
+          status.error ?? "The uploaded CSV could not be parsed as sitemap URLs."
+        );
       }
 
       setCsvPatternCount(status.pattern_count ?? 0);
       setCsvSampledCount(status.sampled_count ?? 0);
+      setCsvFilesTotal(status.files_total ?? 0);
+      setCsvFilesDone(status.files_done ?? 0);
+      setCsvUrlsProcessed(status.urls_processed ?? 0);
+      setCsvSkippedCount(status.skipped_count ?? 0);
 
       if (status.phase === "READY") {
-        setCsvTotalUrls(status.total_urls ?? fallbackUrlCount);
+        setCsvTotalUrls(status.total_urls ?? 0);
         setCsvPhase("ready");
         return;
       }
 
-      setCsvPhase(status.phase === "SAMPLING" ? "sampling" : "extracting");
+      setCsvPhase(
+        status.phase === "INGESTING"
+          ? "chunking"
+          : status.phase === "SAMPLING"
+            ? "sampling"
+            : "extracting"
+      );
 
-      const progressKey = `${status.phase}:${status.pattern_count ?? 0}:${status.sampled_count ?? 0}`;
+      const progressKey = `${status.phase}:${status.files_done ?? 0}:${status.urls_processed ?? 0}:${status.pattern_count ?? 0}:${status.sampled_count ?? 0}`;
 
       if (progressKey !== lastProgressKey) {
         lastProgressKey = progressKey;
@@ -744,13 +769,16 @@ export default function SitemapRegeneratePage() {
     setCsvPhase("uploading");
     setCsvPatternCount(0);
     setCsvSampledCount(0);
+    setCsvFilesTotal(0);
+    setCsvFilesDone(0);
+    setCsvUrlsProcessed(0);
 
     try {
-      const uploaded = await uploadCsvUrlList(sessionId, file);
+      await uploadCsvUrlList(sessionId, file);
 
-      setCsvUploadResult(uploaded);
-      setCsvPhase("extracting");
-      await waitForCsvProcessing(sessionId, uploaded.url_count);
+      setCsvUploaded(true);
+      setCsvPhase("chunking");
+      await waitForCsvProcessing(sessionId);
     } catch (error) {
       if (error instanceof ParsingTimeoutError) {
         setCsvError(error.message);
@@ -764,7 +792,7 @@ export default function SitemapRegeneratePage() {
   }
 
   async function retryCsvProcessing() {
-    if (!sessionId || !csvUploadResult) {
+    if (!sessionId || !csvUploaded) {
       return;
     }
 
@@ -772,7 +800,7 @@ export default function SitemapRegeneratePage() {
     setCsvPhase("extracting");
 
     try {
-      await waitForCsvProcessing(sessionId, csvUploadResult.url_count);
+      await waitForCsvProcessing(sessionId);
     } catch (error) {
       if (error instanceof ParsingTimeoutError) {
         setCsvError(error.message);
@@ -1082,6 +1110,7 @@ export default function SitemapRegeneratePage() {
                   className={cn(
                     "flex h-24 cursor-pointer flex-col items-center justify-center gap-1.5 rounded-lg border-2 border-dashed border-slate-200 text-sm text-slate-500 hover:border-indigo-300 hover:text-indigo-600",
                     (csvPhase === "uploading" ||
+                      csvPhase === "chunking" ||
                       csvPhase === "extracting" ||
                       csvPhase === "sampling") &&
                       "pointer-events-none opacity-60"
@@ -1110,6 +1139,24 @@ export default function SitemapRegeneratePage() {
                     <Loader2 className="h-4 w-4 animate-spin" />
                     Uploading…
                   </p>
+                ) : null}
+
+                {csvPhase === "chunking" ? (
+                  <div className="space-y-2">
+                    <p className="flex items-center gap-2 text-sm text-slate-700">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      {csvFilesTotal > 0
+                        ? `Processing CSV… ${formatNumber(csvFilesDone)} of ${formatNumber(csvFilesTotal)} file(s) written`
+                        : csvUrlsProcessed > 0
+                          ? `Processing CSV… ${formatNumber(csvUrlsProcessed)} URLs written`
+                          : "Processing CSV…"}
+                    </p>
+                    {csvFilesTotal > 0 ? (
+                      <Progress
+                        value={Math.round((csvFilesDone / csvFilesTotal) * 100)}
+                      />
+                    ) : null}
+                  </div>
                 ) : null}
 
                 {csvPhase === "extracting" ? (
@@ -1155,16 +1202,15 @@ export default function SitemapRegeneratePage() {
                   </div>
                 ) : null}
 
-                {csvPhase === "ready" && csvUploadResult ? (
+                {csvPhase === "ready" ? (
                   <div className="space-y-1 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2">
                     <p className="flex items-center gap-2 text-sm font-semibold text-emerald-900">
                       <FileText className="h-4 w-4" />
-                      {formatNumber(csvTotalUrls || csvUploadResult.url_count)} URLs
-                      loaded
+                      {formatNumber(csvTotalUrls)} URLs loaded
                     </p>
-                    {csvUploadResult.skipped_count > 0 ? (
+                    {csvSkippedCount > 0 ? (
                       <p className="text-xs text-emerald-800">
-                        {formatNumber(csvUploadResult.skipped_count)} row(s) skipped
+                        {formatNumber(csvSkippedCount)} row(s) skipped
                         (not a valid URL).
                       </p>
                     ) : null}

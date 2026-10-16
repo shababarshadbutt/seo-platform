@@ -1,9 +1,13 @@
-import { createWriteStream } from "node:fs";
-
-// A synthetic <urlset> built from the sitemap-regenerate wizard's CSV URL
-// list, with no <lastmod> — it is never published itself, only a vehicle to
-// run the CSV's URLs through the existing extraction/sampling pipeline
-// unchanged (see ingest.ts's createStoredSitemapFile, source_role "legacy").
+// A synthetic <urlset> string built from a plain URL list, with no <lastmod>.
+// Used for small, bounded lists only — e.g. sessions.ts's download-failed-urls
+// and sitemapCategorizer.ts's download-404s, both capped well below the sizes
+// that would make building one in-memory string a problem (see those call
+// sites' own comments). The sitemap-regenerate wizard's CSV upload, which
+// used to build its (potentially 1M+ row) URL list this same way synchronously
+// inside an HTTP request handler, no longer does — see
+// jobs/csvUploadIngestJob.ts / sitemaps/csvLegacyChunkFiles.ts, which instead
+// write chunked files in parallel via the existing sitemapGeneratePool piscina
+// worker (already streaming-write, no giant string).
 
 const URLSET_HEADER =
   '<?xml version="1.0" encoding="UTF-8"?>\n' +
@@ -18,15 +22,6 @@ function escapeXml(value: string) {
     .replace(/"/g, "&quot;");
 }
 
-// Await a writable stream fully flushing and closing. Rejects on any stream
-// error so a disk-full / permission failure surfaces instead of hanging.
-function finishStream(stream: import("node:fs").WriteStream): Promise<void> {
-  return new Promise((resolve, reject) => {
-    stream.on("error", reject);
-    stream.end(() => resolve());
-  });
-}
-
 export function buildSyntheticSitemapXml(urls: string[]): string {
   let xml = URLSET_HEADER;
 
@@ -35,13 +30,4 @@ export function buildSyntheticSitemapXml(urls: string[]): string {
   }
 
   return xml + URLSET_FOOTER;
-}
-
-export async function writeSyntheticSitemapXml(
-  urls: string[],
-  outPath: string
-): Promise<void> {
-  const stream = createWriteStream(outPath);
-  stream.write(buildSyntheticSitemapXml(urls));
-  await finishStream(stream);
 }

@@ -13,6 +13,7 @@ export const RESTORE_DELETED_URLS_JOB = "restore-deleted-urls" as const;
 export const FIX_TRAILING_SLASHES_JOB = "fix-trailing-slashes" as const;
 export const FIX_TRAILING_SLASHES_UNDO_JOB =
   "fix-trailing-slashes-undo" as const;
+export const CSV_UPLOAD_INGEST_JOB = "csv-upload-ingest" as const;
 
 export type DeleteProblemUrlsJobData = {
   session_id: string;
@@ -53,17 +54,29 @@ export type FixTrailingSlashesUndoJobData = {
   job_row_id: string;
 };
 
+export type CsvUploadIngestJobData = {
+  session_id: string;
+  job_row_id: string;
+  // Local temp path the uploaded CSV was streamed to — the job parses it and
+  // unlinks it as soon as parsing finishes, so (unlike the other maintenance
+  // jobs, which only touch already-persisted DB state) a BullMQ retry of this
+  // job can never actually help: the file it needs would already be gone.
+  csv_temp_path: string;
+};
+
 export type MaintenanceQueueData =
   | DeleteProblemUrlsJobData
   | RestoreDeletedUrlsJobData
   | FixTrailingSlashesJobData
-  | FixTrailingSlashesUndoJobData;
+  | FixTrailingSlashesUndoJobData
+  | CsvUploadIngestJobData;
 
 export type MaintenanceJobName =
   | typeof DELETE_PROBLEM_URLS_JOB
   | typeof RESTORE_DELETED_URLS_JOB
   | typeof FIX_TRAILING_SLASHES_JOB
-  | typeof FIX_TRAILING_SLASHES_UNDO_JOB;
+  | typeof FIX_TRAILING_SLASHES_UNDO_JOB
+  | typeof CSV_UPLOAD_INGEST_JOB;
 
 export const maintenanceQueue = new Queue<
   MaintenanceQueueData,
@@ -95,7 +108,12 @@ async function reusableSingletonJob(jobId: string) {
 
 async function enqueueSingleton(
   name: MaintenanceJobName,
-  data: MaintenanceQueueData
+  data: MaintenanceQueueData,
+  // csv-upload-ingest overrides this to 1: it unlinks its temp CSV as soon as
+  // parsing finishes, so a BullMQ retry would just fail immediately finding
+  // the file gone — unlike the other kinds here, which only touch
+  // already-persisted DB state and are safely re-runnable.
+  attempts = 3
 ) {
   // One in-flight maintenance op per session per kind.
   const jobId = `${name}-${data.session_id}`;
@@ -109,7 +127,7 @@ async function enqueueSingleton(
     jobId,
     removeOnComplete: { count: 100 },
     removeOnFail: { count: 100 },
-    attempts: 3
+    attempts
   });
 }
 
@@ -129,6 +147,10 @@ export function enqueueFixTrailingSlashesUndoJob(
   data: FixTrailingSlashesUndoJobData
 ) {
   return enqueueSingleton(FIX_TRAILING_SLASHES_UNDO_JOB, data);
+}
+
+export function enqueueCsvUploadIngestJob(data: CsvUploadIngestJobData) {
+  return enqueueSingleton(CSV_UPLOAD_INGEST_JOB, data, 1);
 }
 
 export async function closeMaintenanceQueue() {

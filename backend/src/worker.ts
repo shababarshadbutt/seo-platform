@@ -67,12 +67,14 @@ import {
   type SitemapRegenerateJobData
 } from "./queue/bulkReplaceQueue.js";
 import {
+  CSV_UPLOAD_INGEST_JOB,
   DELETE_PROBLEM_URLS_JOB,
   FIX_TRAILING_SLASHES_JOB,
   FIX_TRAILING_SLASHES_UNDO_JOB,
   MAINTENANCE_QUEUE_NAME,
   RESTORE_DELETED_URLS_JOB,
   closeMaintenanceQueue,
+  type CsvUploadIngestJobData,
   type DeleteProblemUrlsJobData,
   type FixTrailingSlashesJobData,
   type FixTrailingSlashesUndoJobData,
@@ -150,6 +152,7 @@ import {
   processFixTrailingSlashesUndoJob,
   processRestoreDeletedUrlsJob
 } from "./jobs/maintenanceJobs.js";
+import { processCsvUploadIngestJob } from "./jobs/csvUploadIngestJob.js";
 import { destroyZipPool } from "./jobs/zipPool.js";
 import { destroyFileRewritePool } from "./jobs/fileRewritePool.js";
 import { destroyDryRunScanPool } from "./jobs/dryRunScanPool.js";
@@ -560,6 +563,14 @@ async function start() {
         if (job.name === FIX_TRAILING_SLASHES_UNDO_JOB) {
           await processFixTrailingSlashesUndoJob(
             job.data as FixTrailingSlashesUndoJobData,
+            app.log
+          );
+          return;
+        }
+
+        if (job.name === CSV_UPLOAD_INGEST_JOB) {
+          await processCsvUploadIngestJob(
+            job.data as CsvUploadIngestJobData,
             app.log
           );
           return;
