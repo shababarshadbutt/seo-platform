@@ -102,7 +102,7 @@ export async function processCategorizerGenerateJob(
   const categories = categoriesResult.rows.map((row) => row.category);
 
   const chunkDeadlineMs = Date.now() + config.categorizerCrawl.chunkMinutes * 60 * 1000;
-  let doneCount = jobRow.items_done;
+  let doneCount = Number(jobRow.items_done);
 
   for (const category of categories) {
     for (;;) {

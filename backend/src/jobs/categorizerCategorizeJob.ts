@@ -180,7 +180,7 @@ export async function processCategorizerCategorizeJob(
         ? DepthBoundaryDetector.fromSerialized(checkpoint.trackers)
         : new DepthBoundaryDetector();
     let lastId = resumingDetect ? checkpoint.last_id ?? 0 : 0;
-    let scanned = resumingDetect ? jobRow.items_done : 0;
+    let scanned = resumingDetect ? Number(jobRow.items_done) : 0;
 
     for (;;) {
       if (Date.now() > chunkDeadlineMs) {
@@ -260,7 +260,7 @@ export async function processCategorizerCategorizeJob(
   // it when this run is actually resuming an already-in-progress assign pass;
   // every other path (fresh job, or just-finished detect falling through)
   // starts assign at 0, matching the checkpoint reset above.
-  let doneCount = resumingAssign ? jobRow.items_done : 0;
+  let doneCount = resumingAssign ? Number(jobRow.items_done) : 0;
 
   for (;;) {
     if (Date.now() > chunkDeadlineMs) {

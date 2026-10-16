@@ -161,7 +161,7 @@ export async function processCategorizerStatusSampleJob(
     Math.min(config.categorizerCrawl.maxConcurrency, verifyConcurrency(session.base_url))
   );
   const chunkDeadlineMs = Date.now() + config.categorizerCrawl.chunkMinutes * 60 * 1000;
-  let doneCount = jobRow.items_done;
+  let doneCount = Number(jobRow.items_done);
   let sampleIndex = 0;
 
   for (;;) {
