@@ -9149,7 +9149,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
             COUNT(*) FILTER (WHERE parsed_at IS NULL) AS unparsed_files,
             COUNT(*) FILTER (WHERE parsed_at IS NOT NULL AND is_valid = FALSE) AS invalid_files,
             COALESCE(SUM(total_urls), 0) AS total_urls,
-            MIN(id) AS any_file_id
+            MIN(id::text) AS any_file_id
           FROM sitemap_files
           WHERE session_id = $1::uuid AND source_role = 'legacy'
         `,
