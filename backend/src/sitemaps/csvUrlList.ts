@@ -9,7 +9,7 @@ import { isHttpUrl } from "./filenames.js";
 // silently dropped, not counted as a skip) and blank lines. Streaming so a
 // CSV with hundreds of thousands of rows never has to sit fully in memory.
 
-const MAX_SKIPPED_SAMPLE = 50;
+export const MAX_SKIPPED_SAMPLE = 50;
 
 function isWellFormedUrl(value: string): boolean {
   if (!isHttpUrl(value)) {

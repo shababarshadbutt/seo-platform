@@ -9038,24 +9038,41 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           .send({ job_row_id: inFlightIngest.rows[0].id, status: "PENDING" });
       }
 
-      const uploadedFile = await request.file();
+      await mkdir(config.uploadDir, { recursive: true });
 
-      if (!uploadedFile || !isCsvFilename(uploadedFile.filename)) {
-        if (uploadedFile) {
+      // Multiple CSVs selected together (one category can span more URLs
+      // than comfortably fits in one export) land in a single ingest batch —
+      // every part is written to its own temp path here, and
+      // csvUploadIngestJob.ts parses + merges them before chunking, so the
+      // rest of the pipeline never has to know how many files it came from.
+      const csvTempPaths: string[] = [];
+      let invalidFilename: string | null = null;
+
+      for await (const uploadedFile of request.files()) {
+        if (invalidFilename || !isCsvFilename(uploadedFile.filename)) {
+          invalidFilename ??= uploadedFile.filename;
           await drainMultipartFile(uploadedFile);
+          continue;
         }
+
+        const csvTempPath = path.join(
+          config.uploadDir,
+          `${sessionId}-csv-upload-${randomUUID()}-${csvTempPaths.length}.csv`
+        );
+
+        await pipeline(uploadedFile.file, createWriteStream(csvTempPath));
+        csvTempPaths.push(csvTempPath);
+      }
+
+      if (invalidFilename) {
+        await Promise.all(csvTempPaths.map((p) => unlink(p).catch(() => {})));
 
         return reply.code(400).send(badRequest("Only .csv files are supported"));
       }
 
-      await mkdir(config.uploadDir, { recursive: true });
-
-      const csvTempPath = path.join(
-        config.uploadDir,
-        `${sessionId}-csv-upload-${randomUUID()}.csv`
-      );
-
-      await pipeline(uploadedFile.file, createWriteStream(csvTempPath));
+      if (csvTempPaths.length === 0) {
+        return reply.code(400).send(badRequest("Only .csv files are supported"));
+      }
 
       // Parsing + chunked writing happen in the background from here on —
       // see jobs/csvUploadIngestJob.ts. Doing that work inline (as this route
@@ -9071,7 +9088,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       await enqueueCsvUploadIngestJob({
         session_id: sessionId,
         job_row_id: jobRowId,
-        csv_temp_path: csvTempPath
+        csv_temp_paths: csvTempPaths
       });
 
       return reply.code(202).send({ job_row_id: jobRowId, status: "PENDING" });

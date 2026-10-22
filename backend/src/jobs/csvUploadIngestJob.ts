@@ -3,10 +3,11 @@ import { unlink } from "node:fs/promises";
 import type { FastifyBaseLogger } from "fastify";
 
 import { pool } from "../db/pool.js";
-import { parseCsvUrlList, type SkippedCsvRow } from "../sitemaps/csvUrlList.js";
+import { type CsvUrlListResult, type SkippedCsvRow, MAX_SKIPPED_SAMPLE } from "../sitemaps/csvUrlList.js";
 import { writeCsvLegacyChunks } from "../sitemaps/csvLegacyChunkFiles.js";
 import { DEFAULT_URLS_PER_FILE } from "../sitemaps/maxUrlsPerFile.js";
 import { enqueueParseSitemapJobs } from "../queue/sitemapQueue.js";
+import { runCsvParseJob } from "./csvParsePool.js";
 import type { CsvUploadIngestJobData } from "../queue/maintenanceQueue.js";
 
 // Background job for the sitemap-regenerate wizard's CSV upload
@@ -85,21 +86,45 @@ export async function processCsvUploadIngestJob(
   const {
     session_id: sessionId,
     job_row_id: jobRowId,
-    csv_temp_path: csvTempPath
+    csv_temp_paths: csvTempPaths
   } = data;
 
   logger.info(
-    { session_id: sessionId, job_row_id: jobRowId },
+    { session_id: sessionId, job_row_id: jobRowId, file_count: csvTempPaths.length },
     "csv upload ingest job started"
   );
 
   try {
     await markRunning(jobRowId);
 
-    const { urls, skippedCount, skippedSample } =
-      await parseCsvUrlList(csvTempPath);
+    const settled = await Promise.allSettled(
+      csvTempPaths.map((filePath) => runCsvParseJob({ filePath }))
+    );
 
-    await unlink(csvTempPath).catch(() => {});
+    await Promise.all(
+      csvTempPaths.map((filePath) => unlink(filePath).catch(() => {}))
+    );
+
+    const failure = settled.find(
+      (entry): entry is PromiseRejectedResult => entry.status === "rejected"
+    );
+
+    if (failure) {
+      throw failure.reason;
+    }
+
+    const results = (settled as PromiseFulfilledResult<CsvUrlListResult>[]).map(
+      (entry) => entry.value
+    );
+
+    const urls = results.flatMap((result) => result.urls);
+    const skippedCount = results.reduce(
+      (total, result) => total + result.skippedCount,
+      0
+    );
+    const skippedSample = results
+      .flatMap((result) => result.skippedSample)
+      .slice(0, MAX_SKIPPED_SAMPLE);
 
     const skipped: Skipped = { count: skippedCount, sample: skippedSample };
 

@@ -158,6 +158,7 @@ import { destroyFileRewritePool } from "./jobs/fileRewritePool.js";
 import { destroyDryRunScanPool } from "./jobs/dryRunScanPool.js";
 import { destroyPatternPopulationPool } from "./jobs/patternPopulationPool.js";
 import { destroySitemapGeneratePool } from "./jobs/sitemapGeneratePool.js";
+import { destroyCsvParsePool } from "./jobs/csvParsePool.js";
 import { processVerifyUrlsJob } from "./jobs/verifyUrlsJob.js";
 import { processTriageSampleJob } from "./jobs/triageJob.js";
 import { processNormalizationProbeJob } from "./jobs/normalizationProbeJob.js";
@@ -831,6 +832,7 @@ async function close() {
   await destroyDryRunScanPool();
   await destroyPatternPopulationPool();
   await destroySitemapGeneratePool();
+  await destroyCsvParsePool();
   await closeSitemapQueue();
   await closeBulkReplaceQueue();
   await closePublishQueue();

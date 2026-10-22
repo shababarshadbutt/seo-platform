@@ -693,6 +693,11 @@ export default function SitemapRegeneratePage() {
   // "Check again" after a stall; the final counts below come from polling,
   // not from the (now near-instant) upload response itself.
   const [csvUploaded, setCsvUploaded] = useState(false);
+  // How many CSV files were selected together in the current/last upload —
+  // purely for the "Uploading N file(s)…" copy below; merging happens
+  // server-side (see jobs/csvUploadIngestJob.ts), so nothing downstream needs
+  // to track this per-file.
+  const [csvFileCount, setCsvFileCount] = useState(0);
   const [csvTotalUrls, setCsvTotalUrls] = useState(0);
   const [csvPatternCount, setCsvPatternCount] = useState(0);
   const [csvSampledCount, setCsvSampledCount] = useState(0);
@@ -760,13 +765,20 @@ export default function SitemapRegeneratePage() {
     }
   }
 
-  async function handleCsvSelected(file: File) {
-    if (!sessionId) {
+  async function handleCsvSelected(files: File[]) {
+    if (!sessionId || files.length === 0) {
+      return;
+    }
+
+    if (files.some((file) => !file.name.toLowerCase().endsWith(".csv"))) {
+      setCsvError("Only .csv files are supported.");
+      setCsvPhase("error");
       return;
     }
 
     setCsvError("");
     setCsvPhase("uploading");
+    setCsvFileCount(files.length);
     setCsvPatternCount(0);
     setCsvSampledCount(0);
     setCsvFilesTotal(0);
@@ -774,7 +786,7 @@ export default function SitemapRegeneratePage() {
     setCsvUrlsProcessed(0);
 
     try {
-      await uploadCsvUrlList(sessionId, file);
+      await uploadCsvUrlList(sessionId, files);
 
       setCsvUploaded(true);
       setCsvPhase("chunking");
@@ -1097,8 +1109,9 @@ export default function SitemapRegeneratePage() {
           <CardHeader>
             <CardTitle className="text-base">2. New URL list</CardTitle>
             <CardDescription>
-              Upload a CSV with one URL per row — the new/updated URLs for this
-              site.
+              Upload one or more CSVs with one URL per row — the new/updated
+              URLs for this site. Select several files at once if one export
+              doesn&rsquo;t cover everything; they&rsquo;ll be merged.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -1117,16 +1130,17 @@ export default function SitemapRegeneratePage() {
                   )}
                 >
                   <Upload className="h-5 w-5" />
-                  Choose a .csv file
+                  Choose .csv file(s)
                   <input
                     type="file"
                     accept=".csv,text/csv"
+                    multiple
                     className="hidden"
                     onChange={(event) => {
-                      const file = event.target.files?.[0];
+                      const files = Array.from(event.target.files ?? []);
 
-                      if (file) {
-                        void handleCsvSelected(file);
+                      if (files.length > 0) {
+                        void handleCsvSelected(files);
                       }
 
                       event.target.value = "";
@@ -1137,7 +1151,9 @@ export default function SitemapRegeneratePage() {
                 {csvPhase === "uploading" ? (
                   <p className="flex items-center gap-2 text-sm text-slate-700">
                     <Loader2 className="h-4 w-4 animate-spin" />
-                    Uploading…
+                    {csvFileCount > 1
+                      ? `Uploading ${formatNumber(csvFileCount)} files…`
+                      : "Uploading…"}
                   </p>
                 ) : null}
 
@@ -1146,10 +1162,10 @@ export default function SitemapRegeneratePage() {
                     <p className="flex items-center gap-2 text-sm text-slate-700">
                       <Loader2 className="h-4 w-4 animate-spin" />
                       {csvFilesTotal > 0
-                        ? `Processing CSV… ${formatNumber(csvFilesDone)} of ${formatNumber(csvFilesTotal)} file(s) written`
+                        ? `Processing CSV${csvFileCount > 1 ? "s" : ""}… ${formatNumber(csvFilesDone)} of ${formatNumber(csvFilesTotal)} file(s) written`
                         : csvUrlsProcessed > 0
-                          ? `Processing CSV… ${formatNumber(csvUrlsProcessed)} URLs written`
-                          : "Processing CSV…"}
+                          ? `Processing CSV${csvFileCount > 1 ? "s" : ""}… ${formatNumber(csvUrlsProcessed)} URLs written`
+                          : `Processing CSV${csvFileCount > 1 ? "s" : ""}…`}
                     </p>
                     {csvFilesTotal > 0 ? (
                       <Progress

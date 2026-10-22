@@ -57,11 +57,13 @@ export type FixTrailingSlashesUndoJobData = {
 export type CsvUploadIngestJobData = {
   session_id: string;
   job_row_id: string;
-  // Local temp path the uploaded CSV was streamed to — the job parses it and
-  // unlinks it as soon as parsing finishes, so (unlike the other maintenance
-  // jobs, which only touch already-persisted DB state) a BullMQ retry of this
-  // job can never actually help: the file it needs would already be gone.
-  csv_temp_path: string;
+  // Local temp paths the uploaded CSVs were streamed to (one or more files
+  // selected together in a single upload) — the job parses and merges them,
+  // then unlinks every path as soon as parsing finishes, so (unlike the other
+  // maintenance jobs, which only touch already-persisted DB state) a BullMQ
+  // retry of this job can never actually help: the files it needs would
+  // already be gone.
+  csv_temp_paths: string[];
 };
 
 export type MaintenanceQueueData =

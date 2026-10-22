@@ -4511,10 +4511,12 @@ export type CsvUploadAck = {
   status: "PENDING";
 };
 
-export async function uploadCsvUrlList(sessionId: string, file: File) {
+export async function uploadCsvUrlList(sessionId: string, files: File[]) {
   const formData = new FormData();
 
-  formData.append("file", file, file.name);
+  for (const file of files) {
+    formData.append("file", file, file.name);
+  }
 
   const response = await fetchWithTimeout(
     backendUrl(`/api/sessions/${sessionId}/csv-upload`),
